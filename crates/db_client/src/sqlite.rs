@@ -348,7 +348,12 @@ impl DbProvider for SqliteProvider {
             return Ok(result);
         }
 
-        run_query(&self.pool, sql).await
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .context("Failed to take a connection for the query")?;
+        run_query(&mut connection, sql).await
     }
 
     fn holds_transactions(&self) -> bool {
@@ -370,7 +375,11 @@ impl DbProvider for SqliteProvider {
     /// equivalent knob to pass it to. While the editor *is* alive its own idle
     /// timer is the guard, and that timer works precisely because the process
     /// is still there.
-    async fn begin_transaction(&self, _database: &str, _abandoned_after: Duration) -> Result<()> {
+    async fn begin_transaction(
+        &self,
+        _database: &str,
+        _abandoned_after: Option<Duration>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.can_hold_transactions,
             "an in-memory SQLite database cannot hold a transaction: a second connection to it \
@@ -451,10 +460,12 @@ impl DbProvider for SqliteProvider {
 /// for schema work, the transaction's own for the console -- so that the
 /// routing decision lives in exactly one place and the decoding below cannot
 /// drift between the two.
-async fn run_query<'c, E>(executor: E, sql: &str) -> Result<QueryResult>
-where
-    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
-{
+/// Takes the connection itself rather than something to run on, because the
+/// read below needs two turns on it: the rows, and then -- only when there
+/// were none -- what columns the statement would have returned. It has to be
+/// the same connection: a table created inside the reader's transaction does
+/// not exist for any other.
+async fn run_query(connection: &mut SqliteConnection, sql: &str) -> Result<QueryResult> {
     let start = Instant::now();
     let trimmed_upper = sql.trim().to_uppercase();
     let is_read_query = trimmed_upper.starts_with("SELECT")
@@ -463,7 +474,7 @@ where
         || trimmed_upper.starts_with("WITH");
 
     if is_read_query {
-        let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(executor);
+        let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(&mut *connection);
         let mut columns: Vec<String> = Vec::new();
         let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -501,6 +512,11 @@ where
             }
         }
 
+        drop(stream);
+        if columns.is_empty() {
+            columns = the_columns_the_statement_returns(connection, sql).await;
+        }
+
         let execution_time_ms = start.elapsed().as_millis() as u64;
         let rows_affected = result_rows.len() as u64;
         Ok(QueryResult {
@@ -513,7 +529,7 @@ where
         })
     } else {
         let result = sqlx::query(AssertSqlSafe(sql))
-            .execute(executor)
+            .execute(&mut *connection)
             .await
             .context("Query execution failed")?;
 
@@ -525,6 +541,37 @@ where
             execution_time_ms: start.elapsed().as_millis() as u64,
             timing: None,
         })
+    }
+}
+
+/// The column names a statement would return, asked of the database rather
+/// than read off a row.
+///
+/// A result with no rows has no row to take the names from, and a grid with no
+/// columns is not an empty result -- it is a table the reader cannot see the
+/// shape of, and cannot add a row to. Asked for only in that case.
+///
+/// Best effort on purpose. A statement that will not describe leaves the grid
+/// as it was rather than turning an empty result into an error.
+async fn the_columns_the_statement_returns(
+    connection: &mut sqlx::SqliteConnection,
+    sql: &str,
+) -> Vec<String> {
+    use sqlx::{Executor as _, SqlSafeStr as _, Statement as _};
+
+    // Prepared rather than described: `describe` is hidden behind a feature
+    // meant for the query macros, while preparing a statement is a public way
+    // to ask the same thing and gives the columns it would return.
+    let statement = AssertSqlSafe(sql.to_string()).into_sql_str();
+    match (&mut *connection).prepare(statement).await {
+        Ok(prepared) => prepared
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect(),
+        // A statement that will not describe leaves the grid as it was rather
+        // than turning an empty result into an error.
+        Err(_) => Vec::new(),
     }
 }
 
@@ -813,12 +860,74 @@ mod tests {
             .collect()
     }
 
+    /// A query that matches nothing still has to say what the columns are.
+    ///
+    /// The reported symptom was a grid reading "0 rows · 0 cols" with not even
+    /// a header, which is not an empty table -- it is a table whose shape is
+    /// invisible and which no row can be added to by hand. The names used to
+    /// be taken off the first row, so an empty result had nowhere to take them
+    /// from.
+    #[tokio::test]
+    async fn an_empty_result_still_says_what_its_columns_are() {
+        let (_directory, provider) = a_provider_on_a_real_file().await;
+
+        let answered = provider
+            .execute_query(
+                "held.db",
+                "SELECT id, name FROM people WHERE name = 'nobody'",
+            )
+            .await
+            .expect("failed to run a query that matches nothing");
+
+        assert!(answered.rows.is_empty(), "{:?}", answered.rows);
+        assert_eq!(
+            answered.columns,
+            vec!["id".to_string(), "name".to_string()],
+            "an empty result must still carry the columns it would have had"
+        );
+    }
+
+    /// The same, inside a transaction and for a table that exists only inside
+    /// it. This is what forces the columns to be asked of the transaction's own
+    /// connection: on any other one the table does not exist, the question
+    /// fails, and the grid is empty again.
+    #[tokio::test]
+    async fn an_empty_result_from_a_table_made_inside_the_transaction_says_its_columns() {
+        let (_directory, provider) = a_provider_on_a_real_file().await;
+
+        provider
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
+            .await
+            .expect("failed to begin");
+        provider
+            .execute_query("held.db", "CREATE TABLE staged (ticker TEXT, price REAL)")
+            .await
+            .expect("failed to create a table inside the transaction");
+
+        let answered = provider
+            .execute_query("held.db", "SELECT ticker, price FROM staged")
+            .await
+            .expect("failed to read the staged table");
+
+        assert!(answered.rows.is_empty(), "{:?}", answered.rows);
+        assert_eq!(
+            answered.columns,
+            vec!["ticker".to_string(), "price".to_string()],
+            "the columns must come from the transaction's own connection"
+        );
+
+        provider
+            .rollback_transaction()
+            .await
+            .expect("failed to roll back");
+    }
+
     #[tokio::test]
     async fn a_rolled_back_transaction_leaves_no_row_behind() {
         let (_directory, provider) = a_provider_on_a_real_file().await;
 
         provider
-            .begin_transaction("held.db", Duration::from_secs(60))
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
             .await
             .expect("failed to begin");
         provider
@@ -842,7 +951,7 @@ mod tests {
         let (_directory, provider) = a_provider_on_a_real_file().await;
 
         provider
-            .begin_transaction("held.db", Duration::from_secs(60))
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
             .await
             .expect("failed to begin");
         provider
@@ -867,7 +976,7 @@ mod tests {
         let (_directory, provider) = a_provider_on_a_real_file().await;
 
         provider
-            .begin_transaction("held.db", Duration::from_secs(60))
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
             .await
             .expect("failed to begin");
         provider
@@ -896,7 +1005,7 @@ mod tests {
         let (_directory, provider) = a_provider_on_a_real_file().await;
 
         provider
-            .begin_transaction("held.db", Duration::from_secs(60))
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
             .await
             .expect("failed to begin");
         provider
@@ -940,7 +1049,7 @@ mod tests {
         let (_directory, provider) = a_provider_on_a_real_file().await;
 
         provider
-            .begin_transaction("held.db", Duration::from_secs(60))
+            .begin_transaction("held.db", Some(Duration::from_secs(60)))
             .await
             .expect("failed to begin");
         provider
@@ -1057,7 +1166,7 @@ mod tests {
         assert!(!in_memory.holds_transactions());
         assert!(
             in_memory
-                .begin_transaction("mem", Duration::from_secs(60))
+                .begin_transaction("mem", Some(Duration::from_secs(60)))
                 .await
                 .is_err(),
             "a driver that answers false must refuse rather than pretend"

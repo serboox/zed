@@ -126,6 +126,17 @@ impl Workspace {
 
     /// What fraction of one phase is done. Work that never began is not work
     /// left to do, so a phase with nothing to restore reads as finished.
+    /// Whether one phase still has work in flight, so that a list of what is
+    /// running can name each of them rather than only the first.
+    pub fn phase_is_running(&self, phase: WorkspaceLoadPhase) -> bool {
+        self.load_phase_counts[phase as usize] > 0
+    }
+
+    /// How far through one phase, for the same list.
+    pub fn how_far_through_phase(&self, phase: WorkspaceLoadPhase) -> f32 {
+        self.how_far_through(phase)
+    }
+
     fn how_far_through(&self, phase: WorkspaceLoadPhase) -> f32 {
         let left = self.load_phase_counts[phase as usize];
         if left == 0 {

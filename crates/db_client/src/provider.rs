@@ -76,7 +76,11 @@ pub trait DbProvider: Send + Sync {
     /// against everyone else until a person noticed. Told to the server at the
     /// moment the transaction opens, it is the one guard that survives the
     /// editor not being there to keep its promises.
-    async fn begin_transaction(&self, _database: &str, _abandoned_after: Duration) -> Result<()> {
+    async fn begin_transaction(
+        &self,
+        _database: &str,
+        _abandoned_after: Option<Duration>,
+    ) -> Result<()> {
         anyhow::bail!("this connection cannot hold a transaction open")
     }
 

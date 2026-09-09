@@ -225,6 +225,14 @@ pub struct MySqlProvider {
     /// Cleared whenever the pool is replaced: a fresh connection has had no
     /// `USE` applied to it.
     current_database: Mutex<Option<String>>,
+    /// How long a transaction here may sit idle before it is given up on, or
+    /// nothing where the reader asked for no limit.
+    ///
+    /// Read from the connection's own settings at connect time and kept, so
+    /// that a transaction the reader opens by typing the statement themselves
+    /// is guarded by the same number as one opened through the editor. Two
+    /// numbers for the same thing is how a guard ends up meaning nothing.
+    transaction_idle_limit: Option<Duration>,
 }
 
 /// Bounds how long a silently dead physical connection can stall a caller
@@ -298,19 +306,6 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// arriving -- only a genuine stall trips it.
 const ROW_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a transaction the reader opened by typing `START TRANSACTION;`
-/// may sit silent before the server closes its connection and InnoDB rolls it
-/// back.
-///
-/// A transaction opened through `begin_transaction` is told how long by
-/// whoever opened it. One the reader opens by hand in the console has nobody
-/// to ask, and the alternative to a number here is a transaction with no
-/// server-side guard at all -- which is the state that holds its locks
-/// against everyone else until a person notices. An hour is long enough that
-/// nobody loses work they were still thinking about, and short enough that an
-/// editor killed before lunch is not still holding rows after it.
-const CONSOLE_TRANSACTION_ABANDONED_AFTER: Duration = Duration::from_secs(60 * 60);
-
 fn mysql_ssl_mode(mode: SslMode) -> MySqlSslMode {
     match mode {
         SslMode::Disabled => MySqlSslMode::Disabled,
@@ -360,6 +355,7 @@ impl MySqlProvider {
             held: AsyncMutex::new(None),
             transaction_opened_at: Mutex::new(None),
             current_database: Mutex::new(None),
+            transaction_idle_limit: config.transaction_idle_limit(),
         })
     }
 
@@ -456,7 +452,7 @@ impl MySqlProvider {
         &self,
         held: &mut Option<HeldTransaction>,
         database: &str,
-        abandoned_after: Duration,
+        abandoned_after: Option<Duration>,
         opening_statement: &str,
     ) -> Result<QueryResult> {
         if held.is_some() {
@@ -489,13 +485,18 @@ impl MySqlProvider {
         // `MySqlStream::with_socket`), and it is that flag which would make
         // the server seed this session's wait from `interactive_timeout`
         // instead. The unit is seconds, and MySQL accepts 1..=31536000.
-        let seconds = abandoned_after.as_secs().clamp(1, 31_536_000);
-        sqlx::raw_sql(AssertSqlSafe(
-            format!("SET SESSION wait_timeout = {seconds}").as_str(),
-        ))
-        .execute(&mut connection)
-        .await
-        .context("Failed to set the transaction's abandonment guard")?;
+        // Nothing is set where no limit was asked for: the reader stepping
+        // through a migration by hand has said they want none, and a value
+        // invented here would close their connection under them.
+        if let Some(abandoned_after) = abandoned_after {
+            let seconds = abandoned_after.as_secs().clamp(1, 31_536_000);
+            sqlx::raw_sql(AssertSqlSafe(
+                format!("SET SESSION wait_timeout = {seconds}").as_str(),
+            ))
+            .execute(&mut connection)
+            .await
+            .context("Failed to set the transaction's abandonment guard")?;
+        }
 
         let mut transaction = HeldTransaction {
             connection,
@@ -536,7 +537,11 @@ impl MySqlProvider {
         pool_wait_ms: u64,
     ) -> Result<QueryResult> {
         self.switch_to(pool, database).await?;
-        run_the_statement(pool, sql, pool_wait_ms).await
+        let mut connection = pool
+            .acquire()
+            .await
+            .context("Failed to take a connection for the query")?;
+        run_the_statement(&mut connection, sql, pool_wait_ms).await
     }
 
     fn current_pool(&self) -> MySqlPool {
@@ -663,10 +668,16 @@ impl MySqlProvider {
 /// prepared protocol buys nothing here anyway: console SQL carries its values
 /// inline and binds no parameters. One protocol for all of it is the only
 /// version that cannot be incomplete.
-async fn run_the_statement<'e, E>(executor: E, sql: &str, pool_wait_ms: u64) -> Result<QueryResult>
-where
-    E: sqlx::Executor<'e, Database = sqlx::MySql>,
-{
+/// Takes the connection itself rather than something to run on, because the
+/// read below needs two turns on it: the rows, and then -- only when there
+/// were none -- what columns the statement would have returned. It has to be
+/// the same connection: a table created inside the reader's transaction does
+/// not exist for any other.
+async fn run_the_statement(
+    connection: &mut sqlx::MySqlConnection,
+    sql: &str,
+    pool_wait_ms: u64,
+) -> Result<QueryResult> {
     let start = Instant::now();
     let prefixed = format!(
         "{}{}",
@@ -675,11 +686,11 @@ where
     );
 
     if is_a_read_query(sql) {
-        return stream_the_rows(executor, &prefixed, start, pool_wait_ms).await;
+        return stream_the_rows(connection, &prefixed, start, pool_wait_ms).await;
     }
 
     let result = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
-        .execute(executor)
+        .execute(&mut *connection)
         .await
         .context("Query execution failed")?;
     let execution_time_ms = start.elapsed().as_millis() as u64;
@@ -704,16 +715,13 @@ where
 /// capped before the next is read, so a huge result -- many rows, or a single
 /// multi-megabyte BLOB cell -- cannot be pulled into memory all at once and
 /// freeze the client.
-async fn stream_the_rows<'e, E>(
-    executor: E,
+async fn stream_the_rows(
+    connection: &mut sqlx::MySqlConnection,
     prefixed: &str,
     start: Instant,
     pool_wait_ms: u64,
-) -> Result<QueryResult>
-where
-    E: sqlx::Executor<'e, Database = sqlx::MySql>,
-{
-    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed)).fetch(executor);
+) -> Result<QueryResult> {
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed)).fetch(&mut *connection);
     let mut columns: Vec<String> = Vec::new();
     let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
     // Set once the first row (or end-of-stream) arrives, splitting
@@ -762,6 +770,11 @@ where
         }
     }
 
+    drop(stream);
+    if columns.is_empty() {
+        columns = the_columns_the_statement_returns(connection, prefixed).await;
+    }
+
     let execution_time_ms = start.elapsed().as_millis() as u64;
     let rows_affected = result_rows.len() as u64;
     let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
@@ -779,6 +792,41 @@ where
     })
 }
 
+/// The column names a statement would return, asked of the server rather than
+/// read off a row.
+///
+/// A result with no rows has no row to take the names from, and a grid with no
+/// columns is not an empty result -- it is a table the reader cannot see the
+/// shape of, and cannot add a row to. So the columns are asked for separately,
+/// and only in that case: it is one more round trip, and a round trip to a
+/// distant server costs as much as the query did.
+///
+/// Best effort on purpose. A statement the server will describe but not
+/// execute, or one it cannot describe at all, leaves the grid as it was rather
+/// than turning an empty result into an error.
+async fn the_columns_the_statement_returns(
+    connection: &mut sqlx::MySqlConnection,
+    prefixed: &str,
+) -> Vec<String> {
+    use sqlx::{Executor as _, SqlSafeStr as _, Statement as _};
+
+    // Prepared rather than described: `describe` is hidden behind a feature
+    // meant for the query macros, while preparing a statement is a public way
+    // to ask the same thing and gives the columns it would return.
+    let statement = AssertSqlSafe(prefixed.to_string()).into_sql_str();
+    match (&mut *connection).prepare(statement).await {
+        Ok(prepared) => prepared
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect(),
+        // A statement the server will describe but not execute, or one it
+        // cannot describe at all, leaves the grid as it was rather than
+        // turning an empty result into an error.
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Pushes a read query's rows straight into `sink`, with no cap on how many.
 ///
 /// Shares the executor shape of [`run_the_statement`] for the same reason and
@@ -786,14 +834,11 @@ where
 /// never breaks at `MAX_RESULT_ROWS`: the whole point of an export is result
 /// sets too large for the grid. Cells are still capped against a single
 /// multi-megabyte BLOB, but the row count itself is unbounded.
-async fn stream_into_the_sink<'e, E>(
-    executor: E,
+async fn stream_into_the_sink(
+    connection: &mut sqlx::MySqlConnection,
     sql: &str,
     sink: &mut dyn crate::provider::RowSink,
-) -> Result<u64>
-where
-    E: sqlx::Executor<'e, Database = sqlx::MySql>,
-{
+) -> Result<u64> {
     let prefixed = format!(
         "{}{}",
         crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
@@ -802,13 +847,13 @@ where
 
     if !is_a_read_query(sql) {
         sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
-            .execute(executor)
+            .execute(&mut *connection)
             .await
             .context("Query execution failed")?;
         return Ok(0);
     }
 
-    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(executor);
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&mut *connection);
     let mut columns: Vec<String> = Vec::new();
     let mut row_count: u64 = 0;
 
@@ -840,7 +885,12 @@ where
     }
 
     if columns.is_empty() {
-        sink.write_columns(&[])?;
+        // The same reason the grid gets its columns asked for: a file whose
+        // header row is missing does not say the result was empty, it says
+        // nothing at all about what was exported.
+        drop(stream);
+        let asked = the_columns_the_statement_returns(connection, &prefixed).await;
+        sink.write_columns(&asked)?;
     }
     Ok(row_count)
 }
@@ -1525,12 +1575,7 @@ impl DbProvider for MySqlProvider {
 
         if effect == WhatItDoesToTheTransaction::Opens {
             return self
-                .open_a_held_transaction(
-                    &mut held,
-                    database,
-                    CONSOLE_TRANSACTION_ABANDONED_AFTER,
-                    sql,
-                )
+                .open_a_held_transaction(&mut held, database, self.transaction_idle_limit, sql)
                 .await;
         }
         drop(held);
@@ -1589,14 +1634,22 @@ impl DbProvider for MySqlProvider {
 
         let pool = self.ensure_live_pool().await?;
         self.switch_to(&pool, database).await?;
-        stream_into_the_sink(&pool, sql, sink).await
+        let mut connection = pool
+            .acquire()
+            .await
+            .context("Failed to take a connection for the export")?;
+        stream_into_the_sink(&mut connection, sql, sink).await
     }
 
     fn holds_transactions(&self) -> bool {
         true
     }
 
-    async fn begin_transaction(&self, database: &str, abandoned_after: Duration) -> Result<()> {
+    async fn begin_transaction(
+        &self,
+        database: &str,
+        abandoned_after: Option<Duration>,
+    ) -> Result<()> {
         let _guard = self.op_lock.lock().await;
         let mut held = self.held.lock().await;
         self.open_a_held_transaction(&mut held, database, abandoned_after, "START TRANSACTION")
@@ -1935,6 +1988,7 @@ mod integration_tests {
     use crate::provider::DbProvider;
     use crate::schema::ProcedureKind;
     use crate::{ConnectionConfig, DatabaseDriver};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn test_config_from_env() -> Option<ConnectionConfig> {
@@ -3769,5 +3823,286 @@ mod integration_tests {
             );
         })
         .await;
+    }
+
+    /// Everything the reader does with a transaction, against a real server:
+    /// open it, see staged work, roll it back and find it gone, then do the
+    /// same and commit.
+    ///
+    /// The parts that only a real server can answer are the point. That
+    /// `START TRANSACTION` is accepted at all -- it used to fail outright with
+    /// 1295, because the statement went through the prepared-statement
+    /// protocol, which does not carry it. That the statements after it land on
+    /// the same connection, which is what makes the rollback able to undo
+    /// them. And that the schema browser, which deliberately uses the pool,
+    /// does not see the staged table -- if it did, the transaction would not
+    /// be held anywhere in particular.
+    #[tokio::test]
+    #[ignore]
+    async fn a_transaction_stages_work_that_a_rollback_undoes_and_a_commit_keeps() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let database = config
+            .database
+            .clone()
+            .expect("MYSQL_TEST_URL must name a database");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        provider
+            .execute_query(&database, "DROP TABLE IF EXISTS zed_transaction_probe")
+            .await
+            .expect("failed to clear the probe table");
+        provider
+            .execute_query(
+                &database,
+                "CREATE TABLE zed_transaction_probe (ticker VARCHAR(16)) ENGINE=InnoDB",
+            )
+            .await
+            .expect("failed to create the probe table");
+
+        async fn staged_rows(provider: &MySqlProvider, database: &str) -> usize {
+            provider
+                .execute_query(database, "SELECT ticker FROM zed_transaction_probe")
+                .await
+                .expect("failed to read the probe table")
+                .rows
+                .len()
+        }
+
+        // Rolled back.
+        provider
+            .execute_query(&database, "START TRANSACTION")
+            .await
+            .expect("START TRANSACTION must be accepted, not answered with 1295");
+        assert!(
+            provider.transaction_open_since().is_some(),
+            "the transaction must be held after the reader opened it"
+        );
+        provider
+            .execute_query(
+                &database,
+                "INSERT INTO zed_transaction_probe (ticker) VALUES ('AAPL')",
+            )
+            .await
+            .expect("failed to insert inside the transaction");
+        assert_eq!(
+            staged_rows(&provider, &database).await,
+            1,
+            "the console must see its own staged row"
+        );
+        let listed = provider
+            .list_tables(&database)
+            .await
+            .expect("failed to list tables");
+        assert!(
+            listed.iter().any(|t| t.name == "zed_transaction_probe"),
+            "the table itself was committed before the transaction, so it is listed"
+        );
+
+        provider
+            .execute_query(&database, "ROLLBACK")
+            .await
+            .expect("failed to roll back");
+        assert_eq!(
+            provider.transaction_open_since(),
+            None,
+            "a rollback must release the transaction"
+        );
+        assert_eq!(
+            staged_rows(&provider, &database).await,
+            0,
+            "the staged row must be gone after the rollback"
+        );
+
+        // Committed.
+        provider
+            .execute_query(&database, "START TRANSACTION")
+            .await
+            .expect("failed to open the second transaction");
+        provider
+            .execute_query(
+                &database,
+                "INSERT INTO zed_transaction_probe (ticker) VALUES ('MSFT')",
+            )
+            .await
+            .expect("failed to insert inside the second transaction");
+        provider
+            .execute_query(&database, "COMMIT")
+            .await
+            .expect("failed to commit");
+        assert_eq!(
+            provider.transaction_open_since(),
+            None,
+            "a commit must release the transaction"
+        );
+        assert_eq!(
+            staged_rows(&provider, &database).await,
+            1,
+            "the committed row must still be there"
+        );
+
+        provider
+            .execute_query(&database, "DROP TABLE zed_transaction_probe")
+            .await
+            .expect("failed to drop the probe table");
+    }
+
+    /// A savepoint rolled back to must not end the transaction.
+    ///
+    /// This is the case the statement text alone gets wrong: `ROLLBACK TO
+    /// SAVEPOINT` reads like a rollback, and a reader of the text that treats
+    /// it as one lets the connection go while the transaction is still live on
+    /// it -- after which the reader's next statement is outside a transaction
+    /// they can still see the badge for.
+    #[tokio::test]
+    #[ignore]
+    async fn a_rollback_to_a_savepoint_keeps_the_transaction_open_on_a_real_server() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let database = config
+            .database
+            .clone()
+            .expect("MYSQL_TEST_URL must name a database");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        provider
+            .execute_query(&database, "DROP TABLE IF EXISTS zed_savepoint_probe")
+            .await
+            .expect("failed to clear the probe table");
+        provider
+            .execute_query(
+                &database,
+                "CREATE TABLE zed_savepoint_probe (ticker VARCHAR(16)) ENGINE=InnoDB",
+            )
+            .await
+            .expect("failed to create the probe table");
+
+        provider
+            .execute_query(&database, "START TRANSACTION")
+            .await
+            .expect("failed to begin");
+        provider
+            .execute_query(
+                &database,
+                "INSERT INTO zed_savepoint_probe (ticker) VALUES ('KEPT')",
+            )
+            .await
+            .expect("failed to insert the kept row");
+        provider
+            .execute_query(&database, "SAVEPOINT after_kept")
+            .await
+            .expect("SAVEPOINT must be accepted, not answered with 1295");
+        provider
+            .execute_query(
+                &database,
+                "INSERT INTO zed_savepoint_probe (ticker) VALUES ('UNDONE')",
+            )
+            .await
+            .expect("failed to insert the row to be undone");
+        provider
+            .execute_query(&database, "ROLLBACK TO SAVEPOINT after_kept")
+            .await
+            .expect("failed to roll back to the savepoint");
+
+        assert!(
+            provider.transaction_open_since().is_some(),
+            "rolling back to a savepoint must leave the transaction open"
+        );
+        let tickers: Vec<Option<String>> = provider
+            .execute_query(&database, "SELECT ticker FROM zed_savepoint_probe")
+            .await
+            .expect("failed to read the probe table")
+            .rows
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect();
+        assert_eq!(
+            tickers,
+            vec![Some("KEPT".to_string())],
+            "only the row after the savepoint is undone"
+        );
+
+        provider
+            .execute_query(&database, "ROLLBACK")
+            .await
+            .expect("failed to roll back");
+        provider
+            .execute_query(&database, "DROP TABLE zed_savepoint_probe")
+            .await
+            .expect("failed to drop the probe table");
+    }
+
+    /// The guard that survives the editor being killed, proved against a real
+    /// server: a transaction whose connection is told to give up after a
+    /// second is gone a few seconds later, and its staged work with it.
+    ///
+    /// Nothing in the editor takes part. This is what protects everyone else's
+    /// rows when the editor is not there to keep its own promises.
+    #[tokio::test]
+    #[ignore]
+    async fn the_server_ends_a_transaction_the_editor_stopped_speaking_for() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let database = config
+            .database
+            .clone()
+            .expect("MYSQL_TEST_URL must name a database");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        provider
+            .execute_query(&database, "DROP TABLE IF EXISTS zed_abandoned_probe")
+            .await
+            .expect("failed to clear the probe table");
+        provider
+            .execute_query(
+                &database,
+                "CREATE TABLE zed_abandoned_probe (ticker VARCHAR(16)) ENGINE=InnoDB",
+            )
+            .await
+            .expect("failed to create the probe table");
+
+        provider
+            .begin_transaction(&database, Some(Duration::from_secs(1)))
+            .await
+            .expect("failed to begin");
+        provider
+            .execute_query(
+                &database,
+                "INSERT INTO zed_abandoned_probe (ticker) VALUES ('ABANDONED')",
+            )
+            .await
+            .expect("failed to insert inside the transaction");
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        // The statement is expected to fail: the server closed the connection
+        // out from under it. What matters is what the row count says next.
+        provider
+            .execute_query(&database, "SELECT ticker FROM zed_abandoned_probe")
+            .await
+            .ok();
+        provider.rollback_transaction().await.ok();
+
+        let survivors = provider
+            .execute_query(&database, "SELECT ticker FROM zed_abandoned_probe")
+            .await
+            .expect("failed to read the probe table after the server gave up")
+            .rows
+            .len();
+        assert_eq!(
+            survivors, 0,
+            "the server must have rolled the abandoned transaction back"
+        );
+
+        provider
+            .execute_query(&database, "DROP TABLE zed_abandoned_probe")
+            .await
+            .expect("failed to drop the probe table");
     }
 }

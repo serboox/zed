@@ -682,8 +682,12 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_left_item(session_restore_indicator, window, cx);
             status_bar.add_left_item(db_exec_status, window, cx);
+            // First among the right-hand items, which the bar draws in reverse
+            // -- so this sits at the very edge, where a reader looks for the
+            // state of the whole window rather than of the file in front of
+            // them. It takes no width at all when nothing is running.
+            status_bar.add_right_item(session_restore_indicator, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);

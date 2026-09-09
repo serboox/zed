@@ -217,6 +217,20 @@ pub struct ConnectionConfig {
     /// rejected instead of reaching the database.
     #[serde(default)]
     pub read_only: bool,
+    /// How long a transaction on this connection may sit with nothing
+    /// happening before it is given up on, in minutes.
+    ///
+    /// Belongs to the connection rather than to the editor because the
+    /// tolerance is the server's, not the reader's: minutes of held locks on a
+    /// shared production server is a different thing from minutes on a local
+    /// copy nobody else is using.
+    ///
+    /// Zero means no limit, and is deliberately expressible -- somebody
+    /// stepping through a migration by hand has a real reason to want one --
+    /// but it turns off the guard against an abandoned transaction as well, so
+    /// nothing chooses it by default.
+    #[serde(default = "default_transaction_idle_minutes")]
+    pub transaction_idle_minutes: u64,
 }
 
 impl ConnectionConfig {
@@ -227,6 +241,20 @@ impl ConnectionConfig {
     pub fn uses_kubernetes_tunnel(&self) -> bool {
         self.k8s_context.is_some()
     }
+
+    /// How long a transaction here may sit idle, or nothing where no limit was
+    /// asked for.
+    pub fn transaction_idle_limit(&self) -> Option<std::time::Duration> {
+        (self.transaction_idle_minutes > 0)
+            .then(|| std::time::Duration::from_secs(self.transaction_idle_minutes * 60))
+    }
+}
+
+/// Half an hour, which is long enough to read a result and decide, and short
+/// enough that a transaction forgotten over lunch is not still holding locks
+/// when somebody else needs the rows.
+fn default_transaction_idle_minutes() -> u64 {
+    30
 }
 
 fn default_true() -> bool {
@@ -246,6 +274,7 @@ impl Default for ConnectionConfig {
         Self {
             id: Uuid::new_v4(),
             label: String::from("New Connection"),
+            transaction_idle_minutes: default_transaction_idle_minutes(),
             driver: DatabaseDriver::MySQL,
             host: String::from("localhost"),
             port: 3306,

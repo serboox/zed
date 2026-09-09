@@ -123,7 +123,11 @@ impl DbProvider for RuntimeProvider {
         self.inner.holds_transactions()
     }
 
-    async fn begin_transaction(&self, database: &str, abandoned_after: Duration) -> Result<()> {
+    async fn begin_transaction(
+        &self,
+        database: &str,
+        abandoned_after: Option<Duration>,
+    ) -> Result<()> {
         let inner = self.inner.clone();
         let database = database.to_owned();
         on_runtime(async move { inner.begin_transaction(&database, abandoned_after).await }).await

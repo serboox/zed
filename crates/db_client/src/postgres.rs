@@ -21,6 +21,14 @@ pub struct PostgresProvider {
     /// Kept so a held transaction can open a physical connection of its own
     /// rather than borrow the pool's -- see [`HeldTransaction`].
     connect_options: PgConnectOptions,
+    /// How long a transaction here may sit idle before it is given up on, or
+    /// nothing where the reader asked for no limit.
+    ///
+    /// Read from the connection's own settings at connect time and kept, so
+    /// that a transaction the reader opens by typing the statement themselves
+    /// is guarded by the same number as one opened through the editor. Two
+    /// numbers for the same thing is how a guard ends up meaning nothing.
+    transaction_idle_limit: Option<Duration>,
     held_transaction: AsyncMutex<Option<HeldTransaction>>,
     /// When the held transaction opened, deliberately outside the async mutex
     /// above. A statement running inside the transaction holds that mutex for
@@ -55,14 +63,6 @@ struct HeldTransaction {
     /// current, and dropping the connection is what invalidates it.
     search_path: String,
 }
-
-/// How long the server waits on a silent connection before ending a
-/// transaction the reader opened by typing `BEGIN` themselves.
-///
-/// A hand-typed `BEGIN` arrives with nobody having stated their patience, and
-/// the alternative to picking a number here is no server-side guard at all on
-/// exactly the transaction the editor is least aware of.
-const HAND_TYPED_TRANSACTION_ABANDONED_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// What a statement the reader typed does to the transaction the console is
 /// holding.
@@ -218,14 +218,16 @@ where
     Ok(result.rows_affected())
 }
 
-async fn collect_rows<'e, E>(
-    executor: E,
+/// Takes the connection itself rather than something to run on, because this
+/// needs two turns on it: the rows, and then -- only when there were none --
+/// what columns the statement would have returned. It has to be the same
+/// connection: a table created inside the reader's transaction does not exist
+/// for any other.
+async fn collect_rows(
+    connection: &mut sqlx::PgConnection,
     sql: &str,
-) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(executor);
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(&mut *connection);
     let mut columns: Vec<String> = Vec::new();
     let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -246,20 +248,54 @@ where
             break;
         }
     }
+    drop(stream);
+    if columns.is_empty() {
+        columns = the_columns_the_statement_returns(connection, sql).await;
+    }
     Ok((columns, result_rows))
+}
+
+/// The column names a statement would return, asked of the server rather than
+/// read off a row.
+///
+/// A result with no rows has no row to take the names from, and a grid with no
+/// columns is not an empty result -- it is a table the reader cannot see the
+/// shape of, and cannot add a row to. Asked for only in that case: it is one
+/// more round trip, and a round trip to a distant server costs as much as the
+/// query did.
+///
+/// Best effort on purpose. A statement the server will not describe leaves the
+/// grid as it was rather than turning an empty result into an error.
+async fn the_columns_the_statement_returns(
+    connection: &mut sqlx::PgConnection,
+    sql: &str,
+) -> Vec<String> {
+    use sqlx::{Executor as _, SqlSafeStr as _, Statement as _};
+
+    // Prepared rather than described: `describe` is hidden behind a feature
+    // meant for the query macros, while preparing a statement is a public way
+    // to ask the same thing and gives the columns it would return.
+    let statement = AssertSqlSafe(sql.to_string()).into_sql_str();
+    match (&mut *connection).prepare(statement).await {
+        Ok(prepared) => prepared
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect(),
+        // A statement the server will not describe leaves the grid as it was
+        // rather than turning an empty result into an error.
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Unlike [`collect_rows`], this never breaks at `MAX_RESULT_ROWS` — the whole
 /// point of "execute to file" is exporting result sets too large for the grid.
-async fn stream_rows<'e, E>(
-    executor: E,
+async fn stream_rows(
+    connection: &mut sqlx::PgConnection,
     sql: &str,
     sink: &mut dyn crate::provider::RowSink,
-) -> Result<u64>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(executor);
+) -> Result<u64> {
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(&mut *connection);
     let mut columns: Vec<String> = Vec::new();
     let mut row_count: u64 = 0;
 
@@ -280,7 +316,12 @@ where
     }
 
     if columns.is_empty() {
-        sink.write_columns(&[])?;
+        // The same reason the grid gets its columns asked for: a file whose
+        // header row is missing does not say the result was empty, it says
+        // nothing at all about what was exported.
+        drop(stream);
+        let asked = the_columns_the_statement_returns(connection, sql).await;
+        sink.write_columns(&asked)?;
     }
     Ok(row_count)
 }
@@ -301,7 +342,11 @@ async fn run_on_pool(
 
     let start = Instant::now();
     if is_read_query(sql) {
-        let (columns, rows) = collect_rows(pool, prefixed).await?;
+        let mut connection = pool
+            .acquire()
+            .await
+            .context("Failed to take a connection for the query")?;
+        let (columns, rows) = collect_rows(&mut connection, prefixed).await?;
         Ok(rows_result(columns, rows, start))
     } else {
         let rows_affected = execute_statement(pool, prefixed).await?;
@@ -463,6 +508,7 @@ impl PostgresProvider {
         Ok(Self {
             pool,
             connect_options: opts,
+            transaction_idle_limit: config.transaction_idle_limit(),
             held_transaction: AsyncMutex::new(None),
             transaction_opened_at: Mutex::new(None),
         })
@@ -482,18 +528,23 @@ impl PostgresProvider {
     async fn open_held_transaction(
         &self,
         schema: &str,
-        abandoned_after: Duration,
+        abandoned_after: Option<Duration>,
         opening_statement: &str,
     ) -> Result<HeldTransaction> {
         let mut connection = PgConnection::connect_with(&self.connect_options)
             .await
             .context("Failed to open a connection for the transaction")?;
 
-        let guard = idle_in_transaction_timeout_statement(abandoned_after);
-        sqlx::query(AssertSqlSafe(guard.as_str()))
-            .execute(&mut connection)
-            .await
-            .context("Failed to set the transaction's idle timeout")?;
+        // Nothing is set where no limit was asked for: the reader stepping
+        // through a migration by hand has said they want none, and a value
+        // invented here would terminate their session under them.
+        if let Some(abandoned_after) = abandoned_after {
+            let guard = idle_in_transaction_timeout_statement(abandoned_after);
+            sqlx::query(AssertSqlSafe(guard.as_str()))
+                .execute(&mut connection)
+                .await
+                .context("Failed to set the transaction's idle timeout")?;
+        }
 
         let mut search_path = String::new();
         if !schema.is_empty() {
@@ -832,7 +883,11 @@ impl DbProvider for PostgresProvider {
         true
     }
 
-    async fn begin_transaction(&self, schema: &str, abandoned_after: Duration) -> Result<()> {
+    async fn begin_transaction(
+        &self,
+        schema: &str,
+        abandoned_after: Option<Duration>,
+    ) -> Result<()> {
         let mut held = self.held_transaction.lock().await;
         anyhow::ensure!(
             held.is_none(),
@@ -915,11 +970,7 @@ impl DbProvider for PostgresProvider {
         let Some(mut transaction) = held.take() else {
             if effect == TransactionEffect::Opens {
                 let transaction = self
-                    .open_held_transaction(
-                        schema,
-                        HAND_TYPED_TRANSACTION_ABANDONED_AFTER,
-                        prefixed.as_str(),
-                    )
+                    .open_held_transaction(schema, self.transaction_idle_limit, prefixed.as_str())
                     .await?;
                 self.record_transaction_opened_at(Some(Instant::now()));
                 *held = Some(transaction);
@@ -965,11 +1016,7 @@ impl DbProvider for PostgresProvider {
         let Some(mut transaction) = held.take() else {
             if effect == TransactionEffect::Opens {
                 let transaction = self
-                    .open_held_transaction(
-                        schema,
-                        HAND_TYPED_TRANSACTION_ABANDONED_AFTER,
-                        prefixed.as_str(),
-                    )
+                    .open_held_transaction(schema, self.transaction_idle_limit, prefixed.as_str())
                     .await?;
                 self.record_transaction_opened_at(Some(Instant::now()));
                 *held = Some(transaction);
@@ -987,7 +1034,12 @@ impl DbProvider for PostgresProvider {
                 execute_statement(&self.pool, prefixed.as_str()).await?;
                 return Ok(0);
             }
-            return stream_rows(&self.pool, prefixed.as_str(), sink).await;
+            let mut connection = self
+                .pool
+                .acquire()
+                .await
+                .context("Failed to take a connection for the export")?;
+            return stream_rows(&mut connection, prefixed.as_str(), sink).await;
         };
 
         let outcome = async {

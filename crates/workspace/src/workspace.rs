@@ -20,6 +20,7 @@ pub mod only_the_document;
 pub mod path_link;
 mod persistence;
 pub mod preview_appearance;
+pub mod running_work;
 pub mod searchable;
 pub mod security_modal;
 pub mod session_restore_indicator;

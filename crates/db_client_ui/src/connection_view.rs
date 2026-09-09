@@ -192,6 +192,10 @@ pub struct ConnectionView {
     color_editor: Entity<Editor>,
     auto_connect: bool,
     read_only: bool,
+    /// Carried through rather than edited here: the value belongs to the
+    /// connection and is set in the connections file, and losing it every time
+    /// somebody opened this dialog would quietly turn the guard off.
+    transaction_idle_minutes: u64,
     use_ssh: bool,
     ssh_host_editor: Entity<Editor>,
     ssh_port_editor: Entity<Editor>,
@@ -289,6 +293,8 @@ impl ConnectionView {
             color_editor,
             auto_connect: true,
             read_only: false,
+            transaction_idle_minutes: db_client::ConnectionConfig::default()
+                .transaction_idle_minutes,
             use_ssh: false,
             ssh_host_editor,
             ssh_port_editor,
@@ -438,6 +444,7 @@ impl ConnectionView {
             color_editor,
             auto_connect: config.auto_connect,
             read_only: config.read_only,
+            transaction_idle_minutes: config.transaction_idle_minutes,
             use_ssh,
             ssh_host_editor,
             ssh_port_editor,
@@ -727,6 +734,7 @@ impl ConnectionView {
                 order: 0,
                 env_color,
                 read_only: self.read_only,
+                transaction_idle_minutes: self.transaction_idle_minutes,
             });
         }
 
@@ -781,6 +789,7 @@ impl ConnectionView {
             order: 0,
             env_color,
             read_only: self.read_only,
+            transaction_idle_minutes: self.transaction_idle_minutes,
         })
     }
 

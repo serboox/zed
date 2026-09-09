@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
@@ -291,11 +291,16 @@ pub struct ActiveConnection {
     pub table_triggers: HashMap<(String, String), Vec<TriggerInfo>>,
     pub expanded_database_set: HashSet<String>,
     pub expanded_table_set: HashSet<(String, String)>,
-    /// Set while a manually-opened `START TRANSACTION`/`BEGIN` has not yet
-    /// been closed by `COMMIT`/`ROLLBACK`. Only meaningful for drivers whose
-    /// provider holds a single persistent connection per `ActiveConnection`
-    /// (MySQL, PostgreSQL) -- see [`transaction_boundary`].
-    pub in_transaction: bool,
+    /// When the transaction this connection is holding opened, or `None` when
+    /// it holds none.
+    ///
+    /// Read from the provider after every statement rather than worked out
+    /// here from the statement's text. The provider is the only place that
+    /// knows: it is the one holding the connection, and it already has to tell
+    /// `COMMIT AND CHAIN` from `COMMIT`, and `ROLLBACK TO SAVEPOINT` from
+    /// `ROLLBACK`, to decide whether to let the connection go. A second reading
+    /// of the same statements here would disagree with it on exactly those.
+    pub transaction_open_since: Option<Instant>,
     /// Bumped every time the connection is torn down or replaced. Tasks capture
     /// it before they start and compare on completion, so a slow connect,
     /// refresh or prefetch belonging to a previous incarnation cannot write its
@@ -322,36 +327,9 @@ impl ActiveConnection {
             table_triggers: HashMap::new(),
             expanded_database_set: HashSet::new(),
             expanded_table_set: HashSet::new(),
-            in_transaction: false,
+            transaction_open_since: None,
             epoch: 0,
         }
-    }
-}
-
-/// Classifies whether `sql` opens or closes a transaction for `driver`, so the
-/// console can show a visible "transaction open" indicator. Scoped to MySQL
-/// and PostgreSQL: both providers hold a single-connection pool per
-/// `ActiveConnection` (`max_connections(1)`), so every statement sent through
-/// [`DatabaseStore::execute_query`] genuinely runs on the same underlying
-/// connection and standard `START TRANSACTION`/`BEGIN` ... `COMMIT`/
-/// `ROLLBACK` semantics apply. Other drivers either have no such multi-
-/// statement ACID transaction model (Redis, Aerospike, MongoDB without an
-/// explicit session) or execute each statement over a fresh HTTP request
-/// (ClickHouse), so a badge there would be misleading.
-fn transaction_boundary(driver: DatabaseDriver, sql: &str) -> Option<bool> {
-    if !matches!(driver, DatabaseDriver::MySQL | DatabaseDriver::PostgreSQL) {
-        return None;
-    }
-    let trimmed_upper = sql.trim().to_uppercase();
-    if trimmed_upper.starts_with("START TRANSACTION")
-        || trimmed_upper == "BEGIN"
-        || trimmed_upper.starts_with("BEGIN ")
-    {
-        Some(true)
-    } else if trimmed_upper.starts_with("COMMIT") || trimmed_upper.starts_with("ROLLBACK") {
-        Some(false)
-    } else {
-        None
     }
 }
 
@@ -485,7 +463,100 @@ pub enum RelativePosition {
     After,
 }
 
+/// How often the open transactions are looked at: to see whether one has been
+/// left too long, and to bring the age shown beside it up to date.
+///
+/// Half a minute rather than every second. The age is shown in minutes, so a
+/// second-by-second redraw would change nothing on the screen most of the
+/// time, and the limit it is compared against is measured in minutes too.
+const HOW_OFTEN_TO_LOOK: Duration = Duration::from_secs(30);
+
 impl DatabaseStore {
+    /// Whether any connection is holding a transaction open.
+    pub fn holds_a_transaction(&self) -> bool {
+        self.connections
+            .iter()
+            .any(|conn| conn.transaction_open_since.is_some())
+    }
+
+    /// The connections whose transaction has been open longer than that
+    /// connection's own limit allows.
+    fn transactions_left_too_long(&self) -> Vec<ConnectionId> {
+        let now = Instant::now();
+        self.connections
+            .iter()
+            .filter(|conn| {
+                let Some(limit) = conn.config.transaction_idle_limit() else {
+                    return false;
+                };
+                conn.transaction_open_since
+                    .is_some_and(|opened| now.saturating_duration_since(opened) >= limit)
+            })
+            .map(|conn| conn.config.id)
+            .collect()
+    }
+
+    /// Commits the transaction one connection is holding.
+    pub fn commit_transaction(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.finish_the_transaction(id, true, cx)
+    }
+
+    /// Rolls back the transaction one connection is holding.
+    ///
+    /// Safe to call when there is none: it is what everything that goes wrong
+    /// reaches for -- a window closing, an idle transaction expiring, a reader
+    /// pressing the button twice -- and none of those can check and then act
+    /// without a gap in between.
+    pub fn rollback_transaction(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.finish_the_transaction(id, false, cx)
+    }
+
+    fn finish_the_transaction(
+        &mut self,
+        id: ConnectionId,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("Connection is not open")));
+        };
+        let epoch = conn.epoch;
+        cx.spawn(async move |this, cx| {
+            let answer = if commit {
+                provider.commit_transaction().await
+            } else {
+                provider.rollback_transaction().await
+            };
+            // Read back from the provider rather than assumed: a commit that
+            // the server refused leaves the transaction open, and telling the
+            // reader it is closed would invite them to walk away from work
+            // that is still staged and still holding locks.
+            let open_since = provider.transaction_open_since();
+            this.update(cx, |store, cx| {
+                // The transaction belonged to the connection it was opened on,
+                // not to whatever replaced it.
+                if let Some(conn) = store.connection_at_epoch(id, epoch) {
+                    conn.transaction_open_since = open_since;
+                    cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                    cx.notify();
+                }
+            })
+            .ok();
+            answer
+        })
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         // Skip disk load under test: it would read the user's real config dir
         // (non-hermetic) and auto-connect, which drives Tokio work whose
@@ -595,6 +666,56 @@ impl DatabaseStore {
                     this.update(cx, |store, _| store.run_configurations = configs)
                         .ok();
                 }
+            })
+            .detach();
+
+            // The editor's own guard against a transaction nobody came back
+            // to. It is not the same guard as the one the server was told
+            // about when the transaction opened: this one ends the wait while
+            // the editor is running, and the server's ends it when the editor
+            // is not there to.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(HOW_OFTEN_TO_LOOK).await;
+                    let Ok(idle) = this.update(cx, |store, cx| {
+                        // Redrawn on every look, not only when something
+                        // expires: the badge shows how long the transaction
+                        // has been open, and nothing else would bring that
+                        // number up to date.
+                        if store.holds_a_transaction() {
+                            cx.notify();
+                        }
+                        store.transactions_left_too_long()
+                    }) else {
+                        return;
+                    };
+                    for id in idle {
+                        if let Ok(task) =
+                            this.update(cx, |store, cx| store.rollback_transaction(id, cx))
+                        {
+                            task.await.log_err();
+                        }
+                    }
+                }
+            })
+            .detach();
+
+            // Killing the editor runs none of this, which is why the server
+            // was given a limit of its own. This is for the ordinary way an
+            // editor ends: it rolls the reader's staged work back at once
+            // instead of leaving the server to notice minutes later.
+            cx.on_app_quit(|store, cx| {
+                let rollbacks: Vec<_> = store
+                    .connections
+                    .iter()
+                    .filter(|conn| conn.transaction_open_since.is_some())
+                    .filter_map(|conn| conn.provider.clone())
+                    .collect();
+                cx.background_executor().spawn(async move {
+                    for provider in rollbacks {
+                        provider.rollback_transaction().await.log_err();
+                    }
+                })
             })
             .detach();
         }
@@ -1891,7 +2012,7 @@ impl DatabaseStore {
         }
         conn.provider = None;
         conn.status = ConnectionStatus::Error(error.to_string());
-        conn.in_transaction = false;
+        conn.transaction_open_since = None;
         conn.epoch += 1;
         self.tunnels.remove(&id);
         self.prefetching_schema.remove(&id);
@@ -1945,6 +2066,18 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
             return;
         };
+        // Rolled back before the provider goes, rather than left to the
+        // socket's closing. Dropping the provider does end the transaction --
+        // the server rolls one back when its connection closes -- but only
+        // once every clone of it is gone, and a query still running holds one.
+        // Saying so explicitly ends it now instead of whenever that finishes.
+        if conn.transaction_open_since.is_some()
+            && let Some(provider) = conn.provider.clone()
+        {
+            cx.background_executor()
+                .spawn(async move { provider.rollback_transaction().await.log_err() })
+                .detach();
+        }
         let epoch = conn.epoch + 1;
         *conn = ActiveConnection {
             epoch,
@@ -2328,7 +2461,6 @@ impl DatabaseStore {
         if conn.config.read_only && crate::db_agent_tools::requires_confirmation(&sql) {
             return Task::ready(Err(read_only_error(&conn.config.label)));
         }
-        let driver = conn.config.driver;
 
         self.record_query_history(sql.clone(), cx);
 
@@ -2347,18 +2479,19 @@ impl DatabaseStore {
             let result = provider.execute_query(&database, &sql).await;
             match &result {
                 Ok(_) => {
-                    if let Some(opens_transaction) = transaction_boundary(driver, &sql) {
-                        this.update(cx, |store, cx| {
-                            // The transaction belongs to the connection this
-                            // statement ran on, not to whatever replaced it.
-                            if let Some(conn) = store.connection_at_epoch(id, epoch) {
-                                conn.in_transaction = opens_transaction;
-                                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }
+                    let open_since = provider.transaction_open_since();
+                    this.update(cx, |store, cx| {
+                        // The transaction belongs to the connection this
+                        // statement ran on, not to whatever replaced it.
+                        if let Some(conn) = store.connection_at_epoch(id, epoch)
+                            && conn.transaction_open_since != open_since
+                        {
+                            conn.transaction_open_since = open_since;
+                            cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
                 }
                 Err(error) => {
                     this.update(cx, |store, cx| {

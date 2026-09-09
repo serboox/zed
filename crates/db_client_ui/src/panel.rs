@@ -109,7 +109,11 @@ enum DbTreeRow {
         label: String,
         driver: DatabaseDriver,
         status: ConnectionStatus,
-        in_transaction: bool,
+        /// When the transaction this connection holds opened, or `None` when
+        /// it holds none. The instant rather than a flag, so the badge can say
+        /// how long it has been open -- which is the fact that decides whether
+        /// it wants attention.
+        transaction_open_since: Option<std::time::Instant>,
         env_color: Option<String>,
         folder_id: Option<FolderId>,
         depth: usize,
@@ -6360,6 +6364,20 @@ impl DatabasePanel {
             status: DumpStatus::Running,
         });
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Listed among everything else the editor is doing, with a cross that
+        // sets the flag the export already checks before every write. An
+        // export of a large result is exactly the work a reader wants to find
+        // and stop without hunting for the panel that started it.
+        let listed = workspace::running_work::RunningWorkRegistry::add(
+            cx,
+            SharedString::from(format!("Exporting to {}", output_path.display())),
+            Some(std::sync::Arc::new({
+                let cancelled = cancelled.clone();
+                move |_: &mut gpui::App| {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })),
+        );
         let export = crate::execute_to_file::spawn_execute_to_file(
             provider,
             database,
@@ -6371,6 +6389,10 @@ impl DatabasePanel {
         );
         let handle = cx.spawn(async move |panel, cx| {
             let result = export.await;
+            // Dropped here rather than on a separate line, so that an export
+            // which fails or is cancelled leaves the list just as one that
+            // finished does.
+            drop(listed);
             panel
                 .update(cx, |panel, cx| {
                     if let Some(task) = panel
@@ -8333,7 +8355,7 @@ impl DatabasePanel {
             label: conn.config.label.clone(),
             driver: conn.config.driver,
             status: conn.status.clone(),
-            in_transaction: conn.in_transaction,
+            transaction_open_since: conn.transaction_open_since,
             env_color: conn.config.env_color.clone(),
             folder_id: conn.config.folder_id,
             depth,
@@ -8643,7 +8665,7 @@ impl DatabasePanel {
                 label,
                 driver,
                 status,
-                in_transaction,
+                transaction_open_since,
                 env_color,
                 folder_id,
                 depth,
@@ -8651,7 +8673,20 @@ impl DatabasePanel {
                 let id = *id;
                 let driver = *driver;
                 let depth = *depth;
-                let in_transaction = *in_transaction;
+                let in_transaction = transaction_open_since.is_some();
+                let transaction_label = transaction_open_since
+                    .map(|opened| {
+                        let minutes = opened.elapsed().as_secs() / 60;
+                        // Silent for the first minute, because a transaction
+                        // that has just opened says nothing by its age. After
+                        // that the number is the whole point of the badge.
+                        if minutes == 0 {
+                            SharedString::from("Transaction open")
+                        } else {
+                            SharedString::from(format!("Transaction open · {minutes} min"))
+                        }
+                    })
+                    .unwrap_or_else(|| SharedString::from("Transaction open"));
                 let connection_folder = *folder_id;
                 let label = label.clone();
                 let env_color = env_color.clone();
@@ -8832,11 +8867,55 @@ impl DatabasePanel {
                                         .rounded_sm()
                                         .bg(cx.theme().status().warning_background)
                                         .child(
-                                            Label::new("Transaction Open")
+                                            Label::new(transaction_label)
                                                 .size(LabelSize::XSmall)
                                                 .color(Color::Warning)
                                                 .single_line(),
                                         ),
+                                )
+                                // Beside the badge rather than on a row of
+                                // their own: the two things a reader wants
+                                // when they see it are here, in the place
+                                // that told them.
+                                .child(
+                                    IconButton::new(
+                                        ElementId::from(SharedString::from(format!(
+                                            "conn-transaction-commit-{id}"
+                                        ))),
+                                        IconName::Check,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Success)
+                                    .tooltip(Tooltip::text("Commit the transaction"))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.store
+                                                .update(cx, |store, cx| {
+                                                    store.commit_transaction(id, cx)
+                                                })
+                                                .detach_and_log_err(cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        ElementId::from(SharedString::from(format!(
+                                            "conn-transaction-rollback-{id}"
+                                        ))),
+                                        IconName::RotateCcw,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Warning)
+                                    .tooltip(Tooltip::text("Roll the transaction back"))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.store
+                                                .update(cx, |store, cx| {
+                                                    store.rollback_transaction(id, cx)
+                                                })
+                                                .detach_and_log_err(cx);
+                                        },
+                                    )),
                                 )
                             }),
                     )
@@ -12934,10 +13013,56 @@ mod tests {
     // Returns a fixed result row so the end-to-end test runs deterministically
     // without a live database or a Tokio runtime (which would break the
     // GPUI test scheduler's determinism).
-    struct MockProvider;
+    #[derive(Default)]
+    struct MockProvider {
+        /// Set while a transaction is held, the way a real driver holds one.
+        /// The badge is drawn from what the provider says rather than from a
+        /// second reading of the statement text, so a double that never says
+        /// it holds one would leave nothing to draw.
+        transaction_open_since: std::sync::Mutex<Option<std::time::Instant>>,
+    }
 
     #[async_trait::async_trait]
     impl db_client::DbProvider for MockProvider {
+        fn holds_transactions(&self) -> bool {
+            true
+        }
+
+        fn transaction_open_since(&self) -> Option<std::time::Instant> {
+            *self
+                .transaction_open_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        async fn begin_transaction(
+            &self,
+            _database: &str,
+            _abandoned_after: Option<std::time::Duration>,
+        ) -> anyhow::Result<()> {
+            *self
+                .transaction_open_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
+            Ok(())
+        }
+
+        async fn commit_transaction(&self) -> anyhow::Result<()> {
+            *self
+                .transaction_open_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Ok(())
+        }
+
+        async fn rollback_transaction(&self) -> anyhow::Result<()> {
+            *self
+                .transaction_open_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Ok(())
+        }
+
         async fn ping(&self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -12957,8 +13082,25 @@ mod tests {
         async fn execute_query(
             &self,
             _database: &str,
-            _sql: &str,
+            sql: &str,
         ) -> anyhow::Result<db_client::schema::QueryResult> {
+            // A statement typed into the console is how a transaction is
+            // opened and closed in practice, and a real driver reads its own
+            // text to notice. This double reads just enough of it to behave
+            // the same way for the statements the tests type.
+            let words = sql.trim().trim_end_matches(';').to_uppercase();
+            if words.starts_with("START TRANSACTION") || words == "BEGIN" {
+                *self
+                    .transaction_open_since
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(std::time::Instant::now());
+            } else if words.starts_with("COMMIT") || words.starts_with("ROLLBACK") {
+                *self
+                    .transaction_open_since
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
             Ok(db_client::schema::QueryResult {
                 columns: vec!["one".to_string()],
                 rows: vec![vec![Some("1".to_string())]],
@@ -13186,7 +13328,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -13371,7 +13513,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -13812,7 +13954,7 @@ mod tests {
         let _ = terminal_panel;
 
         store.update(&mut cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -13862,7 +14004,7 @@ mod tests {
                 .connections()
                 .iter()
                 .find(|c| c.config.id == connection_id)
-                .map(|c| c.in_transaction)
+                .map(|c| c.transaction_open_since.is_some())
                 .unwrap_or(false)),
             "START TRANSACTION must mark the connection as being inside a transaction"
         );
@@ -13891,7 +14033,7 @@ mod tests {
                 .connections()
                 .iter()
                 .find(|c| c.config.id == connection_id)
-                .map(|c| c.in_transaction)
+                .map(|c| c.transaction_open_since.is_some())
                 .unwrap_or(false)),
             "COMMIT must close the transaction"
         );
@@ -14699,7 +14841,7 @@ mod tests {
             store
         });
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -14882,7 +15024,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -14966,7 +15108,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -15228,7 +15370,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -15423,7 +15565,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -15524,7 +15666,11 @@ mod tests {
         });
         panel.update(&mut cx, |panel, cx| {
             panel.store.update(cx, |store, cx| {
-                store.add_connected_for_test(config.clone(), std::sync::Arc::new(MockProvider), cx);
+                store.add_connected_for_test(
+                    config.clone(),
+                    std::sync::Arc::new(MockProvider::default()),
+                    cx,
+                );
                 store.folders.push(folder.clone());
                 cx.emit(DatabaseStoreEvent::ConnectionsChanged);
             });
@@ -15569,7 +15715,11 @@ mod tests {
             .expect("DatabasePanel::load must succeed");
         restarted_panel.update(&mut cx, |panel, cx| {
             panel.store.update(cx, |store, cx| {
-                store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+                store.add_connected_for_test(
+                    config,
+                    std::sync::Arc::new(MockProvider::default()),
+                    cx,
+                );
                 store.folders.push(folder);
                 cx.emit(DatabaseStoreEvent::ConnectionsChanged);
             });
@@ -15656,7 +15806,7 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         let folder_id = store
             .update(cx, |store, cx| store.add_folder("Prod".into(), None, cx))
@@ -16175,7 +16325,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16254,7 +16404,7 @@ mod tests {
         // databases/tables. link_candidate_range must still recognize entities.
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16342,7 +16492,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16454,7 +16604,7 @@ mod tests {
         );
 
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16521,7 +16671,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16611,7 +16761,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
             let conn = store
                 .connections
                 .iter_mut()
@@ -16695,7 +16845,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16777,7 +16927,7 @@ mod tests {
 
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
-            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
         cx.run_until_parked();
 
@@ -16872,7 +17022,7 @@ mod tests {
         store.update(cx, |store, cx| {
             store.add_connected_for_test(
                 db_client::ConnectionConfig::default(),
-                std::sync::Arc::new(MockProvider),
+                std::sync::Arc::new(MockProvider::default()),
                 cx,
             );
         });
@@ -18047,7 +18197,11 @@ mod tests {
         });
         panel.update(&mut visual_cx, |panel, cx| {
             panel.store.update(cx, |store, cx| {
-                store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+                store.add_connected_for_test(
+                    config,
+                    std::sync::Arc::new(MockProvider::default()),
+                    cx,
+                );
             });
         });
         visual_cx.run_until_parked();
