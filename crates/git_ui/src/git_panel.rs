@@ -5,6 +5,10 @@ use crate::commit_context_menu::{
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
+use crate::git_graph::{
+    CommitEntry, GraphColumn, GraphData, accent_colors_count, graph_column_width,
+    render_graph_column,
+};
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
@@ -30,9 +34,8 @@ use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
-    get_git_committer,
+    GitCommitTemplate, GitCommitter, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+    ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus, get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -43,10 +46,11 @@ use git::{
     ViewFile, parse_git_remote_url,
 };
 use gpui::{
-    AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
+    AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, Bounds, ClickEvent,
     DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton,
-    MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt,
-    TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred, uniform_list,
+    MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, ScrollWheelEvent, Subscription,
+    Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
+    uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
@@ -105,6 +109,11 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
+
+/// The widest the lane column may grow in the History tab. A dock is narrow and
+/// the subject line has to stay readable, so a history with more lanes than fit
+/// scrolls sideways rather than eating the text.
+const MAX_HISTORY_GRAPH_WIDTH: Pixels = px(120.);
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -436,25 +445,51 @@ enum GitPanelTab {
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum CommitHistory {
     Loading,
-    /// A non-empty list can still grow on later fetches.
-    /// An empty list means the repository has no commits.
-    Loaded(Rc<[CommitHistoryEntry]>),
+    /// The commits are in `commit_graph`, which still grows on later fetches.
+    /// An empty graph under this state means the repository has no commits.
+    Loaded,
     Error(SharedString),
 }
 
+/// Whether the history reported is a new one rather than more of the one
+/// already laid out.
+///
+/// The repository throws its own list away and starts again whenever HEAD
+/// moves -- a commit, an amend, a reset -- and the source it was asked for
+/// cannot say so, since a branch source carries only the branch name. What
+/// gives it away is the commit at the head changing, or the list coming back
+/// shorter than what has already been laid out.
+fn history_restarted(
+    laid_out_head: Option<Oid>,
+    reported_head: Option<Oid>,
+    laid_out_count: usize,
+    reported_count: usize,
+) -> bool {
+    if reported_count < laid_out_count {
+        return true;
+    }
+    match (laid_out_head, reported_head) {
+        (Some(laid_out), Some(reported)) => laid_out != reported,
+        // Nothing has been laid out yet, so there is nothing to throw away.
+        (None, _) => false,
+        // Something was laid out and the report is empty: the history is gone.
+        (Some(_), None) => true,
+    }
+}
+
 fn commit_history_from_response(
-    entries: Rc<[CommitHistoryEntry]>,
+    loaded_count: usize,
     is_loading: bool,
     error: Option<SharedString>,
 ) -> CommitHistory {
-    if !entries.is_empty() {
-        CommitHistory::Loaded(entries)
+    if loaded_count > 0 {
+        CommitHistory::Loaded
     } else if let Some(error) = error {
         CommitHistory::Error(error)
     } else if is_loading {
         CommitHistory::Loading
     } else {
-        CommitHistory::Loaded(Rc::from([]))
+        CommitHistory::Loaded
     }
 }
 
@@ -954,6 +989,20 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    /// The lane layout behind the History tab, grown as `git log` streams in.
+    /// It is the row model too: the list and the lane column read the same
+    /// commits, so a dot can never end up beside the wrong subject.
+    commit_graph: GraphData,
+    /// How far the lane column is scrolled sideways, for a history with more
+    /// lanes than a dock this narrow can show at once.
+    commit_graph_scroll_x: Pixels,
+    /// What the layout was built from. A branch switch hands back a different
+    /// history under a different key, and appending that to the lanes of the
+    /// branch left behind would draw one history's commits on another's lines.
+    commit_graph_source: Option<LogSource>,
+    /// Where the lane column was last painted, so a click on it can be traced
+    /// back to a row.
+    commit_graph_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
@@ -969,25 +1018,6 @@ pub struct GitPanel {
 struct BulkStaging {
     repo_id: RepositoryId,
     anchor: RepoPath,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CommitHistoryEntry {
-    sha: Oid,
-    tag_names: Vec<SharedString>,
-}
-
-impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
-    fn from(commit: &Arc<InitialGraphCommitData>) -> Self {
-        Self {
-            sha: commit.sha,
-            tag_names: commit
-                .tag_names()
-                .into_iter()
-                .map(|tag_name| SharedString::from(tag_name.to_string()))
-                .collect(),
-        }
-    }
 }
 
 const MAX_PANEL_EDITOR_LINES: usize = 6;
@@ -1256,6 +1286,10 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                commit_graph: GraphData::new(accent_colors_count(cx.theme().accents())),
+                commit_graph_scroll_x: px(0.),
+                commit_graph_source: None,
+                commit_graph_bounds: Rc::default(),
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
@@ -1603,7 +1637,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         if self.active_tab == GitPanelTab::History {
-            self.select_previous_history_entry(cx);
+            self.select_previous_history_entry(_window, cx);
             return;
         }
 
@@ -1676,7 +1710,7 @@ impl GitPanel {
 
     fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
-            self.select_next_history_entry(cx);
+            self.select_next_history_entry(_window, cx);
             return;
         }
 
@@ -4357,6 +4391,7 @@ impl GitPanel {
             self.git_access = None;
             self._repo_subscriptions.clear();
             if self.active_tab == GitPanelTab::History {
+                self.reset_commit_graph();
                 self.set_commit_history(CommitHistory::Loading, cx);
             }
         }
@@ -6133,10 +6168,10 @@ impl GitPanel {
                 CommitHistory::Loading => {
                     this.child(Self::render_history_placeholder("Loading Commit History…"))
                 }
-                CommitHistory::Loaded(entries) if entries.is_empty() => {
+                CommitHistory::Loaded if self.commit_graph.commits.is_empty() => {
                     this.child(Self::render_history_placeholder("No commits yet"))
                 }
-                CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
+                CommitHistory::Loaded => match self.render_commit_history(window, cx) {
                     Some(history) => this.child(history),
                     None => this.child(Self::render_history_placeholder("Failed to load commits")),
                 },
@@ -6151,14 +6186,28 @@ impl GitPanel {
             .child(Label::new(message).color(Color::Muted))
     }
 
-    fn commit_history_entries(&self) -> &[CommitHistoryEntry] {
+    fn commit_history_entries(&self) -> &[Rc<CommitEntry>] {
         match &self.commit_history {
-            CommitHistory::Loaded(entries) => entries,
+            CommitHistory::Loaded => &self.commit_graph.commits,
             CommitHistory::Loading | CommitHistory::Error(_) => &[],
         }
     }
 
-    fn select_next_history_entry(&mut self, cx: &mut Context<Self>) {
+    /// The height every row of the History tab is laid out at.
+    ///
+    /// It has to be a number rather than whatever the content happens to come
+    /// to: `uniform_list` measures the first row and gives every other row that
+    /// same height, and the lane column beside the list places its dots from
+    /// this number too. A row an odd pixel taller than this would slide every
+    /// dot off the commit it belongs to, further with each row down the list.
+    fn history_row_height(window: &Window) -> Pixels {
+        let line_height = window.text_style().line_height_in_pixels(window.rem_size());
+        let raw = line_height * 2.0 + px(12.);
+        let scale = window.scale_factor();
+        (raw * scale).round() / scale
+    }
+
+    fn select_next_history_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.commit_history_entries().len();
         if count == 0 {
             return;
@@ -6171,10 +6220,11 @@ impl GitPanel {
         self.history_keyboard_nav = true;
         self.commit_history_scroll_handle
             .scroll_to_item(new_index, ScrollStrategy::Top);
+        self.repaint_once_the_scroll_has_settled(window, cx);
         cx.notify();
     }
 
-    fn select_previous_history_entry(&mut self, cx: &mut Context<Self>) {
+    fn select_previous_history_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.commit_history_entries().len();
         if count == 0 {
             return;
@@ -6187,6 +6237,7 @@ impl GitPanel {
         self.history_keyboard_nav = true;
         self.commit_history_scroll_handle
             .scroll_to_item(new_index, ScrollStrategy::Top);
+        self.repaint_once_the_scroll_has_settled(window, cx);
         cx.notify();
     }
 
@@ -6201,7 +6252,7 @@ impl GitPanel {
             return;
         };
         CommitView::open(
-            entry.sha.to_string(),
+            entry.data.sha.to_string(),
             active_repository.downgrade(),
             self.workspace.clone(),
             None,
@@ -6226,8 +6277,13 @@ impl GitPanel {
         };
         let context_menu = commit_context_menu(
             CommitContextMenuData {
-                sha: commit.sha,
-                tag_names: commit.tag_names,
+                sha: commit.data.sha,
+                tag_names: commit
+                    .data
+                    .tag_names()
+                    .into_iter()
+                    .map(|tag_name| SharedString::from(tag_name.to_string()))
+                    .collect(),
             },
             CommitContextMenuSource::GitPanel,
             None,
@@ -6272,6 +6328,7 @@ impl GitPanel {
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
+                self.reset_commit_graph();
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
@@ -6328,22 +6385,61 @@ impl GitPanel {
 
         let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
             // No HEAD commit at all (unborn/empty repository).
-            self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
+            self.reset_commit_graph();
+            self.set_commit_history(CommitHistory::Loaded, cx);
             return;
         };
         let log_order = LogOrder::DateOrder;
 
-        let (entries, is_loading, error) = active_repository.update(cx, |repository, cx| {
-            let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
-            let entries: Rc<[CommitHistoryEntry]> = response
-                .commits
-                .iter()
-                .map(CommitHistoryEntry::from)
-                .collect();
-            (entries, response.is_loading, response.error)
-        });
+        // A different source is a different history, not more of this one.
+        let source_now = log_source.clone();
+        if self.commit_graph_source.as_ref() != Some(&source_now) {
+            self.reset_commit_graph();
+        }
 
-        self.set_commit_history(commit_history_from_response(entries, is_loading, error), cx);
+        // The layout is grown, never rebuilt. `git log` streams in chunks and
+        // every chunk lands here, so only what arrived since last time is laid
+        // out; handing the same commit to `add_commits` twice would claim its
+        // lane twice and bend every line drawn after it.
+        let (is_loading, error) = active_repository.update(cx, |repository, cx| {
+            // The whole range is asked for and the new tail sliced off here,
+            // rather than asking for `laid_out..`: `graph_data` clamps the start
+            // of the range to the last index rather than past it, so a range
+            // that is already exhausted comes back holding the final commit
+            // again instead of nothing.
+            let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
+
+            // The repository throws its own list away and starts a new one
+            // whenever HEAD moves -- a commit, an amend, a reset -- and the
+            // source cannot say so, since a branch source carries only a name.
+            // The commit at the head is compared instead: a different one, or a
+            // list that has grown shorter, is a new history rather than more of
+            // the one already laid out.
+            if history_restarted(
+                self.commit_graph
+                    .commits
+                    .first()
+                    .map(|commit| commit.data.sha),
+                response.commits.first().map(|commit| commit.sha),
+                self.commit_graph.commits.len(),
+                response.commits.len(),
+            ) {
+                self.reset_commit_graph();
+            }
+
+            let laid_out = self.commit_graph.commits.len();
+            if response.commits.len() > laid_out {
+                self.commit_graph.add_commits(&response.commits[laid_out..]);
+            }
+            (response.is_loading, response.error)
+        });
+        self.commit_graph_source = Some(source_now);
+
+        let loaded_count = self.commit_graph.commits.len();
+        self.set_commit_history(
+            commit_history_from_response(loaded_count, is_loading, error),
+            cx,
+        );
     }
 
     fn set_commit_history(&mut self, commit_history: CommitHistory, cx: &mut Context<Self>) {
@@ -6388,15 +6484,15 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let CommitHistory::Loaded(entries) = &self.commit_history else {
+        if !matches!(self.commit_history, CommitHistory::Loaded) {
             return None;
-        };
-        let entries = entries.clone();
+        }
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
-        let item_count = entries.len();
+        let item_count = self.commit_graph.commits.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
+        let row_height = Self::history_row_height(window);
         let remote = self.git_remote(cx);
 
         let focused_history_entry = self.focused_history_entry;
@@ -6423,127 +6519,171 @@ impl GitPanel {
                 .size_full()
                 .overflow_hidden()
                 .child(
-                    uniform_list("commit_history_list", item_count, {
-                        let workspace = workspace;
-                        let repo_weak = repo_weak;
-                        let git_panel = cx.weak_entity();
-                        move |range, window, cx| {
-                            let local_offset = time::UtcOffset::current_local_offset()
-                                .unwrap_or(time::UtcOffset::UTC);
-                            let now = time::OffsetDateTime::now_utc();
+                    h_flex()
+                        .flex_1()
+                        .size_full()
+                        .overflow_hidden()
+                        .child(self.render_history_graph_column(row_height, window, cx))
+                        .child(
+                            uniform_list("commit_history_list", item_count, {
+                                let workspace = workspace;
+                                let repo_weak = repo_weak;
+                                let git_panel = cx.weak_entity();
+                                move |range, window, cx| {
+                                    let local_offset = time::UtcOffset::current_local_offset()
+                                        .unwrap_or(time::UtcOffset::UTC);
+                                    let now = time::OffsetDateTime::now_utc();
 
-                            let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
-                                .update(cx, |repository, cx| {
-                                    entries[range.clone()]
+                                    // Only the rows in view are copied out. The whole
+                                    // history can run to six figures of commits, and it
+                                    // is re-read on every frame the list scrolls.
+                                    let entries: Vec<Rc<CommitEntry>> = git_panel
+                                        .update(cx, |panel, _| {
+                                            let commits = &panel.commit_graph.commits;
+                                            let end = range.end.min(commits.len());
+                                            let start = range.start.min(end);
+                                            commits[start..end].to_vec()
+                                        })
+                                        .unwrap_or_default();
+
+                                    let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
+                                        .update(cx, |repository, cx| {
+                                            entries
+                                                .iter()
+                                                .map(|entry| {
+                                                    match repository.fetch_commit_data(
+                                                        entry.data.sha,
+                                                        false,
+                                                        cx,
+                                                    ) {
+                                                        CommitDataState::Loaded(data) => {
+                                                            Some(data.clone())
+                                                        }
+                                                        CommitDataState::Loading(_) => None,
+                                                    }
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+
+                                    entries
                                         .iter()
-                                        .map(|entry| {
-                                            match repository.fetch_commit_data(entry.sha, false, cx)
-                                            {
-                                                CommitDataState::Loaded(data) => Some(data.clone()),
-                                                CommitDataState::Loading(_) => None,
-                                            }
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                                        .zip(visible_data)
+                                        .enumerate()
+                                        .map(|(ix, (entry, data))| {
+                                            let index = range.start + ix;
+                                            let sha_string = entry.data.sha.to_string();
+                                            let sha_shared: SharedString =
+                                                sha_string.clone().into();
+                                            let short_sha: SharedString = sha_string
+                                                [..7.min(sha_string.len())]
+                                                .to_string()
+                                                .into();
+                                            let tag_names: Vec<SharedString> = entry
+                                                .data
+                                                .tag_names()
+                                                .into_iter()
+                                                .map(|tag_name| {
+                                                    SharedString::from(tag_name.to_string())
+                                                })
+                                                .collect();
 
-                            entries[range.clone()]
-                                .iter()
-                                .zip(visible_data)
-                                .enumerate()
-                                .map(|(ix, (entry, data))| {
-                                    let index = range.start + ix;
-                                    let sha_string = entry.sha.to_string();
-                                    let sha_shared: SharedString = sha_string.clone().into();
-                                    let short_sha: SharedString =
-                                        sha_string[..7.min(sha_string.len())].to_string().into();
-                                    let tag_names = entry.tag_names.clone();
+                                            let (subject, author_name, author_email, timestamp): (
+                                                SharedString,
+                                                SharedString,
+                                                Option<SharedString>,
+                                                Option<i64>,
+                                            ) = match &data {
+                                                Some(data) => (
+                                                    data.subject.clone(),
+                                                    data.author_name.clone(),
+                                                    Some(data.author_email.clone()),
+                                                    Some(data.commit_timestamp),
+                                                ),
+                                                None => ("Loading…".into(), "".into(), None, None),
+                                            };
 
-                                    let (subject, author_name, author_email, timestamp): (
-                                        SharedString,
-                                        SharedString,
-                                        Option<SharedString>,
-                                        Option<i64>,
-                                    ) = match &data {
-                                        Some(data) => (
-                                            data.subject.clone(),
-                                            data.author_name.clone(),
-                                            Some(data.author_email.clone()),
-                                            Some(data.commit_timestamp),
-                                        ),
-                                        None => ("Loading…".into(), "".into(), None, None),
-                                    };
+                                            let relative_time: SharedString = timestamp
+                                                .and_then(|ts| {
+                                                    time::OffsetDateTime::from_unix_timestamp(ts)
+                                                        .ok()
+                                                })
+                                                .map(|dt| {
+                                                    time_format::format_localized_timestamp(
+                                                        dt,
+                                                        now,
+                                                        local_offset,
+                                                        time_format::TimestampFormat::Relative,
+                                                    )
+                                                    .into()
+                                                })
+                                                .unwrap_or_else(|| "".into());
 
-                                    let relative_time: SharedString = timestamp
-                                        .and_then(|ts| {
-                                            time::OffsetDateTime::from_unix_timestamp(ts).ok()
-                                        })
-                                        .map(|dt| {
-                                            time_format::format_localized_timestamp(
-                                                dt,
-                                                now,
-                                                local_offset,
-                                                time_format::TimestampFormat::Relative,
+                                            let avatar = CommitAvatar::new(
+                                                &sha_shared,
+                                                author_email,
+                                                remote.as_ref(),
                                             )
-                                            .into()
-                                        })
-                                        .unwrap_or_else(|| "".into());
+                                            .size(px(14.))
+                                            .render(window, cx);
 
-                                    let avatar = CommitAvatar::new(
-                                        &sha_shared,
-                                        author_email,
-                                        remote.as_ref(),
-                                    )
-                                    .size(px(14.))
-                                    .render(window, cx);
+                                            let is_unpushed = index < ahead_count;
+                                            let is_focused = focused_history_entry == Some(index);
+                                            let is_context_menu_target =
+                                                context_menu_target_index == Some(index);
+                                            let workspace = workspace.clone();
+                                            let repo = repo_weak.clone();
+                                            let sha_for_click = sha_string;
 
-                                    let is_unpushed = index < ahead_count;
-                                    let is_focused = focused_history_entry == Some(index);
-                                    let is_context_menu_target =
-                                        context_menu_target_index == Some(index);
-                                    let workspace = workspace.clone();
-                                    let repo = repo_weak.clone();
-                                    let sha_for_click = sha_string;
+                                            let dot_separator = || {
+                                                Label::new("•")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                                    .alpha(0.5)
+                                            };
 
-                                    let dot_separator = || {
-                                        Label::new("•")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .alpha(0.5)
-                                    };
-
-                                    v_flex()
-                                        .id(("commit-history-item", index))
-                                        .cursor_pointer()
-                                        .w_full()
-                                        .py_1()
-                                        .px_2()
-                                        .gap_0p5()
-                                        .border_1()
-                                        .border_color(gpui::transparent_black())
-                                        .when(
-                                            is_focused && is_panel_focused && show_focus_border,
-                                            |this| {
-                                                this.border_color(
-                                                    cx.theme().colors().panel_focused_border,
-                                                )
-                                            },
-                                        )
-                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                        .when(is_context_menu_target, |this| {
-                                            this.bg(cx.theme().colors().element_hover)
-                                        })
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
+                                            v_flex()
+                                                .id(("commit-history-item", index))
+                                                .cursor_pointer()
                                                 .w_full()
-                                                .min_w_0()
-                                                .child(Label::new(subject).truncate())
-                                                .children((!tag_names.is_empty()).then(|| {
-                                                    let hidden_tag_count = tag_names
-                                                        .len()
-                                                        .saturating_sub(MAX_HISTORY_TAG_CHIPS);
+                                                .h(row_height)
+                                                .py_1()
+                                                .px_2()
+                                                .gap_0p5()
+                                                .border_1()
+                                                .border_color(gpui::transparent_black())
+                                                .when(
+                                                    is_focused
+                                                        && is_panel_focused
+                                                        && show_focus_border,
+                                                    |this| {
+                                                        this.border_color(
+                                                            cx.theme()
+                                                                .colors()
+                                                                .panel_focused_border,
+                                                        )
+                                                    },
+                                                )
+                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                                .when(is_focused, |this| {
+                                                    this.bg(cx.theme().colors().element_selected)
+                                                })
+                                                .when(is_context_menu_target, |this| {
+                                                    this.bg(cx.theme().colors().element_hover)
+                                                })
+                                                .child(
                                                     h_flex()
+                                                        .gap_1()
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .child(Label::new(subject).truncate())
+                                                        .children((!tag_names.is_empty()).then(
+                                                            || {
+                                                                let hidden_tag_count =
+                                                                    tag_names.len().saturating_sub(
+                                                                        MAX_HISTORY_TAG_CHIPS,
+                                                                    );
+                                                                h_flex()
                                                         .gap_1()
                                                         .min_w_0()
                                                         .children(
@@ -6581,99 +6721,280 @@ impl GitPanel {
                                                                 }),
                                                             )
                                                         })
-                                                }))
-                                                .when(is_unpushed, |this| {
-                                                    this.child(
-                                                        Icon::new(IconName::ArrowUp)
-                                                            .size(IconSize::XSmall),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_1p5()
-                                                .child(avatar)
-                                                .when(!author_name.is_empty(), |this| {
-                                                    this.child(
-                                                        Label::new(author_name)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                    .child(dot_separator())
-                                                })
-                                                .when(!relative_time.is_empty(), |this| {
-                                                    this.child(
-                                                        Label::new(relative_time)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                    .child(dot_separator())
-                                                })
-                                                .child(
-                                                    Label::new(short_sha.clone())
-                                                        .size(LabelSize::Small)
-                                                        .color(Color::Muted),
-                                                ),
-                                        )
-                                        .when(!has_context_menu, |this| {
-                                            this.tooltip(move |_, cx| {
-                                                Tooltip::with_meta(
-                                                    "View Commit",
-                                                    None,
-                                                    short_sha.clone(),
-                                                    cx,
+                                                            },
+                                                        ))
+                                                        .when(is_unpushed, |this| {
+                                                            this.child(
+                                                                Icon::new(IconName::ArrowUp)
+                                                                    .size(IconSize::XSmall),
+                                                            )
+                                                        }),
                                                 )
-                                            })
-                                        })
-                                        .on_mouse_down(gpui::MouseButton::Left, {
-                                            let git_panel = git_panel.clone();
-                                            move |_, _, cx| {
-                                                git_panel
-                                                    .update(cx, |panel, cx| {
-                                                        panel.focused_history_entry = Some(index);
-                                                        panel.history_keyboard_nav = false;
-                                                        cx.notify();
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .child(avatar)
+                                                        .when(!author_name.is_empty(), |this| {
+                                                            this.child(
+                                                                Label::new(author_name)
+                                                                    .size(LabelSize::Small)
+                                                                    .color(Color::Muted),
+                                                            )
+                                                            .child(dot_separator())
+                                                        })
+                                                        .when(!relative_time.is_empty(), |this| {
+                                                            this.child(
+                                                                Label::new(relative_time)
+                                                                    .size(LabelSize::Small)
+                                                                    .color(Color::Muted),
+                                                            )
+                                                            .child(dot_separator())
+                                                        })
+                                                        .child(
+                                                            Label::new(short_sha)
+                                                                .size(LabelSize::Small)
+                                                                .color(Color::Muted),
+                                                        ),
+                                                )
+                                                .when(!has_context_menu, |this| {
+                                                    let git_panel = git_panel.clone();
+                                                    let repo = repo.clone();
+                                                    let sha = sha_shared.clone();
+                                                    this.tooltip(move |window, cx| {
+                                                        match (git_panel.upgrade(), repo.upgrade())
+                                                        {
+                                                            (Some(panel), Some(repository)) => {
+                                                                GitPanelMessageTooltip::new(
+                                                                    panel,
+                                                                    sha.clone(),
+                                                                    repository,
+                                                                    window,
+                                                                    cx,
+                                                                )
+                                                                .into()
+                                                            }
+                                                            _ => Tooltip::simple(sha.clone(), cx),
+                                                        }
                                                     })
-                                                    .ok();
-                                            }
+                                                })
+                                                .on_mouse_down(gpui::MouseButton::Left, {
+                                                    let git_panel = git_panel.clone();
+                                                    move |_, _, cx| {
+                                                        git_panel
+                                                            .update(cx, |panel, cx| {
+                                                                panel.focused_history_entry =
+                                                                    Some(index);
+                                                                panel.history_keyboard_nav = false;
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }
+                                                })
+                                                .on_mouse_down(MouseButton::Right, {
+                                                    let git_panel = git_panel.clone();
+                                                    move |event, window, cx| {
+                                                        git_panel
+                                                            .update(cx, |panel, cx| {
+                                                                panel.deploy_history_context_menu(
+                                                                    event.position,
+                                                                    index,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                        cx.stop_propagation();
+                                                    }
+                                                })
+                                                .on_click(move |_, window, cx| {
+                                                    CommitView::open(
+                                                        sha_for_click.clone(),
+                                                        repo.clone(),
+                                                        workspace.clone(),
+                                                        None,
+                                                        None,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .into_any_element()
                                         })
-                                        .on_mouse_down(MouseButton::Right, {
-                                            let git_panel = git_panel.clone();
-                                            move |event, window, cx| {
-                                                git_panel
-                                                    .update(cx, |panel, cx| {
-                                                        panel.deploy_history_context_menu(
-                                                            event.position,
-                                                            index,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    })
-                                                    .ok();
-                                                cx.stop_propagation();
-                                            }
-                                        })
-                                        .on_click(move |_, window, cx| {
-                                            CommitView::open(
-                                                sha_for_click.clone(),
-                                                repo.clone(),
-                                                workspace.clone(),
-                                                None,
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                        .into_any_element()
-                                })
-                                .collect()
-                        }
-                    })
-                    .size_full()
-                    .track_scroll(&commit_history_scroll_handle),
+                                        .collect()
+                                }
+                            })
+                            .size_full()
+                            .track_scroll(&commit_history_scroll_handle),
+                        ),
                 )
                 .vertical_scrollbar_for(&commit_history_scroll_handle, window, cx),
         )
+    }
+
+    /// The lanes drawn beside the History tab.
+    ///
+    /// The column paints no row backgrounds of its own: the list beside it is
+    /// made of real rows that paint theirs, and a second highlight over the
+    /// first would show through as a seam down the middle. The two are held
+    /// together by nothing but a shared row height and a shared scroll offset.
+    fn render_history_graph_column(
+        &self,
+        row_height: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let needed = graph_column_width(self.commit_graph.max_lanes);
+        let width = needed.min(MAX_HISTORY_GRAPH_WIDTH);
+        let hidden = (needed - width).max(px(0.));
+        let scroll_x = self.commit_graph_scroll_x.clamp(px(0.), hidden);
+
+        let scrolled_by = self.history_scroll_offset_once_settled(row_height);
+        let first_visible_row = (scrolled_by / row_height).floor() as usize;
+        // Counting a couple of rows too many costs only a slightly longer slice;
+        // counting too few would stop the lines short of the bottom edge.
+        let visible_row_count = (window.viewport_size().height / row_height).ceil() as usize + 2;
+
+        div()
+            .id("commit-history-graph")
+            .debug_selector(|| "GIT_HISTORY_GRAPH".to_string())
+            .flex_none()
+            .h_full()
+            .w(width)
+            .overflow_hidden()
+            .when(hidden > px(0.), |this| {
+                this.on_scroll_wheel(cx.listener(
+                    move |panel, event: &ScrollWheelEvent, window, cx| {
+                        let delta = event.delta.pixel_delta(window.line_height()).x;
+                        panel.commit_graph_scroll_x =
+                            (panel.commit_graph_scroll_x - delta).clamp(px(0.), hidden);
+                        cx.notify();
+                    },
+                ))
+            })
+            .child(render_graph_column(
+                &self.commit_graph,
+                GraphColumn {
+                    row_height,
+                    first_visible_row,
+                    visible_row_count,
+                    vertical_scroll_offset: scrolled_by - (first_visible_row as f32 * row_height),
+                    horizontal_scroll_offset: scroll_x,
+                    width: needed,
+                    highlight: None,
+                    painted_at: Some(self.commit_graph_bounds.clone()),
+                },
+            ))
+            .on_click(cx.listener(move |panel, event: &ClickEvent, window, cx| {
+                let Some(index) = panel.history_row_at(event.position(), row_height) else {
+                    return;
+                };
+                panel.focused_history_entry = Some(index);
+                panel.history_keyboard_nav = false;
+                cx.notify();
+                panel.open_selected_history_commit(window, cx);
+            }))
+    }
+
+    /// Throws the lane layout away, along with everything positioned against
+    /// it. Whatever comes next is laid out from the first commit again.
+    fn reset_commit_graph(&mut self) {
+        self.commit_graph.clear();
+        self.commit_graph_scroll_x = px(0.);
+        self.commit_graph_source = None;
+        // A row number outlives the rows it pointed at, so the selection and any
+        // scroll still waiting to be carried out go with the layout.
+        self.focused_history_entry = None;
+        self.history_keyboard_nav = false;
+        let mut scroll = self.commit_history_scroll_handle.0.borrow_mut();
+        scroll.deferred_scroll_to_item = None;
+        scroll.base_handle.set_offset(gpui::point(px(0.), px(0.)));
+        drop(scroll);
+        // Where the column was painted, and which row a menu was opened over,
+        // both name rows that no longer exist.
+        self.commit_graph_bounds.set(None);
+        if let Some(context_menu) = self.context_menu.as_mut() {
+            context_menu.target_entry_index = None;
+        }
+    }
+
+    /// Asks for one more frame once the list has actually carried out a scroll.
+    ///
+    /// The lane column predicts where the list is about to go, and that
+    /// prediction reads sizes gpui only refreshes later in the same frame. One
+    /// more frame costs almost nothing and means a prediction that turned out
+    /// wrong is wrong for a frame, rather than until something else happens to
+    /// repaint the panel.
+    fn repaint_once_the_scroll_has_settled(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = cx.entity();
+        window.on_next_frame(move |_, cx| {
+            panel.update(cx, |_, cx| cx.notify());
+        });
+    }
+
+    /// How far down the History tab will be once every scroll asked for has
+    /// been applied.
+    ///
+    /// A scroll from the keyboard is only recorded here and carried out during
+    /// the list's own prepaint, which happens after this column has already
+    /// been rendered. Reading the settled offset alone would leave the lanes a
+    /// row or more out of step with the subjects beside them, and -- since
+    /// nothing schedules another frame -- leave them that way on screen rather
+    /// than for a moment.
+    fn history_scroll_offset_once_settled(&self, row_height: Pixels) -> Pixels {
+        let state = self.commit_history_scroll_handle.0.borrow();
+        let settled = (-state.base_handle.offset().y).max(px(0.));
+        let Some(pending) = state.deferred_scroll_to_item else {
+            return settled;
+        };
+        // Only the one shape the History tab asks for is predicted. Anything
+        // else is left to settle on its own rather than guessed at.
+        if !matches!(pending.strategy, ScrollStrategy::Top)
+            || pending.offset != 0
+            || pending.scroll_strict
+        {
+            return settled;
+        }
+
+        let wanted = row_height * pending.item_index as f32;
+        // The same test `uniform_list` makes in its own prepaint: a row already
+        // in view is left where it is. Predicting a move the list will not make
+        // puts the lanes out of step just as surely as predicting none.
+        let viewport = state.base_handle.bounds().size.height;
+        let above = wanted < settled;
+        let below = wanted + row_height > settled + viewport;
+        if !above && !below {
+            return settled;
+        }
+
+        // A list that has never been laid out reports no furthest offset, which
+        // is not the same as a furthest offset of zero: clamping to it there
+        // would throw the look-ahead away entirely.
+        match state.base_handle.max_offset().y {
+            furthest if furthest > px(0.) => wanted.min(furthest),
+            _ => wanted,
+        }
+    }
+
+    /// How far the History tab has been scrolled down, in pixels.
+    fn history_scroll_offset(&self) -> Pixels {
+        (-self
+            .commit_history_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y)
+            .max(px(0.))
+    }
+
+    /// Which row of the History tab a point on the lane column falls in.
+    fn history_row_at(&self, position: Point<Pixels>, row_height: Pixels) -> Option<usize> {
+        let bounds = self.commit_graph_bounds.get()?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let row = ((position.y - bounds.origin.y + self.history_scroll_offset()) / row_height)
+            .floor() as usize;
+        (row < self.commit_graph.commits.len()).then_some(row)
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9223,7 +9544,314 @@ mod tests {
 
         wait_for_commit_history_to_settle(&panel, cx).await;
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.commit_history, CommitHistory::Loaded(Rc::from([])));
+            assert_eq!(panel.commit_history, CommitHistory::Loaded);
+            assert!(panel.commit_graph.commits.is_empty());
+        });
+    }
+
+    fn sha_of(byte: u8) -> Oid {
+        std::iter::repeat_n(format!("{byte:02x}"), 20)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    /// A merge is where a graph stops being a list: its second parent cannot
+    /// share the lane the first one continues in, so the layout has to widen.
+    /// Nothing about the panel drew lanes before, so this reads zero without
+    /// the graph the History tab now keeps.
+    #[gpui::test]
+    async fn a_merge_widens_the_history_into_more_than_one_lane(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let (merge, side, base) = (sha_of(3), sha_of(2), sha_of(1));
+        let dot_git = Path::new(path!("/root/project/.git"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), merge.to_string());
+            // Newest first, as `git log` hands them over.
+            state.graph_commits = vec![
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: merge,
+                    parents: SmallVec::from_slice(&[base, side]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: side,
+                    parents: SmallVec::from_slice(&[base]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: base,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        wait_for_commit_history_to_settle(&panel, cx).await;
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.commit_graph.commits.len(),
+                3,
+                "every commit the log reported is laid out"
+            );
+            assert!(
+                panel.commit_graph.max_lanes >= 2,
+                "the merge's second parent needs a lane of its own, but the layout is {} lane(s) wide",
+                panel.commit_graph.max_lanes
+            );
+        });
+    }
+
+    /// `git log` streams in chunks and every chunk lands in the same fetch, so
+    /// the layout has to be grown rather than rebuilt. Handing a commit to it
+    /// twice would claim its lane twice and bend every line drawn after it.
+    #[gpui::test]
+    async fn fetching_again_does_not_lay_the_same_commit_out_twice(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let sha = sha_of(7);
+        let dot_git = Path::new(path!("/root/project/.git"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), sha.to_string());
+            state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
+                sha,
+                parents: SmallVec::new(),
+                ref_names: Vec::new(),
+            })];
+        })
+        .unwrap();
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        wait_for_commit_history_to_settle(&panel, cx).await;
+
+        let after_first = panel.read_with(cx, |panel, _| panel.commit_graph.commits.len());
+        assert_eq!(after_first, 1);
+
+        panel.update(cx, |panel, cx| panel.fetch_commit_history_entries(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let laid_out: Vec<Oid> = panel
+                .commit_graph
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect();
+            assert_eq!(
+                laid_out,
+                vec![sha],
+                "a second fetch with nothing new must leave the layout alone"
+            );
+        });
+    }
+
+    /// Another HEAD is another history, not more of this one. Appending it to
+    /// the lanes the last one left behind would draw one history's commits on
+    /// another's lines, and a shorter history would keep showing commits it
+    /// does not contain.
+    #[gpui::test]
+    async fn moving_head_lays_the_history_out_from_scratch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let (first, second, elsewhere) = (sha_of(1), sha_of(2), sha_of(9));
+        let dot_git = Path::new(path!("/root/project/.git"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), second.to_string());
+            state.graph_commits = vec![
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: second,
+                    parents: SmallVec::from_slice(&[first]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: first,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        wait_for_commit_history_to_settle(&panel, cx).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.commit_graph.commits.len(), 2);
+        });
+
+        // A single commit, so a layout that was appended to rather than thrown
+        // away would still be showing the two commits of the history before it.
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("HEAD".into(), elsewhere.to_string());
+            state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
+                sha: elsewhere,
+                parents: SmallVec::new(),
+                ref_names: Vec::new(),
+            })];
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let seen = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_repository
+                .as_ref()
+                .and_then(|repository| GitPanel::commit_history_log_source(repository, cx))
+        });
+        assert_eq!(
+            seen,
+            Some(LogSource::Sha(elsewhere)),
+            "the repository has to see the new HEAD, or this proves nothing"
+        );
+
+        panel.update(cx, |panel, cx| panel.fetch_commit_history_entries(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let laid_out: Vec<Oid> = panel
+                .commit_graph
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect();
+            assert_eq!(
+                laid_out,
+                vec![elsewhere],
+                "the new history is laid out on its own, not appended to the old one"
+            );
+        });
+    }
+
+    /// A scroll asked for from the keyboard is only written down, and carried
+    /// out later during the list's own prepaint. The lane column is rendered
+    /// before that happens, so it has to look ahead at what is pending -- and
+    /// nothing schedules a further frame, so reading the settled offset instead
+    /// would leave the lanes standing beside the wrong subjects, not for a
+    /// moment but until something else happened to repaint.
+    #[gpui::test]
+    async fn the_lanes_look_ahead_to_a_scroll_the_list_has_not_carried_out(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+
+        let row_height = px(40.);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.history_scroll_offset_once_settled(row_height),
+                px(0.),
+                "nothing has been asked for yet"
+            );
+        });
+
+        panel.update(cx, |panel, _| {
+            panel
+                .commit_history_scroll_handle
+                .scroll_to_item(3, ScrollStrategy::Top);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.history_scroll_offset_once_settled(row_height),
+                px(120.),
+                "the fourth row is about to become the top one"
+            );
+        });
+    }
+
+    /// A commit landing on the branch already open does not change the source
+    /// the history was asked for -- a branch source carries only its name -- so
+    /// the head commit is what has to give it away.
+    #[test]
+    fn a_moved_head_reads_as_a_new_history() {
+        let (was, now) = (sha_of(1), sha_of(2));
+
+        assert!(
+            !history_restarted(None, Some(now), 0, 1),
+            "nothing laid out yet is not a restart"
+        );
+        assert!(
+            !history_restarted(Some(was), Some(was), 3, 3),
+            "the same head and the same length is the same history"
+        );
+        assert!(
+            !history_restarted(Some(was), Some(was), 3, 9),
+            "the same history, further streamed in, is not a restart"
+        );
+        assert!(
+            history_restarted(Some(was), Some(now), 3, 3),
+            "a different head is a different history, whatever its length"
+        );
+        assert!(
+            history_restarted(Some(was), Some(was), 9, 3),
+            "a list shorter than what is laid out cannot be more of it"
+        );
+        assert!(
+            history_restarted(Some(was), None, 3, 0),
+            "the history it was laid out from is gone"
+        );
+    }
+
+    /// The lane column predicts only the one kind of scroll the History tab
+    /// asks for. Guessing at the others would put the lanes out of step just as
+    /// surely as not looking ahead at all.
+    #[gpui::test]
+    async fn only_the_scroll_the_history_asks_for_is_looked_ahead_to(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        let row_height = px(40.);
+
+        panel.update(cx, |panel, _| {
+            panel
+                .commit_history_scroll_handle
+                .scroll_to_item(3, ScrollStrategy::Center);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.history_scroll_offset_once_settled(row_height),
+                px(0.),
+                "centring is not the move this column knows how to predict"
+            );
+        });
+
+        panel.update(cx, |panel, _| {
+            panel
+                .commit_history_scroll_handle
+                .scroll_to_item_strict(3, ScrollStrategy::Top);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.history_scroll_offset_once_settled(row_height),
+                px(0.),
+                "a strict scroll skips the visibility test the prediction mirrors"
+            );
         });
     }
 
@@ -9252,13 +9880,14 @@ mod tests {
 
         wait_for_commit_history_to_settle(&panel, cx).await;
         panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                panel.commit_history,
-                CommitHistory::Loaded(Rc::from([CommitHistoryEntry {
-                    sha,
-                    tag_names: Vec::new(),
-                }]))
-            );
+            assert_eq!(panel.commit_history, CommitHistory::Loaded);
+            let laid_out: Vec<Oid> = panel
+                .commit_graph
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect();
+            assert_eq!(laid_out, vec![sha]);
         });
     }
 
@@ -9308,47 +9937,41 @@ mod tests {
 
     #[test]
     fn test_commit_history_from_response() {
-        let sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
         let error = SharedString::from("git log failed");
-        let entries: Rc<[CommitHistoryEntry]> = Rc::from([CommitHistoryEntry {
-            sha,
-            tag_names: Vec::new(),
-        }]);
-        let no_entries: Rc<[CommitHistoryEntry]> = Rc::from([]);
 
         // Commits win even while the fetch task still reports `is_loading`.
         assert_eq!(
-            commit_history_from_response(entries.clone(), true, None),
-            CommitHistory::Loaded(entries.clone())
+            commit_history_from_response(1, true, None),
+            CommitHistory::Loaded
         );
         assert_eq!(
-            commit_history_from_response(entries.clone(), false, None),
-            CommitHistory::Loaded(entries.clone())
+            commit_history_from_response(1, false, None),
+            CommitHistory::Loaded
         );
         // Commits also take precedence over a concurrently reported error.
         assert_eq!(
-            commit_history_from_response(entries.clone(), true, Some(error.clone())),
-            CommitHistory::Loaded(entries)
+            commit_history_from_response(1, true, Some(error.clone())),
+            CommitHistory::Loaded
         );
 
         // With no commits a terminal error beats the loading state.
         assert_eq!(
-            commit_history_from_response(no_entries.clone(), true, Some(error.clone())),
+            commit_history_from_response(0, true, Some(error.clone())),
             CommitHistory::Error(error.clone())
         );
         assert_eq!(
-            commit_history_from_response(no_entries.clone(), false, Some(error.clone())),
+            commit_history_from_response(0, false, Some(error.clone())),
             CommitHistory::Error(error)
         );
 
         // When no commits and no error, loading vs. finished-empty hinges on `is_loading`.
         assert_eq!(
-            commit_history_from_response(no_entries.clone(), true, None),
+            commit_history_from_response(0, true, None),
             CommitHistory::Loading
         );
         assert_eq!(
-            commit_history_from_response(no_entries.clone(), false, None),
-            CommitHistory::Loaded(no_entries)
+            commit_history_from_response(0, false, None),
+            CommitHistory::Loaded
         );
     }
 
