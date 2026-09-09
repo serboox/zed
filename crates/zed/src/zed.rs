@@ -5664,6 +5664,95 @@ mod tests {
         );
     }
 
+    /// The list drops down centred on the plaque. It is half again the plaque's
+    /// width, so hung off the plaque's left corner the whole of that excess
+    /// goes to the right, past the run and debug buttons beside the plaque,
+    /// and the list reads as theirs rather than as the plaque's.
+    ///
+    /// Measured in the real title bar rather than a bar of the test's own: the
+    /// plaque's place there is decided by the two flexible groups either side
+    /// of it, and a bar that puts the plaque somewhere of its own choosing
+    /// proves centring in a layout that exists nowhere.
+    #[gpui::test]
+    async fn test_the_configurations_list_drops_down_centred_on_the_plaque(
+        cx: &mut TestAppContext,
+    ) {
+        use workspace::OpenMode;
+
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            title_bar::init(cx);
+            run_configurations::init(cx);
+            put_run_configurations_in_the_title_bar(cx);
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    ".zed": {
+                        "tasks.json": r#"[
+                          { "label": "api server", "command": "go run ./cmd/api" }
+                        ]"#,
+                    },
+                }),
+            )
+            .await;
+
+        let workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                workspace::Workspace::new_local(
+                    vec![path!("/project").into()],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let wide = px(1600.);
+        cx.simulate_resize(size(wide, px(700.)));
+        cx.run_until_parked();
+
+        let plaque = cx
+            .debug_bounds("run-configurations-plaque")
+            .expect("the plaque that says how to run the project is in the bar");
+
+        cx.simulate_click(plaque.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let list = cx
+            .debug_bounds("run-configurations-list")
+            .expect("clicking the plaque opens the list");
+
+        // A list that reaches past the window is placed by the window's own
+        // margin, and every anchor then gives the same answer. So one touching
+        // either margin says nothing about what it is anchored to, and the two
+        // assertions below would hold whatever that was.
+        assert!(
+            list.origin.x > px(16.) && list.right() < wide - px(16.),
+            "the window is too narrow to tell one anchor from another: {list:?} \
+             in a window {wide:?} wide"
+        );
+        assert!(
+            (list.center().x - plaque.center().x).abs() < px(2.),
+            "the list is centred on the plaque: {list:?} against {plaque:?}"
+        );
+        assert!(
+            (list.origin.y - plaque.bottom()).abs() < px(4.),
+            "and still drops from the plaque's bottom edge: {list:?} against {plaque:?}"
+        );
+    }
+
     /// The list of configurations shows Enter and Shift-Enter on the row it is
     /// on. Those hints are read out of the keymap, so the keymap has to carry
     /// them -- a hint for an unbound key is a lie the reader acts on.

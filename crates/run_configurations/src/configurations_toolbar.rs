@@ -733,7 +733,11 @@ impl Render for ConfigurationsToolbar {
             .items_center()
             .child(
                 PopoverMenu::new("run-configurations-switcher")
-                    .anchor(gpui::Anchor::TopLeft)
+                    // Centred on the plaque rather than hung off its left
+                    // corner: the list is half again the plaque's width, so a
+                    // left corner leaves it all on one side, reaching past the
+                    // buttons beside the plaque and reading as theirs.
+                    .anchor(gpui::Anchor::TopCenter)
                     .trigger_with_tooltip(
                         Self::plaque(pointing_at.clone(), cx),
                         Tooltip::text(match &pointing_at {
