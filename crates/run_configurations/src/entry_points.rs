@@ -290,8 +290,37 @@ fn go_package(path: &Path, contents: &str) -> Option<Offered> {
 #[derive(Default)]
 struct Binary {
     name: String,
+    /// What cargo names it after when the section gives no `name`: the file's
+    /// own stem.
+    path: String,
     /// The features cargo will not build it without.
     features: Vec<String>,
+}
+
+impl Binary {
+    /// What cargo calls this binary. A section with only a `path` is still a
+    /// binary; cargo names it after the file, and dropping it loses a way of
+    /// running that the manifest plainly declares.
+    fn named(&self) -> Option<String> {
+        if !self.name.is_empty() {
+            return Some(self.name.clone());
+        }
+        Path::new(&self.path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// A value with any trailing comment taken off. `name = "server" # the one`
+/// is a name of `server`, not of `server" # the one`.
+fn without_a_comment(value: &str) -> &str {
+    match value.split_once('#') {
+        // A `#` inside the quotes belongs to the value.
+        Some((before, _)) if before.matches('"').count() % 2 == 0 => before.trim_end(),
+        _ => value,
+    }
 }
 
 /// The binaries a Cargo manifest names. Read line by line rather than parsed:
@@ -308,7 +337,8 @@ fn cargo_binaries(path: &Path, contents: &str) -> Vec<Offered> {
     let mut declared: Vec<Binary> = Vec::new();
     let mut section = String::new();
     let mut package_name = None;
-    for line in contents.lines() {
+    let mut lines = contents.lines().peekable();
+    while let Some(line) = lines.next() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
             section = line.to_string();
@@ -320,33 +350,54 @@ fn cargo_binaries(path: &Path, contents: &str) -> Vec<Offered> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let value = value.trim();
-        match (section.as_str(), key.trim()) {
+        let key = key.trim();
+        let mut value = without_a_comment(value.trim()).to_string();
+        // A list may run over several lines, and one read a line at a time
+        // would see an opening bracket and nothing in it -- which offers the
+        // command without the features it cannot build without.
+        if value.starts_with('[') && !value.contains(']') {
+            while let Some(more) = lines.next() {
+                let more = without_a_comment(more.trim());
+                value.push(' ');
+                value.push_str(more);
+                if more.contains(']') {
+                    break;
+                }
+            }
+        }
+        match (section.as_str(), key) {
             ("[package]", "name") => {
-                let name = value.trim_matches('"');
+                let name = value.trim().trim_matches('"');
                 if !name.is_empty() {
                     package_name = Some(name.to_string());
                 }
             }
             ("[[bin]]", "name") => {
-                let name = value.trim_matches('"');
+                let name = value.trim().trim_matches('"');
                 if let Some(binary) = declared.last_mut()
                     && !name.is_empty()
                 {
                     binary.name = name.to_string();
                 }
             }
+            ("[[bin]]", "path") => {
+                let path = value.trim().trim_matches('"');
+                if let Some(binary) = declared.last_mut() {
+                    binary.path = path.to_string();
+                }
+            }
             ("[[bin]]", "required-features") => {
                 if let Some(binary) = declared.last_mut() {
-                    binary.features = features_named(value);
+                    binary.features = features_named(&value);
                 }
             }
             _ => {}
         }
     }
-    // A `[[bin]]` with only a path is one cargo names after that path; there is
-    // nothing here to name it by, so it is left out rather than guessed at.
-    declared.retain(|binary| !binary.name.is_empty());
+    let declared: Vec<(String, Vec<String>)> = declared
+        .iter()
+        .filter_map(|binary| Some((binary.named()?, binary.features.clone())))
+        .collect();
 
     let named_after_the_package =
         declared
@@ -359,8 +410,8 @@ fn cargo_binaries(path: &Path, contents: &str) -> Vec<Offered> {
             });
     declared
         .into_iter()
-        .map(|binary| Offered {
-            point: cargo_run(&binary.name, &binary.features, &at),
+        .map(|(name, features)| Offered {
+            point: cargo_run(&name, &features, &at),
             only_if: None,
         })
         .chain(named_after_the_package)
@@ -389,9 +440,8 @@ fn cargo_run(binary: &str, features: &[String], at: &Path) -> EntryPoint {
     }
 }
 
-/// The features a `required-features` line names, as written on one line. A
-/// list spread over several lines reads as none, which offers the plain command
-/// rather than a wrong one.
+/// The features a `required-features` value names, however many lines it was
+/// written over.
 fn features_named(value: &str) -> Vec<String> {
     value
         .trim_start_matches('[')
@@ -436,10 +486,11 @@ fn python_module(path: &Path, name: &str, contents: &str) -> Option<Offered> {
     // The guard itself, not the word: `__main__` turns up in docstrings and in
     // imports of modules that are not programs.
     let is_a_program = name == "__main__.py" || has_a_main_guard(contents);
-    // A test file is started by its runner, not by `python3 <file>`.
-    let is_a_test = name == "conftest.py"
-        || name.starts_with("test_")
-        || path.components().any(|part| part.as_os_str() == "tests");
+    // A test file is started by its runner, not by `python3 <file>`. Judged by
+    // the file's own name rather than by the directory it sits in: a generator
+    // kept beside the tests is still a program.
+    let is_a_test =
+        name == "conftest.py" || name.starts_with("test_") || name.ends_with("_test.py");
     if !is_a_program || is_a_test {
         return None;
     }
@@ -466,6 +517,11 @@ fn has_a_main_guard(contents: &str) -> bool {
 /// The image a Dockerfile builds, when running it starts anything. A file with
 /// no `CMD` and no `ENTRYPOINT` builds an image that has nothing to run -- a
 /// builder stage, or a base image for CI -- and `docker run` on it fails.
+///
+/// Only this file is read, so a `FROM nginx` that inherits its entrypoint from
+/// the base image is not offered either. Knowing better would mean pulling the
+/// base image, and one way of running missed is a smaller fault than several
+/// offered that cannot start.
 fn docker_image(path: &Path, contents: &str) -> Option<Offered> {
     let starts_something = contents.lines().any(|line| {
         let line = line.trim_start().to_ascii_uppercase();
@@ -670,6 +726,47 @@ mod tests {
         );
     }
 
+    /// A binary cargo will not build without a feature cannot be run without
+    /// it either, and the manifest is the only place that says which -- however
+    /// many lines the list is written over. A section named only by its path is
+    /// still a binary, and cargo names it after the file.
+    #[test]
+    fn a_binary_named_only_by_its_path_is_still_offered() {
+        let found = offered(
+            "crates/collab/Cargo.toml",
+            "[package]\nname = \"collab\"\n\n[[bin]]\npath = \"src/bin/dotenv.rs\"\n",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].point.name, "dotenv");
+    }
+
+    /// A comment after a value is not part of it.
+    #[test]
+    fn a_value_with_a_note_after_it_is_still_the_value() {
+        let found = offered(
+            "crates/thing/Cargo.toml",
+            "[package]\nname = \"thing\"  # the one we ship\n",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].point.name, "thing");
+    }
+
+    /// A features list over several lines is still a features list. Read one
+    /// line at a time it looked empty, and the command was offered without the
+    /// features cargo refuses to build it without.
+    #[test]
+    fn a_features_list_over_several_lines_is_still_read() {
+        let found = offered(
+            "crates/zed/Cargo.toml",
+            "[package]\nname = \"zed\"\n\n[[bin]]\nname = \"runner\"\n\
+             required-features = [\n    \"server\",\n    \"tls\",\n]\n",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].point.how.args,
+            vec!["run", "--bin", "runner", "--features", "server,tls"]
+        );
+    }
     /// A binary cargo will not build without a feature cannot be run without
     /// it either, and the manifest is the only place that says which.
     #[test]
