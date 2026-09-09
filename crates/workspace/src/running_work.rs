@@ -44,7 +44,9 @@ pub struct RunningWorkRegistry {
 /// minutes ago is worse than a panel listing nothing.
 pub struct RunningWorkHandle {
     id: usize,
-    alive: Arc<()>,
+    /// Never read, and that is the point: the registry holds a weak reference
+    /// to it, so this being dropped is what ends the registration.
+    _alive: Arc<()>,
 }
 
 impl RunningWorkRegistry {
@@ -73,7 +75,7 @@ impl RunningWorkRegistry {
             },
         );
         cx.refresh_windows();
-        RunningWorkHandle { id, alive }
+        RunningWorkHandle { id, _alive: alive }
     }
 
     /// Everything still running, oldest first, so a list of it does not
