@@ -23,7 +23,7 @@ use std::time::Duration;
 use ui::{
     Button, ButtonCommon, ButtonStyle, Checkbox, Chip, Color, CommonAnimationExt, ContextMenu,
     CopyButton, Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu,
-    ScrollableHandle, Tooltip, cyberpunk, prelude::*, right_click_menu,
+    ScrollableHandle, Tooltip, WithScrollbar, cyberpunk, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 
@@ -1083,6 +1083,11 @@ fn returns_no_result_set(result: &QueryResult, sql: Option<&str>) -> bool {
 /// How many statements one result view remembers.
 const MAX_VIEW_QUERY_HISTORY: usize = 50;
 
+/// The bar along the bottom of the view: its outer height, border included,
+/// since gpui lays a box out border-first. A surface that floats over the
+/// view stops here, so what the bar says stays readable behind it.
+const STATUS_BAR_HEIGHT: Pixels = px(22.);
+
 /// One statement the reader ran from this view, and what came of it.
 #[derive(Debug, Clone)]
 struct QueryHistoryEntry {
@@ -1629,6 +1634,7 @@ pub struct ResultView {
     /// position: a query dispatched while the fill was in flight sits in front
     /// of it by the time the pages come back.
     pending_history: Option<u64>,
+    history_scroll: gpui::ScrollHandle,
     // Whether the query history popup is open.
     history_open: bool,
     // Whether the record view panel (single-row transpose) is open.
@@ -1949,6 +1955,7 @@ impl ResultView {
             query_history: Vec::new(),
             next_history_id: 0,
             pending_history: None,
+            history_scroll: gpui::ScrollHandle::new(),
             history_open: false,
             record_view_open: false,
             record_view_row: None,
@@ -6499,8 +6506,15 @@ impl ResultView {
         }
     }
 
+    /// What the bar along the bottom describes. Read through here by both the
+    /// bar and the height it takes, so a surface floating over the view cannot
+    /// come to disagree with the bar about whether there is a bar at all.
+    fn status_bar_result(&self) -> Option<&QueryResult> {
+        self.result.as_ref()
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let result = self.result.as_ref()?;
+        let result = self.status_bar_result()?;
         let total_rows = result.rows.len();
         let total_cols = result.columns.len();
         let ms = result.execution_time_ms;
@@ -6562,8 +6576,9 @@ impl ResultView {
 
         Some(
             h_flex()
+                .debug_selector(|| "RESULT_STATUS_BAR".to_string())
                 .flex_none()
-                .h(px(22.))
+                .h(STATUS_BAR_HEIGHT)
                 .px_2()
                 .gap_3()
                 .border_t_1()
@@ -6605,6 +6620,15 @@ impl ResultView {
                     )
                 }),
         )
+    }
+
+    /// What the bar along the bottom takes, which is nothing when there is no
+    /// result for it to describe and `render_status_bar` draws none.
+    fn status_bar_height(&self) -> Pixels {
+        match self.status_bar_result().is_some() {
+            true => STATUS_BAR_HEIGHT,
+            false => px(0.),
+        }
     }
 
     fn render_query_history_popup(
@@ -6700,7 +6724,9 @@ impl ResultView {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
+                .track_scroll(&self.history_scroll)
                 .children(items)
+                .vertical_scrollbar_for(&self.history_scroll, window, cx)
                 .into_any_element()
         };
 
@@ -6711,7 +6737,12 @@ impl ResultView {
             .flex()
             .flex_col()
             .min_w(px(520.0))
-            .max_h(px(420.0))
+            // Down to the bar at the foot of the view rather than to a height
+            // of its own: the body this floats in clips what overflows it, so a
+            // constant taller than the pane loses its last rows in silence, and
+            // one shorter than the pane wastes what it leaves. A size from a
+            // drag still wins over this.
+            .bottom(self.status_bar_height())
             .child(header)
             .when_some(search_box, |el, box_| el.child(box_))
             .child(body);
@@ -12017,6 +12048,7 @@ impl Render for ResultView {
         };
 
         v_flex()
+            .debug_selector(|| "RESULT_VIEW".to_string())
             .key_context("DbResultView")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -18320,6 +18352,117 @@ mod tests {
         assert!(
             cx.debug_bounds("QUERY_HISTORY_ROW-0").is_some(),
             "and the statement is in it"
+        );
+    }
+
+    /// However short the pane, the list stops at the bar along its foot, and
+    /// every entry it holds can be scrolled to.
+    ///
+    /// A height of its own inside a body that clips what overflows it loses its
+    /// last rows in silence, and rows that scroll with no thumb say nothing
+    /// about the ones below.
+    #[gpui::test]
+    async fn the_history_is_not_cut_off_by_a_short_pane(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            for at in 0..60 {
+                view.record_history(
+                    &format!("SELECT {at} FROM t"),
+                    QueryOutcome::Done { elapsed_ms: 1 },
+                );
+            }
+            view.history_open = true;
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(320.)));
+        draw_result_view(window, &mut cx);
+
+        let panel = cx
+            .debug_bounds("QUERY_HISTORY_POPUP")
+            .expect("the list is open");
+        let bar = cx
+            .debug_bounds("RESULT_STATUS_BAR")
+            .expect("the bar at the foot of the view is drawn");
+        assert!(
+            bar.bottom()
+                <= cx
+                    .debug_bounds("RESULT_VIEW")
+                    .expect("the view is drawn")
+                    .bottom(),
+            "the bar is meant to sit at the foot of the view"
+        );
+        assert!(
+            panel.bottom() <= bar.top(),
+            "the list runs over the bar that says what the statement returned: \
+             {panel:?} against {bar:?}"
+        );
+
+        let (last, reach) = view.read_with(&cx, |view, _cx| {
+            (
+                view.query_history.len() - 1,
+                view.history_scroll.max_offset().y,
+            )
+        });
+        let oldest: &str = format!("QUERY_HISTORY_ROW-{last}").leak();
+        assert!(
+            reach > px(0.),
+            "more entries than the pane can hold, yet nothing to scroll through"
+        );
+
+        // A row scrolled out of the box still lays out, so what says whether a
+        // reader can see it is where it sits against the box, not whether it
+        // was drawn at all.
+        let below_the_fold = |cx: &mut gpui::VisualTestContext| {
+            let row = cx.debug_bounds(oldest).expect("the oldest entry lays out");
+            let list = cx
+                .debug_bounds("QUERY_HISTORY_LIST")
+                .expect("the rows are in a box of their own, which is what scrolls");
+            row.bottom() - list.bottom()
+        };
+        assert!(
+            below_the_fold(&mut cx) > px(0.),
+            "the oldest entry is in view before a scroll, so this proves nothing"
+        );
+
+        view.update(&mut cx, |view, _cx| {
+            view.history_scroll.set_offset(gpui::point(px(0.), -reach));
+        });
+        draw_result_view(window, &mut cx);
+        assert!(
+            below_the_fold(&mut cx) <= px(0.),
+            "scrolling to the end still leaves the oldest entry past the bottom"
+        );
+    }
+
+    /// A statement that left no result has no bar along the foot of the view,
+    /// and the list takes the pane down to its last pixel rather than holding
+    /// back a strip of nothing where the bar would have been.
+    ///
+    /// That is the case a reader reaches for the list in: the statement failed,
+    /// there is no grid, and what they want is the one they ran before it.
+    #[gpui::test]
+    async fn the_history_takes_the_whole_pane_when_no_bar_is_drawn(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            view.result = None;
+            view.record_history("SELECT 1", QueryOutcome::Done { elapsed_ms: 1 });
+            view.history_open = true;
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(320.)));
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("RESULT_STATUS_BAR").is_none(),
+            "there is no result for a bar to describe"
+        );
+        let panel = cx
+            .debug_bounds("QUERY_HISTORY_POPUP")
+            .expect("the list is open");
+        let view_bounds = cx.debug_bounds("RESULT_VIEW").expect("the view is drawn");
+        assert_eq!(
+            panel.bottom(),
+            view_bounds.bottom(),
+            "the list stops short of the foot of the view and leaves a strip of \
+             nothing behind: {panel:?} in {view_bounds:?}"
         );
     }
 
