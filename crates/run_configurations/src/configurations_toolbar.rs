@@ -34,13 +34,22 @@ const SEGMENT_CONTENT_HEIGHT: f32 = 26.0;
 
 /// The width the lit segment's label sits in, whichever of the three it is.
 ///
-/// Sized for the longest of `Index`, `Types` and `All`: five characters of
-/// `LabelSize::Small`, whose type is 13px, and a character of the UI face takes
-/// about three fifths of its type size. Fixed rather than grown from the text,
-/// because a label that sizes its own parent gives the gauge a different width
-/// in every mode, so pressing a segment would resize the gauge and shift
-/// everything beside it in the bar.
-const LABEL_SLOT_WIDTH: f32 = 5.0 * 13.0 * 0.6;
+/// Sized for the longest of `Eco`, `Balanced` and `Performance`: eleven
+/// characters of `LabelSize::Small`, whose type is 13px, and a character of the
+/// UI face takes about three fifths of its type size. That estimate lands
+/// within a pixel of what `Performance` actually paints, so it carries a margin
+/// of its own -- the slot clips instead of ellipsising, and one a hair too
+/// narrow is a word with both ends cut off and nothing else looking wrong.
+/// `every_label_fits_the_slot_it_is_painted_in` is what keeps it honest.
+///
+/// Read as rems rather than pixels, so the slot grows with `ui_font_size` the
+/// way the label inside it does. As a flat pixel width it held at the shipped
+/// font size and clipped at larger ones.
+///
+/// Fixed rather than grown from the text, because a label that sizes its own
+/// parent gives the gauge a different width in every mode, so pressing a
+/// segment would resize the gauge and shift everything beside it in the bar.
+const LABEL_SLOT_WIDTH: f32 = 11.0 * 13.0 * 0.6 + 8.0;
 
 /// How often the pair looks to see whether the run it points at is still going.
 /// Nothing in a terminal tells the title bar that a task has ended, so the pair
@@ -64,17 +73,19 @@ const RUST_ANALYZER: &str = "rust-analyzer";
 
 /// How much the editor may spend on answering a question about the code.
 ///
+/// Named for the cost, not the mechanism: the reader is choosing what to spend,
+/// and the same three names name the same scale on every laptop power menu.
 /// Three rather than two, because the choice between no types at all and every
 /// hint repainting on each keystroke is not the one a reader wants to make.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnsweringMode {
     /// The index alone. Nothing starts on its own.
-    Index,
+    Eco,
     /// A server for the language being read, for the one thing an index cannot
     /// work out.
-    Types,
+    Balanced,
     /// Every hint a server can give, warmed before it is asked for.
-    Everything,
+    Performance,
 }
 
 /// What a mode is, spelled out in the settings it stands for.
@@ -91,23 +102,23 @@ struct AnsweringCost {
 }
 
 impl AnsweringMode {
-    const ALL: [Self; 3] = [Self::Index, Self::Types, Self::Everything];
+    const ALL: [Self; 3] = [Self::Eco, Self::Balanced, Self::Performance];
 
     fn costs(self) -> AnsweringCost {
         match self {
-            Self::Index => AnsweringCost {
+            Self::Eco => AnsweringCost {
                 start: LanguageServerStart::ByHand,
                 prime_caches: false,
                 inlay_hints: false,
                 semantic_tokens: SemanticTokens::Off,
             },
-            Self::Types => AnsweringCost {
+            Self::Balanced => AnsweringCost {
                 start: LanguageServerStart::Automatically,
                 prime_caches: false,
                 inlay_hints: false,
                 semantic_tokens: SemanticTokens::Off,
             },
-            Self::Everything => AnsweringCost {
+            Self::Performance => AnsweringCost {
                 start: LanguageServerStart::Automatically,
                 prime_caches: true,
                 inlay_hints: true,
@@ -129,11 +140,11 @@ impl AnsweringMode {
 
     fn icon(self) -> IconName {
         match self {
-            Self::Index => IconName::ListTree,
-            Self::Types => IconName::Code,
+            Self::Eco => IconName::ListTree,
+            Self::Balanced => IconName::Code,
             // A flame rather than a sparkle: a sparkle means AI everywhere else
             // in this chrome, and this mode honestly burns.
-            Self::Everything => IconName::Flame,
+            Self::Performance => IconName::Flame,
         }
     }
 
@@ -141,11 +152,11 @@ impl AnsweringMode {
     /// reader is choosing between.
     fn tooltip(self) -> &'static str {
         match self {
-            Self::Index => "The editor answers from its own index. No language server starts.",
-            Self::Types => {
+            Self::Eco => "The editor answers from its own index. No language server starts.",
+            Self::Balanced => {
                 "A server starts for the language you are in. Types on hover, completion by type."
             }
-            Self::Everything => {
+            Self::Performance => {
                 "Hints in the line, semantic colour, caches warmed before you ask. Costs the most."
             }
         }
@@ -157,9 +168,9 @@ impl AnsweringMode {
     /// than mixed here.
     fn load(self) -> cyberpunk::Load {
         match self {
-            Self::Index => cyberpunk::Load::Calm,
-            Self::Types => cyberpunk::Load::Warm,
-            Self::Everything => cyberpunk::Load::Hot,
+            Self::Eco => cyberpunk::Load::Calm,
+            Self::Balanced => cyberpunk::Load::Warm,
+            Self::Performance => cyberpunk::Load::Hot,
         }
     }
 
@@ -167,20 +178,33 @@ impl AnsweringMode {
     /// gauge is filled as far as it.
     fn stop(self) -> u8 {
         match self {
-            Self::Index => 0,
-            Self::Types => 1,
-            Self::Everything => 2,
+            Self::Eco => 0,
+            Self::Balanced => 1,
+            Self::Performance => 2,
         }
     }
 
     /// Shown on the lit segment alone: three labels do not fit in the bar, and
-    /// one makes the state unmistakable. Kept to five characters at most, so the
-    /// slot the label sits in -- [`LABEL_SLOT_WIDTH`] -- costs the gauge little.
+    /// one makes the state unmistakable. The longest of them decides the width
+    /// of the slot all three sit in -- [`LABEL_SLOT_WIDTH`] -- so a name longer
+    /// than `Performance` costs the bar width in every mode, not just its own.
     fn label(self) -> &'static str {
         match self {
-            Self::Index => "Index",
-            Self::Types => "Types",
-            Self::Everything => "All",
+            Self::Eco => "Eco",
+            Self::Balanced => "Balanced",
+            Self::Performance => "Performance",
+        }
+    }
+
+    /// Names the label on the lit segment. The slot it sits in is a fixed
+    /// width and clips without an ellipsis, so a label that outgrew it would be
+    /// cut off with nothing else looking wrong -- this is what a test measures
+    /// it against.
+    fn label_selector(self) -> &'static str {
+        match self {
+            Self::Eco => "answering-mode-eco-label",
+            Self::Balanced => "answering-mode-balanced-label",
+            Self::Performance => "answering-mode-performance-label",
         }
     }
 
@@ -188,9 +212,9 @@ impl AnsweringMode {
     /// presses.
     fn segment_selector(self) -> &'static str {
         match self {
-            Self::Index => "answering-mode-index",
-            Self::Types => "answering-mode-types",
-            Self::Everything => "answering-mode-everything",
+            Self::Eco => "answering-mode-eco",
+            Self::Balanced => "answering-mode-balanced",
+            Self::Performance => "answering-mode-performance",
         }
     }
 
@@ -199,12 +223,12 @@ impl AnsweringMode {
     /// state is legible from outside the render.
     fn state_selector(self, lit: bool) -> &'static str {
         match (self, lit) {
-            (Self::Index, true) => "answering-mode-index-lit",
-            (Self::Index, false) => "answering-mode-index-dim",
-            (Self::Types, true) => "answering-mode-types-lit",
-            (Self::Types, false) => "answering-mode-types-dim",
-            (Self::Everything, true) => "answering-mode-everything-lit",
-            (Self::Everything, false) => "answering-mode-everything-dim",
+            (Self::Eco, true) => "answering-mode-eco-lit",
+            (Self::Eco, false) => "answering-mode-eco-dim",
+            (Self::Balanced, true) => "answering-mode-balanced-lit",
+            (Self::Balanced, false) => "answering-mode-balanced-dim",
+            (Self::Performance, true) => "answering-mode-performance-lit",
+            (Self::Performance, false) => "answering-mode-performance-dim",
         }
     }
 
@@ -218,15 +242,15 @@ impl AnsweringMode {
     /// up by a `&'static str` and a formatted one could not be passed to it.
     fn fill_selector(self, filled_in: Self) -> &'static str {
         match (self, filled_in) {
-            (Self::Index, Self::Index) => "answering-mode-index-fill-calm",
-            (Self::Index, Self::Types) => "answering-mode-index-fill-warm",
-            (Self::Index, Self::Everything) => "answering-mode-index-fill-hot",
-            (Self::Types, Self::Index) => "answering-mode-types-fill-calm",
-            (Self::Types, Self::Types) => "answering-mode-types-fill-warm",
-            (Self::Types, Self::Everything) => "answering-mode-types-fill-hot",
-            (Self::Everything, Self::Index) => "answering-mode-everything-fill-calm",
-            (Self::Everything, Self::Types) => "answering-mode-everything-fill-warm",
-            (Self::Everything, Self::Everything) => "answering-mode-everything-fill-hot",
+            (Self::Eco, Self::Eco) => "answering-mode-eco-fill-calm",
+            (Self::Eco, Self::Balanced) => "answering-mode-eco-fill-warm",
+            (Self::Eco, Self::Performance) => "answering-mode-eco-fill-hot",
+            (Self::Balanced, Self::Eco) => "answering-mode-balanced-fill-calm",
+            (Self::Balanced, Self::Balanced) => "answering-mode-balanced-fill-warm",
+            (Self::Balanced, Self::Performance) => "answering-mode-balanced-fill-hot",
+            (Self::Performance, Self::Eco) => "answering-mode-performance-fill-calm",
+            (Self::Performance, Self::Balanced) => "answering-mode-performance-fill-warm",
+            (Self::Performance, Self::Performance) => "answering-mode-performance-fill-hot",
         }
     }
 }
@@ -907,14 +931,28 @@ impl Render for AnsweringModeGauge {
                                 // moves nothing beside it.
                                 div()
                                     .flex_none()
-                                    .w(px(LABEL_SLOT_WIDTH))
+                                    .w(rems_from_px(LABEL_SLOT_WIDTH))
                                     .overflow_hidden()
                                     .flex()
                                     .justify_center()
                                     .child(
-                                        Label::new(mode.label())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Custom(load.border())),
+                                        div()
+                                            .flex_none()
+                                            .debug_selector(move || {
+                                                mode.label_selector().to_string()
+                                            })
+                                            .child(
+                                                // Single line, so a label the
+                                                // slot cannot hold is cut off
+                                                // at the sides rather than
+                                                // wrapped onto a second line
+                                                // the segment's own height
+                                                // would then cut off instead.
+                                                Label::new(mode.label())
+                                                    .size(LabelSize::Small)
+                                                    .single_line()
+                                                    .color(Color::Custom(load.border())),
+                                            ),
                                     ),
                             ),
                     )
@@ -1032,10 +1070,10 @@ impl AnsweringModeGauge {
             // Not `stop_all_language_servers`: that latches the store shut until
             // every server is restarted, and asking for one by hand afterwards
             // would then do nothing.
-            AnsweringMode::Index => lsp_store
+            AnsweringMode::Eco => lsp_store
                 .stop_language_servers_for_buffers(open_buffers, HashSet::default(), cx)
                 .detach_and_log_err(cx),
-            AnsweringMode::Types | AnsweringMode::Everything => {
+            AnsweringMode::Balanced | AnsweringMode::Performance => {
                 lsp_store.restart_all_language_servers(cx)
             }
         });
@@ -1893,7 +1931,7 @@ mod tests {
     /// What a fresh install answers with. Read out of the settings that ship
     /// rather than the suite's own, which deliberately start servers.
     #[test]
-    fn a_fresh_install_answers_from_the_index_alone() {
+    fn a_fresh_install_answers_at_the_cheapest_of_the_three() {
         use settings::RootUserSettings as _;
 
         let shipped = settings::UserSettingsContent::parse_json_with_comments(
@@ -1931,7 +1969,7 @@ mod tests {
         assert_eq!(shipped_cost.start, LanguageServerStart::ByHand);
         assert_eq!(
             AnsweringMode::matching(shipped_cost),
-            Some(AnsweringMode::Index),
+            Some(AnsweringMode::Eco),
             "a fresh install is in the mode that starts nothing"
         );
     }
@@ -2119,12 +2157,12 @@ mod tests {
         // The suite starts servers automatically and asks for nothing else,
         // which is the middle mode.
         assert!(
-            cx.debug_bounds(AnsweringMode::Types.state_selector(true))
+            cx.debug_bounds(AnsweringMode::Balanced.state_selector(true))
                 .is_some(),
             "the suite's own settings are the middle mode"
         );
 
-        let everything = AnsweringMode::Everything.costs();
+        let everything = AnsweringMode::Performance.costs();
         cx.update(|_window, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |content| {
@@ -2152,7 +2190,7 @@ mod tests {
         draw_the_bar(bar, &mut cx);
 
         assert!(
-            cx.debug_bounds(AnsweringMode::Everything.state_selector(true))
+            cx.debug_bounds(AnsweringMode::Performance.state_selector(true))
                 .is_some(),
             "settings written by hand move the lit segment"
         );
@@ -2179,6 +2217,69 @@ mod tests {
                 cx.debug_bounds(mode.state_selector(false)).is_some(),
                 "{} is not lit while the settings match no mode",
                 mode.segment_selector()
+            );
+        }
+    }
+
+    /// Writes the settings a mode stands for, the same four the gauge itself
+    /// writes when a segment is pressed.
+    fn put_the_settings_in(mode: AnsweringMode, cx: &mut VisualTestContext) {
+        let costs = mode.costs();
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.global_lsp_settings.get_or_insert_default().start = Some(costs.start);
+                    content.project.lsp.0.insert(
+                        RUST_ANALYZER.into(),
+                        LspSettings {
+                            binary: None,
+                            settings: None,
+                            initialization_options: Some(serde_json::json!({
+                                "cachePriming": { "enable": costs.prime_caches }
+                            })),
+                            enable_lsp_tasks: true,
+                            fetch: None,
+                        },
+                    );
+                    let defaults = &mut content.project.all_languages.defaults;
+                    defaults.inlay_hints.get_or_insert_default().enabled = Some(costs.inlay_hints);
+                    defaults.semantic_tokens = Some(costs.semantic_tokens);
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    /// Every label fits the slot it is painted in.
+    ///
+    /// The slot is one fixed width for all three and clips without an ellipsis,
+    /// so a name too long for it loses both its ends and nothing else about the
+    /// bar looks wrong: the gauge is still the same width in every mode, still
+    /// lit on the right segment, and every other test in this file still
+    /// passes. This is the only one that would notice.
+    #[gpui::test]
+    async fn every_label_fits_the_slot_it_is_painted_in(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+
+        // The slot is declared in rems, so what it comes to in pixels is the
+        // window's own rem size -- reading the constant as pixels would measure
+        // the label against a slot the window never painted.
+        let slot =
+            cx.update(|window, _cx| rems_from_px(LABEL_SLOT_WIDTH).to_pixels(window.rem_size()));
+
+        for mode in AnsweringMode::ALL {
+            put_the_settings_in(mode, &mut cx);
+            draw_the_bar(bar, &mut cx);
+
+            let label = cx
+                .debug_bounds(mode.label_selector())
+                .unwrap_or_else(|| panic!("{} is lit and paints its label", mode.label()));
+            assert!(
+                label.size.width < slot,
+                "{:?} is wider than the slot holding it, so it is painted with its \
+                 ends cut off: {:?} against a slot of {slot:?}",
+                mode.label(),
+                label.size.width,
             );
         }
     }
