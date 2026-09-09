@@ -6732,6 +6732,118 @@ mod tests {
         });
     }
 
+    /// A tab moves from one window into another, alive.
+    ///
+    /// The entity is re-parented rather than re-opened from its path: entities
+    /// belong to the application, not to a window, so the editor that arrives
+    /// is the one that left, with whatever was unsaved in it. Re-opening by
+    /// path would lose that, and would not work at all for the tabs that most
+    /// need this -- a terminal, a query result, a diagram, none of which have
+    /// a path to be reopened from.
+    ///
+    /// A command rather than a drag: on Wayland the compositor sends pointer
+    /// events only to the surface a button was pressed on, so a drag never
+    /// reaches the second window at all.
+    #[gpui::test]
+    async fn test_an_item_moves_from_one_window_into_another(cx: &mut gpui::TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/dir"), json!({ "document.txt": "hello" }))
+            .await;
+
+        let project_a = Project::test(app_state.fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window_a = cx.add_window({
+            let project = project_a.clone();
+            |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let project_b = Project::test(app_state.fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window_b = cx.add_window({
+            let project = project_b.clone();
+            |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        cx.run_until_parked();
+
+        let workspace_a = window_a
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .unwrap();
+        let workspace_b = window_b
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .unwrap();
+
+        // Something to move, and a way to tell it apart from anything the
+        // other window opens for itself.
+        let moved = cx
+            .update_window(*window_a, |_, window, cx| {
+                workspace_a.update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path!("/dir/document.txt")),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let moved_id = moved.item_id();
+        assert_eq!(
+            workspace_a.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            1,
+            "the first window has the tab to move"
+        );
+        assert_eq!(
+            workspace_b.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            0,
+            "and the second window has nothing yet"
+        );
+
+        cx.update_window(*window_a, |_, window, cx| {
+            workspace_a.update(cx, |workspace, cx| {
+                workspace.move_item_to_other_window(
+                    &workspace::MoveItemToOtherWindow { focus: true },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace_a.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            0,
+            "the tab left the window it was in"
+        );
+        let arrived = workspace_b.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .map(|item| item.item_id())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            arrived,
+            vec![moved_id],
+            "and the very same item arrived in the other one, rather than a \
+             fresh one opened from its path"
+        );
+    }
+
     #[gpui::test]
     async fn test_prefer_focused_window(cx: &mut gpui::TestAppContext) {
         let app_state = init_test(cx);

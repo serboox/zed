@@ -385,6 +385,22 @@ actions!(
 #[action(namespace = workspace)]
 pub struct ActivatePane(pub usize);
 
+/// Moves the active editor into another Zed window.
+///
+/// A command rather than a drag, because a drag cannot cross a window boundary
+/// on Wayland: while a button is held the compositor sends pointer events only
+/// to the surface that was pressed, so the second window never learns the
+/// cursor is over it. Crossing it needs the compositor's own drag protocol.
+/// The command works everywhere and on every compositor, and a drag, when it
+/// arrives, is an affordance on top of it.
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct MoveItemToOtherWindow {
+    #[serde(default = "default_true")]
+    pub focus: bool,
+}
+
 /// Moves an item to a specific pane by index.
 #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -5449,6 +5465,61 @@ impl Workspace {
         }
     }
 
+    /// Moves the active item into another Zed window, keeping it alive.
+    ///
+    /// The item entity is re-parented, not re-opened from its path: entities
+    /// are held by the application, not by a window, so unsaved text, the
+    /// cursor, the scroll position and a running terminal all survive the move.
+    /// Re-opening by path would lose every one of them, and would not work at
+    /// all for a tab that has no path -- a terminal, a query result, a diagram.
+    ///
+    /// The item keeps being served by the project of the window it came from.
+    /// Its buffers belong to that project's buffer store, and two windows never
+    /// share one; re-homing them is only defined for a tab that has a path, and
+    /// the tabs that most need this move are the ones that do not.
+    pub fn move_item_to_other_window(
+        &mut self,
+        action: &MoveItemToOtherWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.active_pane.read(cx).active_item() else {
+            return;
+        };
+        let here = window.window_handle();
+        // Front-to-back where the platform reports it, so "the other window"
+        // means the one the reader last looked at rather than the oldest one.
+        let elsewhere = cx.window_stack().unwrap_or_else(|| cx.windows());
+        let Some(destination_window) = elsewhere
+            .into_iter()
+            .filter(|handle| *handle != here)
+            .find_map(|handle| handle.downcast::<MultiWorkspace>())
+        else {
+            return;
+        };
+
+        let item_id = item.item_id();
+        let source = self.active_pane.clone();
+        source.update(cx, |pane, cx| {
+            // Never closing the pane it leaves: a window that emptied itself
+            // out from under the reader is a worse surprise than an empty pane.
+            pane.remove_item(item_id, false, false, window, cx);
+        });
+
+        let focus = action.focus;
+        destination_window
+            .update(cx, move |multi_workspace, window, cx| {
+                let destination = multi_workspace.workspace().read(cx).active_pane().clone();
+                destination.update(cx, |pane, cx| {
+                    pane.add_item(item, focus, focus, None, window, cx);
+                });
+                if focus {
+                    window.activate_window();
+                }
+            })
+            .log_err();
+    }
+
     fn move_item_to_pane_at_index(
         &mut self,
         action: &MoveItemToPane,
@@ -7829,6 +7900,7 @@ impl Workspace {
             .on_action(cx.listener(Self::add_folder_to_project))
             .on_action(cx.listener(Self::follow_next_collaborator))
             .on_action(cx.listener(Self::activate_pane_at_index))
+            .on_action(cx.listener(Self::move_item_to_other_window))
             .on_action(cx.listener(Self::move_item_to_pane_at_index))
             .on_action(cx.listener(Self::move_focused_panel_to_next_position))
             .on_action(cx.listener(Self::reopen_last_picker))
