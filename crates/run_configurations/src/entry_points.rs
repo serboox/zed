@@ -24,6 +24,30 @@ pub struct EntryPoint {
     pub debugger: Option<&'static str>,
 }
 
+/// One way of running, and the file that has to exist for it to be real.
+///
+/// The condition travels with the way rather than being checked where the way
+/// is read, so reading a file stays a pure function of its text -- which is
+/// what makes the readers testable without a filesystem. [`look_through`]
+/// resolves it, beside the reads it is already doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offered {
+    pub point: EntryPoint,
+    /// Relative to the project's root. `None` means the way is real on the
+    /// strength of the file it was read from alone.
+    pub only_if: Option<PathBuf>,
+}
+
+impl EntryPoint {
+    /// This way of running, real on the strength of the file it was read from.
+    fn on_its_own(self) -> Offered {
+        Offered {
+            point: self,
+            only_if: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Family {
     Go,
@@ -78,19 +102,32 @@ pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<(Vec<EntryPoint
             }
             let relative = entry.path.as_std_path();
             if worth_reading(relative) {
-                to_read.push((relative.to_path_buf(), root.join(relative)));
+                to_read.push((relative.to_path_buf(), root.clone()));
             }
         }
     }
     cx.background_spawn(async move {
         let mut found = Vec::new();
-        for (relative, absolute) in to_read {
-            match fs.load(&absolute).await {
-                Ok(contents) => found.extend(ways_to_run(&relative, &contents)),
+        for (relative, root) in to_read {
+            let absolute = root.join(&relative);
+            let contents = match fs.load(&absolute).await {
+                Ok(contents) => contents,
                 // A file that cannot be read is one way fewer to offer, not a
                 // reason to offer none: it may have been deleted between the
                 // worktree scan and this read.
-                Err(error) => log::debug!("{}: {error}", absolute.display()),
+                Err(error) => {
+                    log::debug!("{}: {error}", absolute.display());
+                    continue;
+                }
+            };
+            for offered in ways_to_run(&relative, &contents) {
+                let real = match &offered.only_if {
+                    None => true,
+                    Some(needed) => fs.is_file(&root.join(needed)).await,
+                };
+                if real {
+                    found.push(offered.point);
+                }
             }
         }
         found.sort_by(|one, other| {
@@ -148,8 +185,19 @@ pub fn worth_reading(path: &Path) -> bool {
     )
 }
 
+/// Suffixes that make a `Dockerfile.`-prefixed name a file *about* a Dockerfile
+/// rather than one. `Dockerfile.dockerignore` is a list of paths.
+const NOT_A_DOCKERFILE: [&str; 3] = ["dockerignore", "md", "txt"];
+
 fn is_dockerfile(name: &str) -> bool {
-    name == "Dockerfile" || name.starts_with("Dockerfile.")
+    if name == "Dockerfile" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("Dockerfile.") else {
+        return false;
+    };
+    let last = rest.rsplit('.').next().unwrap_or(rest);
+    !last.is_empty() && !NOT_A_DOCKERFILE.contains(&last)
 }
 
 fn is_compose_file(name: &str) -> bool {
@@ -175,7 +223,7 @@ pub fn is_env_file(path: &Path) -> bool {
 
 /// The ways to run that this one file describes. `path` is relative to the
 /// project's root, which is also what the commands are written against.
-pub fn ways_to_run(path: &Path, contents: &str) -> Vec<EntryPoint> {
+pub fn ways_to_run(path: &Path, contents: &str) -> Vec<Offered> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
@@ -183,7 +231,7 @@ pub fn ways_to_run(path: &Path, contents: &str) -> Vec<EntryPoint> {
         return compose_services(path, contents);
     }
     if is_dockerfile(name) {
-        return vec![docker_image(path)];
+        return docker_image(path, contents).into_iter().collect();
     }
     match name {
         "Cargo.toml" => return cargo_binaries(path, contents),
@@ -218,7 +266,7 @@ fn plain(command: &str, args: Vec<String>) -> HowToRun {
     }
 }
 
-fn go_package(path: &Path, contents: &str) -> Option<EntryPoint> {
+fn go_package(path: &Path, contents: &str) -> Option<Offered> {
     let is_a_program = contents
         .lines()
         .any(|line| line.trim_start().starts_with("package main"))
@@ -227,69 +275,134 @@ fn go_package(path: &Path, contents: &str) -> Option<EntryPoint> {
         return None;
     }
     let package = package_of(path);
-    Some(EntryPoint {
-        name: package.clone(),
-        family: Family::Go,
-        how: plain("go", vec!["run".into(), package]),
-        debugger: Some("Delve"),
-    })
+    Some(
+        EntryPoint {
+            name: package.clone(),
+            family: Family::Go,
+            how: plain("go", vec!["run".into(), package]),
+            debugger: Some("Delve"),
+        }
+        .on_its_own(),
+    )
+}
+
+/// One binary a manifest declares, as its lines are read.
+#[derive(Default)]
+struct Binary {
+    name: String,
+    /// The features cargo will not build it without.
+    features: Vec<String>,
 }
 
 /// The binaries a Cargo manifest names. Read line by line rather than parsed:
-/// only two keys matter, the list is a suggestion the reader can edit, and a
+/// only three keys matter, the list is a suggestion the reader can edit, and a
 /// manifest this cannot read leaves the list shorter rather than wrong.
-fn cargo_binaries(path: &Path, contents: &str) -> Vec<EntryPoint> {
-    let mut found = Vec::new();
+///
+/// A manifest with no `[[bin]]` builds one binary named after the package only
+/// when it has a `src/main.rs`, so that way is offered on the condition that
+/// the file is there. Without the condition every library in a workspace is
+/// offered as something to run and `cargo run --bin <library>` fails outright:
+/// on this one that was most of the list.
+fn cargo_binaries(path: &Path, contents: &str) -> Vec<Offered> {
+    let at = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut declared: Vec<Binary> = Vec::new();
     let mut section = String::new();
     let mut package_name = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
             section = line.to_string();
+            if section == "[[bin]]" {
+                declared.push(Binary::default());
+            }
             continue;
         }
-        let Some(value) = line.strip_prefix("name") else {
+        let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let Some(value) = value.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let name = value.trim().trim_matches('"').to_string();
-        if name.is_empty() {
-            continue;
-        }
-        match section.as_str() {
-            "[package]" => package_name = Some(name),
-            "[[bin]]" => found.push(name),
+        let value = value.trim();
+        match (section.as_str(), key.trim()) {
+            ("[package]", "name") => {
+                let name = value.trim_matches('"');
+                if !name.is_empty() {
+                    package_name = Some(name.to_string());
+                }
+            }
+            ("[[bin]]", "name") => {
+                let name = value.trim_matches('"');
+                if let Some(binary) = declared.last_mut()
+                    && !name.is_empty()
+                {
+                    binary.name = name.to_string();
+                }
+            }
+            ("[[bin]]", "required-features") => {
+                if let Some(binary) = declared.last_mut() {
+                    binary.features = features_named(value);
+                }
+            }
             _ => {}
         }
     }
-    // A manifest with no `[[bin]]` still builds one binary, named after the
-    // package, whenever it has a `src/main.rs` -- which is the usual case and
-    // the one a reader is looking for.
-    if found.is_empty()
-        && let Some(package_name) = package_name
-    {
-        found.push(package_name);
-    }
-    let at = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    found
+    // A `[[bin]]` with only a path is one cargo names after that path; there is
+    // nothing here to name it by, so it is left out rather than guessed at.
+    declared.retain(|binary| !binary.name.is_empty());
+
+    let named_after_the_package =
+        declared
+            .is_empty()
+            .then_some(package_name)
+            .flatten()
+            .map(|name| Offered {
+                point: cargo_run(&name, &[], &at),
+                only_if: Some(at.join("src").join("main.rs")),
+            });
+    declared
         .into_iter()
-        .map(|binary| EntryPoint {
-            name: binary.clone(),
-            family: Family::Rust,
-            how: HowToRun {
-                command: "cargo".to_string(),
-                args: vec!["run".into(), "--bin".into(), binary],
-                cwd: Some(cwd_for(&at)),
-                env: HashMap::default(),
-            },
-            debugger: Some("CodeLLDB"),
+        .map(|binary| Offered {
+            point: cargo_run(&binary.name, &binary.features, &at),
+            only_if: None,
         })
+        .chain(named_after_the_package)
         .collect()
 }
 
-fn node_scripts(path: &Path, contents: &str) -> Vec<EntryPoint> {
+/// Running one binary of a crate, from that crate's own directory.
+fn cargo_run(binary: &str, features: &[String], at: &Path) -> EntryPoint {
+    let mut args = vec!["run".to_string(), "--bin".to_string(), binary.to_string()];
+    // A binary cargo only builds under some features cannot be run without
+    // them, and the manifest is the only place that says which.
+    if !features.is_empty() {
+        args.push("--features".to_string());
+        args.push(features.join(","));
+    }
+    EntryPoint {
+        name: binary.to_string(),
+        family: Family::Rust,
+        how: HowToRun {
+            command: "cargo".to_string(),
+            args,
+            cwd: Some(cwd_for(&at.to_path_buf())),
+            env: HashMap::default(),
+        },
+        debugger: Some("CodeLLDB"),
+    }
+}
+
+/// The features a `required-features` line names, as written on one line. A
+/// list spread over several lines reads as none, which offers the plain command
+/// rather than a wrong one.
+fn features_named(value: &str) -> Vec<String> {
+    value
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|feature| feature.trim().trim_matches('"').to_string())
+        .filter(|feature| !feature.is_empty())
+        .collect()
+}
+
+fn node_scripts(path: &Path, contents: &str) -> Vec<Offered> {
     let Ok(manifest) = serde_json::from_str::<serde_json::Value>(contents) else {
         return Vec::new();
     };
@@ -302,59 +415,95 @@ fn node_scripts(path: &Path, contents: &str) -> Vec<EntryPoint> {
     let at = path.parent().map(Path::to_path_buf).unwrap_or_default();
     scripts
         .keys()
-        .map(|script| EntryPoint {
-            name: format!("npm run {script}"),
-            family: Family::Node,
-            how: HowToRun {
-                command: "npm".to_string(),
-                args: vec!["run".into(), script.clone()],
-                cwd: Some(cwd_for(&at)),
-                env: HashMap::default(),
-            },
-            debugger: Some("JavaScript"),
+        .map(|script| {
+            EntryPoint {
+                name: format!("npm run {script}"),
+                family: Family::Node,
+                how: HowToRun {
+                    command: "npm".to_string(),
+                    args: vec!["run".into(), script.clone()],
+                    cwd: Some(cwd_for(&at)),
+                    env: HashMap::default(),
+                },
+                debugger: Some("JavaScript"),
+            }
+            .on_its_own()
         })
         .collect()
 }
 
-fn python_module(path: &Path, name: &str, contents: &str) -> Option<EntryPoint> {
-    let is_a_program = name == "__main__.py" || contents.contains("__main__");
-    if !is_a_program {
+fn python_module(path: &Path, name: &str, contents: &str) -> Option<Offered> {
+    // The guard itself, not the word: `__main__` turns up in docstrings and in
+    // imports of modules that are not programs.
+    let is_a_program = name == "__main__.py" || has_a_main_guard(contents);
+    // A test file is started by its runner, not by `python3 <file>`.
+    let is_a_test = name == "conftest.py"
+        || name.starts_with("test_")
+        || path.components().any(|part| part.as_os_str() == "tests");
+    if !is_a_program || is_a_test {
         return None;
     }
     let shown = path.to_string_lossy().replace('\\', "/");
-    Some(EntryPoint {
-        name: shown.clone(),
-        family: Family::Python,
-        how: plain("python3", vec![shown]),
-        debugger: Some("Debugpy"),
+    Some(
+        EntryPoint {
+            name: shown.clone(),
+            family: Family::Python,
+            how: plain("python3", vec![shown]),
+            debugger: Some("Debugpy"),
+        }
+        .on_its_own(),
+    )
+}
+
+/// Whether a Python file guards a program on being the module that was run.
+fn has_a_main_guard(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("if __name__") && line.contains("==") && line.contains("__main__")
     })
 }
 
-fn docker_image(path: &Path) -> EntryPoint {
+/// The image a Dockerfile builds, when running it starts anything. A file with
+/// no `CMD` and no `ENTRYPOINT` builds an image that has nothing to run -- a
+/// builder stage, or a base image for CI -- and `docker run` on it fails.
+fn docker_image(path: &Path, contents: &str) -> Option<Offered> {
+    let starts_something = contents.lines().any(|line| {
+        let line = line.trim_start().to_ascii_uppercase();
+        line.starts_with("CMD ")
+            || line.starts_with("CMD[")
+            || line.starts_with("ENTRYPOINT ")
+            || line.starts_with("ENTRYPOINT[")
+    });
+    if !starts_something {
+        return None;
+    }
     let file = path.to_string_lossy().replace('\\', "/");
     // Built and run in one press, tagged after the file so a second press
     // replaces the image rather than leaving a heap of untagged ones behind.
     let tag = format!("zed-run/{}", file.replace(['/', '.'], "-").to_lowercase());
-    EntryPoint {
-        name: file.clone(),
-        family: Family::Docker,
-        how: HowToRun {
-            command: "sh".to_string(),
-            args: vec![
-                "-c".into(),
-                format!("docker build -f {file} -t {tag} . && docker run --rm -it {tag}"),
-            ],
-            cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
-            env: HashMap::default(),
-        },
-        debugger: None,
-    }
+    Some(
+        EntryPoint {
+            name: file.clone(),
+            family: Family::Docker,
+            how: HowToRun {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".into(),
+                    format!("docker build -f {file} -t {tag} . && docker run --rm -it {tag}"),
+                ],
+                cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
+                env: HashMap::default(),
+            },
+            debugger: None,
+        }
+        .on_its_own(),
+    )
 }
 
 /// The services a compose file names. Only the keys one level under `services:`
 /// count, which is what the format says a service is; anything deeper belongs to
 /// a service rather than being one.
-fn compose_services(path: &Path, contents: &str) -> Vec<EntryPoint> {
+fn compose_services(path: &Path, contents: &str) -> Vec<Offered> {
     let file = path.to_string_lossy().replace('\\', "/");
     let mut services = Vec::new();
     let mut inside = false;
@@ -385,23 +534,26 @@ fn compose_services(path: &Path, contents: &str) -> Vec<EntryPoint> {
     }
     services
         .into_iter()
-        .map(|service| EntryPoint {
-            name: format!("{file} · {service}"),
-            family: Family::Compose,
-            how: HowToRun {
-                command: "docker".to_string(),
-                args: vec![
-                    "compose".into(),
-                    "-f".into(),
-                    file.clone(),
-                    "up".into(),
-                    "--build".into(),
-                    service,
-                ],
-                cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
-                env: HashMap::default(),
-            },
-            debugger: None,
+        .map(|service| {
+            EntryPoint {
+                name: format!("{file} · {service}"),
+                family: Family::Compose,
+                how: HowToRun {
+                    command: "docker".to_string(),
+                    args: vec![
+                        "compose".into(),
+                        "-f".into(),
+                        file.clone(),
+                        "up".into(),
+                        "--build".into(),
+                        service,
+                    ],
+                    cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
+                    env: HashMap::default(),
+                },
+                debugger: None,
+            }
+            .on_its_own()
         })
         .collect()
 }
@@ -421,6 +573,15 @@ mod tests {
     use super::*;
 
     fn ways(path: &str, contents: &str) -> Vec<EntryPoint> {
+        offered(path, contents)
+            .into_iter()
+            .map(|offered| offered.point)
+            .collect()
+    }
+
+    /// The same, keeping what each way needs to be real -- which is the whole
+    /// question for a Cargo manifest with no `[[bin]]`.
+    fn offered(path: &str, contents: &str) -> Vec<Offered> {
         ways_to_run(Path::new(path), contents)
     }
 
@@ -492,13 +653,58 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_with_no_binaries_falls_back_to_the_package() {
-        let found = ways(
-            "Cargo.toml",
+    /// A crate with no `[[bin]]` is a way of running only if it has a
+    /// `src/main.rs`. Offering it unconditionally is what filled this
+    /// workspace's list with library crates that `cargo run --bin` refuses.
+    fn a_manifest_with_no_binaries_is_a_way_to_run_only_with_a_main() {
+        let found = offered(
+            "crates/thing/Cargo.toml",
             "[package]\nname = \"thing\"\nversion = \"0\"\n",
         );
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name, "thing");
+        assert_eq!(found[0].point.name, "thing");
+        assert_eq!(
+            found[0].only_if.as_deref(),
+            Some(Path::new("crates/thing/src/main.rs")),
+            "the package name is a binary only where there is a program to build"
+        );
+    }
+
+    /// A binary cargo will not build without a feature cannot be run without
+    /// it either, and the manifest is the only place that says which.
+    #[test]
+    fn a_binary_behind_a_feature_is_offered_with_it() {
+        let found = offered(
+            "crates/zed/Cargo.toml",
+            "[package]\nname = \"zed\"\n\n[[bin]]\nname = \"zed\"\n\n\
+             [[bin]]\nname = \"runner\"\nrequired-features = [\"visual-tests\"]\n",
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].point.how.args, vec!["run", "--bin", "zed"]);
+        assert_eq!(
+            found[1].point.how.args,
+            vec!["run", "--bin", "runner", "--features", "visual-tests"]
+        );
+        assert!(
+            found.iter().all(|offered| offered.only_if.is_none()),
+            "a declared binary is real on the manifest's word alone"
+        );
+    }
+
+    /// A test file is started by its runner, not by `python3 <file>`.
+    #[test]
+    fn a_test_file_is_no_way_to_run_the_project() {
+        let program = "if __name__ == \"__main__\":\n    run()\n";
+        assert!(ways("pkg/tests/test_report.py", program).is_empty());
+        assert!(ways("pkg/conftest.py", program).is_empty());
+        assert!(
+            !ways("script/triage.py", program).is_empty(),
+            "a program that is not a test is still a way of running"
+        );
+        assert!(
+            ways("tool/helpers.py", "# see __main__ for the entry point\n").is_empty(),
+            "the word in a comment is not the guard"
+        );
     }
 
     #[test]
@@ -546,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_dockerfile_builds_and_runs_in_one_press() {
-        let found = ways("Dockerfile.dev", "FROM alpine\n");
+        let found = ways("Dockerfile.dev", "FROM alpine\nCMD [\"/app\"]\n");
         assert_eq!(found.len(), 1);
         let command = found[0].how.args.join(" ");
         assert!(
@@ -555,6 +761,24 @@ mod tests {
             "{command}"
         );
         assert_eq!(found[0].debugger, None);
+    }
+
+    /// An image with nothing to start is a builder stage or a base image, and
+    /// `docker run` on it fails; a `.dockerignore` is not an image at all.
+    #[test]
+    fn a_dockerfile_that_starts_nothing_is_no_way_to_run_anything() {
+        assert!(
+            ways("Dockerfile", "FROM rust:1.95 AS builder\nRUN cargo build\n").is_empty(),
+            "a builder stage has nothing to run"
+        );
+        assert!(
+            ways(
+                "crates/eval_cli/Dockerfile.dockerignore",
+                ".git\n**/target\n"
+            )
+            .is_empty(),
+            "a .dockerignore is a file about a Dockerfile, not one"
+        );
     }
 
     #[test]

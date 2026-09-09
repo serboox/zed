@@ -232,6 +232,21 @@ fn icon_type_of_adapter(adapter: &str) -> &'static str {
 }
 
 /// The icon type a configuration gets, whichever of the two files it came from.
+/// What a discovered way runs, as its row shows it: the command, its arguments,
+/// and the directory when it is not the project's root. Two crates whose names
+/// tell a reader nothing are told apart by this.
+fn what_a_way_runs(point: &crate::entry_points::EntryPoint) -> String {
+    let command = format!("{} {}", point.how.command, point.how.args.join(" "));
+    match point.how.cwd.as_deref() {
+        Some(cwd) if cwd != "$ZED_WORKTREE_ROOT" => format!(
+            "{} · {}",
+            command.trim(),
+            cwd.trim_start_matches("$ZED_WORKTREE_ROOT/")
+        ),
+        _ => command.trim().to_string(),
+    }
+}
+
 fn icon_type_of_configuration(configuration: &Configuration) -> &'static str {
     match (&configuration.task, &configuration.scenario) {
         (Some(task), _) => icon_type_of_task(task),
@@ -2350,35 +2365,14 @@ impl RunConfigurationsView {
                 )
                 .menu(move |window, cx| {
                     let view = view.clone();
-                    // What the project itself says can be run comes first and
-                    // whole: a command with its package, its arguments and the
-                    // directory it runs in, so nothing is left to type. The
-                    // bare templates stay underneath for a project this found
-                    // nothing in.
                     let found = view.read(cx).found.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        let mut family = None;
-                        for point in found {
-                            if family != Some(point.family) {
-                                family = Some(point.family);
-                                menu = menu.header(point.family.shown());
-                            }
-                            let view = view.clone();
-                            menu = menu.entry(
-                                SharedString::from(point.name.clone()),
-                                None,
-                                move |window, cx| {
-                                    let point = point.clone();
-                                    view.update(cx, |view, cx| {
-                                        view.start_a_new_one(Kind::Task, window, cx);
-                                        view.fill_in_from_way(&point, window, cx);
-                                    });
-                                },
-                            );
-                        }
-                        if family.is_some() {
-                            menu = menu.separator().header("Fill in by hand");
-                        }
+                        // The ways of filling one in by hand come first, not
+                        // last. A project can offer dozens of ways of running,
+                        // and underneath them these were past the end of a
+                        // scroll with no visible bar -- reachable in principle
+                        // and not in practice.
+                        menu = menu.header("Fill in by hand");
                         for template in crate::templates::TEMPLATES {
                             let view = view.clone();
                             menu = menu.entry(template.name, None, move |window, cx| {
@@ -2388,12 +2382,94 @@ impl RunConfigurationsView {
                                 });
                             });
                         }
-                        menu.separator()
-                            .entry("Something else", None, move |window, cx| {
+                        {
+                            let view = view.clone();
+                            menu = menu.entry("Something else", None, move |window, cx| {
                                 view.update(cx, |view, cx| {
                                     view.start_a_new_one(Kind::Task, window, cx)
                                 });
-                            })
+                            });
+                        }
+
+                        // What the project itself says can be run, whole: the
+                        // command, its arguments and the directory it runs in,
+                        // so nothing is left to type -- and so a reader can
+                        // tell two crates apart, which their names alone did
+                        // not let them do.
+                        let mut family = None;
+                        for point in found {
+                            if family != Some(point.family) {
+                                family = Some(point.family);
+                                menu = menu.separator().header(point.family.shown());
+                            }
+                            let view = view.clone();
+                            let named = point.name.clone();
+                            let runs = SharedString::from(what_a_way_runs(&point));
+                            let icon_type = icon_type_of_runner(&runner_of(
+                                &point.how.command,
+                                &point.how.args,
+                            ));
+                            let debugger = point.debugger;
+                            let chosen = point.clone();
+                            menu = menu.custom_entry(
+                                move |_, cx| {
+                                    let named = named.clone();
+                                    let for_selector = named.clone();
+                                    let runs = runs.clone();
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .items_start()
+                                        .debug_selector(move || format!("WAY-{for_selector}"))
+                                        .child(Self::runner_icon(
+                                            icon_type,
+                                            format!("WAY-{named}-icon"),
+                                            cx,
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .gap_2()
+                                                        .items_center()
+                                                        .child(
+                                                            Label::new(named)
+                                                                .size(LabelSize::Small),
+                                                        )
+                                                        .child(div().flex_1())
+                                                        // At the far end of the
+                                                        // row it belongs to: it
+                                                        // is a fact about this
+                                                        // way, not a heading
+                                                        // over it.
+                                                        .children(debugger.map(|debugger| {
+                                                            Label::new(debugger)
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                        })),
+                                                )
+                                                .child(
+                                                    Label::new(runs)
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                        .truncate_middle(),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                },
+                                move |window, cx| {
+                                    let chosen = chosen.clone();
+                                    view.update(cx, |view, cx| {
+                                        view.start_a_new_one(Kind::Task, window, cx);
+                                        view.fill_in_from_way(&chosen, window, cx);
+                                    });
+                                },
+                            );
+                        }
+                        menu
                     }))
                 })
                 .into_any_element()
@@ -4017,6 +4093,91 @@ mod tests {
                 .task_variables
                 .get(&task::VariableName::WorktreeRoot),
             Some("/projects/the-one-in-front")
+        );
+    }
+
+    /// A library crate is not a way of running anything, and a way that is one
+    /// says what it will run rather than only what it is called.
+    ///
+    /// Both faults had the same effect on a workspace of any size: a wall of
+    /// crate names, most of which `cargo run --bin` refuses, and no way to tell
+    /// any two of them apart.
+    #[gpui::test]
+    async fn adding_offers_only_what_can_be_run_and_says_how(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".zed": { "tasks.json": "[]" },
+                "crates": {
+                    "server": {
+                        "Cargo.toml": "[package]\nname = \"server\"\n",
+                        "src": { "main.rs": "fn main() {}" },
+                    },
+                    "library": {
+                        "Cargo.toml": "[package]\nname = \"library\"\n",
+                        "src": { "lib.rs": "" },
+                    },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let view = workspace.update_in(cx, |workspace, window, cx| {
+            let view = cx.new(|cx| {
+                RunConfigurationsView::new(
+                    workspace.project().clone(),
+                    workspace.weak_handle(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            view
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+
+        let found = view.read_with(cx, |view, _| {
+            view.found
+                .iter()
+                .map(|point| point.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            found,
+            vec!["server".to_string()],
+            "a crate with a program to build is a way of running; a library is not"
+        );
+
+        draw(cx);
+        let add = cx
+            .debug_bounds("ICON-Plus")
+            .expect("the toolbar offers a way to add one");
+        cx.simulate_click(add.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+
+        assert!(
+            cx.debug_bounds("WAY-server").is_some(),
+            "the way the project says it has is offered"
+        );
+        assert!(
+            cx.debug_bounds("WAY-server-icon").is_some(),
+            "and says what runs it before a word is read"
+        );
+        assert!(
+            cx.debug_bounds("WAY-library").is_none(),
+            "and a library is not offered at all"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Something else").is_some(),
+            "the ways of filling one in by hand are on screen beside them"
         );
     }
 

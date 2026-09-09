@@ -1080,6 +1080,91 @@ fn returns_no_result_set(result: &QueryResult, sql: Option<&str>) -> bool {
 /// Reporting it as "0 rows" is what makes it look like a failure: a reader takes
 /// that as a query that found nothing, when the truth is there was never
 /// anything to find and the statement did what it was asked.
+/// How many statements one result view remembers.
+const MAX_VIEW_QUERY_HISTORY: usize = 50;
+
+/// One statement the reader ran from this view, and what came of it.
+#[derive(Debug, Clone)]
+struct QueryHistoryEntry {
+    /// As it was submitted, so picking it gives back exactly what ran.
+    sql: String,
+    /// When the most recent run of it started, in the reader's own zone.
+    at: time::OffsetDateTime,
+    outcome: QueryOutcome,
+    /// How many times this exact statement has been run from this view. A
+    /// repeat moves the entry to the front rather than adding a second one, so
+    /// this is the only record that it ran more than once.
+    runs: u32,
+    /// Tells this entry apart from an identical statement recorded again later,
+    /// so a fill that finishes late writes its time onto the entry it started.
+    id: u64,
+}
+
+/// What came of a statement, at the three certainties a result view has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryOutcome {
+    /// Submitted; nothing has come back yet.
+    Running,
+    /// The server answered. The time is what the server reported, summed over
+    /// the pages actually fetched.
+    Done { elapsed_ms: u64 },
+    /// The server refused it. No time: a failure returns no result, so there is
+    /// none measured, and a made-up one would be a guess.
+    Failed,
+}
+
+/// How long a statement took, at the coarsest resolution that still separates
+/// two runs a reader would call different.
+///
+/// Sub-millisecond reads as a floor rather than as zero: a statement that ran
+/// took some time, and "0 ms" reads as nobody having measured it.
+fn format_elapsed(ms: u64) -> String {
+    if ms == 0 {
+        return "<1 ms".to_string();
+    }
+    if ms < 1_000 {
+        return format!("{ms} ms");
+    }
+    let tenths = (ms + 50) / 100;
+    if tenths < 600 {
+        return format!("{}.{} s", tenths / 10, tenths % 10);
+    }
+    let seconds = (ms + 500) / 1_000;
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return match seconds % 60 {
+            0 => format!("{minutes} min"),
+            rest => format!("{minutes} min {rest} s"),
+        };
+    }
+    match minutes % 60 {
+        0 => format!("{} h", minutes / 60),
+        rest => format!("{} h {rest} min", minutes / 60),
+    }
+}
+
+/// The wall-clock time a statement ran at, in the reader's own zone.
+fn format_clock(at: time::OffsetDateTime) -> String {
+    let format = time::macros::format_description!("[hour]:[minute]:[second]");
+    at.format(&format).unwrap_or_default()
+}
+
+/// The same instant with its date, for a tooltip: a history outlives a day.
+fn format_clock_full(at: time::OffsetDateTime) -> String {
+    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    at.format(&format).unwrap_or_default()
+}
+
+fn history_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+}
+
+/// A statement as one line, so a list with one row per statement gets one. Only
+/// the whitespace changes; the entry keeps the original.
+fn one_line_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The statement as upper-case words separated by one space, with leading
 /// comments and trailing semicolons gone, so a keyword can be matched as a
 /// whole word. The same normalisation MySQL's own classifier does.
@@ -1538,7 +1623,12 @@ pub struct ResultView {
     // by `recompute_layout`; empty when no result is loaded.
     visible_columns: Vec<usize>,
     // Recent SQL queries (most recent first), pushed on every run_sql call.
-    query_history: Vec<String>,
+    query_history: Vec<QueryHistoryEntry>,
+    next_history_id: u64,
+    /// The entry a fill started and has not resolved. Held by id, not by
+    /// position: a query dispatched while the fill was in flight sits in front
+    /// of it by the time the pages come back.
+    pending_history: Option<u64>,
     // Whether the query history popup is open.
     history_open: bool,
     // Whether the record view panel (single-row transpose) is open.
@@ -1857,6 +1947,8 @@ impl ResultView {
             column_list_visible: false,
             visible_columns: Vec::new(),
             query_history: Vec::new(),
+            next_history_id: 0,
+            pending_history: None,
             history_open: false,
             record_view_open: false,
             record_view_row: None,
@@ -3366,6 +3458,9 @@ impl ResultView {
     }
 
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_history.take() {
+            self.resolve_history(id, QueryOutcome::Failed);
+        }
         self.error = Some(error);
         self.result = None;
         self.is_loading = false;
@@ -3397,9 +3492,7 @@ impl ResultView {
         // Push to history before overwriting base_sql.
         let trimmed = base_sql.trim().to_string();
         if !trimmed.is_empty() {
-            self.query_history.retain(|q| q != &trimmed);
-            self.query_history.insert(0, trimmed);
-            self.query_history.truncate(50);
+            self.pending_history = self.record_history(&trimmed, QueryOutcome::Running);
         }
         self.base_sql = Some(base_sql);
         self.fetch_target = DEFAULT_FETCH_TARGET;
@@ -3433,9 +3526,13 @@ impl ResultView {
         self.database = Some(database);
         let trimmed = base_sql.trim().to_string();
         if !trimmed.is_empty() {
-            self.query_history.retain(|query| query != &trimmed);
-            self.query_history.insert(0, trimmed);
-            self.query_history.truncate(50);
+            self.record_history(
+                &trimmed,
+                QueryOutcome::Done {
+                    elapsed_ms: result.execution_time_ms,
+                },
+            );
+            self.pending_history = None;
         }
         self.base_sql = Some(base_sql);
         self.fetch_target = DEFAULT_FETCH_TARGET;
@@ -3540,6 +3637,9 @@ impl ResultView {
     }
 
     fn append_batch(&mut self, batch: QueryResult, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_history {
+            self.add_history_page_time(id, batch.execution_time_ms);
+        }
         match &mut self.result {
             Some(existing) => existing.rows.extend(batch.rows),
             None => self.result = Some(batch),
@@ -6512,63 +6612,97 @@ impl ResultView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.history_open || self.query_history.is_empty() {
+        if !self.history_open {
             return None;
         }
+        let shown = self.filtered_history();
+        let total = self.query_history.len();
+        let searching = !self.history_search.trim().is_empty();
 
-        let items: Vec<AnyElement> = self
-            .filtered_history()
-            .into_iter()
-            .map(|(i, sql)| {
-                let preview: String = sql.chars().take(80).collect();
-                let preview = if sql.chars().count() > 80 {
-                    format!("{}…", preview)
-                } else {
-                    preview
-                };
-                let sql_owned = sql;
-                div()
-                    .id(("history-item", i))
-                    .px_2()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.history_open = false;
-                        if let Some(editor) = &this.filter_editor {
-                            editor.update(cx, |ed, cx| {
-                                ed.set_text(sql_owned.clone(), window, cx);
-                            });
-                        } else {
-                            this.base_sql = Some(sql_owned.clone());
-                            this.refresh_table_data(window, cx);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        Label::new(preview)
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    )
-                    .into_any_element()
+        let items: Vec<AnyElement> = shown
+            .iter()
+            .filter_map(|(index, _)| {
+                let entry = self.query_history.get(*index)?;
+                Some(self.render_history_row(*index, entry, cx))
             })
             .collect();
 
-        let search_box = self.history_search_editor.clone().map(|editor| {
-            h_flex()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .gap_1()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Icon::new(IconName::MagnifyingGlass)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(div().flex_1().child(editor))
-        });
+        let counted = match searching {
+            true => format!("{} of {total}", items.len()),
+            false => format!("{total} statement{}", if total == 1 { "" } else { "s" }),
+        };
+
+        let header = h_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(Label::new("Query History").size(LabelSize::Small))
+            .child(div().flex_1())
+            .child(
+                Label::new(counted)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("query-history-close", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Close"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.history_open = false;
+                        cx.notify();
+                    })),
+            );
+
+        // No filter over nothing.
+        let search_box = (total > 0)
+            .then(|| self.history_search_editor.clone())
+            .flatten()
+            .map(|editor| {
+                h_flex()
+                    .flex_none()
+                    .debug_selector(|| "QUERY_HISTORY_SEARCH".to_string())
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().child(editor))
+            });
+
+        let body = if items.is_empty() {
+            let said = match searching {
+                true => format!(
+                    "No statement here contains \u{201c}{}\u{201d}.",
+                    self.history_search.trim()
+                ),
+                false => "Nothing has been run from this tab yet.".to_string(),
+            };
+            div()
+                .debug_selector(|| "QUERY_HISTORY_EMPTY".to_string())
+                .flex_1()
+                .px_3()
+                .py_3()
+                .child(Label::new(said).size(LabelSize::Small).color(Color::Muted))
+                .into_any_element()
+        } else {
+            div()
+                .id("query-history-list")
+                .debug_selector(|| "QUERY_HISTORY_LIST".to_string())
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .children(items)
+                .into_any_element()
+        };
 
         let popup = popup_surface(cx)
             .id("query-history-popup")
@@ -6576,16 +6710,11 @@ impl ResultView {
             .absolute()
             .flex()
             .flex_col()
-            .min_w(px(360.0))
-            .max_h(px(360.0))
+            .min_w(px(520.0))
+            .max_h(px(420.0))
+            .child(header)
             .when_some(search_box, |el, box_| el.child(box_))
-            .child(
-                div()
-                    .id("query-history-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(items),
-            );
+            .child(body);
         Some(
             cyberpunk::floating(
                 cyberpunk::Floating::named("Query History")
@@ -6597,6 +6726,85 @@ impl ResultView {
             )
             .into_any_element(),
         )
+    }
+
+    /// One statement the reader ran, and what came of it.
+    ///
+    /// The statement is the content and takes the row's width, elided in the
+    /// middle: a history's entries differ far more often in their tail -- the
+    /// WHERE, the ORDER BY, the LIMIT -- than in the SELECT they all start
+    /// with, and cutting the head hid exactly what told them apart. Everything
+    /// else is a fact about it and sits at the far end, so the facts line up
+    /// into columns down the list.
+    ///
+    /// The one colour is on a failure. A tick on nine rows in ten is
+    /// decoration, and the word beside the colour is what carries the meaning
+    /// where the colour cannot be seen.
+    fn render_history_row(
+        &self,
+        index: usize,
+        entry: &QueryHistoryEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (said, said_color) = match entry.outcome {
+            QueryOutcome::Running => ("running".to_string(), Color::Muted),
+            QueryOutcome::Done { elapsed_ms } => (format_elapsed(elapsed_ms), Color::Muted),
+            QueryOutcome::Failed => ("failed".to_string(), Color::Error),
+        };
+        let runs = (entry.runs > 1).then(|| format!("\u{d7}{}", entry.runs));
+        let clock = format_clock(entry.at);
+        // Everything that would make the row ragged: the untruncated
+        // statement, and the day it ran on -- a history outlives one.
+        let told_in_full = SharedString::from(format!(
+            "{}\n{}",
+            entry.sql.trim(),
+            format_clock_full(entry.at)
+        ));
+        let sql_owned = entry.sql.clone();
+
+        h_flex()
+            .id(("history-item", index))
+            .debug_selector(move || format!("QUERY_HISTORY_ROW-{index}"))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .cursor_pointer()
+            .hover(|el| el.bg(cx.theme().colors().element_hover))
+            .child(
+                Label::new(one_line_sql(&entry.sql))
+                    .size(LabelSize::Small)
+                    .buffer_font(cx)
+                    .truncate_middle()
+                    .into_any_element(),
+            )
+            .child(div().flex_1())
+            .children(runs.map(|runs| Label::new(runs).size(LabelSize::XSmall).color(Color::Muted)))
+            .child(Label::new(said).size(LabelSize::XSmall).color(said_color))
+            .child(
+                Label::new(clock)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(Tooltip::text(told_in_full))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.history_open = false;
+                // Run it, rather than paste the whole statement into the WHERE
+                // box -- which is what this did, and which produced
+                // `... WHERE SELECT * FROM t` on the next refresh.
+                let (Some(store), Some(connection_id)) = (this.store.clone(), this.connection_id)
+                else {
+                    cx.notify();
+                    return;
+                };
+                let database = this.database.clone().unwrap_or_default();
+                this.clear_table_context();
+                this.run_sql(store, connection_id, database, sql_owned.clone(), cx);
+                let _ = window;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_filter_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -8965,7 +9173,7 @@ impl ResultView {
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_date_popup(window, cx), |el, popup| el.child(popup))
                     .when_some(self.render_column_list_popup(window, cx), |el, popup| el.child(popup))
-                    .when_some(self.render_query_history_popup(window, cx), |el, popup| el.child(popup))
+
                     .into_any_element()
             })
             .into_any_element()
@@ -9433,9 +9641,60 @@ impl ResultView {
         self.query_history
             .iter()
             .enumerate()
-            .filter(|(_, sql)| needle.is_empty() || sql.to_lowercase().contains(&needle))
-            .map(|(index, sql)| (index, sql.clone()))
+            .filter(|(_, entry)| needle.is_empty() || entry.sql.to_lowercase().contains(&needle))
+            .map(|(index, entry)| (index, entry.sql.clone()))
             .collect()
+    }
+
+    /// Puts `sql` at the front of this view's history with `outcome`, folding a
+    /// repeat into the entry already there so its count survives. Answers the
+    /// entry's id, for a caller that will learn the outcome later.
+    fn record_history(&mut self, sql: &str, outcome: QueryOutcome) -> Option<u64> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return None;
+        }
+        let runs = match self.query_history.iter().position(|entry| entry.sql == sql) {
+            Some(at) => self.query_history.remove(at).runs.saturating_add(1),
+            None => 1,
+        };
+        let id = self.next_history_id;
+        self.next_history_id = self.next_history_id.wrapping_add(1);
+        self.query_history.insert(
+            0,
+            QueryHistoryEntry {
+                sql: sql.to_string(),
+                at: history_now(),
+                outcome,
+                runs,
+                id,
+            },
+        );
+        self.query_history.truncate(MAX_VIEW_QUERY_HISTORY);
+        Some(id)
+    }
+
+    /// Writes an outcome onto the entry `id` names, if it is still in the list.
+    fn resolve_history(&mut self, id: u64, outcome: QueryOutcome) {
+        if let Some(entry) = self.query_history.iter_mut().find(|entry| entry.id == id) {
+            entry.outcome = outcome;
+        }
+    }
+
+    /// Adds one page's server time to the entry a fill is filling. The first
+    /// page turns `Running` into `Done`; later pages add to it, so the number is
+    /// the server time for everything actually fetched -- which is all it
+    /// claims to be.
+    fn add_history_page_time(&mut self, id: u64, page_ms: u64) {
+        if let Some(entry) = self.query_history.iter_mut().find(|entry| entry.id == id) {
+            let so_far = match entry.outcome {
+                QueryOutcome::Done { elapsed_ms } => elapsed_ms,
+                _ => 0,
+            };
+            entry.outcome = QueryOutcome::Done {
+                elapsed_ms: so_far.saturating_add(page_ms),
+            };
+        }
     }
 
     fn render_value_editor_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -12069,6 +12328,13 @@ impl Render for ResultView {
                 el.child(popup)
             })
             .when_some(self.render_status_bar(cx), |el, bar| el.child(bar))
+            // Last, so it paints over everything and takes no row of its own,
+            // and out here rather than inside the grid: a statement that failed
+            // or returned no rows draws no grid at all, and that is exactly
+            // when a reader reaches for the list.
+            .when_some(self.render_query_history_popup(window, cx), |el, popup| {
+                el.child(popup)
+            })
     }
 }
 
@@ -17969,15 +18235,105 @@ mod tests {
         });
     }
 
+    /// The list is a log, and a log's job is to let a reader scan a column of
+    /// like facts. Every one of these was absent: the entry was a bare string.
+    #[test]
+    fn how_long_a_statement_took_is_said_at_a_readable_resolution() {
+        use super::format_elapsed;
+        // Never "0 ms": that reads as nobody having measured it.
+        assert_eq!(format_elapsed(0), "<1 ms");
+        assert_eq!(format_elapsed(3), "3 ms");
+        assert_eq!(format_elapsed(950), "950 ms");
+        assert_eq!(format_elapsed(1_200), "1.2 s");
+        assert_eq!(format_elapsed(65_000), "1 min 5 s");
+        assert_eq!(format_elapsed(240_000), "4 min");
+        // Rounds out of the seconds branch rather than printing "60.0 s".
+        assert_eq!(format_elapsed(59_950), "1 min");
+        assert_eq!(format_elapsed(3_600_000), "1 h");
+    }
+
+    /// A statement run four times ran four times. Collapsing the repeat into
+    /// one row is what makes the list scannable; throwing away the count with
+    /// it is what made a ROLLBACK run all afternoon look like a one-off.
+    #[gpui::test]
+    fn a_statement_run_again_keeps_the_count_of_how_often(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            for _ in 0..4 {
+                view.record_history("ROLLBACK", QueryOutcome::Done { elapsed_ms: 1 });
+            }
+            view.record_history("SELECT 1", QueryOutcome::Done { elapsed_ms: 2 });
+
+            assert_eq!(
+                view.query_history.len(),
+                2,
+                "a repeat moves the entry, it does not add a second one"
+            );
+            let rolled_back = view
+                .query_history
+                .iter()
+                .find(|entry| entry.sql == "ROLLBACK")
+                .expect("the statement that ran four times is in the list");
+            assert_eq!(rolled_back.runs, 4, "and the list says it ran four times");
+        });
+    }
+
+    /// A failure is the entry a reader most wants to find again, and it was the
+    /// one entry the list never held: the failure path pushed nothing.
+    #[gpui::test]
+    fn a_statement_the_server_refused_is_remembered_as_refused(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            view.pending_history = view.record_history("UPDATE t SET x = 1", QueryOutcome::Running);
+            view.set_error("boom".to_string(), cx);
+
+            let entry = view
+                .query_history
+                .first()
+                .expect("the statement is still in the list");
+            assert_eq!(entry.sql, "UPDATE t SET x = 1");
+            assert_eq!(
+                entry.outcome,
+                QueryOutcome::Failed,
+                "and the list says the server refused it"
+            );
+        });
+    }
+
+    /// The list opens after a statement that drew no grid. It used to be a
+    /// child of the grid renderer, so a failed statement -- or a ROLLBACK,
+    /// which comes back with no columns -- could not open it at all.
+    #[gpui::test]
+    async fn the_history_opens_over_a_statement_that_drew_no_grid(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            view.record_history("ROLLBACK", QueryOutcome::Done { elapsed_ms: 1 });
+            view.set_error("boom".to_string(), cx);
+            view.history_open = true;
+        });
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("QUERY_HISTORY_POPUP").is_some(),
+            "the list opens where there is no grid to open it over"
+        );
+        assert!(
+            cx.debug_bounds("QUERY_HISTORY_ROW-0").is_some(),
+            "and the statement is in it"
+        );
+    }
+
     #[gpui::test]
     fn history_search_filters_entries(cx: &mut gpui::TestAppContext) {
         let (_window, view, mut cx) = table_backed_result_window(cx);
         view.update(&mut cx, |view, _cx| {
-            view.query_history = vec![
-                "select * from users".to_string(),
-                "select * from orders".to_string(),
-                "update users set x = 1".to_string(),
-            ];
+            for sql in [
+                "update users set x = 1",
+                "select * from orders",
+                "select * from users",
+            ] {
+                view.record_history(sql, QueryOutcome::Done { elapsed_ms: 1 });
+            }
             assert_eq!(view.filtered_history().len(), 3);
 
             view.history_search = "users".to_string();
