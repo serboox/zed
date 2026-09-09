@@ -996,6 +996,187 @@ fn select_table_reference(sql: &str) -> Option<SqlTableReference> {
     None
 }
 
+/// Steps past a quoted string or quoted identifier starting at `index`,
+/// honouring doubled quotes and backslash escapes. Answers the end of input
+/// when the closing quote is missing.
+fn skip_sql_quoted(bytes: &[u8], index: usize) -> usize {
+    let Some(&quote) = bytes.get(index) else {
+        return index;
+    };
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'\\' && quote != b'`' && cursor + 1 < bytes.len() {
+            cursor += 2;
+        } else if byte == quote {
+            if bytes.get(cursor + 1) == Some(&quote) {
+                cursor += 2;
+            } else {
+                return cursor + 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    cursor
+}
+
+fn skip_sql_line_comment(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index] != b'\n' {
+        index += 1;
+    }
+    index
+}
+
+/// Steps past a block comment, counting nesting. PostgreSQL nests them, so
+/// stopping at the first `*/` leaves the lexer inside a comment believing it is
+/// reading SQL.
+fn skip_sql_block_comment(bytes: &[u8], mut index: usize) -> usize {
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            index += 2;
+        } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+/// Steps past a PostgreSQL dollar-quoted string, `$tag$ ... $tag$`. Answers
+/// `None` when the `$` at `index` does not open one, which is every other
+/// dialect's use of the character.
+fn skip_sql_dollar_quoted(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&b'$') {
+        return None;
+    }
+    let mut tag_end = index + 1;
+    while tag_end < bytes.len()
+        && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_')
+    {
+        tag_end += 1;
+    }
+    if bytes.get(tag_end) != Some(&b'$') {
+        return None;
+    }
+    let delimiter = &bytes[index..=tag_end];
+    let mut cursor = tag_end + 1;
+    while cursor + delimiter.len() <= bytes.len() {
+        if &bytes[cursor..cursor + delimiter.len()] == delimiter {
+            return Some(cursor + delimiter.len());
+        }
+        cursor += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Whether a `SELECT` reads from more than one table -- an explicit `JOIN`, or
+/// a comma-separated `FROM` list.
+///
+/// Such a result has no one table to write back to, and
+/// [`select_table_reference`] would name the first one after `FROM` as though
+/// it did. A lexer rather than a substring search, because `join` inside an
+/// identifier, a quoted name, a string or a comment is not a join, and a comma
+/// inside a function call or after the `FROM` list has ended says nothing about
+/// how many tables are read.
+fn select_joins_multiple_tables(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    if !keyword_at(bytes, skip_sql_whitespace(bytes, 0), b"select") {
+        return false;
+    }
+    // Past one of these the FROM list is over, and a comma belongs to something
+    // else -- `ORDER BY a, b` reads one table. `UNION` is deliberately not one
+    // of them: it does not end the reading, it adds a second one, and a result
+    // built from two readings has no single table behind it either.
+    const FROM_LIST_END: [&[u8]; 10] = [
+        b"where", b"group", b"having", b"order", b"limit", b"offset", b"window", b"into", b"for",
+        b"fetch",
+    ];
+    let mut depth: usize = 0;
+    let mut in_from_list = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                index = skip_sql_quoted(bytes, index);
+                continue;
+            }
+            // MySQL's line comment. PostgreSQL spells its JSON operators `#>`
+            // and `#>>` with the same character, and swallowing the rest of the
+            // line there would hide a join further along it.
+            b'#' if bytes
+                .get(index + 1)
+                .is_none_or(|byte| !matches!(byte, b'>' | b'-' | b'#')) =>
+            {
+                index = skip_sql_line_comment(bytes, index + 1);
+                continue;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-')
+                && bytes.get(index + 2).is_none_or(|&byte| byte <= b' ') =>
+            {
+                index = skip_sql_line_comment(bytes, index + 2);
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = skip_sql_block_comment(bytes, index + 2);
+                continue;
+            }
+            b'$' => {
+                if let Some(after) = skip_sql_dollar_quoted(bytes, index) {
+                    index = after;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+                continue;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                continue;
+            }
+            b';' => return false,
+            b',' if depth == 0 && in_from_list => return true,
+            _ => {}
+        }
+        if depth == 0 {
+            if !in_from_list {
+                if keyword_at(bytes, index, b"from") {
+                    in_from_list = true;
+                    index += b"from".len();
+                    continue;
+                }
+            } else {
+                if keyword_at(bytes, index, b"join")
+                    || keyword_at(bytes, index, b"straight_join")
+                    || keyword_at(bytes, index, b"union")
+                {
+                    return true;
+                }
+                if FROM_LIST_END
+                    .iter()
+                    .any(|keyword| keyword_at(bytes, index, keyword))
+                {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 fn show_create_table_reference(sql: &str) -> Option<SqlTableReference> {
     let bytes = sql.as_bytes();
     let mut index = skip_sql_whitespace(bytes, 0);
@@ -4282,10 +4463,20 @@ fn run_sql_from_editor(
                     if let Some(inline_view) = &inline_view {
                         inline_view.update(cx, |view, cx| view.set_result(&result, cx));
                     }
-                    let table_context = select_table_reference(&sql).map(|reference| {
-                        let database = reference.database.unwrap_or_else(|| db_name.clone());
-                        (database, reference.table)
-                    });
+                    // A result drawn from several tables has no one table to
+                    // write back to. `select_table_reference` would name the
+                    // first one after FROM as though it did, and every edit
+                    // made against it would be refused by the server instead of
+                    // here.
+                    let joins_many_tables = select_joins_multiple_tables(&sql);
+                    let table_context = if joins_many_tables {
+                        None
+                    } else {
+                        select_table_reference(&sql).map(|reference| {
+                            let database = reference.database.unwrap_or_else(|| db_name.clone());
+                            (database, reference.table)
+                        })
+                    };
                     let store = store.downgrade();
                     result_view.update_in(cx, |view, window, cx| {
                         view.set_query_result(
@@ -4296,8 +4487,14 @@ fn run_sql_from_editor(
                             result,
                             cx,
                         );
-                        if let Some((database, table)) = table_context {
-                            view.set_table_context(store, conn_id, database, table, window, cx);
+                        match table_context {
+                            Some((database, table)) => {
+                                view.set_table_context(store, conn_id, database, table, window, cx);
+                            }
+                            // A tab reused for a multi-table query must not
+                            // inherit the table a single-table one left on it.
+                            None if joins_many_tables => view.clear_table_context(),
+                            None => {}
                         }
                     })?;
                 }
@@ -12689,6 +12886,63 @@ mod tests {
             super::select_table_reference("EXPLAIN SELECT * FROM users"),
             None
         );
+    }
+
+    /// A word is only a join where it is a word. The reads that must NOT count
+    /// are the point: a table called `join_log`, a column quoted as `"join"`, a
+    /// string that mentions one, a comment, and every comma that belongs to
+    /// something other than the FROM list.
+    #[test]
+    fn select_joins_multiple_tables_reads_the_from_list_and_not_the_letters() {
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.a_id",
+            "SELECT *\nFROM a\n  INNER JOIN b USING (id)",
+            "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a, b",
+            "SELECT * FROM a AS x, b AS y WHERE x.id = y.id",
+            "SELECT id FROM a UNION SELECT id FROM b",
+            "SELECT id FROM a UNION ALL SELECT id FROM b",
+            // A dollar-quoted string is not a comment, and the join after it is
+            // still a join.
+            "SELECT $tag$ not sql $tag$ FROM a JOIN b ON a.id = b.a_id",
+            // The comment nests, so the join after it is outside the comment.
+            "SELECT * FROM a /* outer /* inner */ still comment */ JOIN b ON a.id = b.a_id",
+            // `#>>` is an operator, not the start of a comment, so the join on
+            // the same line still counts.
+            "SELECT doc #>> '{a}' FROM a JOIN b ON a.id = b.a_id",
+        ] {
+            assert!(
+                super::select_joins_multiple_tables(sql),
+                "{sql} reads more than one table"
+            );
+        }
+
+        for sql in [
+            "SELECT * FROM users",
+            "SELECT * FROM join_log",
+            "SELECT * FROM \"join\"",
+            "SELECT * FROM `join`",
+            "SELECT * FROM t WHERE note = 'inner join'",
+            "SELECT * FROM t /* join */ WHERE x = 1",
+            "SELECT * FROM t -- join\nWHERE x = 1",
+            "SELECT * FROM t # join\nWHERE x = 1",
+            "SELECT a, b FROM t ORDER BY a, b",
+            "SELECT concat(a, b) FROM t",
+            "SELECT * FROM t WHERE id IN (1, 2)",
+            "SELECT * FROM t GROUP BY a, b",
+            "SELECT * FROM t FOR UPDATE",
+            "UPDATE a JOIN b ON a.id = b.a_id SET a.x = 1",
+            // A join inside a subquery joins nothing in the outer result: the
+            // rows still come from `t` alone, and `t` is still writable.
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM a JOIN b ON a.id = b.a_id)",
+            "SELECT $tag$ inner join $tag$ FROM t",
+        ] {
+            assert!(
+                !super::select_joins_multiple_tables(sql),
+                "{sql} reads one table, or is not a select at all"
+            );
+        }
     }
 
     #[test]

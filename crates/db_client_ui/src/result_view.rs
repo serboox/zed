@@ -4,6 +4,7 @@ use db_client::{
     schema::{ColumnInfo, FkInfo, QueryResult, QueryTiming},
 };
 use editor::{CompletionContext, CompletionProvider, Editor, EditorEvent, MinimapVisibility};
+use futures::FutureExt as _;
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton,
@@ -28,6 +29,11 @@ use util::ResultExt as _;
 
 use crate::widgets::popup_surface;
 use workspace::{Item, Workspace};
+
+/// One in-flight `describe_table` + `list_foreign_keys` round-trip, shared so a
+/// caller that must have typed columns before it acts waits for the same load a
+/// background caller already started rather than issuing a second one.
+type ColumnMetadataLoad = futures::future::Shared<Task<()>>;
 
 /// Rows fetched per network round-trip while the result grid fills (chunked
 /// loading, as common GUI database clients do).
@@ -490,6 +496,9 @@ fn render_cell_value(value: &CellValue) -> (String, Color) {
         CellValue::Text(text) => (display_cell(text), Color::Default),
         CellValue::Null => (NULL_MARKER.to_string(), Color::Muted),
         CellValue::Default => (DEFAULT_MARKER.to_string(), Color::Muted),
+        // Nothing, not a marker: the cell is empty and waiting, and a marker
+        // there would read as a value the reader had chosen.
+        CellValue::Untouched => (String::new(), Color::Muted),
     }
 }
 
@@ -713,6 +722,7 @@ fn bool_cell_display(value: &CellValue) -> (String, Color) {
     match value {
         CellValue::Null => (NULL_MARKER.to_string(), Color::Muted),
         CellValue::Default => (DEFAULT_MARKER.to_string(), Color::Muted),
+        CellValue::Untouched => (String::new(), Color::Muted),
         CellValue::Text(s) => {
             if is_truthy_bool(s) {
                 ("true".to_string(), Color::Default)
@@ -726,7 +736,7 @@ fn bool_cell_display(value: &CellValue) -> (String, Color) {
 fn toggle_bool_value(current: &CellValue) -> CellValue {
     let is_true = match current {
         CellValue::Text(s) => is_truthy_bool(s),
-        CellValue::Null | CellValue::Default => false,
+        CellValue::Null | CellValue::Default | CellValue::Untouched => false,
     };
     CellValue::Text(if is_true { "0" } else { "1" }.to_string())
 }
@@ -1220,6 +1230,13 @@ pub struct ResultView {
     column_infos: Option<Vec<ColumnInfo>>,
     // FK metadata keyed by result-column index; populated alongside column_infos.
     fk_columns: std::collections::HashMap<usize, FkInfo>,
+    /// The in-flight column-metadata load. Held so concurrent callers share one
+    /// round-trip, and so the task is not dropped -- and therefore cancelled --
+    /// before it lands.
+    column_metadata_load: Option<ColumnMetadataLoad>,
+    /// Set while a click on the blank row is waiting for the column types. A
+    /// second click in that window would make a second row.
+    promoting_blank_row: bool,
     // An open enum/set dropdown popup, if any. At most one at a time.
     enum_popup: Option<EnumPopup>,
     // An open calendar popup for a DATE/DATETIME cell, if any. At most one at a time.
@@ -1420,6 +1437,13 @@ enum CellValue {
     Text(String),
     Null,
     Default,
+    /// A cell of a new row the reader has not filled in. The INSERT leaves the
+    /// column out entirely so the engine applies its own default or
+    /// auto-increment; a cell the reader explicitly set to NULL stays `Null`
+    /// and still writes NULL. Without the distinction a row filled in two
+    /// columns out of eight writes NULL into the other six and the server
+    /// refuses it.
+    Untouched,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1433,13 +1457,22 @@ enum AddedRowAnchor {
 enum ResultDisplayRow {
     Loaded(usize),
     Added(usize),
+    /// The row waiting at the bottom of every writable grid. It is in neither
+    /// the database nor `added_rows` and holds no state at all: touching it
+    /// makes a real row and a fresh blank one takes its place. Derived rather
+    /// than stored, so it cannot leak into an INSERT, into the count of
+    /// pending changes, or into an undo step.
+    Blank,
 }
 
 impl ResultDisplayRow {
-    fn abs_idx(self, loaded_count: usize) -> usize {
+    fn abs_idx(self, loaded_count: usize, added_count: usize) -> usize {
         match self {
             Self::Loaded(abs_idx) => abs_idx,
             Self::Added(added_idx) => loaded_count + added_idx,
+            // The index it will occupy once it is real: promotion pushes to the
+            // end of `added_rows`, so the answer does not change across it.
+            Self::Blank => loaded_count + added_count,
         }
     }
 }
@@ -1556,6 +1589,8 @@ impl ResultView {
             primary_key_columns: None,
             column_infos: None,
             fk_columns: std::collections::HashMap::new(),
+            column_metadata_load: None,
+            promoting_blank_row: false,
             enum_popup: None,
             date_popup: None,
             value_editor_open: false,
@@ -2176,14 +2211,30 @@ impl ResultView {
             }
         }
 
+        if self.blank_row_enabled() {
+            entries.push(ResultDisplayRow::Blank);
+        }
+
         entries
     }
 
+    /// Whether the grid shows the blank row waiting at the bottom. It needs a
+    /// table to write to -- a result drawn from several tables has none -- and
+    /// at least one column to put a value in.
+    fn blank_row_enabled(&self) -> bool {
+        self.row_ops_enabled()
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|result| !result.columns.is_empty())
+    }
+
     fn abs_idx_at_display_idx(&self, display_idx: usize) -> Option<usize> {
+        let added_count = self.added_rows.len();
         self.display_row_entries()
             .get(display_idx)
             .copied()
-            .map(|row| row.abs_idx(self.loaded_row_count()))
+            .map(|row| row.abs_idx(self.loaded_row_count(), added_count))
     }
 
     fn remove_added_row(&mut self, added_idx: usize) {
@@ -2619,6 +2670,7 @@ impl ResultView {
         self.enum_popup = None;
         self.date_popup = None;
         self.sort_columns.clear();
+        self.column_metadata_load = None;
     }
 
     pub fn clear_table_context(&mut self) {
@@ -2626,6 +2678,7 @@ impl ResultView {
         self.filter_editor = None;
         self.primary_key_columns = None;
         self.column_infos = None;
+        self.column_metadata_load = None;
         self.fk_columns.clear();
         self.enum_popup = None;
         self.date_popup = None;
@@ -3418,18 +3471,8 @@ impl ResultView {
             .iter()
             .copied()
             .find(|&col_idx| {
-                if matches!(self.column_kind_at(col_idx), CellEditorKind::Boolean) {
-                    return false;
-                }
-                !self.column_infos.as_ref().is_some_and(|infos| {
-                    self.result
-                        .as_ref()
-                        .and_then(|result| result.columns.get(col_idx))
-                        .and_then(|column_name| infos.iter().find(|info| &info.name == column_name))
-                        .is_some_and(|info| {
-                            info.extra.to_ascii_lowercase().contains("auto_increment")
-                        })
-                })
+                !matches!(self.column_kind_at(col_idx), CellEditorKind::Boolean)
+                    && !self.column_is_engine_filled(col_idx)
             })
             .or_else(|| self.visible_columns.first().copied())
     }
@@ -3616,9 +3659,24 @@ impl ResultView {
     // them. Falls back to an empty list (no usable key) on any failure, so a
     // later edit degrades to "kept locally, not persisted" rather than running
     // an unsafe UPDATE.
-    fn ensure_primary_key_columns(&mut self, cx: &mut Context<Self>) {
+    /// Loads the table's primary keys, column metadata and foreign keys once,
+    /// and hands back a handle that resolves when they have landed.
+    ///
+    /// Shared rather than a plain `Task`, because two callers want the same
+    /// round-trip for different reasons: a background caller that only wants
+    /// the metadata eventually, and the blank row, which cannot choose which
+    /// column to open an editor in until it knows which one the engine fills
+    /// in by itself. `None` means there is nothing to wait for -- already
+    /// loaded, or no table behind the result.
+    fn column_metadata_task(&mut self, cx: &mut Context<Self>) -> Option<ColumnMetadataLoad> {
+        // The primary keys, not the column list: they land together, and this
+        // is the guard the load has always used. Widening it to `column_infos`
+        // makes a second load overwrite keys a caller had already put here.
         if self.primary_key_columns.is_some() {
-            return;
+            return None;
+        }
+        if let Some(pending) = self.column_metadata_load.clone() {
+            return Some(pending);
         }
         let (Some(store), Some(conn_id), Some(db), Some(table)) = (
             self.store.clone(),
@@ -3626,46 +3684,59 @@ impl ResultView {
             self.database.clone(),
             self.table_name.clone(),
         ) else {
-            return;
+            return None;
         };
-        let Some(s) = store.upgrade() else {
-            return;
-        };
+        let s = store.upgrade()?;
         let col_task = s.update(cx, |store, cx| {
             store.describe_table(conn_id, db.clone(), table.clone(), cx)
         });
         let fk_task = s.update(cx, |store, cx| {
             store.list_foreign_keys(conn_id, db, table, cx)
         });
-        cx.spawn(async move |this, cx| {
-            let (columns, fks) = futures::join!(col_task, fk_task);
-            this.update(cx, |this, cx| {
-                let all_cols = columns.unwrap_or_default();
-                let keys = all_cols
-                    .iter()
-                    .filter(|col| col.column_key.as_deref() == Some("PRI"))
-                    .map(|col| col.name.clone())
-                    .collect::<Vec<_>>();
-                this.primary_key_columns = Some(keys);
-                // Build FK column map: result-column index → FkInfo.
-                let fk_list = fks.unwrap_or_default();
-                this.fk_columns = all_cols
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, col)| {
-                        fk_list
-                            .iter()
-                            .find(|fk| fk.from_column == col.name)
-                            .map(|fk| (i, fk.clone()))
-                    })
-                    .collect();
-                this.column_infos = Some(all_cols);
-                cx.notify();
+        let load = cx
+            .spawn(async move |this, cx| {
+                let (columns, fks) = futures::join!(col_task, fk_task);
+                this.update(cx, |this, cx| {
+                    let all_cols = columns.unwrap_or_default();
+                    let keys = all_cols
+                        .iter()
+                        .filter(|col| col.column_key.as_deref() == Some("PRI"))
+                        .map(|col| col.name.clone())
+                        .collect::<Vec<_>>();
+                    this.primary_key_columns = Some(keys);
+                    // Keyed by RESULT column index and matched by name. The
+                    // table's column order is not the statement's, so keying
+                    // this by the position describe_table returned put the
+                    // arrow on a different column than the one it belongs to.
+                    let result_columns = this
+                        .result
+                        .as_ref()
+                        .map(|result| result.columns.clone())
+                        .unwrap_or_default();
+                    let fk_list = fks.unwrap_or_default();
+                    this.fk_columns = fk_list
+                        .iter()
+                        .filter_map(|fk| {
+                            let col_idx = result_columns
+                                .iter()
+                                .position(|name| *name == fk.from_column)?;
+                            Some((col_idx, fk.clone()))
+                        })
+                        .collect();
+                    this.column_infos = Some(all_cols);
+                    cx.notify();
+                })
+                .ok();
             })
-            .ok();
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+            .shared();
+        self.column_metadata_load = Some(load.clone());
+        Some(load)
+    }
+
+    /// The same load, for a caller that only wants the metadata eventually.
+    /// The handle it drops is not the last one: the field keeps the task alive.
+    fn ensure_primary_key_columns(&mut self, cx: &mut Context<Self>) {
+        drop(self.column_metadata_task(cx));
     }
 
     fn cancel_cell_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3927,6 +3998,25 @@ impl ResultView {
             .map(|edit| &edit.new_value)
     }
 
+    // Metadata for the result column at `col_idx`, matched BY NAME. The result's
+    // column order is the statement's, not describe_table's, so a positional
+    // lookup reads a different column the moment the two disagree -- which
+    // `SELECT name, id` is enough to do.
+    fn column_info_at(&self, col_idx: usize) -> Option<&ColumnInfo> {
+        let col_name = self.result.as_ref()?.columns.get(col_idx)?;
+        self.column_infos
+            .as_ref()?
+            .iter()
+            .find(|info| &info.name == col_name)
+    }
+
+    // True when the engine supplies this column itself if the INSERT leaves it
+    // out, so a new row must not open its editor there.
+    fn column_is_engine_filled(&self, col_idx: usize) -> bool {
+        self.column_info_at(col_idx)
+            .is_some_and(|info| info.extra.to_ascii_lowercase().contains("auto_increment"))
+    }
+
     // The editor kind for a column, resolved from cached column metadata.
     // Falls back to Text when no metadata has been loaded yet.
     fn column_kind_at(&self, col_idx: usize) -> CellEditorKind {
@@ -3941,26 +4031,15 @@ impl ResultView {
                 CellEditorKind::Text
             }
         };
-        let col_name = self.result.as_ref().and_then(|r| r.columns.get(col_idx));
-        let (Some(col_name), Some(infos)) = (col_name, self.column_infos.as_ref()) else {
-            return provisional();
-        };
-        let Some(info) = infos.iter().find(|ci| &ci.name == col_name) else {
+        let Some(info) = self.column_info_at(col_idx) else {
             return provisional();
         };
         column_editor_kind(&info.data_type)
     }
 
     fn is_column_nullable_at(&self, col_idx: usize) -> bool {
-        let col_name = self.result.as_ref().and_then(|r| r.columns.get(col_idx));
-        let (Some(col_name), Some(infos)) = (col_name, self.column_infos.as_ref()) else {
-            return false;
-        };
-        infos
-            .iter()
-            .find(|ci| &ci.name == col_name)
-            .map(|ci| ci.is_nullable)
-            .unwrap_or(false)
+        self.column_info_at(col_idx)
+            .is_some_and(|info| info.is_nullable)
     }
 
     fn toggle_boolean_cell_loaded(
@@ -4592,6 +4671,136 @@ impl ResultView {
         self.add_blank_row_after(None, cx);
     }
 
+    /// Turns the waiting blank row into a real pending row and opens an editor
+    /// in it. `col_idx` is the column the reader aimed at; `None` lets the row
+    /// choose the first one the engine does not fill in by itself.
+    ///
+    /// The column metadata is waited for first. Opened without it the editor
+    /// lands on column zero -- normally the auto-increment key -- and every
+    /// cell gets a plain text box rather than the calendar or list of values
+    /// its type calls for. Neither corrects itself when the metadata lands.
+    fn promote_blank_row(
+        &mut self,
+        col_idx: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.blank_row_enabled() || self.promoting_blank_row {
+            return;
+        }
+        let Some(load) = self.column_metadata_task(cx) else {
+            self.promote_blank_row_now(col_idx, window, cx);
+            return;
+        };
+        // A second click while the first is still waiting would make a second
+        // row, and the reader asked for one.
+        self.promoting_blank_row = true;
+        // The result can be replaced while the metadata is on its way. The row
+        // was asked for against this table, and adding it to whatever took its
+        // place would be a row the reader never asked for.
+        let asked_for = self.table_name.clone();
+        self.status_message = Some("Reading column types…".to_string());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            load.await;
+            this.update_in(cx, |this, window, cx| {
+                this.promoting_blank_row = false;
+                this.status_message = None;
+                if this.table_name == asked_for {
+                    this.promote_blank_row_now(col_idx, window, cx);
+                } else {
+                    cx.notify();
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn promote_blank_row_now(
+        &mut self,
+        col_idx: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(added_idx) = self.add_blank_row_after(None, cx) else {
+            return;
+        };
+        let Some(col_idx) = col_idx else {
+            self.begin_added_row_edit(added_idx, window, cx);
+            return;
+        };
+        let abs_idx = self.loaded_row_count() + added_idx;
+        if let Some(display_idx) = self.display_idx_of(abs_idx) {
+            self.select_cell_from_click(abs_idx, display_idx, col_idx, false, false);
+        }
+        self.begin_added_cell_edit(
+            abs_idx,
+            col_idx,
+            added_idx,
+            CellEditEntry::CursorEnd,
+            window,
+            cx,
+        );
+    }
+
+    /// The row waiting at the bottom of a writable grid. It holds nothing, so
+    /// there is nothing to paint but the frame: a click on any cell is what
+    /// makes it real.
+    fn render_blank_row(
+        &self,
+        grid_border: gpui::Hsla,
+        added_bg: gpui::Hsla,
+        cell_hover_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let column_count = self
+            .result
+            .as_ref()
+            .map_or(0, |result| result.columns.len());
+        let mut cells: Vec<AnyElement> = Vec::new();
+        for (display_pos, &cell_idx) in self.visible_columns.iter().enumerate() {
+            if cell_idx >= column_count {
+                continue;
+            }
+            let width = self
+                .col_widths
+                .get(display_pos)
+                .copied()
+                .unwrap_or(px(120.));
+            cells.push(
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "blank-cell-{cell_idx}"
+                    ))))
+                    .debug_selector(move || format!("BLANK_CELL-{cell_idx}"))
+                    .px_1p5()
+                    .h(px(Self::GRID_ROW_H))
+                    .w(width)
+                    .flex_none()
+                    .border_r_1()
+                    .border_color(grid_border)
+                    .overflow_hidden()
+                    .hover(move |style| style.bg(cell_hover_bg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.promote_blank_row(Some(cell_idx), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .id("blank-row")
+            .debug_selector(|| "BLANK_ROW".to_string())
+            .flex()
+            .flex_row()
+            .h(px(Self::GRID_ROW_H))
+            .border_b_1()
+            .border_color(grid_border)
+            .bg(added_bg.opacity(0.4))
+            .children(cells)
+            .into_any_element()
+    }
+
     fn add_blank_row_after(
         &mut self,
         after_abs_idx: Option<usize>,
@@ -4609,7 +4818,7 @@ impl ResultView {
         };
         self.record_edit_undo();
         let added_idx = self.added_rows.len();
-        self.added_rows.push(vec![CellValue::Null; col_count]);
+        self.added_rows.push(vec![CellValue::Untouched; col_count]);
         self.added_row_anchors.push(
             after_abs_idx
                 .map(|abs_idx| self.anchor_for_abs_idx(abs_idx))
@@ -4879,7 +5088,7 @@ impl ResultView {
                 // here; map them back to the loaded `Option<String>` shape.
                 *cell = match &edit.new_value {
                     CellValue::Text(text) => Some(text.clone()),
-                    CellValue::Null | CellValue::Default => None,
+                    CellValue::Null | CellValue::Default | CellValue::Untouched => None,
                 };
             }
         }
@@ -5448,7 +5657,7 @@ impl ResultView {
         if let Some(value) = self.pending_cell_value(abs_idx, col_idx) {
             return match value {
                 CellValue::Text(text) => Some(text.clone()),
-                CellValue::Null => None,
+                CellValue::Null | CellValue::Untouched => None,
                 CellValue::Default => Some(DEFAULT_MARKER.to_string()),
             };
         }
@@ -5462,7 +5671,7 @@ impl ResultView {
             .and_then(|row| row.get(col_idx))
             .and_then(|value| match value {
                 CellValue::Text(text) => Some(text.clone()),
-                CellValue::Null => None,
+                CellValue::Null | CellValue::Untouched => None,
                 CellValue::Default => Some(DEFAULT_MARKER.to_string()),
             })
     }
@@ -5470,10 +5679,11 @@ impl ResultView {
     fn selected_display_rows_for_copy(&self) -> Vec<usize> {
         if !self.selected_rows.is_empty() {
             let loaded_count = self.loaded_row_count();
+            let added_count = self.added_rows.len();
             return self
                 .display_row_entries()
                 .into_iter()
-                .map(|row| row.abs_idx(loaded_count))
+                .map(|row| row.abs_idx(loaded_count, added_count))
                 .filter(|abs_idx| self.selected_rows.contains(abs_idx))
                 .collect();
         }
@@ -6607,7 +6817,9 @@ impl ResultView {
                 cell_idx,
                 match self.pending_cell_value(abs_idx, cell_idx) {
                     Some(CellValue::Text(text)) => Some(text.as_str()),
-                    Some(CellValue::Null) | Some(CellValue::Default) => None,
+                    Some(CellValue::Null)
+                    | Some(CellValue::Default)
+                    | Some(CellValue::Untouched) => None,
                     None => self
                         .result
                         .as_ref()
@@ -6709,7 +6921,7 @@ impl ResultView {
                 .pending_cell_value(abs_idx, cell_idx)
                 .map(|cv| match cv {
                     CellValue::Text(s) => s.clone(),
-                    CellValue::Null | CellValue::Default => String::new(),
+                    CellValue::Null | CellValue::Default | CellValue::Untouched => String::new(),
                 })
                 .or_else(|| self.loaded_cell_value(abs_idx, cell_idx))
                 .unwrap_or_default();
@@ -7103,7 +7315,7 @@ impl ResultView {
                 cell_idx,
                 row.get(cell_idx).and_then(|value| match value {
                     CellValue::Text(text) => Some(text.as_str()),
-                    CellValue::Null | CellValue::Default => None,
+                    CellValue::Null | CellValue::Default | CellValue::Untouched => None,
                 }),
                 heatmap_base,
                 heatmap_tint,
@@ -7246,24 +7458,25 @@ impl ResultView {
         let staged_count = self.staged_statements.len();
         let row_ops_enabled = self.row_ops_enabled();
         let has_selected_cell = self.selected_cell.is_some();
+        // By name, the way the cell editor resolves a column. Indexing
+        // `column_infos` positionally reads a different column as soon as the
+        // statement's column order differs from the table's, which puts these
+        // two buttons on a column the reader did not select. With no metadata
+        // yet both still show, as they always did.
         let selected_col_nullable = self
             .selected_cell
-            .and_then(|(_, col_idx)| {
-                self.column_infos
-                    .as_deref()?
-                    .get(col_idx)
-                    .map(|c| c.is_nullable)
+            .map(|(_, col_idx)| {
+                self.column_info_at(col_idx)
+                    .map_or(has_selected_cell, |info| info.is_nullable)
             })
-            .unwrap_or(has_selected_cell);
+            .unwrap_or(false);
         let selected_col_has_default = self
             .selected_cell
-            .and_then(|(_, col_idx)| {
-                self.column_infos
-                    .as_deref()?
-                    .get(col_idx)
-                    .map(|c| c.default_value.is_some())
+            .map(|(_, col_idx)| {
+                self.column_info_at(col_idx)
+                    .map_or(has_selected_cell, |info| info.default_value.is_some())
             })
-            .unwrap_or(has_selected_cell);
+            .unwrap_or(false);
         let result_for_export = self.result.clone();
         let table_for_export = self.table_name.clone();
         let value_editor_open = self.value_editor_open;
@@ -7823,10 +8036,9 @@ impl ResultView {
 
                 // Build per-column type tooltips from column_infos (if loaded).
                 let col_type_tooltips: Vec<Option<SharedString>> = {
-                    let infos = self.column_infos.as_deref();
                     (0..columns.len())
                         .map(|idx| {
-                            infos.and_then(|infos| infos.get(idx)).map(|info| {
+                            self.column_info_at(idx).map(|info| {
                                 let nullable = if info.is_nullable { "yes" } else { "no" };
                                 let key = info.column_key.as_deref().unwrap_or("—");
                                 let default = info.default_value.as_deref().unwrap_or("—");
@@ -8098,6 +8310,13 @@ impl ResultView {
                                             cx,
                                         )
                                         }
+                                        Some(ResultDisplayRow::Blank) => this
+                                            .render_blank_row(
+                                                grid_border,
+                                                added_bg,
+                                                cell_hover_bg,
+                                                cx,
+                                            ),
                                         None => div().into_any_element(),
                                     }
                                 })
@@ -8256,7 +8475,8 @@ impl ResultView {
                             let Some(display_row) = display_rows_for_gutter.get(display_idx).copied() else {
                                 return div().into_any_element();
                             };
-                            let abs_idx = display_row.abs_idx(loaded_count);
+                            let abs_idx =
+                                display_row.abs_idx(loaded_count, this.added_rows.len());
                             let is_selected = this.selected_rows.contains(&abs_idx);
                             let is_deleted = this.deleted_rows.contains(&abs_idx);
                             let is_active_row = this.active_cell_row() == Some(abs_idx);
@@ -8271,6 +8491,7 @@ impl ResultView {
                                 ResultDisplayRow::Added(added_idx) => {
                                     format!("+{}", added_idx + 1).into()
                                 }
+                                ResultDisplayRow::Blank => SharedString::from("*"),
                             };
                             let gutter_row = div()
                                 .id(ElementId::from(SharedString::from(format!("gtr-{display_idx}"))))
@@ -8319,8 +8540,16 @@ impl ResultView {
                                                 }),
                                         ),
                                 )
-                                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                     let gpui::ClickEvent::Mouse(mouse) = event else { return; };
+                                    // The blank row is not a row yet, so there
+                                    // is nothing to select: `abs_idx` names a
+                                    // row that does not exist, and selecting it
+                                    // puts a phantom line into every copy.
+                                    if matches!(display_row, ResultDisplayRow::Blank) {
+                                        this.promote_blank_row(None, window, cx);
+                                        return;
+                                    }
                                     if mouse.down.modifiers.shift {
                                         let anchor_display_idx = this.last_selected_row.unwrap_or(display_idx);
                                         this.select_row_range(anchor_display_idx, display_idx);
@@ -8339,7 +8568,7 @@ impl ResultView {
                                     }
                                     cx.notify();
                                 }));
-                            if gutter_row_ops {
+                            if gutter_row_ops && !matches!(display_row, ResultDisplayRow::Blank) {
                                 let wt = weak_for_gutter.clone();
                                 right_click_menu(ElementId::from(SharedString::from(format!("gtr-ctx-{display_idx}"))))
                                     .trigger(move |_, _, _| gutter_row)
@@ -8590,7 +8819,9 @@ impl ResultView {
                             col_idx,
                             match self.pending_cell_value(record_idx, col_idx) {
                                 Some(CellValue::Text(text)) => Some(text.as_str()),
-                                Some(CellValue::Null) | Some(CellValue::Default) => None,
+                                Some(CellValue::Null)
+                                | Some(CellValue::Default)
+                                | Some(CellValue::Untouched) => None,
                                 None => result
                                     .rows
                                     .get(record_idx)
@@ -8638,6 +8869,7 @@ impl ResultView {
             return Some(match cv {
                 CellValue::Null => NULL_MARKER.to_string(),
                 CellValue::Default => DEFAULT_MARKER.to_string(),
+                CellValue::Untouched => String::new(),
                 CellValue::Text(s) => s.clone(),
             });
         }
@@ -9336,11 +9568,10 @@ impl ResultView {
         if !self.quick_doc_open {
             return None;
         }
-        let infos = self.column_infos.as_deref()?;
         let result = self.result.as_ref()?;
         let col_idx = self.selected_cell.map(|(_, c)| c).unwrap_or(0);
         let col_name = result.columns.get(col_idx)?;
-        let info = infos.get(col_idx)?;
+        let info = self.column_info_at(col_idx)?;
 
         let nullable = if info.is_nullable { "YES" } else { "NO" };
         let key = info.column_key.as_deref().unwrap_or("—");
@@ -9429,9 +9660,10 @@ impl ResultView {
     // the record view in sync when the user clicks a cell.
     fn display_idx_of(&self, abs_idx: usize) -> Option<usize> {
         let loaded_count = self.loaded_row_count();
+        let added_count = self.added_rows.len();
         self.display_row_entries()
             .into_iter()
-            .position(|row| row.abs_idx(loaded_count) == abs_idx)
+            .position(|row| row.abs_idx(loaded_count, added_count) == abs_idx)
     }
 
     fn navigate_to_fk_row(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -10939,7 +11171,9 @@ fn sql_literal(value: Option<&str>) -> String {
 fn sql_value_literal(value: &CellValue) -> String {
     match value {
         CellValue::Null => "NULL".to_string(),
-        CellValue::Default => "DEFAULT".to_string(),
+        // `build_insert_sql` leaves an untouched column out of the statement
+        // before it reaches here. This is the honest answer if it ever does.
+        CellValue::Default | CellValue::Untouched => "DEFAULT".to_string(),
         CellValue::Text(text) => sql_literal(Some(text)),
     }
 }
@@ -11110,15 +11344,31 @@ fn build_pending_deletes(
 // Builds an `INSERT INTO table (cols) VALUES (literals)` statement. Pure and
 // side effect free. INSERT needs no key, so any added row can be inserted.
 fn build_insert_sql(quote: char, table: &str, columns: &[String], values: &[CellValue]) -> String {
-    let column_list: Vec<String> = columns
-        .iter()
-        .map(|col| quote_identifier(quote, col))
-        .collect();
-    let value_list: Vec<String> = columns
-        .iter()
-        .enumerate()
-        .map(|(idx, _)| sql_value_literal(values.get(idx).unwrap_or(&CellValue::Null)))
-        .collect();
+    let mut column_list: Vec<String> = Vec::with_capacity(columns.len());
+    let mut value_list: Vec<String> = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
+        let value = values.get(idx).unwrap_or(&CellValue::Untouched);
+        if matches!(value, CellValue::Untouched) {
+            continue;
+        }
+        column_list.push(quote_identifier(quote, column));
+        value_list.push(sql_value_literal(value));
+    }
+    if column_list.is_empty() {
+        // A row with nothing filled in still has to be legal SQL. MySQL spells
+        // "everything default" as `() VALUES ()`, the ANSI dialects as `DEFAULT
+        // VALUES`, and `quote` is the same dialect signal `refresh_table_data`
+        // already reads.
+        let body = if quote == '`' {
+            "() VALUES ()"
+        } else {
+            "DEFAULT VALUES"
+        };
+        return format!(
+            "-- name: InsertResultRow :exec\nINSERT INTO {table} {body}",
+            table = quote_identifier(quote, table),
+        );
+    }
     format!(
         "-- name: InsertResultRow :exec\nINSERT INTO {table} ({cols}) VALUES ({values})",
         table = quote_identifier(quote, table),
@@ -13298,6 +13548,161 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_result_view(window, &mut cx);
         (window, view, cx)
+    }
+
+    /// The shape of a query that matched nothing: real column names, no rows.
+    /// The columns come back even from an empty result, so the grid knows what
+    /// a new row would have to hold.
+    fn empty_table_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: Vec::new(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        }
+    }
+
+    /// A query that matched nothing still offers a row to fill in. Before, the
+    /// grid drew a header over empty space: both ways of adding a row hang off
+    /// an existing row's context menu, and with no rows there is nothing to
+    /// right-click.
+    #[gpui::test]
+    async fn a_query_that_matched_nothing_still_offers_a_row_to_fill_in(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window_with(cx, empty_table_result());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.display_row_entries(),
+                vec![ResultDisplayRow::Blank],
+                "a table-backed result with no rows still shows the row waiting to be filled in"
+            );
+        });
+        assert!(
+            cx.debug_bounds("BLANK_ROW").is_some(),
+            "and it is painted, not merely counted"
+        );
+    }
+
+    /// The blank row waits under the loaded ones too, the way a spreadsheet
+    /// always keeps one.
+    #[gpui::test]
+    async fn the_blank_row_waits_below_the_rows_that_loaded(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            let entries = view.display_row_entries();
+            assert_eq!(entries.len(), 4, "three loaded rows and the blank one");
+            assert_eq!(entries.last(), Some(&ResultDisplayRow::Blank));
+        });
+    }
+
+    /// A result with no table behind it has nowhere to write, so it offers no
+    /// row. This is also what a JOIN gets: `select_joins_multiple_tables` keeps
+    /// the table context off it.
+    #[gpui::test]
+    async fn a_result_with_no_table_behind_it_offers_no_row(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| view.clear_table_context());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                !view
+                    .display_row_entries()
+                    .contains(&ResultDisplayRow::Blank),
+                "nothing to write to, so nothing to fill in"
+            );
+        });
+        assert!(cx.debug_bounds("BLANK_ROW").is_none());
+    }
+
+    /// Clicking a cell of the blank row makes it a real pending row with an
+    /// editor open in the column that was clicked.
+    #[gpui::test]
+    async fn clicking_the_blank_row_makes_it_real_and_opens_an_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window_with(cx, empty_table_result());
+        draw_result_view(window, &mut cx);
+
+        let name_cell = debug_center(&mut cx, "BLANK_CELL-1");
+        cx.simulate_click(name_cell, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.added_rows.len(),
+                1,
+                "the click turned the waiting row into a real one"
+            );
+            assert_eq!(
+                view.display_row_entries(),
+                vec![ResultDisplayRow::Added(0), ResultDisplayRow::Blank],
+                "and a fresh blank row took its place"
+            );
+            assert_eq!(
+                view.cell_edit.as_ref().map(|edit| edit.col_idx),
+                Some(1),
+                "the editor opened in the column that was clicked"
+            );
+        });
+    }
+
+    /// A column the reader never filled in is left out of the INSERT, so the
+    /// engine applies its own default or auto-increment. Emitting NULL for it
+    /// instead is what made a hand-filled row fail on any table with an
+    /// auto-increment key.
+    #[test]
+    fn build_insert_sql_leaves_out_a_column_that_was_never_filled_in() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        assert_eq!(
+            build_insert_sql(
+                '`',
+                "users",
+                &columns,
+                &[CellValue::Untouched, CellValue::Text("Zed".to_string())],
+            ),
+            "-- name: InsertResultRow :exec\nINSERT INTO `users` (`name`) VALUES ('Zed')"
+        );
+
+        // A cell the reader deliberately set to NULL is not the same thing, and
+        // still writes NULL.
+        assert_eq!(
+            build_insert_sql(
+                '`',
+                "users",
+                &columns,
+                &[CellValue::Null, CellValue::Text("Zed".to_string())],
+            ),
+            "-- name: InsertResultRow :exec\nINSERT INTO `users` (`id`, `name`) VALUES (NULL, 'Zed')"
+        );
+
+        // Nothing filled in at all still has to be legal SQL, in either dialect.
+        assert_eq!(
+            build_insert_sql(
+                '`',
+                "users",
+                &columns,
+                &[CellValue::Untouched, CellValue::Untouched]
+            ),
+            "-- name: InsertResultRow :exec\nINSERT INTO `users` () VALUES ()"
+        );
+        assert_eq!(
+            build_insert_sql(
+                '"',
+                "users",
+                &columns,
+                &[CellValue::Untouched, CellValue::Untouched]
+            ),
+            "-- name: InsertResultRow :exec\nINSERT INTO \"users\" DEFAULT VALUES"
+        );
     }
 
     // Same shape as `sample_table_result`, but row 0's "name" cell is SQL
@@ -16180,8 +16585,10 @@ mod tests {
                     ResultDisplayRow::Loaded(1),
                     ResultDisplayRow::Added(0),
                     ResultDisplayRow::Loaded(2),
+                    ResultDisplayRow::Blank,
                 ],
-                "Add Row should place the pending row directly after the clicked row"
+                "Add Row should place the pending row directly after the clicked row, \
+                 and the blank row stays waiting at the bottom"
             );
             assert!(
                 view.cell_edit.as_ref().is_some_and(|edit| {
@@ -16234,6 +16641,7 @@ mod tests {
                     ResultDisplayRow::Added(0),
                     ResultDisplayRow::Added(1),
                     ResultDisplayRow::Loaded(2),
+                    ResultDisplayRow::Blank,
                 ],
                 "Clone Row should place the cloned row under the clicked row's pending group"
             );
@@ -17205,7 +17613,9 @@ mod tests {
                     .pending_cell_value(abs_idx, col_idx)
                     .map(|value| match value {
                         CellValue::Text(text) => text.clone(),
-                        CellValue::Null | CellValue::Default => String::new(),
+                        CellValue::Null | CellValue::Default | CellValue::Untouched => {
+                            String::new()
+                        }
                     })
                     .or_else(|| view.loaded_cell_value(abs_idx, col_idx))
                     .unwrap_or_default();
@@ -17327,7 +17737,7 @@ mod tests {
                 .pending_cell_value(row_a, 1)
                 .map(|value| match value {
                     CellValue::Text(text) => text.clone(),
-                    CellValue::Null | CellValue::Default => String::new(),
+                    CellValue::Null | CellValue::Default | CellValue::Untouched => String::new(),
                 })
                 .or_else(|| view.loaded_cell_value(row_a, 1))
                 .unwrap_or_default();
