@@ -6,7 +6,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_graph::{
-    CommitEntry, GraphColumn, GraphData, accent_colors_count, graph_column_width,
+    CommitEntry, GraphColumn, GraphData, HistoryDensity, accent_colors_count, graph_column_width,
     render_graph_column,
 };
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
@@ -164,6 +164,10 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Shows more of each commit in the History tab, fewer at a time.
+        ShowMoreOfEachCommit,
+        /// Shows less of each commit in the History tab, more at a time.
+        ShowLessOfEachCommit,
     ]
 );
 
@@ -1003,6 +1007,13 @@ pub struct GitPanel {
     /// Where the lane column was last painted, so a click on it can be traced
     /// back to a row.
     commit_graph_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The row the pointer is over, and the rows lit because of it. The set is
+    /// worked out when the pointer moves rather than every frame: it does not
+    /// change while the pointer sits still, and the list repaints constantly.
+    hovered_history_entry: Option<usize>,
+    history_lit: Option<Rc<HashSet<usize>>>,
+    /// How much of each commit the History tab shows at once.
+    history_density: HistoryDensity,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
@@ -1290,6 +1301,9 @@ impl GitPanel {
                 commit_graph_scroll_x: px(0.),
                 commit_graph_source: None,
                 commit_graph_bounds: Rc::default(),
+                hovered_history_entry: None,
+                history_lit: None,
+                history_density: HistoryDensity::Reading,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
@@ -6200,11 +6214,10 @@ impl GitPanel {
     /// same height, and the lane column beside the list places its dots from
     /// this number too. A row an odd pixel taller than this would slide every
     /// dot off the commit it belongs to, further with each row down the list.
-    fn history_row_height(window: &Window) -> Pixels {
+    fn history_row_height(window: &Window, density: HistoryDensity) -> Pixels {
         let line_height = window.text_style().line_height_in_pixels(window.rem_size());
-        let raw = line_height * 2.0 + px(12.);
         let scale = window.scale_factor();
-        (raw * scale).round() / scale
+        (density.row_height(line_height) * scale).round() / scale
     }
 
     fn select_next_history_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6296,6 +6309,60 @@ impl GitPanel {
         self.focused_history_entry = Some(index);
         self.history_keyboard_nav = false;
         self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    fn show_more_of_each_commit(
+        &mut self,
+        _: &ShowMoreOfEachCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_history_density(self.history_density.closer(), window, cx);
+    }
+
+    fn show_less_of_each_commit(
+        &mut self,
+        _: &ShowLessOfEachCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_history_density(self.history_density.further(), window, cx);
+    }
+
+    /// Moves the History tab a step along the density ladder.
+    ///
+    /// The row the reader was looking at is kept where it was rather than at
+    /// the same scroll offset: rows change height here, so holding the offset
+    /// would slide the history under them by however much the rows shrank.
+    fn set_history_density(
+        &mut self,
+        density: HistoryDensity,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_density == density {
+            return;
+        }
+        let anchor = self.focused_history_entry.or_else(|| {
+            let scroll = self.commit_history_scroll_handle.0.borrow();
+            let was = (-scroll.base_handle.offset().y).max(px(0.));
+            (was > px(0.)).then(|| {
+                (was / Self::history_row_height(window, self.history_density)).floor() as usize
+            })
+        });
+        self.history_density = density;
+        if let Some(anchor) = anchor {
+            self.commit_history_scroll_handle
+                .scroll_to_item(anchor, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// The height a row is laid out at right now -- the very call `render_commit_history`
+    /// makes, so a test asking this asks what layout asks.
+    #[cfg(test)]
+    fn history_density_row_height(&self, window: &Window) -> Pixels {
+        Self::history_row_height(window, self.history_density)
     }
 
     fn activate_changes_tab(
@@ -6492,10 +6559,13 @@ impl GitPanel {
         let repo_weak = active_repository.downgrade();
         let item_count = self.commit_graph.commits.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
-        let row_height = Self::history_row_height(window);
+        let row_height = Self::history_row_height(window, self.history_density);
+        let shows_subject = self.history_density.shows_subject();
+        let shows_details = self.history_density.shows_details();
         let remote = self.git_remote(cx);
 
         let focused_history_entry = self.focused_history_entry;
+        let history_lit = self.history_lit.clone();
         let is_panel_focused = self.focus_handle.is_focused(window);
         let show_focus_border = self.history_keyboard_nav;
         let has_context_menu = self.context_menu.is_some();
@@ -6518,6 +6588,19 @@ impl GitPanel {
                 .flex_1()
                 .size_full()
                 .overflow_hidden()
+                // Only a modified wheel steps the density; a bare one is left
+                // alone so the list scrolls as it always did.
+                .on_scroll_wheel(cx.listener(|panel, event: &ScrollWheelEvent, window, cx| {
+                    if !event.modifiers.control && !event.modifiers.platform {
+                        return;
+                    }
+                    let by = event.delta.pixel_delta(window.line_height()).y;
+                    if by > px(0.) {
+                        panel.set_history_density(panel.history_density.closer(), window, cx);
+                    } else if by < px(0.) {
+                        panel.set_history_density(panel.history_density.further(), window, cx);
+                    }
+                }))
                 .child(
                     h_flex()
                         .flex_1()
@@ -6572,6 +6655,9 @@ impl GitPanel {
                                         .enumerate()
                                         .map(|(ix, (entry, data))| {
                                             let index = range.start + ix;
+                                            let lit = history_lit
+                                                .as_ref()
+                                                .is_none_or(|lit| lit.contains(&index));
                                             let sha_string = entry.data.sha.to_string();
                                             let sha_shared: SharedString =
                                                 sha_string.clone().into();
@@ -6644,6 +6730,24 @@ impl GitPanel {
 
                                             v_flex()
                                                 .id(("commit-history-item", index))
+                                                .when(!lit, |this| this.opacity(0.28))
+                                                .on_hover({
+                                                    let git_panel = git_panel.clone();
+                                                    move |over, _, cx| {
+                                                        let row = over.then_some(index);
+                                                        git_panel
+                                                            .update(cx, |panel, cx| {
+                                                                if *over
+                                                                    || panel.hovered_history_entry
+                                                                        == Some(index)
+                                                                {
+                                                                    panel
+                                                                        .light_history_kin(row, cx);
+                                                                }
+                                                            })
+                                                            .ok();
+                                                    }
+                                                })
                                                 .cursor_pointer()
                                                 .w_full()
                                                 .h(row_height)
@@ -6671,7 +6775,7 @@ impl GitPanel {
                                                 .when(is_context_menu_target, |this| {
                                                     this.bg(cx.theme().colors().element_hover)
                                                 })
-                                                .child(
+                                                .children(shows_subject.then(|| {
                                                     h_flex()
                                                         .gap_1()
                                                         .w_full()
@@ -6728,9 +6832,9 @@ impl GitPanel {
                                                                 Icon::new(IconName::ArrowUp)
                                                                     .size(IconSize::XSmall),
                                                             )
-                                                        }),
-                                                )
-                                                .child(
+                                                        })
+                                                }))
+                                                .children(shows_details.then(|| {
                                                     h_flex()
                                                         .gap_1p5()
                                                         .child(avatar)
@@ -6754,8 +6858,8 @@ impl GitPanel {
                                                             Label::new(short_sha)
                                                                 .size(LabelSize::Small)
                                                                 .color(Color::Muted),
-                                                        ),
-                                                )
+                                                        )
+                                                }))
                                                 .when(!has_context_menu, |this| {
                                                     let git_panel = git_panel.clone();
                                                     let repo = repo.clone();
@@ -6863,6 +6967,13 @@ impl GitPanel {
             .when(hidden > px(0.), |this| {
                 this.on_scroll_wheel(cx.listener(
                     move |panel, event: &ScrollWheelEvent, window, cx| {
+                        // A modified wheel is the density ladder's, and a
+                        // trackpad reports both axes at once: without this the
+                        // same gesture would step the density and slide the
+                        // lanes sideways together.
+                        if event.modifiers.control || event.modifiers.platform {
+                            return;
+                        }
                         let delta = event.delta.pixel_delta(window.line_height()).x;
                         panel.commit_graph_scroll_x =
                             (panel.commit_graph_scroll_x - delta).clamp(px(0.), hidden);
@@ -6881,6 +6992,7 @@ impl GitPanel {
                     width: needed,
                     highlight: None,
                     painted_at: Some(self.commit_graph_bounds.clone()),
+                    lit: self.history_lit.clone(),
                 },
             ))
             .on_click(cx.listener(move |panel, event: &ClickEvent, window, cx| {
@@ -6904,6 +7016,8 @@ impl GitPanel {
         // scroll still waiting to be carried out go with the layout.
         self.focused_history_entry = None;
         self.history_keyboard_nav = false;
+        self.hovered_history_entry = None;
+        self.history_lit = None;
         let mut scroll = self.commit_history_scroll_handle.0.borrow_mut();
         scroll.deferred_scroll_to_item = None;
         scroll.base_handle.set_offset(gpui::point(px(0.), px(0.)));
@@ -6928,6 +7042,19 @@ impl GitPanel {
         window.on_next_frame(move |_, cx| {
             panel.update(cx, |_, cx| cx.notify());
         });
+    }
+
+    /// Lights the row under the pointer, the rows its parents were drawn on and
+    /// the rows that name it as a parent; everything else fades where it stands.
+    fn light_history_kin(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        if self.hovered_history_entry == row {
+            return;
+        }
+        self.hovered_history_entry = row;
+        self.history_lit = row
+            .filter(|row| *row < self.commit_graph.commits.len())
+            .map(|row| Rc::new(self.commit_graph.kin_of(row)));
+        cx.notify();
     }
 
     /// How far down the History tab will be once every scroll asked for has
@@ -8331,6 +8458,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::show_more_of_each_commit))
+            .on_action(cx.listener(Self::show_less_of_each_commit))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9443,6 +9572,43 @@ mod tests {
         assert_editor_opened_with_path(&workspace, Path::new("src/a/foo.rs"), &mut cx);
     }
 
+    /// The same panel, handing back the window it lives in so a test can reach
+    /// a `Window` -- anything that lays out asks for one, and the plain helper
+    /// drops it.
+    async fn history_panel_in_a_window(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<GitPanel>, VisualTestContext) {
+        let project = Project::test(fs, [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
     async fn history_panel_for_project(
         fs: Arc<FakeFs>,
         cx: &mut TestAppContext,
@@ -9780,6 +9946,46 @@ mod tests {
                 "the fourth row is about to become the top one"
             );
         });
+    }
+
+    /// Stepping the density has to actually reach the panel: the row height it
+    /// lays out from is the same number the lane column places its dots by, so
+    /// a step that changed nothing would leave the reader zooming into a
+    /// picture that never moves.
+    #[gpui::test]
+    async fn stepping_the_density_changes_the_height_a_row_is_laid_out_at(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+        let (panel, mut cx) = history_panel_in_a_window(fs.clone(), cx).await;
+
+        let tallest = panel.update_in(&mut cx, |panel, window, _| {
+            panel.history_density_row_height(window)
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_history_density(HistoryDensity::Map, window, cx);
+        });
+        let shortest = panel.update_in(&mut cx, |panel, window, _| {
+            panel.history_density_row_height(window)
+        });
+        assert!(
+            shortest < tallest,
+            "the map has to lay rows out shorter than reading does: {shortest:?} against {tallest:?}"
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_history_density(HistoryDensity::Reading, window, cx);
+        });
+        assert_eq!(
+            panel.update_in(&mut cx, |panel, window, _| {
+                panel.history_density_row_height(window)
+            }),
+            tallest,
+            "and stepping back has to land on the height it started from"
+        );
     }
 
     /// A commit landing on the branch already open does not change the source

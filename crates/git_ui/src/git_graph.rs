@@ -5,7 +5,7 @@ use crate::{
     commit_view::CommitView,
     git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
@@ -888,6 +888,13 @@ pub(crate) struct GraphData {
     lines: Vec<Rc<CommitLine>>,
     active_commit_lines: HashMap<CommitLineKey, usize>,
     active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
+    /// Which row each commit landed on, so an edge can be followed from a
+    /// parent's name back to the row it was drawn on.
+    row_of_commit: HashMap<Oid, usize>,
+    /// The rows that name a commit as their parent. Built as commits arrive,
+    /// because finding them later would be a walk over the whole history for
+    /// every hover.
+    rows_naming_parent: HashMap<Oid, SmallVec<[usize; 2]>>,
 }
 
 impl GraphData {
@@ -904,7 +911,34 @@ impl GraphData {
             lines: Vec::default(),
             active_commit_lines: HashMap::default(),
             active_commit_lines_by_parent: HashMap::default(),
+            row_of_commit: HashMap::default(),
+            rows_naming_parent: HashMap::default(),
         }
+    }
+
+    /// The rows to leave lit while `row` is being looked at: the row itself,
+    /// the rows its parents were drawn on, and the rows naming it as a parent.
+    ///
+    /// One step in each direction, deliberately, rather than the whole ancestry.
+    /// A commit near the head descends from nearly everything, so lighting its
+    /// full ancestry lights the whole history and tells the reader nothing. One
+    /// step answers what is actually being asked -- what did this come from, and
+    /// what came of it -- and stays that size however long the history grows.
+    pub(crate) fn kin_of(&self, row: usize) -> HashSet<usize> {
+        let mut kin = HashSet::default();
+        let Some(commit) = self.commits.get(row) else {
+            return kin;
+        };
+        kin.insert(row);
+        for parent in commit.data.parents.iter() {
+            if let Some(parent_row) = self.row_of_commit.get(parent) {
+                kin.insert(*parent_row);
+            }
+        }
+        if let Some(children) = self.rows_naming_parent.get(&commit.data.sha) {
+            kin.extend(children.iter().copied());
+        }
+        kin
     }
 
     pub(crate) fn clear(&mut self) {
@@ -915,6 +949,8 @@ impl GraphData {
         self.lines.clear();
         self.active_commit_lines.clear();
         self.active_commit_lines_by_parent.clear();
+        self.row_of_commit.clear();
+        self.rows_naming_parent.clear();
         self.next_color = BranchColor(0);
         self.max_commit_count = AllCommitCount::NotLoaded;
         self.max_lanes = 0;
@@ -945,6 +981,14 @@ impl GraphData {
 
         for commit in commits.iter() {
             let commit_row = self.commits.len();
+
+            self.row_of_commit.insert(commit.sha, commit_row);
+            for parent in commit.parents.iter() {
+                self.rows_naming_parent
+                    .entry(*parent)
+                    .or_default()
+                    .push(commit_row);
+            }
 
             let commit_lane = self
                 .parent_to_lanes
@@ -1254,6 +1298,11 @@ pub(crate) struct GraphColumn {
     pub highlight: Option<GraphRowHighlight>,
     /// Where the column landed, for a host that hit-tests it by hand.
     pub painted_at: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
+    /// The rows to paint at full strength while one commit is being looked at.
+    /// Everything else fades where it stands -- a graph that rearranged itself
+    /// under the pointer would cost the reader their place. `None` while nothing
+    /// is being looked at, and then all of it is at full strength.
+    pub lit: Option<Rc<HashSet<usize>>>,
 }
 
 /// Which rows the column paints a background behind.
@@ -1278,7 +1327,20 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
         width,
         highlight,
         painted_at,
+        lit,
     } = column;
+
+    // A row nothing points at is quietened, never hidden: the shape of the
+    // history has to survive the highlight, or the highlight destroys the thing
+    // it was drawn over.
+    const FADED: f32 = 0.22;
+    let strength = move |rows: &[usize]| match &lit {
+        Some(lit) => match rows.iter().all(|row| lit.contains(row)) {
+            true => 1.0,
+            false => FADED,
+        },
+        None => 1.0,
+    };
 
     let loaded_commit_count = data.commits.len();
     let last_visible_row = first_visible_row + visible_row_count + 1;
@@ -1295,7 +1357,7 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
         .cloned()
         .collect();
 
-    let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+    let mut lines: BTreeMap<(usize, bool), Vec<_>> = BTreeMap::new();
 
     let hovered_entry_idx = highlight.as_ref().and_then(|rows| rows.hovered);
     let selected_entry_idx = highlight.as_ref().and_then(|rows| rows.selected);
@@ -1353,7 +1415,9 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                 }
 
                 for (row_idx, row) in rows.into_iter().enumerate() {
-                    let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                    let row_color = accent_colors
+                        .color_for_index(row.color_idx as u32)
+                        .opacity(strength(&[first_visible_row + row_idx]));
                     let row_y_center =
                         bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
                             - vertical_scroll_offset;
@@ -1505,11 +1569,17 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                     }
 
                     builder.close();
-                    lines.entry(line.color_idx).or_default().push(builder);
+                    let faded = strength(&[line.full_interval.start, line.full_interval.end]) < 1.0;
+                    lines
+                        .entry((line.color_idx, faded))
+                        .or_default()
+                        .push(builder);
                 }
 
-                for (color_idx, builders) in lines {
-                    let line_color = accent_colors.color_for_index(color_idx as u32);
+                for ((color_idx, faded), builders) in lines {
+                    let line_color = accent_colors
+                        .color_for_index(color_idx as u32)
+                        .opacity(if faded { FADED } else { 1.0 });
 
                     for builder in builders {
                         if let Ok(path) = builder.build() {
@@ -1526,6 +1596,66 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
     )
     .w(width)
     .h_full()
+}
+
+/// How much of a commit a history shows at once.
+///
+/// Zooming a graph by scaling pixels is a trap: halving the scale halves the
+/// type with it and leaves a screen of text nobody can read, and doubling it
+/// fits eight commits. So a step changes the height of a row instead, and each
+/// one drops the text that would not be legible at that height. What never
+/// drops is the graph -- the lanes, the dots and the lines are the reason to
+/// look at all, and they stay at every step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryDensity {
+    /// Everything: subject, author, date, hash.
+    Reading,
+    /// Subject only. Twice the history on screen, still readable.
+    Compact,
+    /// Subject, small. For finding where a branch left and came back.
+    Titles,
+    /// The graph alone. A thousand commits at once -- the shape of the work.
+    Map,
+}
+
+impl HistoryDensity {
+    /// Rows are a whole number of pixels and every step is distinct: heights in
+    /// between give a row that clips its own text halfway down and reads as
+    /// broken rather than as dense.
+    pub(crate) fn row_height(self, line_height: Pixels) -> Pixels {
+        match self {
+            HistoryDensity::Reading => line_height * 2.0 + px(12.),
+            HistoryDensity::Compact => line_height + px(8.),
+            HistoryDensity::Titles => px(16.),
+            HistoryDensity::Map => px(6.),
+        }
+    }
+
+    pub(crate) fn shows_subject(self) -> bool {
+        !matches!(self, HistoryDensity::Map)
+    }
+
+    pub(crate) fn shows_details(self) -> bool {
+        matches!(self, HistoryDensity::Reading)
+    }
+
+    pub(crate) fn closer(self) -> HistoryDensity {
+        match self {
+            HistoryDensity::Reading => HistoryDensity::Reading,
+            HistoryDensity::Compact => HistoryDensity::Reading,
+            HistoryDensity::Titles => HistoryDensity::Compact,
+            HistoryDensity::Map => HistoryDensity::Titles,
+        }
+    }
+
+    pub(crate) fn further(self) -> HistoryDensity {
+        match self {
+            HistoryDensity::Reading => HistoryDensity::Compact,
+            HistoryDensity::Compact => HistoryDensity::Titles,
+            HistoryDensity::Titles => HistoryDensity::Map,
+            HistoryDensity::Map => HistoryDensity::Map,
+        }
+    }
 }
 
 /// How wide a column must be to show `lanes` lanes in full.
@@ -3505,6 +3635,7 @@ impl GitGraph {
                     focused: self.focus_handle.is_focused(window),
                 }),
                 painted_at: Some(self.graph_canvas_bounds.clone()),
+                lit: None,
             },
         )
     }
@@ -5220,6 +5351,123 @@ mod tests {
         verify_coverage(graph).context("coverage")?;
         verify_line_overlaps(graph).context("line overlaps")?;
         Ok(())
+    }
+
+    /// The ladder only makes sense if every rung is genuinely shorter than the
+    /// one above and drops something the shorter row could not have shown, and
+    /// if the two ends hold rather than wrapping around to the far end.
+    #[test]
+    fn every_step_down_the_ladder_is_shorter_and_says_less() {
+        let line = px(21.);
+        let ladder = [
+            HistoryDensity::Reading,
+            HistoryDensity::Compact,
+            HistoryDensity::Titles,
+            HistoryDensity::Map,
+        ];
+
+        for pair in ladder.windows(2) {
+            let (above, below) = (pair[0], pair[1]);
+            assert!(
+                below.row_height(line) < above.row_height(line),
+                "{below:?} has to be shorter than {above:?}"
+            );
+            assert!(
+                !(below.shows_details() && !above.shows_details())
+                    && !(below.shows_subject() && !above.shows_subject()),
+                "{below:?} cannot show what {above:?} does not"
+            );
+            assert_eq!(above.further(), below, "{above:?} steps down to {below:?}");
+            assert_eq!(
+                below.closer(),
+                above,
+                "{below:?} steps back up to {above:?}"
+            );
+        }
+
+        assert_eq!(
+            HistoryDensity::Reading.closer(),
+            HistoryDensity::Reading,
+            "the top of the ladder holds instead of wrapping to the bottom"
+        );
+        assert_eq!(
+            HistoryDensity::Map.further(),
+            HistoryDensity::Map,
+            "and so does the bottom"
+        );
+
+        assert!(
+            !HistoryDensity::Map.shows_subject(),
+            "six pixels cannot carry a line of text, so the map does not pretend to"
+        );
+        assert!(
+            HistoryDensity::Reading.shows_details(),
+            "the top of the ladder is the one step that shows author and date"
+        );
+    }
+
+    /// What a hover lights: the commit, where it came from, and what came of
+    /// it. One step each way and no further -- the test that matters here is
+    /// the one asserting the grandparent stays dark, because a set that walked
+    /// the whole ancestry would light nearly every row of a real history and
+    /// mean nothing.
+    #[test]
+    fn kin_stops_one_step_from_the_commit() {
+        let sha = |byte: u8| Oid::from_bytes(&[byte; 20]).unwrap();
+        let (merge, mainline, side, root) = (sha(4), sha(3), sha(2), sha(1));
+
+        // Newest first, the order `git log` reports.
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: merge,
+                parents: smallvec![mainline, side],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: mainline,
+                parents: smallvec![root],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: side,
+                parents: smallvec![root],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: root,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph = GraphData::new(6);
+        graph.add_commits(&commits);
+
+        let lit = |row: usize| {
+            let mut rows: Vec<usize> = graph.kin_of(row).into_iter().collect();
+            rows.sort();
+            rows
+        };
+
+        assert_eq!(
+            lit(0),
+            vec![0, 1, 2],
+            "the merge lights itself and both sides it joined"
+        );
+        assert!(
+            !graph.kin_of(0).contains(&3),
+            "the root is the merge's grandparent, and stays dark"
+        );
+        assert_eq!(
+            lit(3),
+            vec![1, 2, 3],
+            "the root lights itself and the two commits naming it"
+        );
+        assert_eq!(
+            lit(1),
+            vec![0, 1, 3],
+            "a commit in the middle lights its parent below and its child above"
+        );
     }
 
     #[test]
