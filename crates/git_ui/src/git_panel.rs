@@ -34,8 +34,9 @@ use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-    ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus, get_git_committer,
+    GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
+    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
+    get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -114,6 +115,12 @@ const MAX_HISTORY_TAG_CHIPS: usize = 3;
 /// the subject line has to stay readable, so a history with more lanes than fit
 /// scrolls sideways rather than eating the text.
 const MAX_HISTORY_GRAPH_WIDTH: Pixels = px(120.);
+
+/// The most commits a single fold will take out of view. Past this the fold is
+/// refused rather than made to wait: the walk that finds them is cheap on the
+/// side branches folding is for, and a merge of a long-lived fork is not what
+/// it is for.
+const MAX_FOLDED_COMMITS: usize = 5_000;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -1014,6 +1021,14 @@ pub struct GitPanel {
     history_lit: Option<Rc<HashSet<usize>>>,
     /// How much of each commit the History tab shows at once.
     history_density: HistoryDensity,
+    /// The merges whose branches are folded away, by commit.
+    folded_merges: HashSet<Oid>,
+    /// How many commits each of those folds took out of view, for the mark left
+    /// on the merge in their place.
+    folded_counts: HashMap<Oid, usize>,
+    /// The history as it reads with those folds made. `None` when nothing is
+    /// folded, and then the whole layout is the one the history streams into.
+    folded_graph: Option<GraphData>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
@@ -1304,6 +1319,9 @@ impl GitPanel {
                 hovered_history_entry: None,
                 history_lit: None,
                 history_density: HistoryDensity::Reading,
+                folded_merges: HashSet::default(),
+                folded_counts: HashMap::default(),
+                folded_graph: None,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
@@ -6182,7 +6200,7 @@ impl GitPanel {
                 CommitHistory::Loading => {
                     this.child(Self::render_history_placeholder("Loading Commit History…"))
                 }
-                CommitHistory::Loaded if self.commit_graph.commits.is_empty() => {
+                CommitHistory::Loaded if self.history_graph().commits.is_empty() => {
                     this.child(Self::render_history_placeholder("No commits yet"))
                 }
                 CommitHistory::Loaded => match self.render_commit_history(window, cx) {
@@ -6200,11 +6218,86 @@ impl GitPanel {
             .child(Label::new(message).color(Color::Muted))
     }
 
+    /// The history as it is read: the whole layout, or the one the folds leave.
+    ///
+    /// Everything that draws or counts rows goes through here. What the history
+    /// streams into stays `commit_graph`, so a fold never has to be undone to
+    /// take in the commits that arrive next.
+    fn history_graph(&self) -> &GraphData {
+        self.folded_graph.as_ref().unwrap_or(&self.commit_graph)
+    }
+
     fn commit_history_entries(&self) -> &[Rc<CommitEntry>] {
         match &self.commit_history {
-            CommitHistory::Loaded => &self.commit_graph.commits,
+            CommitHistory::Loaded => &self.history_graph().commits,
             CommitHistory::Loading | CommitHistory::Error(_) => &[],
         }
+    }
+
+    /// Folds a merge's branch away, or brings it back.
+    fn toggle_folded_merge(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(commit) = self.history_graph().commits.get(row) else {
+            return;
+        };
+        let sha = commit.data.sha;
+        if !self.folded_merges.remove(&sha) {
+            self.folded_merges.insert(sha);
+        }
+        self.rebuild_folded_history(cx);
+        // Row numbers mean something else now, including one a scroll is still
+        // waiting to be carried out against.
+        self.focused_history_entry = None;
+        self.hovered_history_entry = None;
+        self.history_lit = None;
+        self.commit_history_scroll_handle
+            .0
+            .borrow_mut()
+            .deferred_scroll_to_item = None;
+        cx.notify();
+    }
+
+    /// Works out what the folds hide and lays out the history that is left.
+    ///
+    /// A fold whose branch cannot be found, or is too large to be worth taking
+    /// out at once, is dropped rather than guessed at -- see `side_branch_of`.
+    fn rebuild_folded_history(&mut self, cx: &mut Context<Self>) {
+        self.folded_counts.clear();
+        if self.folded_merges.is_empty() {
+            self.folded_graph = None;
+            return;
+        }
+
+        let mut hidden: HashSet<usize> = HashSet::default();
+        let mut still_folded: HashSet<Oid> = HashSet::default();
+        for (row, commit) in self.commit_graph.commits.iter().enumerate() {
+            if !self.folded_merges.contains(&commit.data.sha) {
+                continue;
+            }
+            let Some(branch) = self.commit_graph.side_branch_of(row, MAX_FOLDED_COMMITS) else {
+                continue;
+            };
+            self.folded_counts.insert(commit.data.sha, branch.len());
+            hidden.extend(branch);
+            still_folded.insert(commit.data.sha);
+        }
+        self.folded_merges = still_folded;
+
+        if hidden.is_empty() {
+            self.folded_graph = None;
+            return;
+        }
+
+        let left: Vec<Arc<InitialGraphCommitData>> = self
+            .commit_graph
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| !hidden.contains(row))
+            .map(|(_, commit)| commit.data.clone())
+            .collect();
+        let mut folded = GraphData::new(accent_colors_count(cx.theme().accents()));
+        folded.add_commits(&left);
+        self.folded_graph = Some(folded);
     }
 
     /// The height every row of the History tab is laid out at.
@@ -6468,7 +6561,8 @@ impl GitPanel {
         // every chunk lands here, so only what arrived since last time is laid
         // out; handing the same commit to `add_commits` twice would claim its
         // lane twice and bend every line drawn after it.
-        let (is_loading, error) = active_repository.update(cx, |repository, cx| {
+        let history_before = self.commit_graph.commits.len();
+        let (history_now, is_loading, error) = active_repository.update(cx, |repository, cx| {
             // The whole range is asked for and the new tail sliced off here,
             // rather than asking for `laid_out..`: `graph_data` clamps the start
             // of the range to the last index rather than past it, so a range
@@ -6498,13 +6592,22 @@ impl GitPanel {
             if response.commits.len() > laid_out {
                 self.commit_graph.add_commits(&response.commits[laid_out..]);
             }
-            (response.is_loading, response.error)
+            (
+                self.commit_graph.commits.len(),
+                response.is_loading,
+                response.error,
+            )
         });
         self.commit_graph_source = Some(source_now);
 
-        let loaded_count = self.commit_graph.commits.len();
+        // Folds are only worked out again when the history they were worked
+        // out from has actually changed under them.
+        if !self.folded_merges.is_empty() && history_now != history_before {
+            self.rebuild_folded_history(cx);
+        }
+
         self.set_commit_history(
-            commit_history_from_response(loaded_count, is_loading, error),
+            commit_history_from_response(history_now, is_loading, error),
             cx,
         );
     }
@@ -6557,7 +6660,7 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
-        let item_count = self.commit_graph.commits.len();
+        let item_count = self.history_graph().commits.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let row_height = Self::history_row_height(window, self.history_density);
         let shows_subject = self.history_density.shows_subject();
@@ -6566,6 +6669,7 @@ impl GitPanel {
 
         let focused_history_entry = self.focused_history_entry;
         let history_lit = self.history_lit.clone();
+        let folded_counts = self.folded_counts.clone();
         let is_panel_focused = self.focus_handle.is_focused(window);
         let show_focus_border = self.history_keyboard_nav;
         let has_context_menu = self.context_menu.is_some();
@@ -6622,7 +6726,7 @@ impl GitPanel {
                                     // is re-read on every frame the list scrolls.
                                     let entries: Vec<Rc<CommitEntry>> = git_panel
                                         .update(cx, |panel, _| {
-                                            let commits = &panel.commit_graph.commits;
+                                            let commits = &panel.history_graph().commits;
                                             let end = range.end.min(commits.len());
                                             let start = range.start.min(end);
                                             commits[start..end].to_vec()
@@ -6658,6 +6762,33 @@ impl GitPanel {
                                             let lit = history_lit
                                                 .as_ref()
                                                 .is_none_or(|lit| lit.contains(&index));
+                                            // Only a merge has a branch to put away, and only a row
+                                            // with room for it shows the control.
+                                            let folded_here = folded_counts.get(&entry.data.sha).copied();
+                                            let fold_toggle = (entry.data.parents.len() > 1 && shows_subject)
+                                                .then(|| {
+                                                    let git_panel = git_panel.clone();
+                                                    IconButton::new(
+                                                        ("fold-merged-branch", index),
+                                                        match folded_here.is_some() {
+                                                            true => IconName::ChevronRight,
+                                                            false => IconName::ChevronDown,
+                                                        },
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(Tooltip::text(match folded_here {
+                                                        Some(count) => format!("Bring back the {count} commit(s) merged here"),
+                                                        None => "Fold away the branch merged here".to_string(),
+                                                    }))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        git_panel
+                                                            .update(cx, |panel, cx| {
+                                                                panel.toggle_folded_merge(index, cx);
+                                                            })
+                                                            .ok();
+                                                    })
+                                                });
                                             let sha_string = entry.data.sha.to_string();
                                             let sha_shared: SharedString =
                                                 sha_string.clone().into();
@@ -6780,6 +6911,10 @@ impl GitPanel {
                                                         .gap_1()
                                                         .w_full()
                                                         .min_w_0()
+                                                        .children(fold_toggle)
+                                                        .children(
+                                                            folded_here.map(|count| Chip::new(format!("{count} folded"))),
+                                                        )
                                                         .child(Label::new(subject).truncate())
                                                         .children((!tag_names.is_empty()).then(
                                                             || {
@@ -6946,7 +7081,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let needed = graph_column_width(self.commit_graph.max_lanes);
+        let needed = graph_column_width(self.history_graph().max_lanes);
         let width = needed.min(MAX_HISTORY_GRAPH_WIDTH);
         let hidden = (needed - width).max(px(0.));
         let scroll_x = self.commit_graph_scroll_x.clamp(px(0.), hidden);
@@ -6982,7 +7117,7 @@ impl GitPanel {
                 ))
             })
             .child(render_graph_column(
-                &self.commit_graph,
+                self.history_graph(),
                 GraphColumn {
                     row_height,
                     first_visible_row,
@@ -7018,6 +7153,9 @@ impl GitPanel {
         self.history_keyboard_nav = false;
         self.hovered_history_entry = None;
         self.history_lit = None;
+        self.folded_merges.clear();
+        self.folded_counts.clear();
+        self.folded_graph = None;
         let mut scroll = self.commit_history_scroll_handle.0.borrow_mut();
         scroll.deferred_scroll_to_item = None;
         scroll.base_handle.set_offset(gpui::point(px(0.), px(0.)));
@@ -7052,8 +7190,8 @@ impl GitPanel {
         }
         self.hovered_history_entry = row;
         self.history_lit = row
-            .filter(|row| *row < self.commit_graph.commits.len())
-            .map(|row| Rc::new(self.commit_graph.kin_of(row)));
+            .filter(|row| *row < self.history_graph().commits.len())
+            .map(|row| Rc::new(self.history_graph().kin_of(row)));
         cx.notify();
     }
 
@@ -7121,7 +7259,7 @@ impl GitPanel {
         }
         let row = ((position.y - bounds.origin.y + self.history_scroll_offset()) / row_height)
             .floor() as usize;
-        (row < self.commit_graph.commits.len()).then_some(row)
+        (row < self.history_graph().commits.len()).then_some(row)
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9945,6 +10083,79 @@ mod tests {
                 px(120.),
                 "the fourth row is about to become the top one"
             );
+        });
+    }
+
+    /// Folding is the one thing that makes a long history readable, so it has
+    /// to take the merged branch out of the list and put it back untouched.
+    #[gpui::test]
+    async fn folding_a_merge_takes_its_branch_out_of_the_history_and_back(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let (merge, mainline, tip, base) = (sha_of(5), sha_of(4), sha_of(3), sha_of(1));
+        let dot_git = Path::new(path!("/root/project/.git"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), merge.to_string());
+            let of = |sha, parents: Vec<Oid>| {
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha,
+                    parents: parents.into_iter().collect(),
+                    ref_names: Vec::new(),
+                })
+            };
+            state.graph_commits = vec![
+                of(merge, vec![mainline, tip]),
+                of(mainline, vec![base]),
+                of(tip, vec![base]),
+                of(base, vec![]),
+            ];
+        })
+        .unwrap();
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        wait_for_commit_history_to_settle(&panel, cx).await;
+
+        let shown = |panel: &GitPanel| -> Vec<Oid> {
+            panel
+                .history_graph()
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect()
+        };
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(shown(panel), vec![merge, mainline, tip, base]);
+        });
+
+        panel.update(cx, |panel, cx| panel.toggle_folded_merge(0, cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                shown(panel),
+                vec![merge, mainline, base],
+                "the branch the merge brought in goes, and the commit they both \
+                 descend from stays"
+            );
+            assert_eq!(
+                panel.folded_counts.get(&merge).copied(),
+                Some(1),
+                "and the merge says how many went"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.toggle_folded_merge(0, cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                shown(panel),
+                vec![merge, mainline, tip, base],
+                "unfolding puts back exactly what was taken"
+            );
+            assert!(panel.folded_counts.is_empty());
         });
     }
 

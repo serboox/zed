@@ -916,6 +916,103 @@ impl GraphData {
         }
     }
 
+    /// The rows holding the branch a merge brought in: everything the merge's
+    /// other parents reach that its first parent does not.
+    ///
+    /// This is the question `git merge-base` answers, and it is answered the
+    /// same way -- two fronts walked until they meet -- but in one forward pass
+    /// rather than with a heap, because a parent always sits on a later row
+    /// than its child in the layout these rows come from. Each row carries which
+    /// fronts have reached it; a row both have reached is where the branch
+    /// rejoins, and the walk stops descending through it. What only the second
+    /// front reached is the branch.
+    ///
+    /// `None` means there is nothing to fold, or that the answer was not worth
+    /// the wait or cannot be trusted: the merge brought in nothing the history
+    /// did not already hold, more than `budget` rows belong to the branch, or a
+    /// parent has not been streamed in yet. Refusing is the point -- hiding the wrong commits in a
+    /// tool for reading history is worse than not hiding any.
+    pub(crate) fn side_branch_of(&self, merge_row: usize, budget: usize) -> Option<HashSet<usize>> {
+        const FROM_FIRST_PARENT: u8 = 1;
+        const FROM_THE_REST: u8 = 2;
+        const FROM_BOTH: u8 = FROM_FIRST_PARENT | FROM_THE_REST;
+
+        let merge = self.commits.get(merge_row)?;
+        if merge.data.parents.len() < 2 {
+            return None;
+        }
+
+        let mut reached: HashMap<usize, u8> = HashMap::default();
+        let mut pending = 0usize;
+        let mark = |reached: &mut HashMap<usize, u8>, pending: &mut usize, row, front| {
+            let seen = reached.entry(row).or_insert(0);
+            if *seen & front == front {
+                return;
+            }
+            if *seen == 0 {
+                *pending += 1;
+            }
+            *seen |= front;
+        };
+
+        for (order, parent) in merge.data.parents.iter().enumerate() {
+            let parent_row = *self.row_of_commit.get(parent)?;
+            let front = match order {
+                0 => FROM_FIRST_PARENT,
+                _ => FROM_THE_REST,
+            };
+            mark(&mut reached, &mut pending, parent_row, front);
+        }
+
+        let mut branch_so_far = 0usize;
+        let mut row = merge_row + 1;
+        while pending > 0 && row < self.commits.len() {
+            let Some(front) = reached.get(&row).copied() else {
+                row += 1;
+                continue;
+            };
+            pending -= 1;
+
+            // Every row that sets a flag on this one sits earlier, so by the
+            // time it is reached its fronts are settled and it can be counted
+            // here -- which is what lets the budget stop the walk rather than
+            // judge it after it has already read the whole branch.
+            if front == FROM_THE_REST {
+                branch_so_far += 1;
+                if branch_so_far > budget {
+                    return None;
+                }
+            }
+
+            // Where the fronts meet is where the branch rejoined what it left;
+            // nothing older than that belongs to the branch.
+            if front != FROM_BOTH {
+                for parent in self.commits[row].data.parents.iter() {
+                    let Some(parent_row) = self.row_of_commit.get(parent).copied() else {
+                        return None;
+                    };
+                    if parent_row > row {
+                        mark(&mut reached, &mut pending, parent_row, front);
+                    }
+                }
+            }
+            row += 1;
+        }
+
+        let branch: HashSet<usize> = reached
+            .into_iter()
+            .filter(|(_, front)| *front == FROM_THE_REST)
+            .map(|(row, _)| row)
+            .collect();
+        // A merge of something already in the history brings in no branch, and
+        // an empty fold is not one: it would leave a mark saying nothing was
+        // put away and a control offering to bring it back.
+        match branch.is_empty() {
+            true => None,
+            false => Some(branch),
+        }
+    }
+
     /// The rows to leave lit while `row` is being looked at: the row itself,
     /// the rows its parents were drawn on, and the rows naming it as a parent.
     ///
@@ -5351,6 +5448,77 @@ mod tests {
         verify_coverage(graph).context("coverage")?;
         verify_line_overlaps(graph).context("line overlaps")?;
         Ok(())
+    }
+
+    /// A fold has to take away the branch that was merged in and nothing else.
+    /// The commit both sides descend from is where the branch rejoined what it
+    /// left, and it stays: it belonged to the history before the branch existed.
+    #[test]
+    fn a_fold_takes_the_branch_and_stops_where_it_rejoined() {
+        let sha = |byte: u8| Oid::from_bytes(&[byte; 20]).unwrap();
+        let (merge, mainline, tip, middle, base) = (sha(5), sha(4), sha(3), sha(2), sha(1));
+
+        let of = |sha, parents: Vec<Oid>| {
+            Arc::new(InitialGraphCommitData {
+                sha,
+                parents: parents.into_iter().collect(),
+                ref_names: vec![],
+            })
+        };
+        let commits = vec![
+            of(merge, vec![mainline, tip]),
+            of(mainline, vec![base]),
+            of(tip, vec![middle]),
+            of(middle, vec![base]),
+            of(base, vec![]),
+        ];
+
+        let mut graph = GraphData::new(6);
+        graph.add_commits(&commits);
+
+        let mut folded: Vec<usize> = graph
+            .side_branch_of(0, 100)
+            .expect("the branch is small and every parent is loaded")
+            .into_iter()
+            .collect();
+        folded.sort();
+        assert_eq!(
+            folded,
+            vec![2, 3],
+            "the two commits of the branch go, and nothing else"
+        );
+
+        assert_eq!(
+            graph.side_branch_of(0, 1),
+            None,
+            "a branch larger than the budget is refused rather than half-taken"
+        );
+        assert_eq!(
+            graph.side_branch_of(1, 100),
+            None,
+            "a commit that merged nothing has no branch to fold"
+        );
+        assert_eq!(
+            graph.side_branch_of(99, 100),
+            None,
+            "and neither has a row that is not there"
+        );
+
+        // A merge of something the history already held brings in no branch.
+        // Reporting an empty one would leave a mark saying nothing was put away
+        // beside a control offering to bring it back.
+        let already_held = vec![
+            of(sha(9), vec![mainline, base]),
+            of(mainline, vec![base]),
+            of(base, vec![]),
+        ];
+        let mut graph = GraphData::new(6);
+        graph.add_commits(&already_held);
+        assert_eq!(
+            graph.side_branch_of(0, 100),
+            None,
+            "a merge that brought in nothing has nothing to fold away"
+        );
     }
 
     /// The ladder only makes sense if every rung is genuinely shorter than the
