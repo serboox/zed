@@ -1395,10 +1395,10 @@ pub(crate) struct GraphColumn {
     pub highlight: Option<GraphRowHighlight>,
     /// Where the column landed, for a host that hit-tests it by hand.
     pub painted_at: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
-    /// The rows to paint at full strength while one commit is being looked at.
-    /// Everything else fades where it stands -- a graph that rearranged itself
-    /// under the pointer would cost the reader their place. `None` while nothing
-    /// is being looked at, and then all of it is at full strength.
+    /// The rows joined to the one being looked at. Their lines are drawn heavier;
+    /// nothing else changes. Fading everything else was tried and was wrong: in a
+    /// list of thirty rows a highlight of three dims twenty-seven, and a pointer
+    /// crossing the list makes the whole panel flash.
     pub lit: Option<Rc<HashSet<usize>>>,
 }
 
@@ -1427,16 +1427,12 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
         lit,
     } = column;
 
-    // A row nothing points at is quietened, never hidden: the shape of the
-    // history has to survive the highlight, or the highlight destroys the thing
-    // it was drawn over.
-    const FADED: f32 = 0.22;
-    let strength = move |rows: &[usize]| match &lit {
-        Some(lit) => match rows.iter().all(|row| lit.contains(row)) {
-            true => 1.0,
-            false => FADED,
-        },
-        None => 1.0,
+    // The highlight adds weight, it never takes light away: a commit joined to
+    // the one under the pointer gets a heavier line, and every other row is left
+    // exactly as it was drawn a moment ago.
+    let joined = move |rows: &[usize]| match &lit {
+        Some(lit) => rows.iter().all(|row| lit.contains(row)),
+        None => false,
     };
 
     let loaded_commit_count = data.commits.len();
@@ -1454,7 +1450,7 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
         .cloned()
         .collect();
 
-    let mut lines: BTreeMap<(usize, bool), Vec<_>> = BTreeMap::new();
+    let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
     let hovered_entry_idx = highlight.as_ref().and_then(|rows| rows.hovered);
     let selected_entry_idx = highlight.as_ref().and_then(|rows| rows.selected);
@@ -1511,19 +1507,6 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                     }
                 }
 
-                for (row_idx, row) in rows.into_iter().enumerate() {
-                    let row_color = accent_colors
-                        .color_for_index(row.color_idx as u32)
-                        .opacity(strength(&[first_visible_row + row_idx]));
-                    let row_y_center =
-                        bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
-                            - vertical_scroll_offset;
-
-                    let commit_x = lane_center_x(lane_bounds, row.lane as f32);
-
-                    draw_commit_circle(commit_x, row_y_center, row_color, window);
-                }
-
                 for line in commit_lines {
                     let Some((start_segment_idx, start_column)) =
                         line.get_first_visible_segment_idx(first_visible_row)
@@ -1542,7 +1525,12 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                     let mut current_row = from_y;
                     let mut current_column = line_x;
 
-                    let mut builder = PathBuilder::stroke(LINE_WIDTH);
+                    let mut builder = PathBuilder::stroke(
+                        match joined(&[line.full_interval.start, line.full_interval.end]) {
+                            true => LINE_WIDTH * 2.0,
+                            false => LINE_WIDTH,
+                        },
+                    );
                     builder.move_to(point(line_x, from_y));
 
                     let segments = &line.segments[start_segment_idx..];
@@ -1666,17 +1654,11 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                     }
 
                     builder.close();
-                    let faded = strength(&[line.full_interval.start, line.full_interval.end]) < 1.0;
-                    lines
-                        .entry((line.color_idx, faded))
-                        .or_default()
-                        .push(builder);
+                    lines.entry(line.color_idx).or_default().push(builder);
                 }
 
-                for ((color_idx, faded), builders) in lines {
-                    let line_color = accent_colors
-                        .color_for_index(color_idx as u32)
-                        .opacity(if faded { FADED } else { 1.0 });
+                for (color_idx, builders) in lines {
+                    let line_color = accent_colors.color_for_index(color_idx as u32);
 
                     for builder in builders {
                         if let Ok(path) = builder.build() {
@@ -1687,6 +1669,20 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                             });
                         }
                     }
+                }
+
+                // After the lines, not before them: a line drawn heavier because the
+                // pointer is on one end of it would otherwise paint over the very dot
+                // the reader is pointing at.
+                for (row_idx, row) in rows.into_iter().enumerate() {
+                    let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                    let row_y_center =
+                        bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
+                            - vertical_scroll_offset;
+
+                    let commit_x = lane_center_x(lane_bounds, row.lane as f32);
+
+                    draw_commit_circle(commit_x, row_y_center, row_color, window);
                 }
             })
         },
@@ -1709,8 +1705,6 @@ pub(crate) enum HistoryDensity {
     Reading,
     /// Subject only. Twice the history on screen, still readable.
     Compact,
-    /// Subject, small. For finding where a branch left and came back.
-    Titles,
     /// The graph alone. A thousand commits at once -- the shape of the work.
     Map,
 }
@@ -1720,17 +1714,43 @@ impl HistoryDensity {
     /// between give a row that clips its own text halfway down and reads as
     /// broken rather than as dense.
     pub(crate) fn row_height(self, line_height: Pixels) -> Pixels {
+        // Every number here counts the row's own chrome, because the row is laid
+        // out at exactly this height and the lane column places its dots by it.
+        // A height that does not fit what the row holds crushes the text into
+        // itself and slides every dot off the commit it belongs to.
         match self {
-            HistoryDensity::Reading => line_height * 2.0 + px(12.),
-            HistoryDensity::Compact => line_height + px(8.),
-            HistoryDensity::Titles => px(16.),
-            HistoryDensity::Map => px(6.),
+            // Two lines, the gap between them, the padding and the focus border.
+            HistoryDensity::Reading => line_height * 2.0 + Self::TWO_LINE_CHROME,
+            // One line, the same padding and border.
+            HistoryDensity::Compact => line_height + Self::ONE_LINE_CHROME,
+            // No text at all, so nothing but the border and the lane.
+            HistoryDensity::Map => px(8.),
         }
     }
+
+    /// What a row spends on padding, border and the gap between its two lines.
+    const TWO_LINE_CHROME: Pixels = px(12.);
+    /// The same without that gap.
+    const ONE_LINE_CHROME: Pixels = px(10.);
 
     pub(crate) fn shows_subject(self) -> bool {
         !matches!(self, HistoryDensity::Map)
     }
+
+    /// The name to put on the control that steps this ladder.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            HistoryDensity::Reading => "Full",
+            HistoryDensity::Compact => "Compact",
+            HistoryDensity::Map => "Map",
+        }
+    }
+
+    pub(crate) const STEPS: [HistoryDensity; 3] = [
+        HistoryDensity::Reading,
+        HistoryDensity::Compact,
+        HistoryDensity::Map,
+    ];
 
     pub(crate) fn shows_details(self) -> bool {
         matches!(self, HistoryDensity::Reading)
@@ -1740,16 +1760,14 @@ impl HistoryDensity {
         match self {
             HistoryDensity::Reading => HistoryDensity::Reading,
             HistoryDensity::Compact => HistoryDensity::Reading,
-            HistoryDensity::Titles => HistoryDensity::Compact,
-            HistoryDensity::Map => HistoryDensity::Titles,
+            HistoryDensity::Map => HistoryDensity::Compact,
         }
     }
 
     pub(crate) fn further(self) -> HistoryDensity {
         match self {
             HistoryDensity::Reading => HistoryDensity::Compact,
-            HistoryDensity::Compact => HistoryDensity::Titles,
-            HistoryDensity::Titles => HistoryDensity::Map,
+            HistoryDensity::Compact => HistoryDensity::Map,
             HistoryDensity::Map => HistoryDensity::Map,
         }
     }
@@ -5530,7 +5548,6 @@ mod tests {
         let ladder = [
             HistoryDensity::Reading,
             HistoryDensity::Compact,
-            HistoryDensity::Titles,
             HistoryDensity::Map,
         ];
 
@@ -5572,6 +5589,23 @@ mod tests {
             HistoryDensity::Reading.shows_details(),
             "the top of the ladder is the one step that shows author and date"
         );
+
+        // The rung a row is laid out at has to hold what the row puts on it.
+        // A rung shorter than its own text crushes the lines into each other and,
+        // because the lane column places its dots by this same number, slides
+        // every dot off the commit it belongs to.
+        for step in ladder {
+            let needs = match (step.shows_details(), step.shows_subject()) {
+                (true, _) => line * 2.0 + HistoryDensity::TWO_LINE_CHROME,
+                (false, true) => line + HistoryDensity::ONE_LINE_CHROME,
+                (false, false) => px(0.),
+            };
+            assert!(
+                step.row_height(line) >= needs,
+                "{step:?} is laid out at {:?}, which does not hold the {needs:?} it shows",
+                step.row_height(line)
+            );
+        }
     }
 
     /// What a hover lights: the commit, where it came from, and what came of

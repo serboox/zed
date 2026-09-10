@@ -6185,6 +6185,61 @@ impl GitPanel {
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
             ))
+            .when(active_tab != GitPanelTab::Changes, |this| {
+                this.child(self.render_density_control(cx))
+            })
+    }
+
+    /// How much of each commit the history shows, and how to change it.
+    ///
+    /// It sits at the end of the tab row rather than in a strip of its own: a
+    /// dock is narrow enough without spending a whole row saying what is
+    /// already visible from the rows themselves.
+    fn render_density_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let here = self.history_density;
+        h_flex().flex_none().h_full().px_1().items_center().child(
+            h_flex()
+                .h(px(20.))
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .overflow_hidden()
+                .children(
+                    HistoryDensity::STEPS
+                        .into_iter()
+                        .enumerate()
+                        .map(|(at, step)| {
+                            let chosen = step == here;
+                            h_flex()
+                                .id(("history-density", at))
+                                .cursor_pointer()
+                                .px_1p5()
+                                .h_full()
+                                .items_center()
+                                .when(at > 0, |this| {
+                                    this.border_l_1().border_color(cx.theme().colors().border)
+                                })
+                                .when(chosen, |this| this.bg(cx.theme().colors().element_selected))
+                                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                .tooltip(Tooltip::text(match step {
+                                    HistoryDensity::Reading => "Subject, author and date",
+                                    HistoryDensity::Compact => {
+                                        "Subject only, twice as much at once"
+                                    }
+                                    HistoryDensity::Map => "The graph alone, the whole history",
+                                }))
+                                .child(Label::new(step.label()).size(LabelSize::XSmall).color(
+                                    match chosen {
+                                        true => Color::Default,
+                                        false => Color::Muted,
+                                    },
+                                ))
+                                .on_click(cx.listener(move |panel, _, window, cx| {
+                                    panel.set_history_density(step, window, cx);
+                                }))
+                        }),
+                ),
+        )
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6436,18 +6491,22 @@ impl GitPanel {
         if self.history_density == density {
             return;
         }
-        let anchor = self.focused_history_entry.or_else(|| {
-            let scroll = self.commit_history_scroll_handle.0.borrow();
-            let was = (-scroll.base_handle.offset().y).max(px(0.));
-            (was > px(0.)).then(|| {
-                (was / Self::history_row_height(window, self.history_density)).floor() as usize
-            })
-        });
+        // The place is kept, not the row. Rounding to the nearest row and
+        // scrolling it to the top would snap the history up by however far into
+        // a row the reader happened to be, which reads as the list jumping
+        // whenever the step changes. Scaling the offset by how much the rows
+        // shrank leaves the same commit under the same point on screen.
+        let was = Self::history_row_height(window, self.history_density);
+        let now = Self::history_row_height(window, density);
         self.history_density = density;
-        if let Some(anchor) = anchor {
-            self.commit_history_scroll_handle
-                .scroll_to_item(anchor, ScrollStrategy::Top);
-        }
+
+        let mut scroll = self.commit_history_scroll_handle.0.borrow_mut();
+        scroll.deferred_scroll_to_item = None;
+        let offset = scroll.base_handle.offset();
+        scroll
+            .base_handle
+            .set_offset(gpui::point(offset.x, offset.y * (now / was)));
+        drop(scroll);
         cx.notify();
     }
 
@@ -6668,7 +6727,6 @@ impl GitPanel {
         let remote = self.git_remote(cx);
 
         let focused_history_entry = self.focused_history_entry;
-        let history_lit = self.history_lit.clone();
         let folded_counts = self.folded_counts.clone();
         let is_panel_focused = self.focus_handle.is_focused(window);
         let show_focus_border = self.history_keyboard_nav;
@@ -6759,9 +6817,6 @@ impl GitPanel {
                                         .enumerate()
                                         .map(|(ix, (entry, data))| {
                                             let index = range.start + ix;
-                                            let lit = history_lit
-                                                .as_ref()
-                                                .is_none_or(|lit| lit.contains(&index));
                                             // Only a merge has a branch to put away, and only a row
                                             // with room for it shows the control.
                                             let folded_here = folded_counts.get(&entry.data.sha).copied();
@@ -6861,7 +6916,6 @@ impl GitPanel {
 
                                             v_flex()
                                                 .id(("commit-history-item", index))
-                                                .when(!lit, |this| this.opacity(0.28))
                                                 .on_hover({
                                                     let git_panel = git_panel.clone();
                                                     move |over, _, cx| {
@@ -6882,9 +6936,9 @@ impl GitPanel {
                                                 .cursor_pointer()
                                                 .w_full()
                                                 .h(row_height)
-                                                .py_1()
+                                                .when(shows_subject, |this| this.py_1())
                                                 .px_2()
-                                                .gap_0p5()
+                                                .when(shows_details, |this| this.gap_0p5())
                                                 .border_1()
                                                 .border_color(gpui::transparent_black())
                                                 .when(
@@ -7182,8 +7236,10 @@ impl GitPanel {
         });
     }
 
-    /// Lights the row under the pointer, the rows its parents were drawn on and
-    /// the rows that name it as a parent; everything else fades where it stands.
+    /// Lights the row under the pointer along with the rows its parents were
+    /// drawn on and the rows that name it as a parent. Nothing else changes:
+    /// the highlight adds weight to what is joined rather than taking light
+    /// from what is not.
     fn light_history_kin(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
         if self.hovered_history_entry == row {
             return;
