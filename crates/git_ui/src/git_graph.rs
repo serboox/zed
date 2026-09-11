@@ -20,9 +20,10 @@ use git::{
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
-    SharedString, Subscription, Task, TextStyleRefinement, UniformListScrollHandle, WeakEntity,
-    Window, actions, anchored, deferred, hsla, point, prelude::*, px, uniform_list,
+    MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollHandle,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, hsla, point,
+    prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
@@ -915,9 +916,11 @@ pub(crate) struct GraphData {
     /// because finding them later would be a walk over the whole history for
     /// every hover.
     rows_naming_parent: HashMap<Oid, SmallVec<[usize; 2]>>,
-    /// Whether any commit loaded so far carries a ref. A history with no labels
-    /// at all should not reserve a column for them.
-    pub has_ref_names: bool,
+    /// Every distinct label in the history loaded so far, so the column can be
+    /// made as wide as the longest one. Only branch tips and tags carry a
+    /// label, so this stays short; past the cap a history is not being read by
+    /// its labels anyway.
+    pub label_names: Vec<SharedString>,
     /// What each row paints of the lanes crossing it, filled in as lines close.
     /// Built once per line rather than searched per frame: the painter used to
     /// scan every line in the history on every frame to find the few crossing
@@ -941,7 +944,7 @@ impl GraphData {
             active_commit_lines_by_parent: HashMap::default(),
             row_of_commit: HashMap::default(),
             rows_naming_parent: HashMap::default(),
-            has_ref_names: false,
+            label_names: Vec::new(),
             rows_paint: Vec::default(),
         }
     }
@@ -1030,6 +1033,22 @@ impl GraphData {
                     column = *to_column;
                     row = *on_row;
                 }
+            }
+        }
+    }
+
+    /// Remembers the decorations of a commit, so the label column can be sized
+    /// from the longest of them rather than from a guess.
+    fn note_label_names(&mut self, ref_names: &[SharedString]) {
+        /// A history with more labels than this is not read by its labels.
+        const MAX_TRACKED: usize = 256;
+
+        for name in ref_names {
+            if self.label_names.len() >= MAX_TRACKED {
+                return;
+            }
+            if !self.label_names.iter().any(|known| known == name) {
+                self.label_names.push(name.clone());
             }
         }
     }
@@ -1175,7 +1194,7 @@ impl GraphData {
         self.row_of_commit.clear();
         self.rows_naming_parent.clear();
         self.rows_paint.clear();
-        self.has_ref_names = false;
+        self.label_names.clear();
         self.next_color = BranchColor(0);
         self.max_commit_count = AllCommitCount::NotLoaded;
         self.max_lanes = 0;
@@ -1227,7 +1246,7 @@ impl GraphData {
             // Before anything else: a line closes on its parent's row, which is
             // this one, and it has nowhere to be recorded until the slot exists.
             self.rows_paint.push(SmallVec::new());
-            self.has_ref_names |= !commit.ref_names.is_empty();
+            self.note_label_names(&commit.ref_names);
 
             self.row_of_commit.insert(commit.sha, commit_row);
             for parent in commit.parents.iter() {
@@ -1973,41 +1992,15 @@ impl GraphMetrics {
         Self::new(line_height, window.scale_factor())
     }
 
-    /// Where a lane's line runs, measured from the left edge of the graph cell.
-    pub(crate) fn lane_center(self, column: usize) -> Pixels {
-        self.left_pad + self.lane * column as f32 + self.lane / 2.0
+    /// Where a lane's line runs, measured from the left edge of a graph cell
+    /// showing lanes from `first` onwards.
+    pub(crate) fn lane_center_in(self, column: usize, first: usize) -> Pixels {
+        self.left_pad + self.lane * (column as f32 - first as f32) + self.lane / 2.0
     }
 
     /// How wide the graph column has to be to show `lanes` lanes in full.
     pub(crate) fn width_for(self, lanes: usize) -> Pixels {
         self.left_pad * 2.0 + self.lane * lanes.max(1) as f32
-    }
-
-    /// The same graph squeezed into a column too narrow to hold it.
-    ///
-    /// A clipped graph hides commits: a branch past the right edge of the
-    /// column has no dot at all, and the row beside its subject is empty. Lanes
-    /// drawn closer together are still all there, so the squeeze wins over the
-    /// clip, giving up the side padding first and then closing the lanes up.
-    ///
-    /// Below `closest` it stops: lanes that near read as one thick line, and a
-    /// graph nobody can tell apart is no better than a clipped one. A column
-    /// that narrow -- a few dozen pixels -- does clip, and the reader widens it.
-    pub(crate) fn fitted_to(self, lanes: usize, available: Pixels) -> Self {
-        let lanes = lanes.max(1);
-        if available <= px(0.) || self.width_for(lanes) <= available {
-            return self;
-        }
-
-        let closest = self.row * 0.32;
-        let left_pad = self.left_pad.min(available / 8.0).max(px(0.));
-        let lane = ((available - left_pad * 2.0) / lanes as f32).max(closest);
-        Self {
-            lane,
-            node: self.node.min(lane * 0.9),
-            left_pad,
-            ..self
-        }
     }
 
     /// Whether a node of this size can carry two letters legibly.
@@ -2098,50 +2091,280 @@ pub(crate) fn read_ref(
     Some((kind, SharedString::from(name.to_string())))
 }
 
-/// Which of the four areas of a row survive at a given width.
+/// How much of a branch label survives at a given width.
 ///
-/// A pane that runs out of room drops text, never the graph: the lanes are the
-/// reason to open a history at all, and a column of dots with no subject beside
-/// it still reads, where a subject with no dots does not.
+/// The tail of a name is what tells two branches in one namespace apart; the
+/// prefix almost never does. So the prefix is what goes first, a segment at a
+/// time, and only when there is nothing left to squeeze is the tail cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HistoryFit {
-    /// Graph and subject.
-    Narrow,
-    /// Ref labels join them.
-    Medium,
-    /// Everything: refs, graph, subject, age.
-    Wide,
+pub(crate) enum LabelMode {
+    /// Full names, every icon, and a count for the rest.
+    Full,
+    /// Path segments squeezed to their first letter: `fix/10-async` reads
+    /// `f/10-async`. One icon.
+    Abbreviated,
+    /// One label a row and a count, showing the tail of the name.
+    Single,
+    /// No column at all: a chip in front of the subject, an icon and a short
+    /// tail, with the whole name in its tooltip.
+    Inline,
 }
 
-impl HistoryFit {
-    const MEDIUM_FROM: Pixels = px(470.);
-    const WIDE_FROM: Pixels = px(700.);
+impl LabelMode {
+    /// Whether labels get a column of their own.
+    pub(crate) fn has_a_column(self) -> bool {
+        !matches!(self, LabelMode::Inline)
+    }
 
-    pub(crate) fn of(width: Pixels) -> Self {
-        if width >= Self::WIDE_FROM {
-            Self::Wide
-        } else if width >= Self::MEDIUM_FROM {
-            Self::Medium
-        } else {
-            Self::Narrow
+    /// How many labels a row shows before the rest become a count.
+    pub(crate) fn chips_a_row(self) -> usize {
+        match self {
+            LabelMode::Full => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Where the age of a commit is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgeShown {
+    /// A column of its own, on every row.
+    Column,
+    /// Only where the reader is already looking, and on anything young enough
+    /// that "when" is the question being asked.
+    WhereItMatters,
+    Nowhere,
+}
+
+/// What a row shows at the width it was given.
+///
+/// This is the order of concessions written down: what gives up its room, and
+/// in which order, when there is not enough. The graph and the subject never
+/// do -- the lanes are the reason to open a history at all, and a subject with
+/// no dots beside it reads where dots with no subject do not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HistoryLayout {
+    pub age: AgeShown,
+    pub labels: LabelMode,
+    /// How many lanes the graph column shows before the rest become rings at
+    /// its edge.
+    pub lane_cap: usize,
+    /// What the subject keeps whatever else is asked for.
+    pub subject_min: Pixels,
+    /// What the label column ends up with, already clamped.
+    pub label_width: Pixels,
+}
+
+/// One rung of the ladder, richest first.
+struct Rung {
+    age: AgeShown,
+    labels: LabelMode,
+    lane_cap: usize,
+    subject_min_chars: f32,
+}
+
+/// The thresholds are not numbers picked off a mock-up: each rung states its
+/// own minimums, and the width at which it stops fitting is worked out from
+/// them on every frame.
+const RUNGS: [Rung; 4] = [
+    Rung {
+        age: AgeShown::Column,
+        labels: LabelMode::Full,
+        lane_cap: 8,
+        subject_min_chars: 24.,
+    },
+    Rung {
+        age: AgeShown::WhereItMatters,
+        labels: LabelMode::Abbreviated,
+        lane_cap: 6,
+        subject_min_chars: 24.,
+    },
+    Rung {
+        age: AgeShown::Nowhere,
+        labels: LabelMode::Single,
+        lane_cap: 4,
+        subject_min_chars: 16.,
+    },
+    Rung {
+        age: AgeShown::Nowhere,
+        labels: LabelMode::Inline,
+        lane_cap: 3,
+        subject_min_chars: 12.,
+    },
+];
+
+/// What the age column takes when it has one.
+pub(crate) const AGE_COLUMN_WIDTH: Pixels = px(90.);
+/// A label column narrower than this says nothing, so it is not offered.
+pub(crate) const LABEL_COLUMN_MIN: Pixels = px(120.);
+/// However long the longest label is, the column stops here.
+pub(crate) const LABEL_COLUMN_MAX_SHARE: f32 = 0.28;
+
+/// Everything `fit` needs to know about what it is laying out.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryContents {
+    pub metrics: GraphMetrics,
+    /// The width of one character of the interface font.
+    pub character: Pixels,
+    /// How wide the longest label would be drawn in each mode.
+    pub widest_label: [Pixels; 4],
+    pub lanes: usize,
+}
+
+impl HistoryContents {
+    fn label_width(&self, mode: LabelMode, available: Pixels) -> Pixels {
+        if !mode.has_a_column() {
+            return px(0.);
+        }
+        let wanted = self.widest_label[mode as usize];
+        if wanted <= px(0.) {
+            return px(0.);
+        }
+        wanted
+            .max(LABEL_COLUMN_MIN)
+            .min(available * LABEL_COLUMN_MAX_SHARE)
+    }
+}
+
+/// Picks the richest row that fits in `available`.
+pub(crate) fn fit(available: Pixels, contents: HistoryContents) -> HistoryLayout {
+    let mut chosen = RUNGS.len() - 1;
+    for (idx, rung) in RUNGS.iter().enumerate() {
+        let age = match rung.age {
+            AgeShown::Column => AGE_COLUMN_WIDTH,
+            _ => px(0.),
+        };
+        let labels = contents.label_width(rung.labels, available);
+        let graph = contents
+            .metrics
+            .width_for(rung.lane_cap.min(contents.lanes.max(1)));
+        let subject = contents.character * rung.subject_min_chars;
+
+        if age + labels + graph + subject <= available {
+            chosen = idx;
+            break;
         }
     }
 
-    pub(crate) fn shows_refs(self) -> bool {
-        !matches!(self, Self::Narrow)
+    let rung = &RUNGS[chosen];
+    HistoryLayout {
+        age: rung.age,
+        labels: rung.labels,
+        lane_cap: rung.lane_cap,
+        subject_min: contents.character * rung.subject_min_chars,
+        label_width: contents.label_width(rung.labels, available),
     }
+}
 
-    pub(crate) fn shows_age(self) -> bool {
-        matches!(self, Self::Wide)
+/// How wide a string is drawn in the interface font.
+///
+/// The label column is sized from its longest label rather than from a share of
+/// the row, so that it neither clips a name nor leaves a hand's width of empty
+/// column beside a history whose branches are all called `main`.
+pub(crate) fn measure_text(window: &Window, text: &str) -> Pixels {
+    if text.is_empty() {
+        return px(0.);
     }
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .layout_line(text, font_size, &[run], None)
+        .width
+}
 
-    /// The table reads `true` as "hidden", so this is the inverse of what the
-    /// row shows.
-    pub(crate) fn column_mask(self) -> TableRow<bool> {
-        TableRow::from_vec(
-            vec![!self.shows_refs(), false, false, !self.shows_age()],
-            TABLE_COLUMN_COUNT,
-        )
+/// What a chip adds around the name inside it: its icon, the gaps and its own
+/// border.
+pub(crate) fn chip_chrome(metrics: GraphMetrics, _kind: RefKind) -> Pixels {
+    metrics.label + px(18.)
+}
+
+/// Which columns the table draws. `true` means hidden, which is what the
+/// table's filter reads.
+pub(crate) fn column_mask(layout: HistoryLayout) -> TableRow<bool> {
+    TableRow::from_vec(
+        vec![
+            !layout.labels.has_a_column(),
+            false,
+            false,
+            // A column only when every row has an age to put in it. Where the
+            // age is shown on a row or two the age rides at the end of the
+            // subject instead, because a column that is empty on nineteen rows
+            // out of twenty is a column of nothing.
+            !matches!(layout.age, AgeShown::Column),
+        ],
+        TABLE_COLUMN_COUNT,
+    )
+}
+
+/// Where a node's circle starts, inside the column showing `lane_cap` lanes
+/// from `first_lane`.
+pub(crate) fn node_left(
+    metrics: GraphMetrics,
+    place: NodePlace,
+    first_lane: usize,
+    lane_cap: usize,
+) -> Pixels {
+    let column = match place {
+        NodePlace::InLane(lane) => lane,
+        NodePlace::BeforeTheEdge => first_lane,
+        NodePlace::PastTheEdge => first_lane + lane_cap,
+    };
+    metrics.lane_center_in(column, first_lane) - metrics.node / 2.0
+}
+
+/// Whether a commit is recent enough that a reader is asking when rather than
+/// which.
+pub(crate) fn is_younger_than_a_day(timestamp: i64, now: OffsetDateTime) -> bool {
+    const DAY: i64 = 24 * 60 * 60;
+    let Ok(then) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return false;
+    };
+    (now - then).whole_seconds() < DAY
+}
+
+/// A branch name shortened by the rule rather than by the character count.
+pub(crate) fn shorten_ref(name: &str, mode: LabelMode) -> SharedString {
+    /// What an inline chip can hold of a name before its tooltip has to.
+    const INLINE_TAIL: usize = 12;
+
+    match mode {
+        LabelMode::Full => SharedString::from(name.to_string()),
+        LabelMode::Abbreviated => {
+            let Some(cut) = name.rfind('/') else {
+                return SharedString::from(name.to_string());
+            };
+            let mut shortened = String::with_capacity(name.len());
+            for segment in name[..cut].split('/') {
+                match segment.chars().next() {
+                    Some(first) => shortened.push(first),
+                    None => {}
+                }
+                shortened.push('/');
+            }
+            shortened.push_str(&name[cut + 1..]);
+            SharedString::from(shortened)
+        }
+        LabelMode::Single => {
+            let tail = name.rsplit('/').next().unwrap_or(name);
+            SharedString::from(tail.to_string())
+        }
+        LabelMode::Inline => {
+            let tail = name.rsplit('/').next().unwrap_or(name);
+            if tail.chars().count() <= INLINE_TAIL {
+                return SharedString::from(tail.to_string());
+            }
+            let kept: String = tail.chars().take(INLINE_TAIL - 1).collect();
+            SharedString::from(format!("{kept}…"))
+        }
     }
 }
 
@@ -2186,9 +2409,13 @@ fn paint_row_lanes(
 ) {
     let GraphRowPaint {
         metrics,
+        first_lane,
+        lane_cap,
         connector,
         emphasis,
     } = row;
+    let lane_center = |column: usize| metrics.lane_center_in(column, first_lane);
+    let in_view = |column: usize| column >= first_lane && column < first_lane + lane_cap;
     let top = bounds.origin.y;
     let bottom = top + bounds.size.height;
     let center = top + bounds.size.height / 2.0;
@@ -2196,7 +2423,8 @@ fn paint_row_lanes(
     let stroke = LINE_WIDTH * emphasis;
 
     if let Some((lane, color_idx)) = connector {
-        let to_x = bounds.origin.x + metrics.lane_center(lane) - node_gap;
+        let to_x = bounds.origin.x + lane_center(lane.clamp(first_lane, first_lane + lane_cap - 1))
+            - node_gap;
         let mut builder = PathBuilder::stroke(px(1.));
         builder.move_to(point(bounds.origin.x, center));
         builder.line_to(point(to_x, center));
@@ -2212,8 +2440,12 @@ fn paint_row_lanes(
     let mut by_color: BTreeMap<usize, Vec<PathBuilder>> = BTreeMap::new();
 
     for lane in lanes {
-        let from_x = bounds.origin.x + metrics.lane_center(lane.from_column);
-        let to_x = bounds.origin.x + metrics.lane_center(lane.to_column);
+        // A line with both ends outside the window has nothing to draw in it.
+        if !in_view(lane.from_column) && !in_view(lane.to_column) {
+            continue;
+        }
+        let from_x = bounds.origin.x + lane_center(lane.from_column);
+        let to_x = bounds.origin.x + lane_center(lane.to_column);
         let enters_at = if lane.starts_at_node {
             center + node_gap
         } else {
@@ -2297,10 +2529,26 @@ fn paint_row_lanes(
     }
 }
 
+/// Where a commit sits relative to the lanes the column is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodePlace {
+    /// In view, in the lane it belongs to.
+    InLane(usize),
+    /// Off the left edge: drawn as a ring there, so the reader sees the commit
+    /// exists and which branch it is on without seeing its lane.
+    BeforeTheEdge,
+    /// Off the right edge.
+    PastTheEdge,
+}
+
 /// What one row of the graph column paints besides its lanes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GraphRowPaint {
     pub metrics: GraphMetrics,
+    /// The leftmost lane the column is showing.
+    pub first_lane: usize,
+    /// How many lanes it shows before the rest become rings.
+    pub lane_cap: usize,
     /// The lane and colour of a node that carries ref chips, which get a rule
     /// joining them to it.
     pub connector: Option<(usize, usize)>,
@@ -2393,11 +2641,21 @@ pub struct GitGraph {
     workspace: WeakEntity<Workspace>,
     context_menu: Option<GitGraphContextMenu>,
     table_interaction_state: Entity<TableInteractionState>,
-    /// How wide the history was last laid out. An element cannot know its own
-    /// width until it has been laid out, so this is read a frame late; a change
+    /// Where the graph's own scrollbar was painted, so a drag along it can be
+    /// turned into a lane.
+    graph_track: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The leftmost lane the graph column is showing. A history deeper than the
+    /// column is wide is read by pushing this along rather than by squeezing
+    /// the lanes until nothing can be told apart.
+    graph_first_lane: Rc<Cell<usize>>,
+    /// What the reader dragged the label column to, if they did. Manual beats
+    /// automatic until they ask for the automatic back with a double click.
+    column_override: Rc<Cell<Option<Pixels>>>,
+    /// Where the history was last laid out. An element cannot know its own
+    /// size until it has been laid out, so this is read a frame late; a change
     /// asks for one more frame, and the layout settles on the frame after the
     /// one that measured it rather than on the reader's next mouse move.
-    measured_width: Rc<Cell<Pixels>>,
+    measured: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The repository's remote names, read once. Empty until they arrive, which
     /// only means a remote-tracking ref is drawn as a plain branch until then.
     remote_names: Vec<SharedString>,
@@ -2421,6 +2679,7 @@ pub struct GitGraph {
 
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        self.graph_first_lane.set(0);
         self.graph_data.clear();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
@@ -2460,79 +2719,245 @@ impl GitGraph {
     ///
     /// Only the subject stretches. The graph takes exactly the room its lanes
     /// need, the age takes the room the longest age needs, and the labels take a
-    /// share of what is left -- so a history of three lanes does not leave a
-    /// hand's width of empty column between its dots and its subjects.
-    /// How much of the row the lanes get.
-    ///
-    /// However many lanes a history has, the graph stops at a share of the row;
-    /// the alternative is a row that is all graph and no subject. A narrow pane
-    /// gives it more, because there the graph and the subject are all there is.
-    fn graph_column_width(&self, window: &Window, cx: &App, fit: HistoryFit) -> Pixels {
-        let max_share = match fit {
-            HistoryFit::Narrow => 0.5,
-            HistoryFit::Medium => 0.45,
-            HistoryFit::Wide => 0.4,
-        };
-        GraphMetrics::for_window(window)
-            .width_for(self.graph_data.max_lanes)
-            .min(self.history_width(window, cx).max(px(1.)) * max_share)
+    /// What this history shows at the width it has, worked out from what it
+    /// actually holds.
+    fn history_layout(&self, window: &Window, cx: &App) -> HistoryLayout {
+        let head = self.head_branch_name(cx);
+        let metrics = GraphMetrics::for_window(window);
+        let character = measure_text(window, "0");
+
+        let mut widest_label = [px(0.); 4];
+        for name in self.graph_data.label_names.iter() {
+            let Some((kind, read)) = read_ref(name.as_ref(), head.as_deref(), &self.remote_names)
+            else {
+                continue;
+            };
+            for mode in [
+                LabelMode::Full,
+                LabelMode::Abbreviated,
+                LabelMode::Single,
+                LabelMode::Inline,
+            ] {
+                let text = shorten_ref(read.as_ref(), mode);
+                let drawn = measure_text(window, text.as_ref()) + chip_chrome(metrics, kind);
+                let slot = &mut widest_label[mode as usize];
+                *slot = (*slot).max(drawn);
+            }
+        }
+
+        fit(
+            self.history_width(window, cx).max(px(1.)),
+            HistoryContents {
+                metrics,
+                character,
+                widest_label,
+                lanes: self.graph_data.max_lanes,
+            },
+        )
     }
 
-    /// The sizes this history's rows are drawn at: the metrics of the interface
-    /// font, closed up to whatever width the graph column ended up with.
-    fn row_metrics(&self, window: &Window, cx: &App) -> GraphMetrics {
-        let fit = HistoryFit::of(self.history_width(window, cx));
-        GraphMetrics::for_window(window).fitted_to(
-            self.graph_data.max_lanes,
-            self.graph_column_width(window, cx, fit),
-        )
+    /// How much of the row the lanes get: the step never changes, so the column
+    /// is whatever the lanes it shows need. What is past the cap becomes rings
+    /// at its edge rather than a graph squeezed until nothing can be told apart.
+    fn graph_column_width(&self, window: &Window, layout: HistoryLayout) -> Pixels {
+        let lanes = layout.lane_cap.min(self.graph_data.max_lanes.max(1));
+        let rings = match self.graph_data.max_lanes > layout.lane_cap {
+            true => GraphMetrics::for_window(window).lane,
+            false => px(0.),
+        };
+        GraphMetrics::for_window(window).width_for(lanes) + rings
+    }
+
+    /// The sizes this history's rows are drawn at.
+    fn row_metrics(&self, window: &Window, _cx: &App) -> GraphMetrics {
+        GraphMetrics::for_window(window)
     }
 
     fn table_column_widths(
         &self,
         window: &Window,
         cx: &App,
-        fit: HistoryFit,
+        layout: HistoryLayout,
     ) -> Vec<DefiniteLength> {
-        /// Enough for "12mo" and the padding around it.
-        const AGE_WIDTH: Pixels = px(52.);
-        /// The labels never take more of the row than this, however wide it is.
-        const REFS_SHARE: f32 = 0.2;
-        const REFS_MAX: Pixels = px(280.);
-
         let container = self.history_width(window, cx).max(px(1.));
-        let graph = self.graph_column_width(window, cx, fit);
-        let age = match fit.shows_age() {
-            true => AGE_WIDTH,
-            false => px(0.),
+        let graph = self.graph_column_width(window, layout);
+        let age = match layout.age {
+            AgeShown::Column => AGE_COLUMN_WIDTH,
+            _ => px(0.),
         };
-        let refs = match fit.shows_refs() && self.graph_data.has_ref_names {
-            true => (container * REFS_SHARE).min(REFS_MAX),
-            false => px(0.),
-        };
-        let subject = (container - graph - age - refs).max(px(1.));
+        let labels = self
+            .column_override
+            .get()
+            .unwrap_or(layout.label_width)
+            .min((container - graph - age - layout.subject_min).max(px(0.)));
+        let subject = (container - graph - age - labels).max(px(1.));
         let share = |width: Pixels| DefiniteLength::Fraction(width / container);
 
-        vec![
-            share(refs),
-            // Absolute, not a share: a share would move the lanes sideways by a
-            // fraction of a pixel every time the window is dragged wider.
-            DefiniteLength::Absolute(graph.into()),
-            share(subject),
-            DefiniteLength::Absolute(age.into()),
-        ]
+        // All four are shares of the same measured width. Mixing shares with
+        // absolute widths only holds while the measurement is current: one
+        // frame behind, the shares scale to the new width and the absolutes do
+        // not, and the last column is pushed off the edge of the row.
+        vec![share(labels), share(graph), share(subject), share(age)]
+    }
+
+    /// How far the lane window can be pushed before its right edge meets the
+    /// last lane.
+    fn furthest_lane(&self, layout: HistoryLayout) -> usize {
+        self.graph_data
+            .max_lanes
+            .saturating_sub(layout.lane_cap.max(1))
+    }
+
+    /// Shift and the wheel walk the lane window. Without Shift the wheel is the
+    /// list's, as it always was.
+    fn handle_lane_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.modifiers.shift {
+            return;
+        }
+        let layout = self.history_layout(window, cx);
+        let furthest = self.furthest_lane(layout);
+        if furthest == 0 {
+            return;
+        }
+
+        let delta = event.delta.pixel_delta(window.line_height());
+        // A trackpad sends the sideways part, a wheel sends the vertical one.
+        let step = match delta.x.abs() > delta.y.abs() {
+            true => delta.x,
+            false => delta.y,
+        };
+        let at = self.graph_first_lane.get();
+        let next = match step < px(0.) {
+            true => (at + 1).min(furthest),
+            false => at.saturating_sub(1),
+        };
+        if next != at {
+            self.graph_first_lane.set(next);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    /// Turns a point along the graph's scrollbar into the lane it names.
+    fn scrub_lanes_to(&mut self, at: Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        let Some(track) = self.graph_track.get() else {
+            return;
+        };
+        if track.size.width <= px(0.) {
+            return;
+        }
+        let layout = self.history_layout(window, cx);
+        let furthest = self.furthest_lane(layout);
+        if furthest == 0 {
+            return;
+        }
+
+        let along = ((at.x - track.origin.x) / track.size.width).clamp(0., 1.);
+        let lane = (along * furthest as f32).round() as usize;
+        if lane != self.graph_first_lane.get() {
+            self.graph_first_lane.set(lane.min(furthest));
+            cx.notify();
+        }
+    }
+
+    /// The graph's own scrollbar, shown only when there is more graph than the
+    /// column can hold.
+    fn render_lane_scrollbar(
+        &self,
+        layout: HistoryLayout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        const TRACK_HEIGHT: Pixels = px(8.);
+
+        let furthest = self.furthest_lane(layout);
+        if furthest == 0 {
+            self.graph_track.set(None);
+            return None;
+        }
+
+        let container = self.history_width(window, cx).max(px(1.));
+        let graph = self.graph_column_width(window, layout);
+        let left = self
+            .column_override
+            .get()
+            .unwrap_or(layout.label_width)
+            .min(container);
+        let shown = layout.lane_cap.max(1) as f32 / self.graph_data.max_lanes.max(1) as f32;
+        let at = self.graph_first_lane.get() as f32 / furthest as f32;
+        let measured = self.graph_track.clone();
+
+        Some(
+            div()
+                .id("graph-lane-scrollbar")
+                .debug_selector(|| "GRAPH_LANE_SCROLLBAR".to_string())
+                .absolute()
+                .bottom_0()
+                .left(left)
+                .w(graph)
+                .h(TRACK_HEIGHT)
+                .bg(cx.theme().colors().scrollbar_track_background)
+                .child(
+                    gpui::canvas(
+                        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                            measured.set(Some(bounds));
+                        },
+                        |_, _: (), _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(relative(at * (1.0 - shown)))
+                        .w(relative(shown))
+                        .rounded_sm()
+                        .bg(cx.theme().colors().scrollbar_thumb_background),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.scrub_lanes_to(event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.scrub_lanes_to(event.position, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The branch `HEAD` is on, which decides which label is the current one.
+    fn head_branch_name(&self, cx: &App) -> Option<SharedString> {
+        self.get_repository(cx).and_then(|repository| {
+            repository
+                .read(cx)
+                .snapshot()
+                .branch
+                .as_ref()
+                .map(|branch| SharedString::from(branch.name().to_string()))
+        })
     }
 
     /// How wide the history is, for deciding what fits in it.
     fn history_width(&self, window: &Window, _cx: &App) -> Pixels {
-        let measured = self.measured_width.get();
-        // Zero until the history has been laid out once. Guessing narrow there
-        // would show the narrow layout for a frame and then swap it, which
-        // reads as a flicker.
-        if measured > px(0.) {
-            measured
-        } else {
-            window.viewport_size().width
+        // Nothing until the history has been laid out once. Guessing narrow
+        // there would show the narrow layout for a frame and then swap it,
+        // which reads as a flicker.
+        match self.measured.get() {
+            Some(bounds) if bounds.size.width > px(0.) => bounds.size.width,
+            _ => window.viewport_size().width,
         }
     }
 
@@ -2542,11 +2967,11 @@ impl GitGraph {
     /// dragged to a new size and then left alone keeps the old set of columns
     /// until the reader touches something.
     fn measure_history_width(&self) -> impl IntoElement {
-        let measured = self.measured_width.clone();
+        let measured = self.measured.clone();
         gpui::canvas(
             move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
-                if measured.get() != bounds.size.width {
-                    measured.set(bounds.size.width);
+                if measured.get().map(|was| was.size.width) != Some(bounds.size.width) {
+                    measured.set(Some(bounds));
                     window.request_animation_frame();
                 }
             },
@@ -2554,6 +2979,73 @@ impl GitGraph {
         )
         .absolute()
         .size_full()
+    }
+
+    /// The border between the labels and the graph, which the reader can drag.
+    ///
+    /// What they drag it to is remembered and beats what the width would have
+    /// chosen, until they ask for the automatic back with a double click.
+    fn render_label_divider(
+        &self,
+        layout: HistoryLayout,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        /// Wide enough to hit without being wide enough to see.
+        const GRIP: Pixels = px(6.);
+
+        if !layout.labels.has_a_column() {
+            return None;
+        }
+        let at = self.column_override.get().unwrap_or(layout.label_width);
+        if at <= px(0.) {
+            return None;
+        }
+
+        Some(
+            div()
+                .id("label-column-divider")
+                .debug_selector(|| "GRAPH_LABEL_DIVIDER".to_string())
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(at - GRIP / 2.0)
+                .w(GRIP)
+                .cursor_col_resize()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        match event.click_count >= 2 {
+                            // A second click gives the width back to the layout.
+                            true => this.column_override.set(None),
+                            false => this.drag_label_divider(event.position, window, cx),
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_label_divider(event.position, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Puts the border where the reader dropped it, within what the row can give.
+    fn drag_label_divider(&mut self, at: Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        let Some(bounds) = self.measured.get() else {
+            return;
+        };
+        let layout = self.history_layout(window, cx);
+        let graph = self.graph_column_width(window, layout);
+        let widest = (bounds.size.width - graph - layout.subject_min).max(LABEL_COLUMN_MIN);
+        let wanted = (at.x - bounds.origin.x).clamp(LABEL_COLUMN_MIN, widest);
+
+        if self.column_override.get() != Some(wanted) {
+            self.column_override.set(Some(wanted));
+            cx.notify();
+        }
     }
 
     pub fn new(
@@ -2629,7 +3121,10 @@ impl GitGraph {
             _commit_diff_task: None,
             context_menu: None,
             table_interaction_state,
-            measured_width: Rc::new(Cell::new(px(0.))),
+            graph_track: Rc::new(Cell::new(None)),
+            graph_first_lane: Rc::new(Cell::new(0)),
+            column_override: Rc::new(Cell::new(None)),
+            measured: Rc::new(Cell::new(None)),
             remote_names: Vec::new(),
             _remote_names_task: None,
             selected_entry_idx: None,
@@ -2796,11 +3291,13 @@ impl GitGraph {
         kind: RefKind,
         name: &SharedString,
         accent_color: Hsla,
+        mode: LabelMode,
         commit_idx: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_head = kind == RefKind::Head;
-        let chip = Chip::new(name.clone())
+        let shortened = shorten_ref(name.as_ref(), mode);
+        let chip = Chip::new(shortened.clone())
             .label_size(LabelSize::Small)
             .truncate()
             .icon(kind.icon())
@@ -2815,7 +3312,16 @@ impl GitGraph {
 
         let ref_name = name.clone();
         div()
+            .id(ElementId::Name(
+                format!("ref-chip-{commit_idx}-{name}").into(),
+            ))
             .child(chip)
+            // Whatever the rule left of the name, the whole of it is one hover
+            // away: a shortened label that cannot be read in full is a label
+            // that names nothing.
+            .when(shortened != *name, |this| {
+                this.tooltip(Tooltip::text(name.clone()))
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2857,23 +3363,18 @@ impl GitGraph {
         metrics: GraphMetrics,
         accent_color: Hsla,
         head_branch_name: Option<&str>,
-        fit: HistoryFit,
+        mode: LabelMode,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // A commit on a release day can carry a dozen tags. Past a couple the
-        // chips stop naming anything and start eating the subject, so the rest
-        // are counted instead and named in the count's tooltip.
-        let max_chips = match fit {
-            HistoryFit::Wide => 2,
-            _ => 1,
-        };
-
         let refs = self.refs_of(idx, head_branch_name);
         if refs.is_empty() {
             return div().h(metrics.row).into_any_element();
         }
 
-        let shown = refs.len().min(max_chips);
+        // A commit on a release day can carry a dozen tags. Past what the width
+        // allows the chips stop naming anything and start eating the subject,
+        // so the rest are counted instead and named in the count's tooltip.
+        let shown = refs.len().min(mode.chips_a_row());
         let rest: Vec<&str> = refs[shown..]
             .iter()
             .map(|(_, name)| name.as_ref())
@@ -2898,7 +3399,7 @@ impl GitGraph {
                     // -- the one end of it a reader cannot do without.
                     .min_w_0()
                     .overflow_hidden()
-                    .child(self.render_ref_chip(*kind, name, accent_color, idx, cx))
+                    .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
             }))
             .when_some(overflow, |this, (count, names)| {
@@ -2930,6 +3431,7 @@ impl GitGraph {
         &self,
         idx: usize,
         metrics: GraphMetrics,
+        layout: HistoryLayout,
         author: &SharedString,
         cx: &App,
     ) -> AnyElement {
@@ -2944,12 +3446,23 @@ impl GitGraph {
 
         let lanes: SmallVec<[LanePaint; 4]> = SmallVec::from_slice(self.graph_data.lanes_at(idx));
         let node_lane = commit.lane;
+        let first_lane = self.graph_first_lane.get();
+        let lane_cap = layout.lane_cap.max(1);
+        let place = if node_lane < first_lane {
+            NodePlace::BeforeTheEdge
+        } else if node_lane >= first_lane + lane_cap {
+            NodePlace::PastTheEdge
+        } else {
+            NodePlace::InLane(node_lane)
+        };
         let node_color = cx
             .theme()
             .accents()
             .color_for_index(commit.color_idx as u32);
         let paint = GraphRowPaint {
             metrics,
+            first_lane,
+            lane_cap,
             connector: (!commit.data.ref_names.is_empty()).then_some((node_lane, commit.color_idx)),
             emphasis: match self.selected_entry_idx == Some(idx) {
                 true => SELECTED_LINE_WEIGHT,
@@ -2980,20 +3493,27 @@ impl GitGraph {
                     .id(ElementId::NamedInteger("graph-node".into(), idx as u64))
                     .debug_selector(move || format!("GRAPH_NODE-{idx}"))
                     .absolute()
-                    .left(metrics.lane_center(node_lane) - metrics.node / 2.0)
+                    .left(node_left(metrics, place, first_lane, lane_cap))
                     .top((metrics.row - metrics.node) / 2.0)
                     .size(metrics.node)
                     .rounded_full()
-                    .bg(node_color)
                     .flex()
                     .items_center()
                     .justify_center()
+                    // A commit whose lane the column is not showing is a ring
+                    // rather than a dot: the reader sees that it is there and
+                    // which branch it is on, and that its lane is elsewhere.
+                    .map(|this| match place {
+                        NodePlace::InLane(_) => this.bg(node_color),
+                        _ => this.border_2().border_color(node_color),
+                    })
                     .when(metrics.node_holds_initials(), |this| {
-                        this.child(
-                            Label::new(initials)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Custom(readable_on(node_color))),
-                        )
+                        this.child(Label::new(initials).size(LabelSize::XSmall).color(
+                            Color::Custom(match place {
+                                NodePlace::InLane(_) => readable_on(node_color),
+                                _ => node_color,
+                            }),
+                        ))
                     })
                     .when(!author.is_empty(), |this| {
                         this.tooltip(Tooltip::text(author))
@@ -3010,15 +3530,9 @@ impl GitGraph {
     ) -> Vec<Vec<AnyElement>> {
         let repository = self.get_repository(cx);
 
-        let head_branch_name: Option<SharedString> = repository.as_ref().and_then(|repo| {
-            repo.read(cx)
-                .snapshot()
-                .branch
-                .as_ref()
-                .map(|branch| SharedString::from(branch.name().to_string()))
-        });
-
-        let fit = HistoryFit::of(self.history_width(window, cx));
+        let head_branch_name = self.head_branch_name(cx);
+        let layout = self.history_layout(window, cx);
+        let age_has_a_column = matches!(layout.age, AgeShown::Column);
         let metrics = self.row_metrics(window, cx);
         let now = OffsetDateTime::now_utc();
 
@@ -3057,17 +3571,20 @@ impl GitGraph {
                 let author_name: SharedString;
                 let age: SharedString;
                 let committed_on: Option<SharedString>;
+                let is_fresh: bool;
 
                 if let CommitDataState::Loaded(ref data) = data {
                     subject = data.subject.clone();
                     author_name = data.author_name.clone();
                     age = format_relative_timestamp(data.commit_timestamp, now).into();
                     committed_on = Some(format_timestamp(data.commit_timestamp).into());
+                    is_fresh = is_younger_than_a_day(data.commit_timestamp, now);
                 } else {
                     subject = "Loading…".into();
                     author_name = "".into();
                     age = "".into();
                     committed_on = None;
+                    is_fresh = false;
                 }
 
                 let accent_colors = cx.theme().accents();
@@ -3079,6 +3596,17 @@ impl GitGraph {
 
                 let is_selected = self.selected_entry_idx == Some(idx);
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
+                // A date on every row is noise in a list a reader scans by
+                // subject. It earns its place where the reader is already
+                // looking, and on anything recent enough that "when" is the
+                // question being asked.
+                let shows_age = match layout.age {
+                    AgeShown::Column => true,
+                    AgeShown::WhereItMatters => {
+                        is_selected || self.hovered_entry_idx == Some(idx) || is_fresh
+                    }
+                    AgeShown::Nowhere => false,
+                };
 
                 let subject_label = if is_matched {
                     let query = match &self.search_state.state {
@@ -3121,25 +3649,57 @@ impl GitGraph {
                         .into_any_element()
                 };
 
-                vec![
+                // A history too narrow for a column of labels still has to say
+                // which commit is a branch tip, so the label comes back as a
+                // chip in front of the subject.
+                let inline_label = (!layout.labels.has_a_column()).then(|| {
                     self.render_refs_cell(
                         idx,
                         metrics,
                         accent_color,
                         head_branch_name.as_deref(),
-                        fit,
+                        layout.labels,
                         cx,
-                    ),
-                    self.render_graph_cell(idx, metrics, &author_name, cx),
+                    )
+                });
+
+                vec![
+                    match layout.labels.has_a_column() {
+                        true => self.render_refs_cell(
+                            idx,
+                            metrics,
+                            accent_color,
+                            head_branch_name.as_deref(),
+                            layout.labels,
+                            cx,
+                        ),
+                        false => div().h(metrics.row).into_any_element(),
+                    },
+                    self.render_graph_cell(idx, metrics, layout, &author_name, cx),
                     h_flex()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .debug_selector(move || format!("GRAPH_SUBJECT-{idx}"))
                         .h(metrics.row)
                         .w_full()
                         .items_center()
+                        .gap_1()
                         .px_1()
                         .overflow_hidden()
-                        .child(subject_label)
+                        .children(inline_label)
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(subject_label),
+                        )
+                        .when(shows_age && !age_has_a_column, |this| {
+                            this.child(
+                                Label::new(age.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .into_any_element(),
                     h_flex()
                         .id(ElementId::NamedInteger("commit-age".into(), idx as u64))
@@ -3150,12 +3710,14 @@ impl GitGraph {
                         .justify_end()
                         .px_1()
                         .overflow_hidden()
-                        .child(
-                            Label::new(age)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        )
+                        .when(shows_age && age_has_a_column, |this| {
+                            this.child(
+                                Label::new(age)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        })
                         .when_some(committed_on, |this, on| this.tooltip(Tooltip::text(on)))
                         .into_any_element(),
                 ]
@@ -4052,6 +4614,7 @@ impl GitGraph {
                                         *kind,
                                         name,
                                         accent_color,
+                                        LabelMode::Full,
                                         selected_idx,
                                         cx,
                                     )
@@ -4555,10 +5118,10 @@ impl Render for GitGraph {
                     this.child(self.render_loading_spinner(cx))
                 })
         } else {
-            let fit = HistoryFit::of(self.history_width(window, cx));
-            let column_filter = fit.column_mask();
+            let layout = self.history_layout(window, cx);
+            let column_filter = column_mask(layout);
             let table_width_config =
-                ColumnWidthConfig::explicit(self.table_column_widths(window, cx, fit));
+                ColumnWidthConfig::explicit(self.table_column_widths(window, cx, layout));
 
             let row_height = Self::row_height(window, cx);
             let selected_entry_idx = self.selected_entry_idx;
@@ -4662,6 +5225,7 @@ impl Render for GitGraph {
                             .flex_1()
                             .w_full()
                             .overflow_hidden()
+                            .on_scroll_wheel(cx.listener(Self::handle_lane_scroll))
                             .child(self.measure_history_width())
                             .child(
                                 div()
@@ -4670,7 +5234,9 @@ impl Render for GitGraph {
                                     .tab_stop(false)
                                     .size_full()
                                     .child(commits_table),
-                            ),
+                            )
+                            .children(self.render_label_divider(layout, cx))
+                            .children(self.render_lane_scrollbar(layout, window, cx)),
                     ),
                 )
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
@@ -8358,6 +8924,13 @@ mod tests {
         (git_graph, cx)
     }
 
+    fn place_of(lane: usize, layout: HistoryLayout) -> NodePlace {
+        match lane >= layout.lane_cap {
+            true => NodePlace::PastTheEdge,
+            false => NodePlace::InLane(lane),
+        }
+    }
+
     fn selector(name: &str, idx: usize) -> &'static str {
         Box::leak(format!("{name}-{idx}").into_boxed_str())
     }
@@ -8391,7 +8964,7 @@ mod tests {
         assert!(larger.label > metrics.label);
 
         assert!(
-            metrics.lane_center(1) - metrics.lane_center(0) == metrics.lane,
+            metrics.lane_center_in(1, 0) - metrics.lane_center_in(0, 0) == metrics.lane,
             "lanes are one lane step apart"
         );
         assert!(
@@ -8399,41 +8972,8 @@ mod tests {
             "a node wider than its lane step would touch the node beside it"
         );
         assert!(
-            metrics.lane_center(0) - metrics.node / 2.0 >= px(0.),
+            metrics.lane_center_in(0, 0) - metrics.node / 2.0 >= px(0.),
             "the first node is cut off by the left edge of its column"
-        );
-    }
-
-    #[gpui::test]
-    fn test_a_narrow_column_closes_the_lanes_rather_than_hiding_them(_cx: &mut TestAppContext) {
-        let metrics = GraphMetrics::new(px(21.), 1.0);
-
-        assert_eq!(
-            metrics.fitted_to(3, px(400.)),
-            metrics,
-            "a column with room to spare should change nothing"
-        );
-
-        let tight = metrics.fitted_to(6, px(120.));
-        assert!(tight.lane < metrics.lane, "the lanes did not close up");
-        assert!(
-            tight.width_for(6) <= px(120.) + px(0.01),
-            "six lanes still need {} in a column of 120",
-            tight.width_for(6)
-        );
-        assert!(
-            tight.node <= tight.lane,
-            "the nodes are wider than the lanes they sit in"
-        );
-        assert_eq!(tight.row, metrics.row, "the rows must not move");
-
-        // Past the point where lanes stop being telling apart, the squeeze
-        // stops and the column clips instead.
-        let hopeless = metrics.fitted_to(40, px(60.));
-        assert!(hopeless.lane >= metrics.row * 0.3);
-        assert!(
-            !hopeless.node_holds_initials(),
-            "a node that small cannot carry two letters"
         );
     }
 
@@ -8505,28 +9045,113 @@ mod tests {
         assert_eq!(ago(-5_000), "now");
     }
 
-    #[gpui::test]
-    fn test_what_fits_at_each_width(_cx: &mut TestAppContext) {
-        assert_eq!(HistoryFit::of(px(0.)), HistoryFit::Narrow);
-        assert_eq!(HistoryFit::of(px(469.)), HistoryFit::Narrow);
-        assert_eq!(HistoryFit::of(px(470.)), HistoryFit::Medium);
-        assert_eq!(HistoryFit::of(px(699.)), HistoryFit::Medium);
-        assert_eq!(HistoryFit::of(px(700.)), HistoryFit::Wide);
-        assert_eq!(HistoryFit::of(px(4000.)), HistoryFit::Wide);
-
-        // The graph and the subject are never dropped, whatever the width.
-        for fit in [HistoryFit::Narrow, HistoryFit::Medium, HistoryFit::Wide] {
-            let mask = fit.column_mask();
-            assert_eq!(mask.cols(), TABLE_COLUMN_COUNT);
-            assert_eq!(mask.get(1usize), Some(&false), "{fit:?} dropped the graph");
-            assert_eq!(
-                mask.get(2usize),
-                Some(&false),
-                "{fit:?} dropped the subject"
-            );
-            assert_eq!(mask.get(0usize), Some(&!fit.shows_refs()));
-            assert_eq!(mask.get(3usize), Some(&!fit.shows_age()));
+    fn contents_for_test(widest: Pixels, lanes: usize) -> HistoryContents {
+        HistoryContents {
+            metrics: GraphMetrics::new(px(21.), 1.0),
+            character: px(8.),
+            widest_label: [widest; 4],
+            lanes,
         }
+    }
+
+    #[gpui::test]
+    fn test_what_a_row_gives_up_first(_cx: &mut TestAppContext) {
+        let contents = contents_for_test(px(180.), 12);
+
+        // Wide enough for everything.
+        let roomy = fit(px(1400.), contents);
+        assert_eq!(roomy.age, AgeShown::Column);
+        assert_eq!(roomy.labels, LabelMode::Full);
+        assert_eq!(roomy.lane_cap, 8);
+
+        // The order of concessions: the age column goes before the labels are
+        // touched, the labels shorten before they are dropped to one, and the
+        // column itself is the last thing to go.
+        let mut seen = Vec::new();
+        let mut width = px(1400.);
+        while width > px(200.) {
+            let layout = fit(width, contents);
+            let rung = (layout.age, layout.labels, layout.lane_cap);
+            if seen.last() != Some(&rung) {
+                seen.push(rung);
+            }
+            width -= px(10.);
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (AgeShown::Column, LabelMode::Full, 8),
+                (AgeShown::WhereItMatters, LabelMode::Abbreviated, 6),
+                (AgeShown::Nowhere, LabelMode::Single, 4),
+                (AgeShown::Nowhere, LabelMode::Inline, 3),
+            ],
+            "a narrowing history did not give its room up in the written order"
+        );
+    }
+
+    #[gpui::test]
+    fn test_the_thresholds_follow_what_is_in_the_history(_cx: &mut TestAppContext) {
+        // The same width, two histories: one whose labels are short and one
+        // whose labels are long. The long one has to give up sooner. A ladder
+        // of fixed pixel thresholds cannot tell these apart.
+        let gives_up_at = |widest: Pixels| {
+            let mut width = px(1600.);
+            while width > px(100.)
+                && fit(width, contents_for_test(widest, 12)).labels == LabelMode::Full
+            {
+                width -= px(10.);
+            }
+            width
+        };
+        assert!(
+            gives_up_at(px(340.)) > gives_up_at(px(60.)),
+            "a history of long branch names gives up its labels no sooner than \
+             one of short names ({:?} against {:?})",
+            gives_up_at(px(340.)),
+            gives_up_at(px(60.))
+        );
+
+        // And a history with no labels at all spends nothing on them.
+        let bare = fit(px(900.), contents_for_test(px(0.), 12));
+        assert_eq!(bare.label_width, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_the_label_column_is_clamped_at_both_ends(_cx: &mut TestAppContext) {
+        // Narrower than the floor: a column this narrow names nothing.
+        let tiny = fit(px(1400.), contents_for_test(px(20.), 2));
+        assert_eq!(tiny.label_width, LABEL_COLUMN_MIN);
+
+        // Wider than the share: the labels stop, the subject keeps the rest.
+        let huge = fit(px(1400.), contents_for_test(px(900.), 2));
+        assert_eq!(huge.label_width, px(1400.) * LABEL_COLUMN_MAX_SHARE);
+    }
+
+    #[gpui::test]
+    fn test_a_name_loses_its_prefix_before_its_tail(_cx: &mut TestAppContext) {
+        let name = "fix/10-async";
+        assert_eq!(shorten_ref(name, LabelMode::Full).as_ref(), "fix/10-async");
+        assert_eq!(
+            shorten_ref(name, LabelMode::Abbreviated).as_ref(),
+            "f/10-async"
+        );
+        assert_eq!(shorten_ref(name, LabelMode::Single).as_ref(), "10-async");
+        assert_eq!(shorten_ref(name, LabelMode::Inline).as_ref(), "10-async");
+
+        // Several segments all squeeze, and the last one never does.
+        assert_eq!(
+            shorten_ref("team/fix/10-async", LabelMode::Abbreviated).as_ref(),
+            "t/f/10-async"
+        );
+        // A name with no prefix has nothing to squeeze.
+        assert_eq!(shorten_ref("main", LabelMode::Abbreviated).as_ref(), "main");
+        // Only the tail that will not fit is cut, and it says so.
+        assert_eq!(
+            shorten_ref("feature/a-very-long-branch-name", LabelMode::Inline).as_ref(),
+            "a-very-long…"
+        );
+        assert_eq!(shorten_ref("", LabelMode::Abbreviated).as_ref(), "");
     }
 
     #[gpui::test]
@@ -8744,11 +9369,9 @@ mod tests {
             drawn_history(cx, unlabelled_commits(20), gpui::size(px(1240.), px(700.))).await;
 
         let fit_now = |cx: &mut VisualTestContext| {
-            git_graph.update_in(cx, |graph, window, cx| {
-                HistoryFit::of(graph.history_width(window, cx))
-            })
+            git_graph.update_in(cx, |graph, window, cx| graph.history_layout(window, cx).age)
         };
-        assert_eq!(fit_now(cx), HistoryFit::Wide);
+        assert_eq!(fit_now(cx), AgeShown::Column);
 
         // Counting frames says nothing -- other views ask for them too. What
         // the history must do is mark itself for drawing again, so that is what
@@ -8774,12 +9397,12 @@ mod tests {
         // before the control frame is taken.
         draw_and_settle(cx, px(1240.));
         let quiet_frame = draw_and_settle(cx, px(1240.));
-        let frame_that_resized = draw_and_settle(cx, px(520.));
+        let frame_that_resized = draw_and_settle(cx, px(300.));
 
         assert_eq!(
             fit_now(cx),
-            HistoryFit::Medium,
-            "after one frame at 520 the history still thinks it is as wide as it was"
+            AgeShown::WhereItMatters,
+            "after one frame at 300 the history still thinks it is as wide as it was"
         );
         assert_eq!(
             quiet_frame, 0,
@@ -8852,7 +9475,7 @@ mod tests {
 
         git_graph.read_with(&*cx, |graph, _| {
             assert!(
-                !graph.graph_data.has_ref_names,
+                graph.graph_data.label_names.is_empty(),
                 "the fixture was meant to carry no labels"
             );
         });
@@ -8871,6 +9494,217 @@ mod tests {
         );
     }
 
+    /// A history whose lanes run deeper than any column will show.
+    fn deep_commits(branches: usize) -> Vec<Arc<InitialGraphCommitData>> {
+        let mut rng = StdRng::seed_from_u64(9);
+        let trunk: Vec<Oid> = (0..branches + 2).map(|_| Oid::random(&mut rng)).collect();
+        let tips: Vec<Oid> = (0..branches).map(|_| Oid::random(&mut rng)).collect();
+
+        let mut commits = Vec::new();
+        // Every trunk commit merges in a branch of its own, so each one opens a
+        // lane that stays open until the very bottom.
+        for idx in 0..branches {
+            commits.push(Arc::new(InitialGraphCommitData {
+                sha: trunk[idx],
+                parents: smallvec![trunk[idx + 1], tips[idx]],
+                ref_names: vec![],
+            }));
+        }
+        commits.push(Arc::new(InitialGraphCommitData {
+            sha: trunk[branches],
+            parents: smallvec![trunk[branches + 1]],
+            ref_names: vec![],
+        }));
+        for tip in tips.iter() {
+            commits.push(Arc::new(InitialGraphCommitData {
+                sha: *tip,
+                parents: smallvec![trunk[branches + 1]],
+                ref_names: vec![],
+            }));
+        }
+        commits.push(Arc::new(InitialGraphCommitData {
+            sha: trunk[branches + 1],
+            parents: smallvec![],
+            ref_names: vec![],
+        }));
+        commits
+    }
+
+    #[gpui::test]
+    async fn test_a_dragged_column_border_beats_the_layout(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut rng = StdRng::seed_from_u64(13);
+        let commits = generate_random_commit_dag(&mut rng, 20, true);
+        let (git_graph, cx) = drawn_history(cx, commits, gpui::size(px(1400.), px(800.))).await;
+
+        let chosen = git_graph.update_in(cx, |graph, window, cx| {
+            graph.history_layout(window, cx).label_width
+        });
+        assert!(chosen > px(0.), "the fixture was meant to carry labels");
+
+        let border = cx
+            .debug_bounds("GRAPH_LABEL_DIVIDER")
+            .expect("a column of labels should offer a border to drag");
+        assert!(
+            (border.origin.x + border.size.width / 2.0 - chosen).abs() < px(1.),
+            "the border is drawn at {} where the column ends at {chosen}",
+            border.origin.x + border.size.width / 2.0
+        );
+
+        // Dragging it puts the column where the reader left it.
+        let wanted = chosen + px(90.);
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.drag_label_divider(point(wanted, px(200.)), window, cx);
+        });
+        let after = git_graph.read_with(&*cx, |graph, _| graph.column_override.get());
+        assert_eq!(
+            after,
+            Some(wanted),
+            "the column did not follow the border it was dragged by"
+        );
+
+        // And it stays there when the layout would have chosen otherwise.
+        let widths = git_graph.update_in(cx, |graph, window, cx| {
+            let layout = graph.history_layout(window, cx);
+            graph.table_column_widths(window, cx, layout)
+        });
+        let DefiniteLength::Fraction(labels) = widths[0] else {
+            panic!("the label column should be a share of the row");
+        };
+        assert!(
+            (labels * 1400. - f32::from(wanted)).abs() < 2.,
+            "the row gives the labels {} where the reader asked for {wanted}",
+            labels * 1400.
+        );
+
+        // A second click on the border gives the width back to the layout.
+        git_graph.update_in(cx, |graph, _window, _cx| graph.column_override.set(None));
+        let back = git_graph.update_in(cx, |graph, window, cx| {
+            graph.history_layout(window, cx).label_width
+        });
+        assert_eq!(back, chosen, "the automatic width did not come back");
+    }
+
+    #[gpui::test]
+    async fn test_a_lane_past_the_edge_becomes_a_ring(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, deep_commits(12), gpui::size(px(1000.), px(900.))).await;
+
+        let (metrics, layout, lanes) = git_graph.update_in(cx, |graph, window, cx| {
+            (
+                graph.row_metrics(window, cx),
+                graph.history_layout(window, cx),
+                graph
+                    .graph_data
+                    .commits
+                    .iter()
+                    .map(|commit| commit.lane)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert!(
+            lanes.iter().copied().max().unwrap_or(0) >= layout.lane_cap,
+            "the fixture was meant to run deeper than the column shows"
+        );
+
+        let mut past_the_edge = Vec::new();
+        for idx in 0..lanes.len() {
+            let (Some(cell), Some(node)) = (
+                cx.debug_bounds(selector("GRAPH_CELL", idx)),
+                cx.debug_bounds(selector("GRAPH_NODE", idx)),
+            ) else {
+                continue;
+            };
+
+            // Whatever its lane, a commit is drawn inside the column: a dot has
+            // to be somewhere the reader can see it.
+            assert!(
+                node.origin.x >= cell.origin.x - px(0.6)
+                    && node.origin.x + node.size.width <= cell.origin.x + cell.size.width + px(0.6),
+                "row {idx} in lane {} is drawn outside the graph column",
+                lanes[idx]
+            );
+
+            if lanes[idx] >= layout.lane_cap {
+                past_the_edge.push((idx, node.origin.x - cell.origin.x));
+            }
+        }
+
+        assert!(
+            past_the_edge.len() >= 2,
+            "only {} rows were past the edge; the fixture proves nothing",
+            past_the_edge.len()
+        );
+        let edge = metrics.lane_center_in(layout.lane_cap, 0) - metrics.node / 2.0;
+        for (idx, at) in past_the_edge {
+            assert!(
+                (at - edge).abs() < px(0.6),
+                "row {idx} is past the edge but is drawn at {at} rather than on it, at {edge}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_shift_and_the_wheel_walk_the_lane_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, deep_commits(12), gpui::size(px(1000.), px(900.))).await;
+
+        let furthest = git_graph.update_in(cx, |graph, window, cx| {
+            let layout = graph.history_layout(window, cx);
+            graph.furthest_lane(layout)
+        });
+        assert!(furthest > 0, "the fixture has nothing to scroll to");
+
+        fn wheel(shift: bool) -> ScrollWheelEvent {
+            ScrollWheelEvent {
+                position: point(px(400.), px(300.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-60.))),
+                modifiers: gpui::Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+                touch_phase: gpui::TouchPhase::Moved,
+            }
+        }
+        assert_eq!(
+            git_graph.read_with(&*cx, |graph, _| graph.graph_first_lane.get()),
+            0
+        );
+
+        // Without Shift the wheel belongs to the list, as it always has.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.handle_lane_scroll(&wheel(false), window, cx);
+        });
+        assert_eq!(
+            git_graph.read_with(&*cx, |graph, _| graph.graph_first_lane.get()),
+            0,
+            "a plain wheel moved the lanes sideways"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.handle_lane_scroll(&wheel(true), window, cx);
+        });
+        assert_eq!(
+            git_graph.read_with(&*cx, |graph, _| graph.graph_first_lane.get()),
+            1,
+            "Shift and the wheel did not walk the lane window"
+        );
+
+        // And it stops where the last lane meets the right edge.
+        for _ in 0..(furthest + 5) {
+            git_graph.update_in(cx, |graph, window, cx| {
+                graph.handle_lane_scroll(&wheel(true), window, cx);
+            });
+        }
+        assert_eq!(
+            git_graph.read_with(&*cx, |graph, _| graph.graph_first_lane.get()),
+            furthest,
+            "the lane window ran past the last lane"
+        );
+    }
+
     #[gpui::test]
     async fn test_every_node_sits_on_its_own_row(cx: &mut TestAppContext) {
         init_test(cx);
@@ -8878,9 +9712,10 @@ mod tests {
         let commits = generate_random_commit_dag(&mut rng, 40, true);
         let (git_graph, cx) = drawn_history(cx, commits, gpui::size(px(1200.), px(800.))).await;
 
-        let (metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
+        let (metrics, layout, lanes) = git_graph.update_in(cx, |graph, window, cx| {
             (
                 graph.row_metrics(window, cx),
+                graph.history_layout(window, cx),
                 graph
                     .graph_data
                     .commits
@@ -8894,6 +9729,7 @@ mod tests {
         assert!(drawn_rows > 0);
 
         let mut measured = 0;
+        let mut labels_drawn = 0;
         for idx in 0..drawn_rows {
             let Some(cell) = cx.debug_bounds(selector("GRAPH_CELL", idx)) else {
                 continue;
@@ -8914,7 +9750,8 @@ mod tests {
                 node.center().y,
                 cell.center().y
             );
-            let expected_x = cell.origin.x + metrics.lane_center(lanes[idx]) - metrics.node / 2.0;
+            let expected_x = cell.origin.x
+                + node_left(metrics, place_of(lanes[idx], layout), 0, layout.lane_cap);
             assert!(
                 (node.origin.x - expected_x).abs() < px(0.6),
                 "row {idx}: the node starts at {} where its lane puts it at {expected_x}",
@@ -8934,8 +9771,24 @@ mod tests {
                     );
                 }
             }
+
+            // A label names one commit. Drawn beside any other row it names the
+            // wrong one, which is worse than not being drawn at all.
+            if let Some(label) = cx.debug_bounds(selector("GRAPH_REFS", idx)) {
+                labels_drawn += 1;
+                assert!(
+                    (label.center().y - cell.center().y).abs() < px(0.6),
+                    "row {idx}: its label is centred at {} and the commit it names at {}",
+                    label.center().y,
+                    cell.center().y
+                );
+            }
         }
 
+        assert!(
+            labels_drawn > 0,
+            "no row carried a label, so nothing proved a label lands on its own row"
+        );
         let wanted = rows_a_pane_must_paint(px(800.), row_height).min(drawn_rows);
         assert!(
             measured >= wanted,
@@ -8961,9 +9814,9 @@ mod tests {
                 cx.run_until_parked();
             }
 
-            let (fit, metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
+            let (layout, metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
                 (
-                    HistoryFit::of(graph.history_width(window, cx)),
+                    graph.history_layout(window, cx),
                     graph.row_metrics(window, cx),
                     graph
                         .graph_data
@@ -8989,8 +9842,9 @@ mod tests {
                 let age = cx.debug_bounds(selector("GRAPH_AGE", idx));
                 assert_eq!(
                     age.is_some(),
-                    fit.shows_age(),
-                    "at {width:?} ({fit:?}) row {idx} disagrees about showing the age"
+                    matches!(layout.age, AgeShown::Column),
+                    "at {width:?} ({:?}) row {idx} disagrees about having an age column",
+                    layout.age
                 );
 
                 for name in ["GRAPH_CELL", "GRAPH_SUBJECT", "GRAPH_AGE", "GRAPH_REFS"] {
@@ -9011,11 +9865,51 @@ mod tests {
                     "at {width:?} the graph column collapsed to nothing"
                 );
 
+                // The areas of a row are laid side by side. One drawn over
+                // another is a label on a subject or a subject on an age, and
+                // no width should ever produce it.
+                let mut drawn: Vec<(&str, Bounds<Pixels>)> = Vec::new();
+                let columns: &[&str] = match layout.labels.has_a_column() {
+                    true => &["GRAPH_REFS", "GRAPH_CELL", "GRAPH_SUBJECT", "GRAPH_AGE"],
+                    // Too narrow for a column, the label rides inside the
+                    // subject, so it is checked against that instead.
+                    false => &["GRAPH_CELL", "GRAPH_SUBJECT", "GRAPH_AGE"],
+                };
+                for name in columns {
+                    if let Some(bounds) = cx.debug_bounds(selector(name, idx)) {
+                        drawn.push((name, bounds));
+                    }
+                }
+                if !layout.labels.has_a_column()
+                    && let (Some(label), Some(subject)) = (
+                        cx.debug_bounds(selector("GRAPH_REFS", idx)),
+                        cx.debug_bounds(selector("GRAPH_SUBJECT", idx)),
+                    )
+                {
+                    assert!(
+                        label.origin.x >= subject.origin.x - px(0.6)
+                            && label.origin.x + label.size.width
+                                <= subject.origin.x + subject.size.width + px(0.6),
+                        "at {width:?} on row {idx} the inline label is not inside the subject"
+                    );
+                }
+                for pair in drawn.windows(2) {
+                    let (before, after) = (pair[0], pair[1]);
+                    assert!(
+                        before.1.origin.x + before.1.size.width <= after.1.origin.x + px(0.6),
+                        "at {width:?} on row {idx} {} ends at {} and {} starts at {}",
+                        before.0,
+                        before.1.origin.x + before.1.size.width,
+                        after.0,
+                        after.1.origin.x
+                    );
+                }
+
                 let node = cx
                     .debug_bounds(selector("GRAPH_NODE", idx))
                     .unwrap_or_else(|| panic!("at {width:?} row {idx} painted no node"));
-                let expected_x =
-                    cell.origin.x + metrics.lane_center(lanes[idx]) - metrics.node / 2.0;
+                let expected_x = cell.origin.x
+                    + node_left(metrics, place_of(lanes[idx], layout), 0, layout.lane_cap);
                 assert!(
                     (node.origin.x - expected_x).abs() < px(0.6),
                     "at {width:?} the node on row {idx} starts at {} \
@@ -9026,9 +9920,8 @@ mod tests {
                 // Whenever the lanes fit at all, no commit may be left without a
                 // dot: a row whose node is off the edge reads as if nothing
                 // happened on it.
-                if metrics.width_for(lanes.iter().copied().max().unwrap_or(0) + 1)
-                    <= cell.size.width + px(0.6)
-                {
+                let shown = (lanes.iter().copied().max().unwrap_or(0) + 1).min(layout.lane_cap);
+                if metrics.width_for(shown) <= cell.size.width + px(0.6) {
                     assert!(
                         node.origin.x >= cell.origin.x - px(0.6)
                             && node.origin.x + node.size.width
