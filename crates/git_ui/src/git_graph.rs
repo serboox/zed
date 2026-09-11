@@ -4,6 +4,7 @@ use crate::{
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_status_icon,
+    project_diff::ProjectDiff,
 };
 use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
@@ -2305,6 +2306,14 @@ pub(crate) fn column_mask(layout: HistoryLayout) -> TableRow<bool> {
     )
 }
 
+/// What a node needs to look for a picture of its author.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitPortrait {
+    pub sha: SharedString,
+    pub author_email: Option<SharedString>,
+    pub remote: Option<GitRemote>,
+}
+
 /// Where a node's circle starts, inside the column showing `lane_cap` lanes
 /// from `first_lane`.
 pub(crate) fn node_left(
@@ -2319,6 +2328,25 @@ pub(crate) fn node_left(
         NodePlace::PastTheEdge => first_lane + lane_cap,
     };
     metrics.lane_center_in(column, first_lane) - metrics.node / 2.0
+}
+
+/// Whether this row shows its age.
+///
+/// A date on every row is noise in a list a reader scans by subject. Where
+/// there is no room for a column of them it earns its place on the row the
+/// reader picked, the row under the pointer, and on anything recent enough that
+/// "when" is the question being asked.
+pub(crate) fn age_is_shown(
+    age: AgeShown,
+    is_selected: bool,
+    is_hovered: bool,
+    is_fresh: bool,
+) -> bool {
+    match age {
+        AgeShown::Column => true,
+        AgeShown::WhereItMatters => is_selected || is_hovered || is_fresh,
+        AgeShown::Nowhere => false,
+    }
 }
 
 /// Whether a commit is recent enough that a reader is asking when rather than
@@ -2938,6 +2966,129 @@ impl GitGraph {
         )
     }
 
+    /// The row for what has not been committed yet.
+    ///
+    /// A history that starts at the last commit is missing the work its reader
+    /// is in the middle of. This row says how much there is and opens it.
+    ///
+    /// It is pinned above the list rather than being its first item: making it
+    /// an item would shift every index the selection, the keyboard, the search
+    /// and the scrolling are written in terms of, and a history that selects
+    /// the commit below the one that was clicked is worse than a row that does
+    /// not scroll away.
+    fn render_working_tree_row(
+        &self,
+        layout: HistoryLayout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let repository = self.get_repository(cx)?;
+        let changed = repository.read(cx).snapshot().status_summary().count;
+        if changed == 0 {
+            return None;
+        }
+
+        let metrics = self.row_metrics(window, cx);
+        let container = self.history_width(window, cx).max(px(1.));
+        let labels = self
+            .column_override
+            .get()
+            .unwrap_or(layout.label_width)
+            .min(container);
+        let first_lane = self.graph_first_lane.get();
+        let lane_cap = layout.lane_cap.max(1);
+        let lane = self
+            .graph_data
+            .commits
+            .first()
+            .map(|commit| commit.lane)
+            .unwrap_or(0);
+        let place = match lane >= first_lane && lane < first_lane + lane_cap {
+            true => NodePlace::InLane(lane),
+            false => NodePlace::PastTheEdge,
+        };
+        let colour = cx.theme().colors().text_accent;
+        let subject = match changed {
+            1 => "1 changed file".to_string(),
+            many => format!("{many} changed files"),
+        };
+        let workspace = self.workspace.clone();
+
+        Some(
+            h_flex()
+                .id("working-tree-row")
+                .debug_selector(|| "GRAPH_WORKING_TREE".to_string())
+                .h(metrics.row)
+                .w_full()
+                .flex_none()
+                .cursor_pointer()
+                .hover(|this| this.bg(cx.theme().colors().element_hover.opacity(0.6)))
+                .child(div().w(labels).h_full().flex_none())
+                .child(
+                    div()
+                        .relative()
+                        .h_full()
+                        .w(self.graph_column_width(window, layout))
+                        .flex_none()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .left(node_left(metrics, place, first_lane, lane_cap))
+                                .top((metrics.row - metrics.node) / 2.0)
+                                .size(metrics.node)
+                                .rounded_full()
+                                // Dashed, because it is not a commit: there is
+                                // nothing here to check out, revert or copy.
+                                .border_1()
+                                .border_dashed()
+                                .border_color(colour),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(2.))
+                                .h(metrics.label)
+                                .rounded_sm()
+                                .bg(colour.opacity(0.7)),
+                        )
+                        .child(Label::new(subject).color(Color::Accent).truncate()),
+                )
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            ProjectDiff::deploy_at(workspace, None, window, cx);
+                        })
+                        .ok();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The remote a picture of an author can be asked for, if the host has any.
+    fn avatar_remote(&self, cx: &mut Context<Self>) -> Option<GitRemote> {
+        let repository = self.get_repository(cx)?;
+        repository.update(cx, |repository, cx| {
+            let remote_url = repository.default_remote_url()?;
+            let registry = GitHostingProviderRegistry::default_global(cx);
+            let (provider, parsed) = parse_git_remote_url(registry, &remote_url)?;
+            Some(GitRemote {
+                host: provider,
+                owner: parsed.owner.into(),
+                repo: parsed.repo.into(),
+            })
+        })
+    }
+
     /// The branch `HEAD` is on, which decides which label is the current one.
     fn head_branch_name(&self, cx: &App) -> Option<SharedString> {
         self.get_repository(cx).and_then(|repository| {
@@ -3433,7 +3584,9 @@ impl GitGraph {
         metrics: GraphMetrics,
         layout: HistoryLayout,
         author: &SharedString,
-        cx: &App,
+        portrait: Option<CommitPortrait>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
         // The selected row's lines are drawn heavier. Hover is deliberately left
         // alone: a weight that changes under a moving pointer reads as the whole
@@ -3515,6 +3668,25 @@ impl GitGraph {
                             }),
                         ))
                     })
+                    // The initials are drawn first and stay drawn: a picture
+                    // that never arrives leaves a node that still says whose
+                    // commit it is, rather than a grey circle.
+                    .children(portrait.and_then(|portrait| {
+                        let avatar = CommitAvatar::new(
+                            &portrait.sha,
+                            portrait.author_email,
+                            portrait.remote.as_ref(),
+                        )
+                        .avatar(window, cx)?;
+                        Some(
+                            div()
+                                .absolute()
+                                .size_full()
+                                .rounded_full()
+                                .overflow_hidden()
+                                .child(avatar.size(metrics.node)),
+                        )
+                    }))
                     .when(!author.is_empty(), |this| {
                         this.tooltip(Tooltip::text(author))
                     }),
@@ -3533,6 +3705,7 @@ impl GitGraph {
         let head_branch_name = self.head_branch_name(cx);
         let layout = self.history_layout(window, cx);
         let age_has_a_column = matches!(layout.age, AgeShown::Column);
+        let remote = self.avatar_remote(cx);
         let metrics = self.row_metrics(window, cx);
         let now = OffsetDateTime::now_utc();
 
@@ -3573,9 +3746,13 @@ impl GitGraph {
                 let committed_on: Option<SharedString>;
                 let is_fresh: bool;
 
+                let mut author_email: Option<SharedString> = None;
+
                 if let CommitDataState::Loaded(ref data) = data {
                     subject = data.subject.clone();
                     author_name = data.author_name.clone();
+                    author_email =
+                        (!data.author_email.is_empty()).then(|| data.author_email.clone());
                     age = format_relative_timestamp(data.commit_timestamp, now).into();
                     committed_on = Some(format_timestamp(data.commit_timestamp).into());
                     is_fresh = is_younger_than_a_day(data.commit_timestamp, now);
@@ -3600,13 +3777,12 @@ impl GitGraph {
                 // subject. It earns its place where the reader is already
                 // looking, and on anything recent enough that "when" is the
                 // question being asked.
-                let shows_age = match layout.age {
-                    AgeShown::Column => true,
-                    AgeShown::WhereItMatters => {
-                        is_selected || self.hovered_entry_idx == Some(idx) || is_fresh
-                    }
-                    AgeShown::Nowhere => false,
-                };
+                let shows_age = age_is_shown(
+                    layout.age,
+                    is_selected,
+                    self.hovered_entry_idx == Some(idx),
+                    is_fresh,
+                );
 
                 let subject_label = if is_matched {
                     let query = match &self.search_state.state {
@@ -3675,7 +3851,21 @@ impl GitGraph {
                         ),
                         false => div().h(metrics.row).into_any_element(),
                     },
-                    self.render_graph_cell(idx, metrics, layout, &author_name, cx),
+                    self.render_graph_cell(
+                        idx,
+                        metrics,
+                        layout,
+                        &author_name,
+                        // Only for the rows on screen: a picture for a commit
+                        // nobody is looking at is a request nobody asked for.
+                        author_email.map(|author_email| CommitPortrait {
+                            sha: commit.data.sha.to_string().into(),
+                            author_email: Some(author_email),
+                            remote: remote.clone(),
+                        }),
+                        window,
+                        cx,
+                    ),
                     h_flex()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .debug_selector(move || format!("GRAPH_SUBJECT-{idx}"))
@@ -3685,6 +3875,17 @@ impl GitGraph {
                         .gap_1()
                         .px_1()
                         .overflow_hidden()
+                        // The tick carries the branch colour into the text, so
+                        // a reader following one branch down a long history can
+                        // keep to it without crossing back to the graph.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(2.))
+                                .h(metrics.label)
+                                .rounded_sm()
+                                .bg(accent_color.opacity(0.7)),
+                        )
                         .children(inline_label)
                         .child(
                             h_flex()
@@ -5158,9 +5359,22 @@ impl Render for GitGraph {
                     } else {
                         cx.theme().colors().element_hover
                     };
+                    // Faint enough to be read as "which branch" rather than as
+                    // "look here": the selection and the pointer are what say
+                    // look here, and they paint over this.
+                    let band = weak.upgrade().and_then(|graph| {
+                        let commit = graph.read(cx).graph_data.commits.get(index)?.clone();
+                        Some(
+                            cx.theme()
+                                .accents()
+                                .color_for_index(commit.color_idx as u32)
+                                .opacity(0.05),
+                        )
+                    });
 
                     row.h(row_height)
                         .cursor_pointer()
+                        .when_some(band, |row, band| row.bg(band))
                         .when(is_selected || is_context_menu_target, |row| {
                             row.bg(selected_bg)
                         })
@@ -5219,25 +5433,30 @@ impl Render for GitGraph {
             h_flex()
                 .size_full()
                 .child(
-                    v_flex().flex_1().min_w_0().size_full().child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .w_full()
-                            .overflow_hidden()
-                            .on_scroll_wheel(cx.listener(Self::handle_lane_scroll))
-                            .child(self.measure_history_width())
-                            .child(
-                                div()
-                                    .tab_index(2)
-                                    .tab_group()
-                                    .tab_stop(false)
-                                    .size_full()
-                                    .child(commits_table),
-                            )
-                            .children(self.render_label_divider(layout, cx))
-                            .children(self.render_lane_scrollbar(layout, window, cx)),
-                    ),
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .size_full()
+                        .children(self.render_working_tree_row(layout, window, cx))
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .w_full()
+                                .overflow_hidden()
+                                .on_scroll_wheel(cx.listener(Self::handle_lane_scroll))
+                                .child(self.measure_history_width())
+                                .child(
+                                    div()
+                                        .tab_index(2)
+                                        .tab_group()
+                                        .tab_stop(false)
+                                        .size_full()
+                                        .child(commits_table),
+                                )
+                                .children(self.render_label_divider(layout, cx))
+                                .children(self.render_lane_scrollbar(layout, window, cx)),
+                        ),
                 )
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
                     this.commit_details_split_state.update(cx, |state, cx| {
@@ -8873,6 +9092,16 @@ mod tests {
         commits: Vec<Arc<InitialGraphCommitData>>,
         size: gpui::Size<Pixels>,
     ) -> (Entity<GitGraph>, &mut VisualTestContext) {
+        drawn_history_with_changes(cx, commits, &[], size).await
+    }
+
+    /// The same, over a working tree with something in it.
+    async fn drawn_history_with_changes<'a>(
+        cx: &'a mut TestAppContext,
+        commits: Vec<Arc<InitialGraphCommitData>>,
+        changed: &[(&str, FileStatus)],
+        size: gpui::Size<Pixels>,
+    ) -> (Entity<GitGraph>, &'a mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             Path::new("/project"),
@@ -8884,6 +9113,15 @@ mod tests {
         .await;
 
         fs.set_graph_commits(Path::new("/project/.git"), commits);
+        // Committed and unchanged, so that a working tree is only dirty when a
+        // test says it is.
+        fs.set_head_and_index_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+        );
+        if !changed.is_empty() {
+            fs.set_status_for_repo(Path::new("/project/.git"), changed);
+        }
 
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
         cx.run_until_parked();
@@ -9152,6 +9390,70 @@ mod tests {
             "a-very-long…"
         );
         assert_eq!(shorten_ref("", LabelMode::Abbreviated).as_ref(), "");
+    }
+
+    #[gpui::test]
+    fn test_where_an_age_earns_its_place(_cx: &mut TestAppContext) {
+        // With a column of its own, every row has one.
+        for row in [(false, false, false), (true, false, false)] {
+            assert!(age_is_shown(AgeShown::Column, row.0, row.1, row.2));
+        }
+
+        // Without one, only where the reader is looking or where the commit is
+        // recent enough for "when" to be the question.
+        assert!(!age_is_shown(AgeShown::WhereItMatters, false, false, false));
+        assert!(age_is_shown(AgeShown::WhereItMatters, true, false, false));
+        assert!(age_is_shown(AgeShown::WhereItMatters, false, true, false));
+        assert!(age_is_shown(AgeShown::WhereItMatters, false, false, true));
+
+        // And where there is no room at all, nowhere.
+        assert!(!age_is_shown(AgeShown::Nowhere, true, true, true));
+    }
+
+    #[gpui::test]
+    fn test_yesterday_is_fresh_and_last_week_is_not(_cx: &mut TestAppContext) {
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000_000).expect("a valid instant");
+        let ago = |seconds: i64| is_younger_than_a_day(1_000_000_000 - seconds, now);
+
+        assert!(ago(0));
+        assert!(ago(23 * 60 * 60));
+        assert!(!ago(24 * 60 * 60));
+        assert!(!ago(7 * 24 * 60 * 60));
+    }
+
+    #[gpui::test]
+    fn test_one_graph_gives_one_set_of_colours_however_it_arrives(_cx: &mut TestAppContext) {
+        for seed in 0..8u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let commits = generate_random_commit_dag(&mut rng, 90, true);
+
+            let mut whole = GraphData::new(13);
+            whole.add_commits(&commits);
+            let at_once: Vec<(usize, usize)> = whole
+                .commits
+                .iter()
+                .map(|commit| (commit.lane, commit.color_idx))
+                .collect();
+
+            // The same history, streamed in the chunks a repository sends.
+            for chunk in [1usize, 7, 30] {
+                let mut streamed = GraphData::new(13);
+                for part in commits.chunks(chunk) {
+                    streamed.add_commits(part);
+                }
+                let in_parts: Vec<(usize, usize)> = streamed
+                    .commits
+                    .iter()
+                    .map(|commit| (commit.lane, commit.color_idx))
+                    .collect();
+
+                assert_eq!(
+                    at_once, in_parts,
+                    "seed {seed}: a history arriving in chunks of {chunk} is not \
+                     drawn the same as one that arrived whole"
+                );
+            }
+        }
     }
 
     #[gpui::test]
@@ -9583,6 +9885,50 @@ mod tests {
             graph.history_layout(window, cx).label_width
         });
         assert_eq!(back, chosen, "the automatic width did not come back");
+    }
+
+    #[gpui::test]
+    async fn test_the_work_in_progress_row(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Nothing uncommitted: the history starts at its first commit.
+        {
+            let (_graph, cx) =
+                drawn_history(cx, unlabelled_commits(8), gpui::size(px(1200.), px(700.))).await;
+            assert!(
+                cx.debug_bounds("GRAPH_WORKING_TREE").is_none(),
+                "a clean working tree drew a row for work that is not there"
+            );
+        }
+
+        let (_graph, cx) = drawn_history_with_changes(
+            cx,
+            unlabelled_commits(8),
+            &[
+                ("file.txt", FileStatus::Untracked),
+                ("other.txt", FileStatus::Untracked),
+            ],
+            gpui::size(px(1200.), px(700.)),
+        )
+        .await;
+
+        let wip = cx
+            .debug_bounds("GRAPH_WORKING_TREE")
+            .expect("two changed files should be worth a row");
+        let first_commit = cx
+            .debug_bounds(selector("GRAPH_CELL", 0))
+            .expect("the first commit should have been painted");
+        assert!(
+            wip.origin.y + wip.size.height <= first_commit.origin.y + px(0.6),
+            "the work in progress is drawn at {} and the first commit at {}; \
+             what is not committed yet belongs above what is",
+            wip.origin.y,
+            first_commit.origin.y
+        );
+        assert_eq!(
+            wip.size.height, first_commit.size.height,
+            "the row for uncommitted work is not the height of a row"
+        );
     }
 
     #[gpui::test]
