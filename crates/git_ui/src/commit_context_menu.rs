@@ -4,6 +4,7 @@ use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity,
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
 use git::repository::ResetMode;
+use std::rc::Rc;
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{App, Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
 use workspace::Workspace;
@@ -44,6 +45,9 @@ pub(crate) fn commit_context_menu(
     focus_handle: FocusHandle,
     repository: Option<WeakEntity<Repository>>,
     workspace: WeakEntity<Workspace>,
+    // What "Solo" does, where the view offers it. The panel has no filter of
+    // its own, so it passes nothing and the entry does not appear.
+    solo: Option<Rc<dyn Fn(SharedString, &mut App)>>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
@@ -142,6 +146,7 @@ pub(crate) fn commit_context_menu(
                     ref_name.clone(),
                     repository.clone(),
                     workspace.clone(),
+                    solo.clone(),
                 )
             })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
@@ -261,6 +266,7 @@ fn git_context_menu_tasks(
 ///
 /// Everything here goes through the same `Repository` calls the panel uses, so
 /// an error reads the same wherever it came from.
+#[allow(clippy::too_many_arguments)]
 fn git_actions_menu(
     menu: ContextMenu,
     sha: Oid,
@@ -268,6 +274,7 @@ fn git_actions_menu(
     ref_name: Option<SharedString>,
     repository: Option<WeakEntity<Repository>>,
     workspace: WeakEntity<Workspace>,
+    solo: Option<Rc<dyn Fn(SharedString, &mut App)>>,
 ) -> ContextMenu {
     let Some(repository) = repository else {
         return menu;
@@ -288,6 +295,7 @@ fn git_actions_menu(
     let menu = match ref_name {
         None => menu,
         Some(name) => {
+            let name_for_solo = name.clone();
             let checkout = (name.clone(), repository.clone());
             let branch_from = (name.clone(), repository.clone());
             let rename = (name.clone(), repository.clone());
@@ -348,6 +356,12 @@ fn git_actions_menu(
                         // merged is worth refusing rather than losing.
                         repository.delete_branch(false, name.to_string(), false)
                     });
+                })
+                .when_some(solo, |menu, solo| {
+                    let name = name_for_solo.clone();
+                    menu.entry("Solo", None, move |_window, cx| {
+                        solo(name.clone(), cx);
+                    })
                 })
                 .entry("Push", None, move |window, cx| {
                     dispatch_git(&push, window, cx, git::Push.boxed_clone());

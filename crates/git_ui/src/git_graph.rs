@@ -2294,6 +2294,48 @@ pub(crate) fn chip_chrome(metrics: GraphMetrics, _kind: RefKind) -> Pixels {
     metrics.label + px(18.)
 }
 
+/// What a reader has asked the history to leave out.
+///
+/// Hiding a branch takes its rows out of the list rather than dimming them: a
+/// reader filtering a history of a hundred thousand commits wants the scrolling
+/// to get shorter, not the same scrolling with less to read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HistoryFilter {
+    /// Branch tips whose rows are left out.
+    pub hidden: Vec<SharedString>,
+    /// One branch, and only it.
+    pub solo: Option<SharedString>,
+    /// Remote-tracking refs are not labelled. Their commits stay: a remote ref
+    /// and a local branch of the same name usually name the same commit, and a
+    /// reader hiding the remote one does not mean to lose the local one.
+    pub hide_remotes: bool,
+    /// The same for tags.
+    pub hide_tags: bool,
+}
+
+impl HistoryFilter {
+    pub(crate) fn is_on(&self) -> bool {
+        !self.hidden.is_empty() || self.solo.is_some() || self.hide_remotes || self.hide_tags
+    }
+
+    /// Whether a label of this kind is drawn at all.
+    pub(crate) fn shows(&self, kind: RefKind) -> bool {
+        match kind {
+            RefKind::Remote => !self.hide_remotes,
+            RefKind::Tag => !self.hide_tags,
+            _ => true,
+        }
+    }
+
+    /// Whether the rows of a branch are left in.
+    pub(crate) fn keeps(&self, name: &SharedString) -> bool {
+        match &self.solo {
+            Some(only) => only == name,
+            None => !self.hidden.contains(name),
+        }
+    }
+}
+
 /// Which columns the table draws. `true` means hidden, which is what the
 /// table's filter reads.
 pub(crate) fn column_mask(layout: HistoryLayout) -> TableRow<bool> {
@@ -2675,6 +2717,12 @@ pub struct GitGraph {
     workspace: WeakEntity<Workspace>,
     context_menu: Option<GitGraphContextMenu>,
     table_interaction_state: Entity<TableInteractionState>,
+    /// What the reader has asked the history to leave out.
+    filter: HistoryFilter,
+    /// The rows the filter leaves, in order, or `None` when it leaves them all.
+    /// The list is laid out over this; everything else counts in rows of the
+    /// history itself, and the two meet only where the list is addressed.
+    kept_rows: Option<Rc<Vec<usize>>>,
     /// Every row the reader has picked with Ctrl or Shift, for the commands
     /// that act on more than one commit. Empty means the selection is the one
     /// row the card is showing.
@@ -2726,6 +2774,7 @@ impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_first_lane.set(0);
         self.lit_branch = None;
+        self.kept_rows = None;
         self.graph_data.clear();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
@@ -3216,6 +3265,232 @@ impl GitGraph {
         .detach();
     }
 
+    /// What is being left out, and the one click that puts it all back.
+    ///
+    /// Shown only while something is filtered: a row of switches that are all
+    /// off most of the time is a row spent saying nothing.
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let filter = &self.filter;
+        let mut says = Vec::new();
+        if let Some(solo) = &filter.solo {
+            says.push(format!("only {solo}"));
+        }
+        match filter.hidden.len() {
+            0 => {}
+            1 => says.push(format!("{} hidden", filter.hidden[0])),
+            many => says.push(format!("{many} branches hidden")),
+        }
+        if filter.hide_remotes {
+            says.push("remotes unlabelled".to_string());
+        }
+        if filter.hide_tags {
+            says.push("tags unlabelled".to_string());
+        }
+        if says.is_empty() {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .id("history-filter-bar")
+                .debug_selector(|| "GRAPH_FILTER_BAR".to_string())
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().colors().element_selected.opacity(0.5))
+                .child(
+                    Label::new(says.join(" · "))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+                .child(div().flex_1())
+                .child(
+                    IconButton::new("clear-history-filter", IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Show everything again"))
+                        .on_click(cx.listener(|this, _, _window, cx| this.clear_filter(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The two switches that are about whole kinds of label rather than one
+    /// branch.
+    fn render_label_switches(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .gap_0p5()
+            .items_center()
+            .child(
+                IconButton::new("hide-remotes", IconName::Server)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(match self.filter.hide_remotes {
+                        true => Color::Disabled,
+                        false => Color::Muted,
+                    })
+                    .tooltip(Tooltip::text(match self.filter.hide_remotes {
+                        true => "Label remote branches",
+                        false => "Stop labelling remote branches",
+                    }))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.filter.hide_remotes = !this.filter.hide_remotes;
+                        this.apply_filter(cx);
+                    })),
+            )
+            .child(
+                IconButton::new("hide-tags", IconName::Bookmark)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(match self.filter.hide_tags {
+                        true => Color::Disabled,
+                        false => Color::Muted,
+                    })
+                    .tooltip(Tooltip::text(match self.filter.hide_tags {
+                        true => "Label tags",
+                        false => "Stop labelling tags",
+                    }))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.filter.hide_tags = !this.filter.hide_tags;
+                        this.apply_filter(cx);
+                    })),
+            )
+    }
+
+    /// Works out which rows the filter leaves, and hands the list its new
+    /// length. Called whenever the filter changes or the history grows.
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {
+        if !self.filter.is_on() {
+            self.kept_rows = None;
+            cx.notify();
+            return;
+        }
+
+        let head = self.head_branch_name(cx);
+        // Every branch the filter has an opinion about, and the rows behind it.
+        let mut keep: Option<HashSet<usize>> = None;
+        let mut drop: HashSet<usize> = HashSet::default();
+        let mut gave_up = false;
+
+        for row in 0..self.graph_data.commits.len() {
+            let Some(commit) = self.graph_data.commits.get(row) else {
+                break;
+            };
+            if commit.data.ref_names.is_empty() {
+                continue;
+            }
+            let names: Vec<SharedString> = commit
+                .data
+                .ref_names
+                .iter()
+                .filter_map(|name| {
+                    read_ref(name.as_ref(), head.as_deref(), &self.remote_names)
+                        .map(|(_, read)| read)
+                })
+                .collect();
+
+            for name in names {
+                let Some(reached) = self.graph_data.branch_of(row, Self::BRANCH_WALK_BUDGET) else {
+                    gave_up = true;
+                    continue;
+                };
+                match self.filter.solo.as_ref() {
+                    // Soloing one branch decides the whole of what is kept.
+                    Some(only) if *only == name => {
+                        keep.get_or_insert_with(HashSet::default).extend(reached);
+                    }
+                    Some(_) => {}
+                    None if !self.filter.keeps(&name) => drop.extend(reached),
+                    None => {}
+                }
+            }
+        }
+
+        // A history too large to walk keeps everything rather than losing rows
+        // the reader did not ask to lose.
+        if gave_up && keep.is_none() {
+            self.kept_rows = None;
+            cx.notify();
+            return;
+        }
+
+        let kept: Vec<usize> = (0..self.graph_data.commits.len())
+            .filter(|row| match &keep {
+                Some(keep) => keep.contains(row),
+                None => !drop.contains(row),
+            })
+            .collect();
+
+        self.kept_rows = Some(Rc::new(kept));
+        // The selection is in rows of the history, and the row it names may
+        // have just been filtered away.
+        if let Some(selected) = self.selected_entry_idx
+            && self.list_row_of(selected).is_none()
+        {
+            self.selected_entry_idx = None;
+            self.compare_against = None;
+        }
+        let picked: Vec<usize> = self
+            .picked_rows
+            .iter()
+            .copied()
+            .filter(|row| self.list_row_of(*row).is_some())
+            .collect();
+        self.picked_rows = picked;
+        cx.notify();
+    }
+
+    /// How many rows the list has.
+    fn rows_in_the_list(&self, all: usize) -> usize {
+        match &self.kept_rows {
+            Some(kept) => kept.len(),
+            None => all,
+        }
+    }
+
+    /// The row of the history the list is showing at this position.
+    fn row_at(&self, in_the_list: usize) -> Option<usize> {
+        match &self.kept_rows {
+            Some(kept) => kept.get(in_the_list).copied(),
+            None => (in_the_list < self.graph_data.commits.len()).then_some(in_the_list),
+        }
+    }
+
+    /// Where in the list a row of the history is, if the filter left it.
+    fn list_row_of(&self, row: usize) -> Option<usize> {
+        match &self.kept_rows {
+            Some(kept) => kept.binary_search(&row).ok(),
+            None => (row < self.graph_data.commits.len()).then_some(row),
+        }
+    }
+
+    /// Hides a branch, or brings it back.
+    fn toggle_hidden(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        match self.filter.hidden.iter().position(|hidden| *hidden == name) {
+            Some(at) => {
+                self.filter.hidden.remove(at);
+            }
+            None => self.filter.hidden.push(name),
+        }
+        self.apply_filter(cx);
+    }
+
+    /// Leaves one branch on screen, or puts the rest back.
+    fn toggle_solo(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.filter.solo = match self.filter.solo.as_ref() == Some(&name) {
+            true => None,
+            false => Some(name),
+        };
+        self.apply_filter(cx);
+    }
+
+    /// Puts every row back.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.filter = HistoryFilter::default();
+        self.apply_filter(cx);
+    }
+
     /// The commits a command opened over `idx` should act on, oldest last,
     /// which is the order the history is drawn in.
     fn picked_commits(&self, idx: usize) -> Vec<Oid> {
@@ -3488,6 +3763,8 @@ impl GitGraph {
             _commit_diff_task: None,
             context_menu: None,
             table_interaction_state,
+            filter: HistoryFilter::default(),
+            kept_rows: None,
             picked_rows: Vec::new(),
             compare_against: None,
             lit_branch: None,
@@ -3578,6 +3855,10 @@ impl GitGraph {
                     }
                     GitGraphEvent::CountUpdated(commit_count) => {
                         let old_count = self.graph_data.commits.len();
+                        // The rows a filter leaves have to keep up with the rows
+                        // arriving, or a filtered history stops growing where
+                        // the reader cannot see why.
+                        let refilter = self.filter.is_on();
 
                         if let Some(pending_selection_index) =
                             repository.update(cx, |repository, cx| {
@@ -3610,6 +3891,9 @@ impl GitGraph {
                             self.pending_select_sha.take();
                         }
 
+                        if refilter {
+                            self.apply_filter(cx);
+                        }
                         cx.notify();
                     }
                 }
@@ -3666,6 +3950,8 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_head = kind == RefKind::Head;
+        let is_hidden = self.filter.hidden.contains(name);
+        let is_solo = self.filter.solo.as_ref() == Some(name);
         let shortened = shorten_ref(name.as_ref(), mode);
         let chip = Chip::new(shortened.clone())
             .label_size(LabelSize::Small)
@@ -3681,15 +3967,47 @@ impl GitGraph {
             });
 
         let ref_name = name.clone();
-        div()
+        h_flex()
             .id(ElementId::Name(
                 format!("ref-chip-{commit_idx}-{name}").into(),
             ))
+            .gap_0p5()
+            .items_center()
             .cursor_pointer()
+            .when(is_hidden, |this| this.opacity(0.5))
             .child(chip)
             .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
                 this.light_branch(hovering.then_some(commit_idx), cx);
             }))
+            .child(
+                // The eye carries the state a reader set: a hidden branch is
+                // greyed, a soloed one wears the accent, and both say so on the
+                // label rather than in a list somewhere else.
+                IconButton::new(
+                    ElementId::Name(format!("hide-{commit_idx}-{name}").into()),
+                    match is_hidden {
+                        true => IconName::EyeOff,
+                        false => IconName::Eye,
+                    },
+                )
+                .icon_size(IconSize::XSmall)
+                .icon_color(match (is_hidden, is_solo) {
+                    (true, _) => Color::Disabled,
+                    (_, true) => Color::Accent,
+                    _ => Color::Muted,
+                })
+                .tooltip(Tooltip::text(match is_hidden {
+                    true => "Show this branch",
+                    false => "Hide this branch",
+                }))
+                .on_click({
+                    let ref_name = ref_name.clone();
+                    cx.listener(move |this, _, _window, cx| {
+                        this.toggle_hidden(ref_name.clone(), cx);
+                        cx.stop_propagation();
+                    })
+                }),
+            )
             .on_click(cx.listener({
                 let ref_name = ref_name.clone();
                 move |this, event: &ClickEvent, window, cx| {
@@ -3736,6 +4054,7 @@ impl GitGraph {
             .filter_map(|decoration| {
                 read_ref(decoration.as_ref(), head_branch_name, &self.remote_names)
             })
+            .filter(|(kind, _)| self.filter.shows(*kind))
             .collect();
         refs.sort_by_key(|(kind, _)| *kind);
         refs
@@ -3999,9 +4318,12 @@ impl GitGraph {
         }
 
         range
-            .map(|idx| {
-                let Some((commit, repository)) =
-                    self.graph_data.commits.get(idx).zip(repository.as_ref())
+            .map(|in_the_list| {
+                let Some((commit, repository, idx)) = self
+                    .row_at(in_the_list)
+                    .and_then(|idx| self.graph_data.commits.get(idx).map(|commit| (commit, idx)))
+                    .zip(repository.as_ref())
+                    .map(|((commit, idx), repository)| (commit, repository, idx))
                 else {
                     return (0..TABLE_COLUMN_COUNT)
                         .map(|_| div().h(metrics.row).into_any_element())
@@ -4735,6 +5057,14 @@ impl GitGraph {
             self.focus_handle.clone(),
             repository,
             self.workspace.clone(),
+            Some(Rc::new({
+                let graph = cx.weak_entity();
+                move |name: SharedString, cx: &mut App| {
+                    graph
+                        .update(cx, |graph, cx| graph.toggle_solo(name.clone(), cx))
+                        .ok();
+                }
+            })),
             window,
             cx,
         );
@@ -4823,6 +5153,7 @@ impl GitGraph {
                         query_focus_handle,
                     )),
             )
+            .child(self.render_label_switches(cx))
             .child(
                 h_flex()
                     .min_w_64()
@@ -5651,6 +5982,7 @@ impl Render for GitGraph {
                 })
         } else {
             let layout = self.history_layout(window, cx);
+            let rows_in_the_list = self.rows_in_the_list(commit_count);
             let column_filter = column_mask(layout);
             let table_width_config =
                 ColumnWidthConfig::explicit(self.table_column_widths(window, cx, layout));
@@ -5675,7 +6007,13 @@ impl Render for GitGraph {
                 .hide_row_hover()
                 .width_config(table_width_config)
                 .column_filter(column_filter)
-                .map_row(move |(index, row), window, cx| {
+                .map_row(move |(in_the_list, row), window, cx| {
+                    // The list counts the rows it was given; everything else in
+                    // the view counts rows of the history.
+                    let index = weak_self
+                        .upgrade()
+                        .and_then(|graph| graph.read(cx).row_at(in_the_list))
+                        .unwrap_or(in_the_list);
                     let is_selected = selected_entry_idx == Some(index);
                     let is_hovered = hovered_entry_idx == Some(index);
                     let is_context_menu_target = context_menu_target_index == Some(index);
@@ -5771,7 +6109,7 @@ impl Render for GitGraph {
                 })
                 .uniform_list(
                     "git-graph-commits",
-                    commit_count,
+                    rows_in_the_list,
                     cx.processor(Self::render_table_rows),
                 );
 
@@ -5864,6 +6202,7 @@ impl Render for GitGraph {
                 v_flex()
                     .size_full()
                     .child(self.render_search_bar(cx))
+                    .children(self.render_filter_bar(cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -10276,6 +10615,128 @@ mod tests {
             // Row 2 was merged in, so nothing has it as a first parent.
             assert_eq!(graph.first_child_of(2), None);
             assert_eq!(graph.first_parent_of(4), None);
+        });
+    }
+
+    /// main with a side branch, and a remote-tracking ref of the same name as
+    /// the local branch -- the case the reference client is criticised for
+    /// getting wrong.
+    fn labelled_commits() -> Vec<Arc<InitialGraphCommitData>> {
+        let mut rng = StdRng::seed_from_u64(53);
+        let oids: Vec<Oid> = (0..6).map(|_| Oid::random(&mut rng)).collect();
+        let of = |idx: usize, parents: SmallVec<[Oid; 1]>, refs: Vec<SharedString>| {
+            Arc::new(InitialGraphCommitData {
+                sha: oids[idx],
+                parents,
+                ref_names: refs,
+            })
+        };
+        vec![
+            of(
+                0,
+                smallvec![oids[1], oids[2]],
+                vec!["main".into(), "origin/main".into()],
+            ),
+            of(1, smallvec![oids[4]], vec![]),
+            of(2, smallvec![oids[3]], vec!["feature".into()]),
+            of(3, smallvec![oids[4]], vec![]),
+            of(4, smallvec![oids[5]], vec!["tag: v1.0".into()]),
+            of(5, smallvec![], vec![]),
+        ]
+    }
+
+    #[gpui::test]
+    async fn test_hiding_a_branch_takes_its_rows_out(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            let all = graph.graph_data.commits.len();
+            assert_eq!(graph.rows_in_the_list(all), all);
+
+            // The side branch goes, and what it shares with main stays: rows 4
+            // and 5 are behind both.
+            graph.toggle_hidden("feature".into(), cx);
+            let kept: Vec<usize> = (0..graph.rows_in_the_list(all))
+                .filter_map(|at| graph.row_at(at))
+                .collect();
+            assert_eq!(
+                kept,
+                vec![0, 1],
+                "hiding one branch took rows that other branches reach too"
+            );
+
+            // And it comes back.
+            graph.toggle_hidden("feature".into(), cx);
+            assert_eq!(graph.rows_in_the_list(all), all);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_soloing_a_branch_leaves_only_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            let all = graph.graph_data.commits.len();
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+
+            graph.toggle_solo("feature".into(), cx);
+            let kept: Vec<usize> = (0..graph.rows_in_the_list(all))
+                .filter_map(|at| graph.row_at(at))
+                .collect();
+            assert_eq!(
+                kept,
+                vec![2, 3, 4, 5],
+                "soloing a branch did not leave exactly what is behind its tip"
+            );
+
+            // The selection named a row the filter took away, so it lets go
+            // rather than pointing at a row that is no longer in the list.
+            assert_eq!(graph.selected_entry_idx, None);
+
+            graph.toggle_solo("feature".into(), cx);
+            assert_eq!(graph.rows_in_the_list(all), all);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unlabelling_remotes_leaves_the_local_branch_alone(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.remote_names = vec!["origin".into()];
+
+            let labels = |graph: &GitGraph| -> Vec<(RefKind, SharedString)> {
+                graph.refs_of(0, Some("main"))
+            };
+            assert_eq!(labels(graph).len(), 2, "the fixture needs both labels");
+
+            graph.filter.hide_remotes = true;
+            graph.apply_filter(cx);
+
+            let left = labels(graph);
+            assert_eq!(
+                left,
+                vec![(RefKind::Head, "main".into())],
+                "unlabelling the remotes took the local branch of the same name with it"
+            );
+            // And no row went anywhere: this is about labels, not commits.
+            assert_eq!(
+                graph.rows_in_the_list(graph.graph_data.commits.len()),
+                graph.graph_data.commits.len()
+            );
+
+            graph.filter.hide_tags = true;
+            graph.apply_filter(cx);
+            assert!(
+                graph.refs_of(4, Some("main")).is_empty(),
+                "the tag is still labelled"
+            );
         });
     }
 
