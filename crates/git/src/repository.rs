@@ -524,6 +524,15 @@ pub struct CommitDetails {
     pub author_name: SharedString,
 }
 
+/// Which listing of changes to ask git for.
+#[derive(Debug, Clone)]
+pub enum RawDiff {
+    /// What one commit changed.
+    Of(String),
+    /// What is different between two commits.
+    Between(String, String),
+}
+
 #[derive(Debug)]
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
@@ -982,7 +991,23 @@ pub trait GitRepository: Send + Sync {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
-    fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>>;
+    fn load_raw_diff(&self, what: RawDiff, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// What one commit changed, against its first parent.
+    fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
+        self.load_raw_diff(RawDiff::Of(commit), cx)
+    }
+
+    /// What is different between two commits, in the same shape, so one card
+    /// can show either.
+    fn load_diff(
+        &self,
+        from: String,
+        to: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        self.load_raw_diff(RawDiff::Between(from, to), cx)
+    }
     fn blame(
         &self,
         path: RepoPath,
@@ -1475,11 +1500,13 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
+    fn load_raw_diff(&self, what: RawDiff, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
         let git = self.git_binary();
         cx.background_spawn(async move {
-            let show_output = git
-                .build_command(&[
+            let mut command = match &what {
+                // A commit is read against its first parent, which is what the
+                // history draws it as.
+                RawDiff::Of(_) => git.build_command(&[
                     "show",
                     "--format=",
                     "-z",
@@ -1487,17 +1514,25 @@ impl GitRepository for RealGitRepository {
                     "--raw",
                     "--no-abbrev",
                     "--first-parent",
-                ])
-                .arg(&commit)
+                ]),
+                RawDiff::Between(_, _) => {
+                    git.build_command(&["diff", "-z", "--no-renames", "--raw", "--no-abbrev"])
+                }
+            };
+            match &what {
+                RawDiff::Of(commit) => command.arg(commit),
+                RawDiff::Between(from, to) => command.arg(from).arg(to),
+            };
+            let show_output = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .context("starting git show process")?;
+                .context("starting the git process that lists what changed")?;
             anyhow::ensure!(
                 show_output.status.success(),
-                "git show failed: {}",
+                "git failed to list what changed: {}",
                 String::from_utf8_lossy(&show_output.stderr)
             );
 

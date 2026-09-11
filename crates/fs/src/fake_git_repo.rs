@@ -173,9 +173,9 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
-    fn load_commit(
+    fn load_raw_diff(
         &self,
-        _commit: String,
+        _what: git::repository::RawDiff,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
         async { Ok(git::repository::CommitDiff { files: Vec::new() }) }.boxed()

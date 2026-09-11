@@ -6192,6 +6192,28 @@ impl Repository {
         })
     }
 
+    /// What is different between two commits.
+    ///
+    /// Only answered for a repository on this machine: a project opened over a
+    /// remote has no message for it yet, and saying so is better than showing a
+    /// comparison of nothing.
+    pub fn load_diff_between(
+        &mut self,
+        from: String,
+        to: String,
+    ) -> oneshot::Receiver<Result<CommitDiff>> {
+        self.send_job("load_diff_between", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.load_diff(from, to, cx).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("comparing two commits is not available over a remote project")
+                }
+            }
+        })
+    }
+
     pub fn load_commit_diff(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDiff>> {
         let id = self.id;
         self.send_job("load_commit_diff", None, move |git_repo, cx| async move {

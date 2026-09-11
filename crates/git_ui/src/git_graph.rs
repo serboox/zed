@@ -589,6 +589,10 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Selects the first parent of the selected commit, staying on its branch.
+        SelectFirstParent,
+        /// Selects the commit that has the selected one as its first parent.
+        SelectFirstChild,
     ]
 );
 
@@ -1060,6 +1064,90 @@ impl GraphData {
             .get(row)
             .map(|at| at.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Every row a branch tip reaches by following parents.
+    ///
+    /// Answered by one forward pass, because a parent always sits on a later
+    /// row than its child in the layout these rows come from: a row that has
+    /// been reached passes the mark on to its parents, and rows are visited in
+    /// order. `budget` stops a history too large to answer for; the caller is
+    /// expected to show nothing rather than a wrong answer.
+    pub(crate) fn branch_of(&self, tip_row: usize, budget: usize) -> Option<HashSet<usize>> {
+        if tip_row >= self.commits.len() {
+            return None;
+        }
+
+        let mut reached: HashSet<usize> = HashSet::default();
+        reached.insert(tip_row);
+        let mut pending = 1usize;
+
+        for row in tip_row..self.commits.len() {
+            if pending == 0 {
+                break;
+            }
+            if !reached.contains(&row) {
+                continue;
+            }
+            pending -= 1;
+
+            let commit = self.commits.get(row)?;
+            for parent in commit.data.parents.iter() {
+                let Some(parent_row) = self.row_of_commit.get(parent).copied() else {
+                    // The parent has not been streamed in yet, so this is all
+                    // of the branch that can be answered for.
+                    continue;
+                };
+                if reached.insert(parent_row) {
+                    if reached.len() > budget {
+                        return None;
+                    }
+                    pending += 1;
+                }
+            }
+        }
+
+        Some(reached)
+    }
+
+    /// The nearest branch tip that has the given row in it, walking towards the
+    /// children -- the answer to "which branch is this commit on" for a commit
+    /// that carries no label of its own.
+    pub(crate) fn nearest_tip(&self, row: usize, budget: usize) -> Option<usize> {
+        if row >= self.commits.len() {
+            return None;
+        }
+
+        let mut seen: HashSet<usize> = HashSet::default();
+        let mut front = vec![row];
+        seen.insert(row);
+
+        for _ in 0..budget {
+            let mut next = Vec::new();
+            for at in front.drain(..) {
+                let commit = self.commits.get(at)?;
+                if at != row && !commit.data.ref_names.is_empty() {
+                    return Some(at);
+                }
+                let Some(children) = self.rows_naming_parent.get(&commit.data.sha) else {
+                    continue;
+                };
+                for child in children.iter() {
+                    if seen.insert(*child) {
+                        next.push(*child);
+                    }
+                }
+            }
+            if next.is_empty() {
+                return None;
+            }
+            // Nearest first: the rows closest to this one are the ones a reader
+            // would call the branch it is on.
+            next.sort_unstable();
+            front = next;
+        }
+
+        None
     }
 
     /// The rows holding the branch a merge brought in: everything the merge's
@@ -2669,6 +2757,13 @@ pub struct GitGraph {
     workspace: WeakEntity<Workspace>,
     context_menu: Option<GitGraphContextMenu>,
     table_interaction_state: Entity<TableInteractionState>,
+    /// The commit the card is comparing the selected one against, picked with
+    /// Shift. `None` means the card shows one commit, as it always has.
+    compare_against: Option<usize>,
+    /// The rows of the branch whose label is under the pointer. Everything
+    /// else is dimmed while it is set, which is a deliberate question about one
+    /// branch rather than something a pointer crossing the list can trigger.
+    lit_branch: Option<Rc<HashSet<usize>>>,
     /// Where the graph's own scrollbar was painted, so a drag along it can be
     /// turned into a lane.
     graph_track: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -2708,6 +2803,7 @@ pub struct GitGraph {
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_first_lane.set(0);
+        self.lit_branch = None;
         self.graph_data.clear();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
@@ -3074,6 +3170,108 @@ impl GitGraph {
         )
     }
 
+    /// A history larger than this is not worth walking for a hover; nothing is
+    /// dimmed rather than the wrong thing being dimmed.
+    const BRANCH_WALK_BUDGET: usize = 20_000;
+
+    /// The commit this one came from along its own branch: its first parent.
+    ///
+    /// Walking by the first parent keeps to the branch a reader is following,
+    /// where the arrow keys walk the rows in the order the log printed them and
+    /// wander into whatever was merged in.
+    fn first_parent_of(&self, idx: usize) -> Option<usize> {
+        let commit = self.graph_data.commits.get(idx)?;
+        let parent = commit.data.parents.first()?;
+        self.graph_data.row_of_commit.get(parent).copied()
+    }
+
+    /// The other way: the nearest commit that has this one as its first parent.
+    fn first_child_of(&self, idx: usize) -> Option<usize> {
+        let commit = self.graph_data.commits.get(idx)?;
+        self.graph_data
+            .rows_naming_parent
+            .get(&commit.data.sha)?
+            .iter()
+            .copied()
+            .filter(|row| {
+                self.graph_data
+                    .commits
+                    .get(*row)
+                    .and_then(|child| child.data.parents.first())
+                    == Some(&commit.data.sha)
+            })
+            // Children sit above their parents, so the nearest is the last one
+            // before this row.
+            .filter(|row| *row < idx)
+            .max()
+    }
+
+    fn select_first_parent(
+        &mut self,
+        _: &SelectFirstParent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent) = self
+            .selected_entry_idx
+            .and_then(|idx| self.first_parent_of(idx))
+        else {
+            return;
+        };
+        self.select_entry(parent, ScrollStrategy::Center, cx);
+    }
+
+    fn select_first_child(
+        &mut self,
+        _: &SelectFirstChild,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(child) = self
+            .selected_entry_idx
+            .and_then(|idx| self.first_child_of(idx))
+        else {
+            return;
+        };
+        self.select_entry(child, ScrollStrategy::Center, cx);
+    }
+
+    /// Lights the branch a label names, and dims everything that is not in it.
+    fn light_branch(&mut self, tip_row: Option<usize>, cx: &mut Context<Self>) {
+        let lit = tip_row.and_then(|row| {
+            self.graph_data
+                .branch_of(row, Self::BRANCH_WALK_BUDGET)
+                .map(Rc::new)
+        });
+        let changed = match (&self.lit_branch, &lit) {
+            (None, None) => false,
+            (Some(was), Some(now)) => !Rc::ptr_eq(was, now) && **was != **now,
+            _ => true,
+        };
+        if changed {
+            self.lit_branch = lit;
+            cx.notify();
+        }
+    }
+
+    /// The branch a commit is on when it carries no label of its own, shown as
+    /// a translucent chip so it does not read as a label the commit has.
+    fn ghost_branch(&self, idx: usize) -> Option<(RefKind, SharedString)> {
+        let commit = self.graph_data.commits.get(idx)?;
+        if !commit.data.ref_names.is_empty() {
+            return None;
+        }
+        let tip = self.graph_data.nearest_tip(idx, Self::BRANCH_WALK_BUDGET)?;
+        let head = None;
+        self.graph_data
+            .commits
+            .get(tip)?
+            .data
+            .ref_names
+            .iter()
+            .find_map(|name| read_ref(name.as_ref(), head, &self.remote_names))
+    }
+
     /// The remote a picture of an author can be asked for, if the host has any.
     fn avatar_remote(&self, cx: &mut Context<Self>) -> Option<GitRemote> {
         let repository = self.get_repository(cx)?;
@@ -3272,6 +3470,8 @@ impl GitGraph {
             _commit_diff_task: None,
             context_menu: None,
             table_interaction_state,
+            compare_against: None,
+            lit_branch: None,
             graph_track: Rc::new(Cell::new(None)),
             graph_first_lane: Rc::new(Cell::new(0)),
             column_override: Rc::new(Cell::new(None)),
@@ -3466,7 +3666,15 @@ impl GitGraph {
             .id(ElementId::Name(
                 format!("ref-chip-{commit_idx}-{name}").into(),
             ))
+            .cursor_pointer()
             .child(chip)
+            .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
+                this.light_branch(hovering.then_some(commit_idx), cx);
+            }))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.select_entry(commit_idx, ScrollStrategy::Center, cx);
+                cx.stop_propagation();
+            }))
             // Whatever the rule left of the name, the whole of it is one hover
             // away: a shortened label that cannot be read in full is a label
             // that names nothing.
@@ -3570,6 +3778,45 @@ impl GitGraph {
                         .tooltip(Tooltip::text(names)),
                 )
             })
+            .into_any_element()
+    }
+
+    /// The branch a commit is on, drawn hollow so it does not read as a label
+    /// the commit carries.
+    fn render_ghost_chip(
+        &self,
+        idx: usize,
+        metrics: GraphMetrics,
+        accent_color: Hsla,
+        kind: RefKind,
+        name: &SharedString,
+        layout: HistoryLayout,
+    ) -> AnyElement {
+        h_flex()
+            .h(metrics.row)
+            .w_full()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .pl_1()
+            .overflow_hidden()
+            .debug_selector(move || format!("GRAPH_GHOST-{idx}"))
+            .child(
+                h_flex()
+                    .h(metrics.label)
+                    .items_center()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .opacity(0.55)
+                    .child(
+                        Chip::new(shorten_ref(name.as_ref(), layout.labels))
+                            .label_size(LabelSize::Small)
+                            .truncate()
+                            .icon(kind.icon())
+                            .bg_color(accent_color.opacity(0.04))
+                            .border_color(accent_color.opacity(0.18)),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -3828,6 +4075,12 @@ impl GitGraph {
                 // A history too narrow for a column of labels still has to say
                 // which commit is a branch tip, so the label comes back as a
                 // chip in front of the subject.
+                // A commit with no label of its own still belongs to a branch,
+                // and a reader who has just picked it is asking which.
+                let ghost = (is_selected && layout.labels.has_a_column())
+                    .then(|| self.ghost_branch(idx))
+                    .flatten();
+
                 let inline_label = (!layout.labels.has_a_column()).then(|| {
                     self.render_refs_cell(
                         idx,
@@ -3840,8 +4093,8 @@ impl GitGraph {
                 });
 
                 vec![
-                    match layout.labels.has_a_column() {
-                        true => self.render_refs_cell(
+                    match (layout.labels.has_a_column(), ghost) {
+                        (true, None) => self.render_refs_cell(
                             idx,
                             metrics,
                             accent_color,
@@ -3849,7 +4102,10 @@ impl GitGraph {
                             layout.labels,
                             cx,
                         ),
-                        false => div().h(metrics.row).into_any_element(),
+                        (true, Some((kind, name))) => {
+                            self.render_ghost_chip(idx, metrics, accent_color, kind, &name, layout)
+                        }
+                        (false, _) => div().h(metrics.row).into_any_element(),
                     },
                     self.render_graph_cell(
                         idx,
@@ -3928,6 +4184,7 @@ impl GitGraph {
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
+        self.compare_against = None;
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.changed_files_expanded_dirs.clear();
@@ -4152,10 +4409,20 @@ impl GitGraph {
 
         let commit_message_handle = commit.data.sha;
         let diff_handle = commit.data.sha.to_string();
+        let against = self
+            .compare_against
+            .filter(|row| *row != idx)
+            .and_then(|row| self.graph_data.commits.get(row))
+            .map(|commit| commit.data.sha.to_string());
 
         self.load_selected_commit_message(cx, &commit_message_handle, &repository);
 
-        let diff_receiver = repository.update(cx, |repo, _| repo.load_commit_diff(diff_handle));
+        let diff_receiver = repository.update(cx, |repo, _| match against {
+            // Two commits picked with Shift: what is different between them,
+            // not what either of them changed on its own.
+            Some(against) => repo.load_diff_between(against, diff_handle),
+            None => repo.load_commit_diff(diff_handle),
+        });
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
             if let Ok(Ok(diff)) = diff_receiver.await {
@@ -4708,6 +4975,11 @@ impl GitGraph {
                 .render(window, cx)
         };
 
+        let compared_with = self
+            .compare_against
+            .filter(|row| *row != selected_idx)
+            .and_then(|row| self.graph_data.commits.get(row))
+            .map(|commit| commit.data.sha.display_short());
         let changed_files_count = self
             .selected_commit_diff
             .as_ref()
@@ -4995,6 +5267,16 @@ impl GitGraph {
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                     )
+                                    // A comparison has to say what it is
+                                    // comparing, or it reads as the changes of
+                                    // the commit that happens to be selected.
+                                    .children(compared_with.map(|other| {
+                                        h_flex().gap_1().child(Divider::vertical()).child(
+                                            Label::new(format!("since {other}"))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                    }))
                                     .child(Divider::vertical())
                                     .child(view_toggle),
                             )
@@ -5133,6 +5415,11 @@ impl GitGraph {
 
         if let Some(focus_handle) = focus_handle {
             focus_handle.focus(window, cx);
+        }
+
+        match event.modifiers().shift {
+            true => self.compare_against = self.selected_entry_idx.filter(|at| *at != entry_idx),
+            false => self.compare_against = None,
         }
 
         self.select_entry(entry_idx, scroll_strategy, cx);
@@ -5334,6 +5621,7 @@ impl Render for GitGraph {
             let weak_self = cx.weak_entity();
             let focus_handle = self.focus_handle.clone();
             let table_focus_handle = self.table_interaction_state.read(cx).focus_handle.clone();
+            let lit_branch = self.lit_branch.clone();
 
             let commits_table = Table::new(TABLE_COLUMN_COUNT)
                 .interactable(&self.table_interaction_state)
@@ -5372,8 +5660,17 @@ impl Render for GitGraph {
                         )
                     });
 
+                    let in_the_question = lit_branch
+                        .as_ref()
+                        .map(|lit| lit.contains(&index))
+                        .unwrap_or(true);
+
                     row.h(row_height)
                         .cursor_pointer()
+                        // Asked about one branch, the rest of the history steps
+                        // back. Only a label can ask: a pointer crossing the
+                        // rows must never make the whole list flash.
+                        .when(!in_the_question, |row| row.opacity(0.35))
                         .when_some(band, |row, band| row.bg(band))
                         .when(is_selected || is_context_menu_target, |row| {
                             row.bg(selected_bg)
@@ -5479,6 +5776,8 @@ impl Render for GitGraph {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .on_action(cx.listener(Self::select_first_parent))
+            .on_action(cx.listener(Self::select_first_child))
             .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
                 this.open_selected_commit_view(window, cx);
             }))
@@ -9885,6 +10184,120 @@ mod tests {
             graph.history_layout(window, cx).label_width
         });
         assert_eq!(back, chosen, "the automatic width did not come back");
+    }
+
+    #[gpui::test]
+    fn test_a_branch_reaches_everything_behind_its_tip(_cx: &mut TestAppContext) {
+        // main merges a side branch; the side branch's tip reaches its own two
+        // commits and the base they came from, and nothing of main's own.
+        let mut rng = StdRng::seed_from_u64(31);
+        let oids: Vec<Oid> = (0..6).map(|_| Oid::random(&mut rng)).collect();
+        let of = |idx: usize, parents: SmallVec<[Oid; 1]>| {
+            Arc::new(InitialGraphCommitData {
+                sha: oids[idx],
+                parents,
+                ref_names: vec![],
+            })
+        };
+        let commits = vec![
+            of(0, smallvec![oids[1], oids[2]]),
+            of(1, smallvec![oids[4]]),
+            of(2, smallvec![oids[3]]),
+            of(3, smallvec![oids[4]]),
+            of(4, smallvec![oids[5]]),
+            of(5, smallvec![]),
+        ];
+
+        let mut graph = GraphData::new(8);
+        graph.add_commits(&commits);
+
+        let mut side: Vec<usize> = graph
+            .branch_of(2, 100)
+            .expect("a branch this small has an answer")
+            .into_iter()
+            .collect();
+        side.sort();
+        assert_eq!(
+            side,
+            vec![2, 3, 4, 5],
+            "the tip of the side branch does not reach what is behind it"
+        );
+
+        // The merge reaches everything, because everything is behind it.
+        let all = graph.branch_of(0, 100).expect("the merge has an answer");
+        assert_eq!(all.len(), 6);
+
+        // And a history too large to answer for says so rather than guessing.
+        assert_eq!(graph.branch_of(0, 2), None);
+        assert_eq!(graph.branch_of(99, 100), None);
+    }
+
+    #[gpui::test]
+    fn test_the_nearest_branch_a_commit_is_on(_cx: &mut TestAppContext) {
+        let mut rng = StdRng::seed_from_u64(37);
+        let oids: Vec<Oid> = (0..5).map(|_| Oid::random(&mut rng)).collect();
+        let of = |idx: usize, parents: SmallVec<[Oid; 1]>, refs: Vec<SharedString>| {
+            Arc::new(InitialGraphCommitData {
+                sha: oids[idx],
+                parents,
+                ref_names: refs,
+            })
+        };
+        let commits = vec![
+            of(0, smallvec![oids[1]], vec!["main".into()]),
+            of(1, smallvec![oids[2]], vec![]),
+            of(2, smallvec![oids[3]], vec![]),
+            of(3, smallvec![oids[4]], vec!["v1.0".into()]),
+            of(4, smallvec![], vec![]),
+        ];
+
+        let mut graph = GraphData::new(8);
+        graph.add_commits(&commits);
+
+        // Walking towards the children, the first label above row 2 is main.
+        assert_eq!(graph.nearest_tip(2, 100), Some(0));
+        // Row 4 is below a tag, and the tag is the nearer of the two.
+        assert_eq!(graph.nearest_tip(4, 100), Some(3));
+        // A labelled row is not its own answer.
+        assert_eq!(graph.nearest_tip(0, 100), None);
+    }
+
+    #[gpui::test]
+    async fn test_walking_by_the_first_parent_keeps_to_one_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        // A merge whose first parent is main and whose second is a side branch.
+        let mut rng = StdRng::seed_from_u64(41);
+        let oids: Vec<Oid> = (0..5).map(|_| Oid::random(&mut rng)).collect();
+        let of = |idx: usize, parents: SmallVec<[Oid; 1]>| {
+            Arc::new(InitialGraphCommitData {
+                sha: oids[idx],
+                parents,
+                ref_names: vec![],
+            })
+        };
+        let commits = vec![
+            of(0, smallvec![oids[1], oids[2]]),
+            of(1, smallvec![oids[3]]),
+            of(2, smallvec![oids[3]]),
+            of(3, smallvec![oids[4]]),
+            of(4, smallvec![]),
+        ];
+
+        let (git_graph, cx) = drawn_history(cx, commits, gpui::size(px(1200.), px(700.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            // The arrow keys would walk to row 1, which is main, and to row 2,
+            // which is the branch that was merged in. The first parent is the
+            // one that keeps to the branch being read.
+            assert_eq!(graph.first_parent_of(0), Some(1));
+            assert_eq!(graph.first_parent_of(1), Some(3));
+            // And back the other way.
+            assert_eq!(graph.first_child_of(1), Some(0));
+            // Row 2 was merged in, so nothing has it as a first parent.
+            assert_eq!(graph.first_child_of(2), None);
+            assert_eq!(graph.first_parent_of(4), None);
+        });
     }
 
     #[gpui::test]

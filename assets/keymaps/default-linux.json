@@ -1745,6 +1745,10 @@
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
       "shift-tab": "git_graph::FocusPreviousTabStop",
+      "shift-down": "git_graph::SelectFirstParent",
+      "shift-up": "git_graph::SelectFirstChild",
+      "ctrl-home": "menu::SelectFirst",
+      "ctrl-end": "menu::SelectLast",
     },
   },
   {
