@@ -53,6 +53,7 @@ mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
 pub mod multi_diff_view;
+mod name_prompt;
 pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;

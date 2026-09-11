@@ -2757,6 +2757,10 @@ pub struct GitGraph {
     workspace: WeakEntity<Workspace>,
     context_menu: Option<GitGraphContextMenu>,
     table_interaction_state: Entity<TableInteractionState>,
+    /// Every row the reader has picked with Ctrl or Shift, for the commands
+    /// that act on more than one commit. Empty means the selection is the one
+    /// row the card is showing.
+    picked_rows: Vec<usize>,
     /// The commit the card is comparing the selected one against, picked with
     /// Shift. `None` means the card shows one commit, as it always has.
     compare_against: Option<usize>,
@@ -3236,6 +3240,102 @@ impl GitGraph {
         self.select_entry(child, ScrollStrategy::Center, cx);
     }
 
+    /// Moves the working tree to a branch, asking first if there is work in it
+    /// that a checkout would carry along or refuse over.
+    fn check_out(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let dirty = repository.read(cx).snapshot().status_summary().count > 0;
+
+        fn switch(name: SharedString, repository: Entity<Repository>, cx: &mut App) {
+            let answer = repository.update(cx, |repository, _| {
+                repository.change_branch(name.to_string())
+            });
+            cx.spawn(async move |_| {
+                if let Ok(Err(error)) = answer.await {
+                    log::error!("failed to check out the branch: {error:#}");
+                }
+            })
+            .detach();
+        }
+
+        if !dirty {
+            switch(name, repository, cx);
+            return;
+        }
+
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "There is work in this tree that has not been committed.",
+            Some("Stash it and check the branch out, or stay where you are."),
+            &["Stash and Check Out", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            let stashed = this
+                .update(cx, |this, cx| {
+                    this.get_repository(cx)
+                        .map(|repository| repository.update(cx, |repo, cx| repo.stash_all(cx)))
+                })
+                .ok()
+                .flatten();
+            if let Some(stashed) = stashed
+                && stashed.await.is_err()
+            {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if let Some(repository) = this.get_repository(cx) {
+                    switch(name, repository, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The commits a command opened over `idx` should act on, oldest last,
+    /// which is the order the history is drawn in.
+    fn picked_commits(&self, idx: usize) -> Vec<Oid> {
+        let mut rows = match self.picked_rows.contains(&idx) {
+            true => self.picked_rows.clone(),
+            false => vec![idx],
+        };
+        rows.sort_unstable();
+        rows.iter()
+            .filter_map(|row| self.graph_data.commits.get(*row))
+            .map(|commit| commit.data.sha)
+            .collect()
+    }
+
+    /// Adds or removes one row from what is picked.
+    fn toggle_picked(&mut self, idx: usize) {
+        match self.picked_rows.iter().position(|row| *row == idx) {
+            Some(at) => {
+                self.picked_rows.remove(at);
+            }
+            None => self.picked_rows.push(idx),
+        }
+    }
+
+    /// Picks everything between the selection and `idx`, which is what a reader
+    /// means by holding Shift over a list.
+    fn pick_through(&mut self, idx: usize) {
+        let Some(from) = self.selected_entry_idx else {
+            self.picked_rows = vec![idx];
+            return;
+        };
+        let (first, last) = match from <= idx {
+            true => (from, idx),
+            false => (idx, from),
+        };
+        self.picked_rows = (first..=last).collect();
+    }
+
     /// Lights the branch a label names, and dims everything that is not in it.
     fn light_branch(&mut self, tip_row: Option<usize>, cx: &mut Context<Self>) {
         let lit = tip_row.and_then(|row| {
@@ -3470,6 +3570,7 @@ impl GitGraph {
             _commit_diff_task: None,
             context_menu: None,
             table_interaction_state,
+            picked_rows: Vec::new(),
             compare_against: None,
             lit_branch: None,
             graph_track: Rc::new(Cell::new(None)),
@@ -3671,9 +3772,17 @@ impl GitGraph {
             .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
                 this.light_branch(hovering.then_some(commit_idx), cx);
             }))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.select_entry(commit_idx, ScrollStrategy::Center, cx);
-                cx.stop_propagation();
+            .on_click(cx.listener({
+                let ref_name = ref_name.clone();
+                move |this, event: &ClickEvent, window, cx| {
+                    match event.click_count() >= 2 {
+                        // Twice on a label is the shortest way to ask for the
+                        // branch it names.
+                        true => this.check_out(ref_name.clone(), window, cx),
+                        false => this.select_entry(commit_idx, ScrollStrategy::Center, cx),
+                    }
+                    cx.stop_propagation();
+                }
             }))
             // Whatever the rule left of the name, the whole of it is one hover
             // away: a shortened label that cannot be read in full is a label
@@ -4185,6 +4294,7 @@ impl GitGraph {
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
         self.compare_against = None;
+        self.picked_rows.clear();
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.changed_files_expanded_dirs.clear();
@@ -4700,6 +4810,7 @@ impl GitGraph {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                selected: self.picked_commits(index),
             },
             CommitContextMenuSource::GitGraph,
             ref_name,
@@ -5417,9 +5528,24 @@ impl GitGraph {
             focus_handle.focus(window, cx);
         }
 
-        match event.modifiers().shift {
-            true => self.compare_against = self.selected_entry_idx.filter(|at| *at != entry_idx),
-            false => self.compare_against = None,
+        let modifiers = event.modifiers();
+        match (modifiers.shift, modifiers.secondary()) {
+            // Shift reaches from the selection to here, which is both the run
+            // of commits a command should act on and the pair the card compares.
+            (true, _) => {
+                self.compare_against = self.selected_entry_idx.filter(|at| *at != entry_idx);
+                self.pick_through(entry_idx);
+            }
+            // Ctrl (or Cmd) adds one commit to what is picked without moving
+            // the run.
+            (false, true) => {
+                self.compare_against = None;
+                self.toggle_picked(entry_idx);
+            }
+            (false, false) => {
+                self.compare_against = None;
+                self.picked_rows.clear();
+            }
         }
 
         self.select_entry(entry_idx, scroll_strategy, cx);
@@ -5622,6 +5748,7 @@ impl Render for GitGraph {
             let focus_handle = self.focus_handle.clone();
             let table_focus_handle = self.table_interaction_state.read(cx).focus_handle.clone();
             let lit_branch = self.lit_branch.clone();
+            let picked_rows = self.picked_rows.clone();
 
             let commits_table = Table::new(TABLE_COLUMN_COUNT)
                 .interactable(&self.table_interaction_state)
@@ -5665,8 +5792,11 @@ impl Render for GitGraph {
                         .map(|lit| lit.contains(&index))
                         .unwrap_or(true);
 
+                    let is_picked = picked_rows.contains(&index);
+
                     row.h(row_height)
                         .cursor_pointer()
+                        .when(is_picked && !is_selected, |row| row.bg(hover_bg))
                         // Asked about one branch, the rest of the history steps
                         // back. Only a label can ask: a pointer crossing the
                         // rows must never make the whole list flash.
@@ -10297,6 +10427,56 @@ mod tests {
             // Row 2 was merged in, so nothing has it as a first parent.
             assert_eq!(graph.first_child_of(2), None);
             assert_eq!(graph.first_parent_of(4), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_picking_more_than_one_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, unlabelled_commits(10), gpui::size(px(1200.), px(800.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            let sha_at = |graph: &GitGraph, row: usize| graph.graph_data.commits[row].data.sha;
+
+            // With nothing picked, a command is about the row it was opened on.
+            assert_eq!(graph.picked_commits(3), vec![sha_at(graph, 3)]);
+
+            // Ctrl adds rows one at a time, and a command gets them oldest last
+            // -- the order the history is drawn in, which is the order they
+            // have to be replayed in.
+            graph.select_entry(2, ScrollStrategy::Nearest, cx);
+            graph.toggle_picked(5);
+            graph.toggle_picked(2);
+            graph.toggle_picked(8);
+            assert_eq!(
+                graph.picked_commits(5),
+                vec![sha_at(graph, 2), sha_at(graph, 5), sha_at(graph, 8)]
+            );
+
+            // Picking the same row again puts it back.
+            graph.toggle_picked(5);
+            assert_eq!(
+                graph.picked_commits(2),
+                vec![sha_at(graph, 2), sha_at(graph, 8)]
+            );
+
+            // Shift reaches from the selection to the row, whichever way round.
+            graph.select_entry(6, ScrollStrategy::Nearest, cx);
+            graph.pick_through(3);
+            assert_eq!(
+                graph.picked_commits(4),
+                vec![
+                    sha_at(graph, 3),
+                    sha_at(graph, 4),
+                    sha_at(graph, 5),
+                    sha_at(graph, 6)
+                ]
+            );
+
+            // A command opened on a row that is not picked is about that row
+            // alone, whatever else is picked.
+            assert_eq!(graph.picked_commits(9), vec![sha_at(graph, 9)]);
         });
     }
 

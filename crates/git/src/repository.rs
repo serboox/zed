@@ -637,6 +637,7 @@ pub struct Remote {
     pub name: SharedString,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
     /// Reset the branch pointer, leave index and worktree unchanged (this will make it look like things that were
     /// committed are now staged).
@@ -644,6 +645,9 @@ pub enum ResetMode {
     /// Reset the branch pointer and index, leave worktree unchanged (this makes it look as though things that were
     /// committed are now unstaged).
     Mixed,
+    /// Reset the branch pointer, the index and the worktree. Whatever was not
+    /// committed is gone, which is why every caller of this has to ask first.
+    Hard,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -927,6 +931,28 @@ pub trait GitRepository: Send + Sync {
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Replays the given commits, oldest first, on top of the current branch.
+    fn cherry_pick(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    /// Commits the inverse of the given commits, newest first.
+    fn revert(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    /// Names a commit.
+    fn create_tag(
+        &self,
+        name: String,
+        commit: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
@@ -1270,6 +1296,35 @@ impl RefEdit {
 }
 
 impl RealGitRepository {
+    /// Runs a git command that replays commits, one argument list, all of them
+    /// at once, so git stops at the first one that conflicts rather than
+    /// leaving the rest half-applied behind it.
+    fn replay(
+        &self,
+        command: Vec<String>,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let git = git?;
+            anyhow::ensure!(!commits.is_empty(), "no commits to replay");
+
+            let mut args: Vec<&str> = command.iter().map(String::as_str).collect();
+            args.extend(commits.iter().map(String::as_str));
+
+            let output = git.build_command(&args).envs(env.iter()).output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to {}:\n{}",
+                command.first().map(String::as_str).unwrap_or("replay"),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
     pub fn new(
         dotgit_path: &Path,
         bundled_git_binary_path: Option<PathBuf>,
@@ -1630,6 +1685,7 @@ impl GitRepository for RealGitRepository {
             let mode_flag = match mode {
                 ResetMode::Mixed => "--mixed",
                 ResetMode::Soft => "--soft",
+                ResetMode::Hard => "--hard",
             };
 
             let output = git
@@ -2220,6 +2276,56 @@ impl GitRepository for RealGitRepository {
                 anyhow::Ok(())
             })
             .boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        // Oldest first: replaying them in the order they were made is the only
+        // order in which each one applies to what the one before it left.
+        self.replay(vec!["cherry-pick".to_string()], commits, env)
+    }
+
+    fn revert(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        // Newest first, for the same reason in reverse: undoing an older commit
+        // before a newer one that builds on it conflicts with itself.
+        let mut commits = commits;
+        commits.reverse();
+        self.replay(
+            vec!["revert".to_string(), "--no-edit".to_string()],
+            commits,
+            env,
+        )
+    }
+
+    fn create_tag(
+        &self,
+        name: String,
+        commit: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let git = git?;
+            let output = git
+                .build_command(&["tag", "--", &name, &commit])
+                .envs(env.iter())
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to create the tag:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
     }
 
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>> {

@@ -3,8 +3,9 @@ use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
+use git::repository::ResetMode;
 use task::{TaskContext, TaskVariables, VariableName};
-use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
+use ui::{App, Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
 use workspace::Workspace;
 
 actions!(
@@ -25,6 +26,9 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    /// Every commit the reader has picked, oldest last, when the menu was
+    /// opened over more than one.
+    pub(crate) selected: Vec<Oid>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,6 +48,7 @@ pub(crate) fn commit_context_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
+    let selected = commit.selected.clone();
     let sha_short = sha.display_short();
     let git_tasks = git_context_menu_tasks(
         git_task_context(&repository, sha, ref_name.as_deref(), cx),
@@ -128,6 +133,16 @@ pub(crate) fn commit_context_menu(
                         }),
                     }
                 })
+            })
+            .map(|menu| {
+                git_actions_menu(
+                    menu,
+                    sha,
+                    &selected,
+                    ref_name.clone(),
+                    repository.clone(),
+                    workspace.clone(),
+                )
             })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {
@@ -240,4 +255,275 @@ fn git_context_menu_tasks(
     task_inventory
         .read(cx)
         .resolve_global_tasks_with_tag(GIT_COMMAND_TASK_TAG, &task_context)
+}
+
+/// The commands a history offers over a commit or over the ref on it.
+///
+/// Everything here goes through the same `Repository` calls the panel uses, so
+/// an error reads the same wherever it came from.
+fn git_actions_menu(
+    menu: ContextMenu,
+    sha: Oid,
+    selected: &[Oid],
+    ref_name: Option<SharedString>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+) -> ContextMenu {
+    let Some(repository) = repository else {
+        return menu;
+    };
+
+    // A menu opened over a selection of commits acts on all of them; over one,
+    // on the one.
+    let commits: Vec<String> = match selected.len() > 1 {
+        true => selected.iter().map(|sha| sha.to_string()).collect(),
+        false => vec![sha.to_string()],
+    };
+    let many = commits.len() > 1;
+    let of_them = match many {
+        true => format!(" ({} commits)", commits.len()),
+        false => String::new(),
+    };
+
+    let menu = match ref_name {
+        None => menu,
+        Some(name) => {
+            let checkout = (name.clone(), repository.clone());
+            let branch_from = (name.clone(), repository.clone());
+            let rename = (name.clone(), repository.clone());
+            let delete = (name, repository.clone());
+            let push = repository.clone();
+            let pull = repository.clone();
+            let workspace_for_branch = workspace.clone();
+            let workspace_for_rename = workspace.clone();
+
+            menu.separator()
+                .header("Branch")
+                .entry("Check Out", None, move |_window, cx| {
+                    let (name, repository) = checkout.clone();
+                    run_on_repository(&repository, cx, move |repository| {
+                        repository.change_branch(name.to_string())
+                    });
+                })
+                .entry("New Branch From Here…", None, move |window, cx| {
+                    let (from, repository) = branch_from.clone();
+                    ask_for_a_name(
+                        &workspace_for_branch,
+                        "New branch",
+                        "Branch name",
+                        "",
+                        window,
+                        cx,
+                        move |name, _window, cx| {
+                            let repository = repository.clone();
+                            let from = from.clone();
+                            run_on_repository(&repository, cx, move |repository| {
+                                repository.create_branch(name.to_string(), Some(from.to_string()))
+                            });
+                        },
+                    );
+                })
+                .entry("Rename…", None, move |window, cx| {
+                    let (name, repository) = rename.clone();
+                    ask_for_a_name(
+                        &workspace_for_rename,
+                        "Rename branch",
+                        "New name",
+                        name.clone(),
+                        window,
+                        cx,
+                        move |new_name, _window, cx| {
+                            let repository = repository.clone();
+                            let name = name.clone();
+                            run_on_repository(&repository, cx, move |repository| {
+                                repository.rename_branch(name.to_string(), new_name.to_string())
+                            });
+                        },
+                    );
+                })
+                .entry("Delete", None, move |_window, cx| {
+                    let (name, repository) = delete.clone();
+                    run_on_repository(&repository, cx, move |repository| {
+                        // Local, and not forced: a branch that has not been
+                        // merged is worth refusing rather than losing.
+                        repository.delete_branch(false, name.to_string(), false)
+                    });
+                })
+                .entry("Push", None, move |window, cx| {
+                    dispatch_git(&push, window, cx, git::Push.boxed_clone());
+                })
+                .entry("Pull", None, move |window, cx| {
+                    dispatch_git(&pull, window, cx, git::Pull.boxed_clone());
+                })
+        }
+    };
+
+    let tag_at = repository.clone();
+    let branch_at = repository.clone();
+    let cherry_pick = (commits.clone(), repository.clone());
+    let revert = (commits, repository.clone());
+    let workspace_for_tag = workspace.clone();
+    let workspace_for_commit_branch = workspace;
+
+    let menu = menu
+        .separator()
+        .header("Commit")
+        .entry("New Branch Here…", None, move |window, cx| {
+            let repository = branch_at.clone();
+            let at = sha.to_string();
+            ask_for_a_name(
+                &workspace_for_commit_branch,
+                "New branch",
+                "Branch name",
+                "",
+                window,
+                cx,
+                move |name, _window, cx| {
+                    let repository = repository.clone();
+                    let at = at.clone();
+                    run_on_repository(&repository, cx, move |repository| {
+                        repository.create_branch(name.to_string(), Some(at))
+                    });
+                },
+            );
+        })
+        .entry("New Tag Here…", None, move |window, cx| {
+            let repository = tag_at.clone();
+            let at = sha.to_string();
+            ask_for_a_name(
+                &workspace_for_tag,
+                "New tag",
+                "Tag name",
+                "",
+                window,
+                cx,
+                move |name, _window, cx| {
+                    let repository = repository.clone();
+                    let at = at.clone();
+                    run_on_repository(&repository, cx, move |repository| {
+                        repository.create_tag(name.to_string(), at)
+                    });
+                },
+            );
+        })
+        .entry(format!("Cherry-Pick{of_them}"), None, move |_window, cx| {
+            let (commits, repository) = cherry_pick.clone();
+            run_on_repository(&repository, cx, move |repository| {
+                repository.cherry_pick(commits)
+            });
+        })
+        .entry(format!("Revert{of_them}"), None, move |_window, cx| {
+            let (commits, repository) = revert.clone();
+            run_on_repository(&repository, cx, move |repository| {
+                repository.revert_commits(commits)
+            });
+        });
+
+    // A reset moves the branch, and a hard one throws the working tree away
+    // with it, so that one asks first.
+    let resets = [
+        ("Reset Here (Soft)", ResetMode::Soft, false),
+        ("Reset Here (Mixed)", ResetMode::Mixed, false),
+        ("Reset Here (Hard)", ResetMode::Hard, true),
+    ];
+    let mut menu = menu;
+    for (label, mode, ask_first) in resets {
+        let repository = repository.clone();
+        let at = sha.to_string();
+        menu = menu.entry(label, None, move |window, cx| {
+            let repository = repository.clone();
+            let at = at.clone();
+            if !ask_first {
+                reset_to(&repository, at, mode, cx);
+                return;
+            }
+
+            let answer = window.prompt(
+                gpui::PromptLevel::Warning,
+                "Reset this branch, discarding everything not committed?",
+                Some("A hard reset cannot be undone."),
+                &["Reset", "Cancel"],
+                cx,
+            );
+            cx.spawn(async move |cx| {
+                if answer.await.ok() == Some(0) {
+                    cx.update(|cx| reset_to(&repository, at, mode, cx));
+                }
+            })
+            .detach();
+        });
+    }
+
+    let _ = many;
+    menu
+}
+
+/// Moves the branch to a commit.
+fn reset_to(repository: &WeakEntity<Repository>, at: String, mode: ResetMode, cx: &mut App) {
+    let Some(repository) = repository.upgrade() else {
+        return;
+    };
+    let answer = repository.update(cx, |repository, cx| repository.reset(at, mode, cx));
+    cx.spawn(async move |_| {
+        if let Ok(Err(error)) = answer.await {
+            log::error!("git reset failed: {error:#}");
+        }
+    })
+    .detach();
+}
+
+/// Runs one repository command and reports what it says, wherever it failed.
+fn run_on_repository<F, R>(repository: &WeakEntity<Repository>, cx: &mut App, command: F)
+where
+    F: FnOnce(&mut Repository) -> futures::channel::oneshot::Receiver<anyhow::Result<R>> + 'static,
+    R: 'static,
+{
+    let Some(repository) = repository.upgrade() else {
+        return;
+    };
+    let answer = repository.update(cx, |repository, _| command(repository));
+    cx.spawn(async move |_| {
+        if let Ok(Err(error)) = answer.await {
+            log::error!("git command failed: {error:#}");
+        }
+    })
+    .detach();
+}
+
+/// Sends a workspace-level git action, for the commands the panel already owns.
+fn dispatch_git(
+    repository: &WeakEntity<Repository>,
+    window: &mut Window,
+    cx: &mut App,
+    action: Box<dyn Action>,
+) {
+    let _ = repository;
+    window.dispatch_action(action, cx);
+}
+
+/// Opens the one-field prompt and runs `then` with what was typed.
+fn ask_for_a_name(
+    workspace: &WeakEntity<Workspace>,
+    title: &'static str,
+    field: &'static str,
+    starting_with: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+    then: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+) {
+    let starting_with = starting_with.into();
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                crate::name_prompt::NamePrompt::new(
+                    title,
+                    field,
+                    starting_with.clone(),
+                    then,
+                    window,
+                    cx,
+                )
+            });
+        })
+        .ok();
 }

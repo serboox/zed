@@ -6154,6 +6154,14 @@ impl Repository {
                             mode: match reset_mode {
                                 ResetMode::Soft => git_reset::ResetMode::Soft.into(),
                                 ResetMode::Mixed => git_reset::ResetMode::Mixed.into(),
+                                // The wire has no word for it, and inventing one
+                                // silently would throw away a worktree on the
+                                // far side of a remote project.
+                                ResetMode::Hard => {
+                                    anyhow::bail!(
+                                        "a hard reset is not available over a remote project"
+                                    )
+                                }
                             },
                         })
                         .await?;
@@ -8623,6 +8631,70 @@ impl Repository {
                             .await?;
 
                         Ok(())
+                    }
+                }
+            },
+        )
+    }
+
+    /// Replays the given commits on top of the current branch.
+    ///
+    /// Only for a repository on this machine: the wire has no message for it,
+    /// and a command that quietly does nothing over a remote project is worse
+    /// than one that says it cannot.
+    pub fn cherry_pick(&mut self, commits: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "cherry_pick",
+            Some(format!("git cherry-pick ({} commits)", commits.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.cherry_pick(commits, environment).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("cherry-pick is not available over a remote project")
+                    }
+                }
+            },
+        )
+    }
+
+    /// Commits the inverse of the given commits.
+    pub fn revert_commits(&mut self, commits: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "revert",
+            Some(format!("git revert ({} commits)", commits.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.revert(commits, environment).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("revert is not available over a remote project")
+                    }
+                }
+            },
+        )
+    }
+
+    /// Names a commit.
+    pub fn create_tag(&mut self, name: String, commit: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "create_tag",
+            Some(format!("git tag {name}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.create_tag(name, commit, environment).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("creating a tag is not available over a remote project")
                     }
                 }
             },

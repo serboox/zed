@@ -6445,6 +6445,7 @@ impl GitPanel {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                selected: vec![commit.data.sha],
             },
             CommitContextMenuSource::GitPanel,
             None,

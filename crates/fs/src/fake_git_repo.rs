@@ -173,6 +173,31 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn cherry_pick(
+        &self,
+        _commits: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn revert(
+        &self,
+        _commits: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn create_tag(
+        &self,
+        _name: String,
+        _sha: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
     fn load_raw_diff(
         &self,
         _what: git::repository::RawDiff,
@@ -322,6 +347,13 @@ impl GitRepository for FakeGitRepository {
                     state.head_contents = snapshot.head_contents;
                 }
                 ResetMode::Mixed => {
+                    state.head_contents = snapshot.head_contents;
+                    state.index_contents = state.head_contents.clone();
+                }
+                // The fake repository has no worktree of its own, so a hard
+                // reset is a mixed one here: the part it can model is the part
+                // it models.
+                ResetMode::Hard => {
                     state.head_contents = snapshot.head_contents;
                     state.index_contents = state.head_contents.clone();
                 }
