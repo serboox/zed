@@ -79,6 +79,8 @@ use settings::{
     update_settings_file,
 };
 use smallvec::SmallVec;
+#[cfg(test)]
+use smallvec::smallvec;
 use std::cell::Cell;
 use std::future::Future;
 use std::ops::Range;
@@ -6765,7 +6767,11 @@ impl GitPanel {
                                                 author_email,
                                                 remote.as_ref(),
                                             )
-                                            .size(px(14.))
+                                            // The size the plan gives the
+                                            // dock: the same face the full
+                                            // page shows, at the size a narrow
+                                            // column has room for.
+                                            .size(px(20.))
                                             .render(window, cx);
 
                                             let is_unpushed = index < ahead_count;
@@ -6785,6 +6791,9 @@ impl GitPanel {
 
                                             v_flex()
                                                 .id(("commit-history-item", index))
+                                                .debug_selector(move || {
+                                                    format!("HISTORY_ROW-{index}")
+                                                })
                                                 .on_hover({
                                                     let git_panel = git_panel.clone();
                                                     move |over, _, cx| {
@@ -6968,7 +6977,25 @@ impl GitPanel {
                                                         cx.stop_propagation();
                                                     }
                                                 })
-                                                .on_click(move |_, window, cx| {
+                                                .on_click(move |event: &ClickEvent, window, cx| {
+                                                    // The dock draws the same
+                                                    // graph as the full page,
+                                                    // narrowed; a second click
+                                                    // is how a reader asks for
+                                                    // the room the full page
+                                                    // has, at the commit they
+                                                    // are already looking at.
+                                                    if event.click_count() > 1 {
+                                                        window.dispatch_action(
+                                                            Box::new(
+                                                                crate::git_graph::OpenAtCommit {
+                                                                    sha: sha_for_click.to_string(),
+                                                                },
+                                                            ),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
                                                     CommitView::open(
                                                         sha_for_click.clone(),
                                                         repo.clone(),
@@ -7025,10 +7052,10 @@ impl GitPanel {
             .when(hidden > px(0.), |this| {
                 this.on_scroll_wheel(cx.listener(
                     move |panel, event: &ScrollWheelEvent, window, cx| {
-                        // A modified wheel is the density ladder's, and a
-                        // trackpad reports both axes at once: without this the
-                        // same gesture would step the density and slide the
-                        // lanes sideways together.
+                        // A modified wheel belongs to the editor's own
+                        // zoom, and a trackpad reports both axes at once:
+                        // without this the same gesture would zoom and slide
+                        // the lanes sideways together.
                         if event.modifiers.control || event.modifiers.platform {
                             return;
                         }
@@ -9665,6 +9692,141 @@ mod tests {
         });
         cx.run_until_parked();
         panel
+    }
+
+    /// The same panel, still in its workspace and still drawable, for a test
+    /// that has to click a row rather than read one.
+    async fn a_history_panel_on_screen(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Entity<GitPanel>, VisualTestContext) {
+        let project = Project::test(fs, [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    /// The dock draws the same graph as the full page, narrowed. A second
+    /// click is how a reader asks for the room the full page has, without
+    /// losing the commit they were looking at.
+    #[gpui::test]
+    async fn a_second_click_in_the_dock_opens_the_full_page_at_that_commit(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({ "project": { ".git": {}, "file.txt": "content" } }),
+        )
+        .await;
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let older = sha_of(1);
+        let newer = sha_of(2);
+        fs.set_graph_commits(
+            dot_git,
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: newer,
+                    parents: smallvec![older],
+                    ref_names: vec!["HEAD -> main".into()],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: older,
+                    parents: smallvec![],
+                    ref_names: Vec::new(),
+                }),
+            ],
+        );
+        fs.set_commit_data(
+            dot_git,
+            [older, newer].map(|sha| {
+                (
+                    CommitData {
+                        sha,
+                        parents: smallvec![],
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 1_700_000_000,
+                        subject: "Commit subject".into(),
+                        message: "Commit message".into(),
+                    },
+                    false,
+                )
+            }),
+        );
+
+        let (workspace, panel, mut cx) = a_history_panel_on_screen(fs, cx).await;
+        wait_for_commit_history_to_settle(&panel, &mut cx).await;
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("HISTORY_ROW-0")
+            .expect("the dock draws a row for the newest commit");
+        double_click(row.center(), &mut cx);
+        cx.run_until_parked();
+
+        let opened = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<crate::git_graph::GitGraph>())
+        });
+        let opened = opened.expect("a second click opens the full page");
+        opened.read_with(&cx, |graph, cx| {
+            assert_eq!(
+                graph.selected_sha(cx),
+                Some(newer),
+                "and it opens at the commit that was clicked"
+            );
+        });
+    }
+
+    /// A real second click, which `simulate_click` cannot produce: it always
+    /// reports the first.
+    fn double_click(at: gpui::Point<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
     }
 
     async fn wait_for_commit_history_to_settle(panel: &Entity<GitPanel>, cx: &mut TestAppContext) {

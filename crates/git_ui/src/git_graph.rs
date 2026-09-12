@@ -4099,6 +4099,12 @@ impl GitGraph {
                 }),
             )
             .child(chip)
+            // A name the column was too narrow for is a name the reader cannot
+            // read; the whole of it is a hover away rather than a guess.
+            .when(shortened.as_ref() != name.as_ref(), |this| {
+                let whole = name.clone();
+                this.tooltip(move |_window, cx| Tooltip::simple(whole.clone(), cx))
+            })
             .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
                 this.light_branch(hovering.then_some(commit_idx), cx);
             }))
@@ -4485,7 +4491,17 @@ impl GitGraph {
                     author_email =
                         (!data.author_email.is_empty()).then(|| data.author_email.clone());
                     age = format_relative_timestamp(data.commit_timestamp, now).into();
-                    committed_on = Some(format_timestamp(data.commit_timestamp).into());
+                    // The hash beside the date: the card carries it, and a
+                    // reader reading a row should not have to open the card to
+                    // learn which commit the row is.
+                    committed_on = Some(
+                        format!(
+                            "{} · {}",
+                            format_timestamp(data.commit_timestamp),
+                            commit.data.sha.display_short()
+                        )
+                        .into(),
+                    );
                     is_fresh = is_younger_than_a_day(data.commit_timestamp, now);
                 } else {
                     subject = "Loading…".into();
@@ -5044,6 +5060,21 @@ impl GitGraph {
             self.repo_id = repo_id;
             self.invalidate_state(cx);
         }
+    }
+
+    /// The commit the reader has selected, by its own name.
+    ///
+    /// The row number it is held as means nothing outside this view -- a
+    /// filter or a reload moves it -- so anything asking which commit is
+    /// selected asks for the sha.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn selected_sha(&self, cx: &App) -> Option<Oid> {
+        let row = self.selected_entry_idx?;
+        let repository = self.get_repository(cx)?;
+        let data = repository
+            .read(cx)
+            .get_graph_data(self.log_source.clone(), self.log_order)?;
+        data.commit_data.get(row).map(|commit| commit.sha)
     }
 
     pub fn select_commit_by_sha(&mut self, sha: impl TryInto<Oid>, cx: &mut Context<Self>) {
@@ -10962,6 +10993,34 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_mouse_up(onto, MouseButton::Left, Modifiers::default());
         cx.run_until_parked();
+    }
+
+    /// A label names the commit it sits beside, so a label drawn a row off is
+    /// a label that names the wrong commit. Measured rather than reasoned
+    /// about: the two are laid out by different parents and only a shared row
+    /// height holds them together.
+    #[gpui::test]
+    async fn a_label_sits_on_the_row_of_the_commit_it_names(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (_git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        for (row, name) in [(0usize, "main"), (2, "feature"), (4, "v1.0")] {
+            let chip = cx
+                .debug_bounds(Box::leak(
+                    format!("GRAPH_CHIP-{row}-{name}").into_boxed_str(),
+                ))
+                .unwrap_or_else(|| panic!("the label {name} is drawn"));
+            let cell = cx
+                .debug_bounds(selector("GRAPH_CELL", row))
+                .unwrap_or_else(|| panic!("the graph cell of row {row} is drawn"));
+            let apart = (chip.center().y - cell.center().y).abs();
+            assert!(
+                apart < cell.size.height / 2.,
+                "the label {name} is {apart:?} from the middle of row {row}, \
+                 which is more than half a row: it reads as another commit's"
+            );
+        }
     }
 
     #[gpui::test]
