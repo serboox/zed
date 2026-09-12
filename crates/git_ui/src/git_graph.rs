@@ -13,7 +13,7 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
+        CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath, ResetMode,
         SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
@@ -2099,6 +2099,44 @@ pub(crate) fn chip_chrome(metrics: GraphMetrics, _kind: RefKind) -> Pixels {
     metrics.label + px(18.)
 }
 
+/// What a drop offered.
+///
+/// Two different gestures both end in a menu, and a test that can only see
+/// "a menu opened" cannot tell dropping a label on a label from dropping it on
+/// the row underneath -- which is exactly the mistake the nesting invites.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DropOffer {
+    Branches {
+        dragged: SharedString,
+        onto: SharedString,
+    },
+    BranchOnCommit {
+        dragged: SharedString,
+        row: usize,
+    },
+    CommitsOnBranch {
+        count: usize,
+    },
+}
+
+/// A label being dragged somewhere.
+///
+/// Carried by value rather than by row, because the row a label sits on can
+/// change under a drag while the history is still streaming in.
+#[derive(Debug, Clone)]
+pub(crate) struct DraggedRef {
+    pub name: SharedString,
+    pub kind: RefKind,
+}
+
+/// A commit being dragged onto a label.
+#[derive(Debug, Clone)]
+pub(crate) struct DraggedCommits {
+    /// Oldest last, which is the order they have to be replayed in.
+    pub shas: Vec<Oid>,
+}
+
 /// What a reader has asked the history to leave out.
 ///
 /// Hiding a branch takes its rows out of the list rather than dimming them: a
@@ -2139,6 +2177,81 @@ impl HistoryFilter {
             None => !self.hidden.contains(name),
         }
     }
+}
+
+/// The label that follows the cursor while it is being dragged.
+pub(crate) struct DraggedRefLabel {
+    dragged: DraggedRef,
+}
+
+impl Render for DraggedRefLabel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().colors().text_accent;
+        Chip::new(self.dragged.name.clone())
+            .label_size(LabelSize::Small)
+            .icon(self.dragged.kind.icon())
+            .bg_color(accent.opacity(0.2))
+            .border_color(accent.opacity(0.6))
+    }
+}
+
+/// The commits that follow the cursor while they are being dragged.
+pub(crate) struct DraggedCommitsLabel {
+    count: usize,
+}
+
+impl Render for DraggedCommitsLabel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().colors().text_accent;
+        Chip::new(match self.count {
+            1 => "1 commit".to_string(),
+            many => format!("{many} commits"),
+        })
+        .label_size(LabelSize::Small)
+        .bg_color(accent.opacity(0.2))
+        .border_color(accent.opacity(0.6))
+    }
+}
+
+/// Asks before doing something a button cannot undo.
+pub(crate) fn confirm_then(
+    window: &mut Window,
+    cx: &mut App,
+    question: &str,
+    detail: &str,
+    then: impl FnOnce(&mut App) + 'static,
+) {
+    let answer = window.prompt(
+        gpui::PromptLevel::Warning,
+        question,
+        Some(detail),
+        &["Continue", "Cancel"],
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if answer.await.ok() == Some(0) {
+            cx.update(|cx| then(cx));
+        }
+    })
+    .detach();
+}
+
+/// Runs one repository command and says where it failed.
+pub(crate) fn run_command<F, R>(repository: &WeakEntity<Repository>, cx: &mut App, command: F)
+where
+    F: FnOnce(&mut Repository) -> futures::channel::oneshot::Receiver<anyhow::Result<R>> + 'static,
+    R: 'static,
+{
+    let Some(repository) = repository.upgrade() else {
+        return;
+    };
+    let answer = repository.update(cx, |repository, _| command(repository));
+    cx.spawn(async move |_| {
+        if let Ok(Err(error)) = answer.await {
+            log::error!("git command failed: {error:#}");
+        }
+    })
+    .detach();
 }
 
 /// Which columns the table draws. `true` means hidden, which is what the
@@ -2519,6 +2632,9 @@ pub struct GitGraph {
     /// that act on more than one commit. Empty means the selection is the one
     /// row the card is showing.
     picked_rows: Vec<usize>,
+    /// What the last drop offered, so a test can tell one offer from another.
+    #[cfg(test)]
+    last_drop_offer: Option<DropOffer>,
     /// The commit the card is comparing the selected one against, picked with
     /// Shift. `None` means the card shows one commit, as it always has.
     compare_against: Option<usize>,
@@ -2997,6 +3113,191 @@ impl GitGraph {
             return;
         };
         self.select_entry(child, ScrollStrategy::Center, cx);
+    }
+
+    /// What dropping one label onto another offers.
+    ///
+    /// The menu appears where the label was dropped rather than acting at once:
+    /// merge, rebase and fast-forward are three different answers to the same
+    /// gesture, and guessing which one was meant is not a guess worth making.
+    fn offer_ref_onto_ref(
+        &mut self,
+        dragged: DraggedRef,
+        onto: SharedString,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged.name == onto {
+            return;
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.last_drop_offer = Some(DropOffer::Branches {
+                dragged: dragged.name.clone(),
+                onto: onto.clone(),
+            });
+        }
+
+        // A local branch dropped on the remote-tracking ref of the same branch
+        // is the one gesture with a single meaning.
+        let is_its_own_remote = dragged.kind == RefKind::Remote
+            && onto
+                .as_ref()
+                .rsplit('/')
+                .next()
+                .is_some_and(|tail| tail == dragged.name.as_ref())
+            || onto.as_ref().ends_with(&format!("/{}", dragged.name));
+        if dragged.kind != RefKind::Remote && is_its_own_remote {
+            window.dispatch_action(Box::new(git::Push), cx);
+            return;
+        }
+
+        let focus_handle = self.focus_handle.clone();
+        let repository = repository.downgrade();
+        let dragged_name = dragged.name;
+        let menu = ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            let merge = (dragged_name.clone(), repository.clone());
+            let fast_forward = (dragged_name.clone(), repository.clone());
+            let rebase = (dragged_name.clone(), repository.clone());
+            menu.context(focus_handle)
+                .header(format!("{dragged_name} onto {onto}"))
+                .entry("Merge", None, move |window, cx| {
+                    let (what, repository) = merge.clone();
+                    confirm_then(
+                        window,
+                        cx,
+                        "Merge these branches?",
+                        "A conflict cannot be undone with a button.",
+                        move |cx| {
+                            run_command(&repository, cx, move |repository| {
+                                repository.merge(what.to_string(), false)
+                            });
+                        },
+                    );
+                })
+                .entry("Fast-Forward", None, move |_window, cx| {
+                    let (what, repository) = fast_forward.clone();
+                    run_command(&repository, cx, move |repository| {
+                        repository.merge(what.to_string(), true)
+                    });
+                })
+                .entry("Rebase Onto", None, move |window, cx| {
+                    let (onto, repository) = rebase.clone();
+                    confirm_then(
+                        window,
+                        cx,
+                        "Replay this branch onto the other?",
+                        "A conflict cannot be undone with a button.",
+                        move |cx| {
+                            run_command(&repository, cx, move |repository| {
+                                repository.rebase(onto.to_string())
+                            });
+                        },
+                    );
+                })
+        });
+        self.set_context_menu(menu, at, None, window, cx);
+    }
+
+    /// What dropping a label onto a commit offers: the three resets, with the
+    /// one that cannot be undone asking first.
+    fn offer_ref_onto_commit(
+        &mut self,
+        dragged: DraggedRef,
+        row: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self.graph_data.commits.get(row) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.last_drop_offer = Some(DropOffer::BranchOnCommit {
+                dragged: dragged.name.clone(),
+                row,
+            });
+        }
+        let sha = commit.data.sha.to_string();
+        let short = commit.data.sha.display_short();
+        let focus_handle = self.focus_handle.clone();
+        let repository = repository.downgrade();
+
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            menu = menu
+                .context(focus_handle)
+                .header(format!("{} to {short}", dragged.name));
+            for (label, mode, ask_first) in [
+                ("Reset (Soft)", ResetMode::Soft, false),
+                ("Reset (Mixed)", ResetMode::Mixed, false),
+                ("Reset (Hard)", ResetMode::Hard, true),
+            ] {
+                let repository = repository.clone();
+                let sha = sha.clone();
+                menu = menu.entry(label, None, move |window, cx| {
+                    let repository = repository.clone();
+                    let sha = sha.clone();
+                    let act = move |cx: &mut App| {
+                        let Some(repository) = repository.upgrade() else {
+                            return;
+                        };
+                        let answer = repository
+                            .update(cx, |repository, cx| repository.reset(sha.clone(), mode, cx));
+                        cx.spawn(async move |_| {
+                            if let Ok(Err(error)) = answer.await {
+                                log::error!("git reset failed: {error:#}");
+                            }
+                        })
+                        .detach();
+                    };
+                    match ask_first {
+                        true => confirm_then(
+                            window,
+                            cx,
+                            "Reset this branch, discarding everything not committed?",
+                            "A hard reset cannot be undone.",
+                            act,
+                        ),
+                        false => act(cx),
+                    }
+                });
+            }
+            menu
+        });
+        self.set_context_menu(menu, at, None, window, cx);
+    }
+
+    /// Dropping commits on a label replays them there. One meaning, so it acts
+    /// rather than asking which.
+    fn cherry_pick_onto(&mut self, dragged: DraggedCommits, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let commits: Vec<String> = dragged.shas.iter().map(|sha| sha.to_string()).collect();
+        if commits.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.last_drop_offer = Some(DropOffer::CommitsOnBranch {
+                count: commits.len(),
+            });
+        }
+        let answer = repository.update(cx, |repository, _| repository.cherry_pick(commits));
+        cx.spawn(async move |_, _| {
+            if let Ok(Err(error)) = answer.await {
+                log::error!("cherry-pick failed: {error:#}");
+            }
+        })
+        .detach();
     }
 
     /// Moves the working tree to a branch, asking first if there is work in it
@@ -3558,6 +3859,8 @@ impl GitGraph {
             filter: HistoryFilter::default(),
             kept_rows: None,
             picked_rows: Vec::new(),
+            #[cfg(test)]
+            last_drop_offer: None,
             compare_against: None,
             lit_branch: None,
             graph_track: Rc::new(Cell::new(None)),
@@ -3763,10 +4066,38 @@ impl GitGraph {
             .id(ElementId::Name(
                 format!("ref-chip-{commit_idx}-{name}").into(),
             ))
+            .debug_selector({
+                let name = name.clone();
+                move || format!("GRAPH_CHIP-{commit_idx}-{name}")
+            })
             .gap_0p5()
             .items_center()
             .cursor_pointer()
             .when(is_hidden, |this| this.opacity(0.5))
+            .on_drag(
+                DraggedRef {
+                    name: name.clone(),
+                    kind,
+                },
+                |dragged, _, _window, cx| {
+                    // What follows the cursor is the label itself, so a reader
+                    // can see what they picked up and what it is over.
+                    let dragged = dragged.clone();
+                    cx.new(|_| DraggedRefLabel { dragged })
+                },
+            )
+            .on_drop(cx.listener({
+                let onto = name.clone();
+                move |this, dragged: &DraggedRef, window, cx| {
+                    let at = window.mouse_position();
+                    this.offer_ref_onto_ref(dragged.clone(), onto.clone(), at, window, cx);
+                }
+            }))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedCommits, _window, cx| {
+                    this.cherry_pick_onto(dragged.clone(), cx);
+                }),
+            )
             .child(chip)
             .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
                 this.light_branch(hovering.then_some(commit_idx), cx);
@@ -4009,6 +4340,9 @@ impl GitGraph {
         };
         let initials = initials_of(author);
         let author = author.clone();
+        // Dragging a node carries whatever is picked, so a run of commits can
+        // be replayed onto a branch in one gesture.
+        let dragged_commits = self.picked_commits(idx);
 
         div()
             .relative()
@@ -4074,7 +4408,16 @@ impl GitGraph {
                     }))
                     .when(!author.is_empty(), |this| {
                         this.tooltip(Tooltip::text(author))
-                    }),
+                    })
+                    .on_drag(
+                        DraggedCommits {
+                            shas: dragged_commits,
+                        },
+                        |dragged, _, _window, cx| {
+                            let count = dragged.shas.len();
+                            cx.new(|_| DraggedCommitsLabel { count })
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -5815,6 +6158,7 @@ impl Render for GitGraph {
                     let weak = weak_self.clone();
                     let weak_for_hover = weak.clone();
                     let weak_for_context_menu = weak.clone();
+                    let weak_for_drop = weak.clone();
 
                     let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
                     let selected_bg = if is_focused {
@@ -5897,6 +6241,17 @@ impl Render for GitGraph {
                                     .ok();
                             },
                         )
+                        .on_drop({
+                            let weak = weak_for_drop;
+                            move |dragged: &DraggedRef, window, cx| {
+                                let at = window.mouse_position();
+                                let dragged = dragged.clone();
+                                weak.update(cx, |this, cx| {
+                                    this.offer_ref_onto_commit(dragged, index, at, window, cx);
+                                })
+                                .ok();
+                            }
+                        })
                         .into_any_element()
                 })
                 .uniform_list(
@@ -6584,7 +6939,7 @@ mod tests {
     use fs::FakeFs;
     use git::Oid;
     use git::repository::{CommitData, InitialGraphCommitData};
-    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, UpdateGlobal, VisualTestContext};
     use project::git_store::{GitStoreEvent, RepositoryEvent};
     use project::{
         GIT_COMMAND_TASK_TAG, Project, TaskSourceKind, task_store::TaskSettingsLocation,
@@ -9571,6 +9926,80 @@ mod tests {
         (git_graph, cx)
     }
 
+    /// The same history, but opened in a workspace the way a reader opens it.
+    ///
+    /// `drawn_history` paints the view over the window's own root, which is
+    /// enough to measure what was drawn but not to click it: an event is
+    /// dispatched against whatever the window last drew for itself, and that is
+    /// the workspace, which does not contain a view drawn over it. A test of a
+    /// real gesture has to put the history where the window will draw it.
+    async fn history_in_a_workspace(
+        cx: &mut TestAppContext,
+        commits: Vec<Arc<InitialGraphCommitData>>,
+        size: gpui::Size<Pixels>,
+    ) -> (Entity<GitGraph>, &mut VisualTestContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+        fs.set_head_and_index_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let git_graph = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let git_graph = cx.new(|cx| {
+                    GitGraph::new(
+                        repository.read(cx).id,
+                        project.read(cx).git_store().clone(),
+                        workspace.weak_handle(),
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item_to_active_pane(
+                    Box::new(git_graph.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+                git_graph
+            })
+        });
+
+        cx.simulate_resize(size);
+        cx.run_until_parked();
+        // Twice, because what the columns do depends on a width only the first
+        // one can measure.
+        cx.draw(point(px(0.), px(0.)), size, |_, _| gpui::Empty);
+        cx.run_until_parked();
+
+        (git_graph, cx)
+    }
+
     fn place_of(lane: usize, layout: HistoryLayout) -> NodePlace {
         match lane >= layout.lane_cap {
             true => NodePlace::PastTheEdge,
@@ -10506,6 +10935,102 @@ mod tests {
             of(4, smallvec![oids[5]], vec!["tag: v1.0".into()]),
             of(5, smallvec![], vec![]),
         ]
+    }
+
+    /// Drags from one point to another the way a hand does.
+    ///
+    /// A drop is dispatched to whatever hitbox the pointer is over, and
+    /// hitboxes are worked out while painting, so the window has to draw
+    /// between the move and the release.
+    fn drag_between(cx: &mut VisualTestContext, from: Point<Pixels>, onto: Point<Pixels>) {
+        cx.simulate_mouse_move(from, None, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        // Far enough to be a drag rather than a click.
+        cx.simulate_mouse_move(
+            from + point(px(8.), px(8.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_window, cx| cx.has_active_drag()),
+            "the gesture never became a drag, so nothing could be dropped"
+        );
+        cx.simulate_mouse_move(onto, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(onto, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_dragging_one_label_onto_another(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        let from = cx
+            .debug_bounds("GRAPH_CHIP-2-feature")
+            .expect("the side branch should carry a label to drag");
+        let onto = cx
+            .debug_bounds("GRAPH_CHIP-0-main")
+            .expect("main should carry a label to drop onto");
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert!(graph.context_menu.is_none(), "a menu was already open");
+        });
+
+        drag_between(cx, from.center(), onto.center());
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert!(
+                graph.context_menu.is_some(),
+                "dropping a label on another offered nothing; merge, rebase and \
+                 fast-forward are three answers to that gesture and it has to ask"
+            );
+            // The label sits inside the row, so both could have taken the drop.
+            // The one the pointer was actually over has to win.
+            assert_eq!(
+                graph.last_drop_offer,
+                Some(DropOffer::Branches {
+                    dragged: "feature".into(),
+                    onto: "main".into()
+                }),
+                "the row underneath took a drop meant for the label on it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dragging_a_label_onto_a_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        let from = cx
+            .debug_bounds("GRAPH_CHIP-0-main")
+            .expect("main should carry a label to drag");
+        let onto = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 3))
+            .expect("row 3 should have been painted");
+
+        drag_between(cx, from.center(), onto.center());
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert!(
+                graph.context_menu.is_some(),
+                "dropping a label on a commit offered no reset"
+            );
+            assert_eq!(
+                graph.last_drop_offer,
+                Some(DropOffer::BranchOnCommit {
+                    dragged: "main".into(),
+                    row: 3
+                }),
+                "the drop landed on the wrong row"
+            );
+        });
     }
 
     #[gpui::test]

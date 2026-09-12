@@ -8637,6 +8637,50 @@ impl Repository {
         )
     }
 
+    /// Merges a ref into the branch that is checked out.
+    pub fn merge(
+        &mut self,
+        what: String,
+        fast_forward_only: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "merge",
+            Some(format!("git merge {what}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.merge(what, fast_forward_only, environment).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("merging is not available over a remote project")
+                    }
+                }
+            },
+        )
+    }
+
+    /// Replays the checked-out branch on top of a ref.
+    pub fn rebase(&mut self, onto: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "rebase",
+            Some(format!("git rebase {onto}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.rebase(onto, environment).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("rebasing is not available over a remote project")
+                    }
+                }
+            },
+        )
+    }
+
     /// Replays the given commits on top of the current branch.
     ///
     /// Only for a repository on this machine: the wire has no message for it,

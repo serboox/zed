@@ -932,6 +932,17 @@ pub trait GitRepository: Send + Sync {
 
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
 
+    /// Merges a ref into the branch that is checked out.
+    fn merge(
+        &self,
+        what: String,
+        fast_forward_only: bool,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    /// Replays the checked-out branch on top of a ref.
+    fn rebase(&self, onto: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
     /// Replays the given commits, oldest first, on top of the current branch.
     fn cherry_pick(
         &self,
@@ -2276,6 +2287,25 @@ impl GitRepository for RealGitRepository {
                 anyhow::Ok(())
             })
             .boxed()
+    }
+
+    fn merge(
+        &self,
+        what: String,
+        fast_forward_only: bool,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let mut command = vec!["merge".to_string()];
+        if fast_forward_only {
+            // Refused rather than turned into a merge commit: a reader who
+            // asked to fast-forward is asking whether it is possible.
+            command.push("--ff-only".to_string());
+        }
+        self.replay(command, vec![what], env)
+    }
+
+    fn rebase(&self, onto: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        self.replay(vec!["rebase".to_string()], vec![onto], env)
     }
 
     fn cherry_pick(

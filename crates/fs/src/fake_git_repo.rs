@@ -173,6 +173,23 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn merge(
+        &self,
+        _what: String,
+        _fast_forward_only: bool,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn rebase(
+        &self,
+        _onto: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
     fn cherry_pick(
         &self,
         _commits: Vec<String>,
