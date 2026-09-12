@@ -6607,7 +6607,11 @@ impl GitPanel {
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let row_height = Self::history_row_height(window);
         let shows_subject = true;
-        let shows_details = true;
+        // The dock draws the page's row, narrowed: one line a reader scans by
+        // subject. Who wrote it and when is a hover away, and putting it on a
+        // second line is what made a row of the dock a different thing from a
+        // row of the page.
+        let shows_details = false;
         let remote = self.git_remote(cx);
 
         let focused_history_entry = self.focused_history_entry;
@@ -6715,6 +6719,8 @@ impl GitPanel {
                                                             .ok();
                                                     })
                                                 });
+                                            let lane_colour =
+                                                ui::cyberpunk::lane(entry.color_idx);
                                             let sha_string = entry.data.sha.to_string();
                                             let sha_shared: SharedString =
                                                 sha_string.clone().into();
@@ -6831,18 +6837,40 @@ impl GitPanel {
                                                         )
                                                     },
                                                 )
-                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                                // The same ladder the page
+                                                // uses: the row wears its
+                                                // branch's colour, and the
+                                                // pointer and the selection
+                                                // are steps up in it rather
+                                                // than a grey laid over it.
+                                                .bg(lane_colour.opacity(0.14))
+                                                .hover(|s| s.bg(lane_colour.opacity(0.22)))
                                                 .when(is_focused, |this| {
-                                                    this.bg(cx.theme().colors().element_selected)
+                                                    this.bg(lane_colour.opacity(0.30))
                                                 })
                                                 .when(is_context_menu_target, |this| {
-                                                    this.bg(cx.theme().colors().element_hover)
+                                                    this.bg(lane_colour.opacity(0.30))
                                                 })
                                                 .children(shows_subject.then(|| {
                                                     h_flex()
                                                         .gap_1()
                                                         .w_full()
                                                         .min_w_0()
+                                                        // The tick carries the
+                                                        // branch colour into
+                                                        // the text, so a reader
+                                                        // following one branch
+                                                        // keeps to it without
+                                                        // crossing back to the
+                                                        // graph.
+                                                        .child(
+                                                            div()
+                                                                .flex_none()
+                                                                .w(px(2.))
+                                                                .h(px(20.))
+                                                                .rounded_sm()
+                                                                .bg(lane_colour.opacity(0.7)),
+                                                        )
                                                         .children(fold_toggle)
                                                         .children(
                                                             folded_here.map(|count| Chip::new(format!("{count} folded"))),

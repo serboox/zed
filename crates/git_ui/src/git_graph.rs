@@ -2420,12 +2420,14 @@ fn paint_row_lanes(
     if let Some((lane, color_idx)) = connector {
         let to_x = bounds.origin.x + lane_center(lane.clamp(first_lane, first_lane + lane_cap - 1))
             - node_gap;
-        let mut builder = PathBuilder::stroke(px(1.));
+        let mut builder = PathBuilder::stroke(px(1.2));
         builder.move_to(point(bounds.origin.x, center));
         builder.line_to(point(to_x, center));
         builder.close();
         if let Ok(path) = builder.build() {
-            window.paint_path(path, cyberpunk::lane(color_idx).opacity(0.35));
+            // The same line the label column started, at the same weight: the
+            // two halves are one line crossing a column border.
+            window.paint_path(path, cyberpunk::lane(color_idx).opacity(0.85));
         }
     }
 
@@ -4049,13 +4051,20 @@ impl GitGraph {
             .label_size(LabelSize::Small)
             .truncate()
             .icon(kind.icon())
+            // Filled with the branch's own colour rather than outlined in it:
+            // the pill is the branch, and a reader picking one name out of ten
+            // down the left edge finds it by its colour before they read it.
+            // White, not whatever `readable_on` says of the raw colour: the
+            // pill is painted at little over half opacity onto a dark row, so
+            // what the reader sees is always darker than the colour itself.
+            .label_color(Color::Custom(hsla(0., 0., 1., 1.)))
             .map(|chip| match is_head {
                 true => chip
-                    .bg_color(accent_color.opacity(0.25))
-                    .border_color(accent_color.opacity(0.5)),
+                    .bg_color(accent_color.opacity(0.75))
+                    .border_color(accent_color),
                 false => chip
-                    .bg_color(accent_color.opacity(0.08))
-                    .border_color(accent_color.opacity(0.25)),
+                    .bg_color(accent_color.opacity(0.55))
+                    .border_color(accent_color.opacity(0.7)),
             });
 
         let ref_name = name.clone();
@@ -4188,6 +4197,13 @@ impl GitGraph {
 
     /// The ref chips for a commit, packed against the graph so that a label and
     /// its node read as one thing.
+    /// The names a commit carries.
+    ///
+    /// `carried_across` says whether this is the column of its own, where the
+    /// name sits at the far edge and a line runs from it to the commit. Written
+    /// inside the subject instead -- which is what the narrowest width leaves
+    /// room for -- there is nothing to cross, and a name that took the width of
+    /// the row would take the subject with it.
     fn render_refs_cell(
         &self,
         idx: usize,
@@ -4195,9 +4211,16 @@ impl GitGraph {
         accent_color: Hsla,
         head_branch_name: Option<&str>,
         mode: LabelMode,
+        carried_across: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let refs = self.refs_of(idx, head_branch_name);
+        // Tags ride beside the subject they mark, so the column of branch
+        // names is only ever branch names.
+        let refs: Vec<(RefKind, SharedString)> = self
+            .refs_of(idx, head_branch_name)
+            .into_iter()
+            .filter(|(kind, _)| *kind != RefKind::Tag)
+            .collect();
         if refs.is_empty() {
             return div().h(metrics.row).into_any_element();
         }
@@ -4214,12 +4237,28 @@ impl GitGraph {
 
         h_flex()
             .h(metrics.row)
-            .w_full()
+            .when(carried_across, |this| this.w_full())
+            // Written inside the subject it shrinks with the row rather than
+            // holding its natural width and pushing the row past the window --
+            // and it never takes more than a third of it, because a row of
+            // branch names with three letters of subject left is not a history
+            // anybody can read down.
+            .when(!carried_across, |this| {
+                this.min_w_0().max_w(gpui::relative(0.34))
+            })
             .items_center()
-            .justify_end()
+            // In a column of its own the name sits at the far edge and a line
+            // carries it across to its commit. Pushed up against the graph
+            // instead, the names of eight branches make a ragged wall nobody
+            // can read down, and nothing says which line belongs to which name.
+            .justify_start()
             .gap_1()
             .pl_1()
-            .overflow_hidden()
+            // Clipped, a name ends mid-letter and reads as a rendering fault.
+            // Left to shrink, the chip's own truncation ends it in an ellipsis,
+            // which reads as a name that goes on.
+            .when(carried_across, |this| this.overflow_hidden())
+            .when(!carried_across, |this| this.pr_1())
             .debug_selector(move || format!("GRAPH_REFS-{idx}"))
             .children(refs[..shown].iter().map(|(kind, name)| {
                 h_flex()
@@ -4250,7 +4289,25 @@ impl GitGraph {
                         .tooltip(Tooltip::text(names)),
                 )
             })
+            .when(carried_across, |this| {
+                this.child(Self::carried_across(idx, accent_color))
+            })
             .into_any_element()
+    }
+
+    /// The line that carries a branch's name across to its own commit.
+    ///
+    /// Without it a column of names on one side and a column of nodes on the
+    /// other are two lists a reader has to join up by counting rows. The line
+    /// is the join, and it is the branch's own colour so that it says which
+    /// lane it is going to before it gets there.
+    fn carried_across(idx: usize, colour: Hsla) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("GRAPH_LEAD-{idx}"))
+            .flex_1()
+            .min_w_0()
+            .h(px(1.2))
+            .bg(colour.opacity(0.85))
     }
 
     /// The branch a commit is on, drawn hollow so it does not read as a label
@@ -4268,7 +4325,7 @@ impl GitGraph {
             .h(metrics.row)
             .w_full()
             .items_center()
-            .justify_end()
+            .justify_start()
             .gap_1()
             .pl_1()
             .overflow_hidden()
@@ -4289,6 +4346,7 @@ impl GitGraph {
                             .border_color(accent_color.opacity(0.18)),
                     ),
             )
+            .child(Self::carried_across(idx, accent_color.opacity(0.4)))
             .into_any_element()
     }
 
@@ -4570,6 +4628,17 @@ impl GitGraph {
                     .then(|| self.ghost_branch(idx))
                     .flatten();
 
+                // A tag names a release, not a line of work: it belongs
+                // beside the subject it marks rather than in the column of
+                // branches, where it would sit among names that mean something
+                // else and push them out of the room they have.
+                let tags: Vec<SharedString> = self
+                    .refs_of(idx, head_branch_name.as_deref())
+                    .into_iter()
+                    .filter(|(kind, _)| *kind == RefKind::Tag)
+                    .map(|(_, name)| name)
+                    .collect();
+
                 let inline_label = (!layout.labels.has_a_column()).then(|| {
                     self.render_refs_cell(
                         idx,
@@ -4577,6 +4646,7 @@ impl GitGraph {
                         accent_color,
                         head_branch_name.as_deref(),
                         layout.labels,
+                        false,
                         cx,
                     )
                 });
@@ -4589,6 +4659,7 @@ impl GitGraph {
                             accent_color,
                             head_branch_name.as_deref(),
                             layout.labels,
+                            true,
                             cx,
                         ),
                         (true, Some((kind, name))) => {
@@ -4636,14 +4707,44 @@ impl GitGraph {
                             h_flex()
                                 .flex_1()
                                 .min_w_0()
+                                .items_center()
+                                .gap_1()
                                 .overflow_hidden()
-                                .child(subject_label),
+                                .child(subject_label)
+                                .children(tags.into_iter().take(layout.labels.chips_a_row()).map(
+                                    |tag| {
+                                        let named = tag.clone();
+                                        div()
+                                            .flex_none()
+                                            .debug_selector(move || {
+                                                format!("GRAPH_TAG-{idx}-{named}")
+                                            })
+                                            .child(
+                                                Chip::new(tag)
+                                                    .label_size(LabelSize::Small)
+                                                    .truncate()
+                                                    .icon(RefKind::Tag.icon())
+                                                    .bg_color(accent_color.opacity(0.10))
+                                                    .border_color(accent_color.opacity(0.30)),
+                                            )
+                                            .into_any_element()
+                                    },
+                                )),
                         )
-                        .when(shows_age && !age_has_a_column, |this| {
+                        // The age keeps its place whether or not it is
+                        // written: appearing on hover, it would push the
+                        // subject aside, and a list whose every row jumps as
+                        // the pointer crosses it cannot be read at all.
+                        .when(!age_has_a_column, |this| {
                             this.child(
-                                Label::new(age.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                div()
+                                    .flex_none()
+                                    .when(!shows_age, |this| this.opacity(0.))
+                                    .child(
+                                        Label::new(age.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             )
                         })
                         .into_any_element(),
@@ -6181,13 +6282,15 @@ impl Render for GitGraph {
                     } else {
                         cx.theme().colors().element_hover
                     };
-                    // Faint enough to be read as "which branch" rather than as
-                    // "look here": the selection and the pointer are what say
-                    // look here, and they paint over this.
-                    let band = weak.upgrade().and_then(|graph| {
+                    // The row wears its branch's colour, and the selection and
+                    // the pointer are steps up in that same colour rather than
+                    // a grey laid over it: a reader scanning for one branch
+                    // must not lose the row they are pointing at.
+                    let lane = weak.upgrade().and_then(|graph| {
                         let commit = graph.read(cx).graph_data.commits.get(index)?.clone();
-                        Some(cyberpunk::lane(commit.color_idx).opacity(0.05))
+                        Some(cyberpunk::lane(commit.color_idx))
                     });
+                    let band = lane.map(|lane| lane.opacity(0.14));
 
                     let in_the_question = lit_branch
                         .as_ref()
@@ -6205,11 +6308,11 @@ impl Render for GitGraph {
                         .when(!in_the_question, |row| row.opacity(0.35))
                         .when_some(band, |row, band| row.bg(band))
                         .when(is_selected || is_context_menu_target, |row| {
-                            row.bg(selected_bg)
+                            row.bg(lane.map_or(selected_bg, |lane| lane.opacity(0.30)))
                         })
                         .when(
                             is_hovered && !is_selected && !is_context_menu_target,
-                            |row| row.bg(hover_bg),
+                            |row| row.bg(lane.map_or(hover_bg, |lane| lane.opacity(0.22))),
                         )
                         .on_hover(move |&is_hovered, _, cx| {
                             weak_for_hover
@@ -11021,13 +11124,97 @@ mod tests {
     /// a label that names the wrong commit. Measured rather than reasoned
     /// about: the two are laid out by different parents and only a shared row
     /// height holds them together.
+    /// At the narrowest width the name is written inside the subject, where
+    /// there is no column to cross. A name that took the width of the row
+    /// there would take the subject with it, and a history of branch names
+    /// with no subjects is not a history.
+    #[gpui::test]
+    async fn a_name_written_inside_the_subject_leaves_the_subject_its_room(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let size = gpui::size(px(300.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        let labels = git_graph.update_in(cx, |graph, window, cx| {
+            graph.history_layout(window, cx).labels
+        });
+        assert!(
+            !labels.has_a_column(),
+            "this width was meant to be too narrow for a column of names, but the \
+             layout chose {labels:?}"
+        );
+
+        let subject = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 0))
+            .expect("the first row has a subject cell");
+        let label = cx
+            .debug_bounds(selector("GRAPH_REFS", 0))
+            .expect("and its name is written inside it");
+
+        assert!(
+            cx.debug_bounds(selector("GRAPH_LEAD", 0)).is_none(),
+            "there is no column here for a line to cross"
+        );
+        assert!(
+            label.size.width <= subject.size.width * 0.35,
+            "the name takes {:?} of the {:?} the subject has, leaving it nothing",
+            label.size.width,
+            subject.size.width
+        );
+    }
+
+    /// The name goes to the far edge of the row and a line carries it across
+    /// to its own commit. Pushed up against the graph instead, eight names
+    /// make a ragged wall nobody can read down, and nothing says which line
+    /// belongs to which name.
+    #[gpui::test]
+    async fn a_branch_name_sits_at_the_edge_and_is_carried_across(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (_git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        let column = cx
+            .debug_bounds(selector("GRAPH_REFS", 0))
+            .expect("the first row is labelled");
+        let chip = cx
+            .debug_bounds("GRAPH_CHIP-0-main")
+            .expect("and its label is drawn");
+        let lead = cx
+            .debug_bounds(selector("GRAPH_LEAD", 0))
+            .expect("and a line carries it across to its commit");
+        let cell = cx
+            .debug_bounds(selector("GRAPH_CELL", 0))
+            .expect("beside its graph cell");
+
+        assert!(
+            chip.origin.x - column.origin.x < px(12.),
+            "the name starts {:?} into its column instead of at its edge",
+            chip.origin.x - column.origin.x
+        );
+        assert!(
+            lead.origin.x >= chip.origin.x + chip.size.width - px(1.),
+            "the line starts at {:?}, which is behind the name it carries",
+            lead.origin.x
+        );
+        assert!(
+            lead.origin.x + lead.size.width >= column.origin.x + column.size.width - px(2.),
+            "the line stops {:?} short of the graph, so it carries the name nowhere",
+            column.origin.x + column.size.width - (lead.origin.x + lead.size.width)
+        );
+        assert!(
+            cell.origin.x >= column.origin.x + column.size.width - px(1.),
+            "the graph should begin where the label column ends"
+        );
+    }
+
     #[gpui::test]
     async fn a_label_sits_on_the_row_of_the_commit_it_names(cx: &mut TestAppContext) {
         init_test(cx);
         let size = gpui::size(px(1400.), px(800.));
         let (_git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
 
-        for (row, name) in [(0usize, "main"), (2, "feature"), (4, "v1.0")] {
+        for (row, name) in [(0usize, "main"), (2, "feature")] {
             let chip = cx
                 .debug_bounds(Box::leak(
                     format!("GRAPH_CHIP-{row}-{name}").into_boxed_str(),
@@ -11043,6 +11230,25 @@ mod tests {
                  which is more than half a row: it reads as another commit's"
             );
         }
+
+        // A tag names a release rather than a line of work, so it rides beside
+        // the subject it marks instead of standing in the column of branches.
+        assert!(
+            cx.debug_bounds("GRAPH_CHIP-4-v1.0").is_none(),
+            "a tag has no place among the branch names"
+        );
+        let tag = cx
+            .debug_bounds("GRAPH_TAG-4-v1.0")
+            .expect("but it is drawn beside the subject it marks");
+        let subject = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 4))
+            .expect("on that row");
+        assert!(
+            tag.origin.x >= subject.origin.x
+                && tag.origin.x < subject.origin.x + subject.size.width,
+            "the tag is drawn at {:?}, outside the subject it belongs to",
+            tag.origin.x
+        );
     }
 
     #[gpui::test]
