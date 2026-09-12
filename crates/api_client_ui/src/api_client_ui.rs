@@ -7,6 +7,7 @@ mod full_export;
 mod grpc_view;
 mod history_view;
 mod import;
+mod laying_a_body_out;
 mod panel;
 mod redirect_capture;
 mod request_view;

@@ -413,18 +413,21 @@ pub fn pretty_print_body(body: &[u8], content_type: &str) -> Option<(String, &'s
     let text = std::str::from_utf8(body).ok()?;
     let looks_like_json =
         content_type.contains("json") || text.trim_start().starts_with(['{', '[']);
-    if looks_like_json {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-            return serde_json::to_string_pretty(&value)
-                .ok()
-                .map(|pretty| (pretty, "JSON"));
-        }
+    if looks_like_json && let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return serde_json::to_string_pretty(&value)
+            .ok()
+            .map(|pretty| (pretty, "JSON"));
     }
-    let looks_like_xml = content_type.contains("xml") || text.trim_start().starts_with('<');
-    if looks_like_xml {
-        return Some((text.to_string(), "XML"));
-    }
-    None
+    // A truncated or malformed body is the one a reader most needs laid out,
+    // and it is also the one a parser refuses. Laying it out by its brackets
+    // or its tags changes only the whitespace between what is there, so a
+    // body nothing can parse is still readable.
+    let shape = crate::laying_a_body_out::shape_named_by(content_type)?;
+    let named = match shape {
+        crate::laying_a_body_out::Shape::Brackets => "JSON",
+        crate::laying_a_body_out::Shape::Xml | crate::laying_a_body_out::Shape::Html => "XML",
+    };
+    Some((crate::laying_a_body_out::laid_out_again(text, shape), named))
 }
 
 /// The text a response's body should be diffed as: pretty-printed when the
@@ -671,18 +674,23 @@ mod tests {
         assert_eq!(language, "JSON");
     }
 
+    /// A body a parser refuses is the one a reader most needs laid out -- a
+    /// truncated response is read to find out where it stopped. Laying it out
+    /// by its brackets changes only the whitespace between what is there.
     #[test]
-    fn malformed_json_falls_back_to_none_rather_than_panicking() {
-        let body = br#"{"a": "#;
-        assert!(pretty_print_body(body, "application/json").is_none());
+    fn malformed_json_is_laid_out_rather_than_given_up_on() {
+        let body = br#"{"a": 1, "b": ["#;
+        let (text, language) = pretty_print_body(body, "application/json").unwrap();
+        assert_eq!(language, "JSON");
+        assert_eq!(text, "{\n  \"a\": 1,\n  \"b\": [");
     }
 
     #[test]
-    fn an_xml_body_is_tagged_as_xml_without_reformatting() {
+    fn an_xml_body_is_tagged_as_xml_and_laid_out() {
         let body = b"<root><child/></root>";
         let (text, language) = pretty_print_body(body, "application/xml").unwrap();
         assert_eq!(language, "XML");
-        assert_eq!(text, "<root><child/></root>");
+        assert_eq!(text, "<root>\n  <child/>\n</root>");
     }
 
     #[test]

@@ -1779,9 +1779,18 @@ impl RequestView {
         });
     }
 
-    fn set_body_kind(&mut self, kind: BodyKind, cx: &mut Context<Self>) {
+    /// Switching the body on has to attach the language too.
+    ///
+    /// The content type does not change here -- a request whose body is turned
+    /// on is already typed JSON -- so nothing else was reaching
+    /// `sync_body_language`, and a reader who turned the body on saw their
+    /// JSON in one colour until they reopened the request.
+    fn set_body_kind(&mut self, kind: BodyKind, window: &mut Window, cx: &mut Context<Self>) {
         self.body_kind = kind;
         self.persist_body(cx);
+        if kind == BodyKind::Raw {
+            self.sync_body_language(self.body_content_type, window, cx);
+        }
         cx.notify();
     }
 
@@ -1868,14 +1877,23 @@ impl RequestView {
     /// well-formed JSON/XML -- reuses the same detection `pretty_print_body`
     /// already applies to response bodies, so a request body and a response
     /// body format identically for the same content type.
+    /// Lays the raw body out again, whether or not it is well-formed.
+    ///
+    /// A reader presses this precisely when the body has got away from them --
+    /// a pasted line with no line breaks, a brace they cannot find. A
+    /// formatter that answered only well-formed bodies would be missing at the
+    /// one moment it is wanted, so this one changes the whitespace between the
+    /// body's tokens and nothing else, and a half-typed body lays out as far
+    /// as it goes. Plain text has no structure to lay out and is left alone.
     fn format_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.body_editor.read(cx).text(cx);
-        let content_type = content_type_header_value(self.body_content_type);
-        let Some((formatted, _)) =
-            crate::response_view::pretty_print_body(text.as_bytes(), content_type)
-        else {
+        let Some(shape) = crate::laying_a_body_out::shape_of(self.body_content_type) else {
             return;
         };
+        let text = self.body_editor.read(cx).text(cx);
+        let formatted = crate::laying_a_body_out::laid_out_again(&text, shape);
+        if formatted == text {
+            return;
+        }
         self.body_editor.update(cx, |editor, cx| {
             editor.set_text(formatted, window, cx);
         });
@@ -3889,8 +3907,8 @@ impl RequestView {
                             "None",
                             body_kind == BodyKind::None,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_kind(BodyKind::None, cx);
+                            |this, _, window, cx| {
+                                this.set_body_kind(BodyKind::None, window, cx);
                             },
                         ))
                         .child(Self::render_chip_scoped(
@@ -3898,8 +3916,8 @@ impl RequestView {
                             "Raw",
                             body_kind == BodyKind::Raw,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_kind(BodyKind::Raw, cx);
+                            |this, _, window, cx| {
+                                this.set_body_kind(BodyKind::Raw, window, cx);
                             },
                         )),
                 );
@@ -5888,6 +5906,32 @@ mod tests {
         );
     }
 
+    /// The languages the body editor asks for by name. A test registry ships
+    /// none, so without these `sync_body_language` has nothing to attach and a
+    /// test could not tell a broken wiring from an empty registry.
+    fn register_the_body_languages(project: &Entity<Project>, cx: &mut TestAppContext) {
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        for name in ["JSON", "XML", "HTML", "JavaScript"] {
+            languages.add(std::sync::Arc::new(language::Language::new(
+                language::LanguageConfig {
+                    name: name.into(),
+                    ..Default::default()
+                },
+                None,
+            )));
+        }
+    }
+
+    fn body_language(view: &Entity<RequestView>, cx: &mut TestAppContext) -> Option<String> {
+        view.read_with(cx, |view, cx| {
+            let buffer = view.body_editor.read(cx).buffer().read(cx).as_singleton()?;
+            buffer
+                .read(cx)
+                .language()
+                .map(|language| language.name().to_string())
+        })
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -5968,6 +6012,7 @@ mod tests {
         // chrome to be interaction-testable.
         let fs = project::FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
+        register_the_body_languages(&project, cx);
         let workspace_window =
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let workspace_handle = workspace_window
@@ -6774,7 +6819,7 @@ mod tests {
         let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
 
         view.update_in(&mut cx, |view, window, cx| {
-            view.set_body_kind(BodyKind::Raw, cx);
+            view.set_body_kind(BodyKind::Raw, window, cx);
             view.set_body_content_type(RawBodyContentType::Json, window, cx);
             view.active_tab = RequestTab::Body;
             view.body_editor.update(cx, |editor, cx| {
@@ -7169,8 +7214,8 @@ mod tests {
     #[gpui::test]
     async fn clicking_the_variable_picker_trigger_opens_its_picker(cx: &mut TestAppContext) {
         let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
-        view.update(&mut cx, |view, cx| {
-            view.set_body_kind(BodyKind::Raw, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
             view.active_tab = RequestTab::Body;
         });
         draw(&mut cx);
@@ -7195,7 +7240,7 @@ mod tests {
     async fn inserting_a_dynamic_variable_token_appends_it_to_the_body(cx: &mut TestAppContext) {
         let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
         let body_editor = view.update_in(&mut cx, |view, window, cx| {
-            view.set_body_kind(BodyKind::Raw, cx);
+            view.set_body_kind(BodyKind::Raw, window, cx);
             view.body_editor.update(cx, |editor, cx| {
                 editor.set_text("", window, cx);
             });
@@ -8834,7 +8879,7 @@ mod tests {
     async fn clicking_format_pretty_prints_a_minified_json_body(cx: &mut TestAppContext) {
         let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
         view.update_in(&mut cx, |view, window, cx| {
-            view.set_body_kind(BodyKind::Raw, cx);
+            view.set_body_kind(BodyKind::Raw, window, cx);
             view.set_body_content_type(RawBodyContentType::Json, window, cx);
             view.body_editor.update(cx, |editor, cx| {
                 editor.set_text(r#"{"a":1,"b":[2,3]}"#, window, cx);
@@ -8850,6 +8895,131 @@ mod tests {
         view.read_with(&cx, |view, cx| {
             let text = view.body_editor.read(cx).text(cx);
             assert_eq!(text, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3\n  ]\n}");
+        });
+    }
+
+    /// Turning the body on is the one route that left the editor with no
+    /// language: the content type does not change, so nothing was reaching
+    /// `sync_body_language`, and the reader saw their JSON in one colour until
+    /// they reopened the request.
+    #[gpui::test]
+    async fn turning_the_body_on_attaches_its_language(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        assert_eq!(
+            body_language(&view, &mut cx),
+            None,
+            "a request with no body has no language to attach yet"
+        );
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            body_language(&view, &mut cx),
+            Some("JSON".to_string()),
+            "the body is typed JSON already, so JSON is what it is written in"
+        );
+    }
+
+    #[gpui::test]
+    async fn switching_the_content_type_attaches_the_other_language(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
+            view.set_body_content_type(RawBodyContentType::Xml, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(body_language(&view, &mut cx), Some("XML".to_string()));
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_content_type(RawBodyContentType::Text, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            body_language(&view, &mut cx),
+            None,
+            "plain text is plain text"
+        );
+    }
+
+    /// The reason a reader reaches for this button: the body has got away
+    /// from them. A formatter that answered only well-formed bodies would be
+    /// missing at exactly that moment.
+    #[gpui::test]
+    async fn clicking_format_lays_out_a_json_body_that_is_not_valid_json(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
+            view.set_body_content_type(RawBodyContentType::Json, window, cx);
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text(r#"{"a":1,"b":[2,3"#, window, cx);
+            });
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let format_button = debug_center(&mut cx, "request-format-body");
+        cx.simulate_click(format_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let text = view.body_editor.read(cx).text(cx);
+            assert_eq!(text, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3");
+            assert!(
+                view.body_json_invalid,
+                "laying it out does not make it valid, and the warning still says so"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_format_lays_out_an_xml_body(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
+            view.set_body_content_type(RawBodyContentType::Xml, window, cx);
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text("<a><b>one</b><c/></a>", window, cx);
+            });
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let format_button = debug_center(&mut cx, "request-format-body");
+        cx.simulate_click(format_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.body_editor.read(cx).text(cx),
+                "<a>\n  <b>one</b>\n  <c/>\n</a>"
+            );
+        });
+    }
+
+    /// Plain text has no structure, and rearranging somebody's plain text is
+    /// not formatting it.
+    #[gpui::test]
+    async fn clicking_format_leaves_a_text_body_alone(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, window, cx);
+            view.set_body_content_type(RawBodyContentType::Text, window, cx);
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text("one  two\n   three", window, cx);
+            });
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let format_button = debug_center(&mut cx, "request-format-body");
+        cx.simulate_click(format_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.body_editor.read(cx).text(cx), "one  two\n   three");
         });
     }
 
