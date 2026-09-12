@@ -134,6 +134,18 @@ pub fn claimant(name: &str, claimed: &HashMap<&str, usize>) -> Option<usize> {
 ///
 /// A query that does not compile is left out and named, rather than bringing the
 /// whole thing down: what is wanted is a measurement of what there is.
+/// One grammar by name, without compiling any query.
+///
+/// [`readable`] builds every outline query the editor ships, which costs more
+/// than a question asked while a reader holds a modifier key down. A caller
+/// that only needs to parse a file wants this one.
+pub fn grammar_named(name: &str) -> Option<tree_sitter::Language> {
+    grammars::native_grammars()
+        .into_iter()
+        .find(|(named, _)| *named == name)
+        .map(|(_, grammar)| grammar)
+}
+
 pub fn readable() -> (Vec<Readable>, Vec<String>) {
     let grammars: HashMap<String, tree_sitter::Language> = grammars::native_grammars()
         .into_iter()

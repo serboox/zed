@@ -1402,6 +1402,31 @@ impl Catalogue {
             .collect()
     }
 
+    /// Every symbol whose name is exactly `name`.
+    ///
+    /// Not the same question as [`Self::candidates`], which ranks by fuzzy
+    /// score and cuts the list off: a caller that has to see *all* the
+    /// declarations of one name -- to find that there is exactly one of them
+    /// in some package, or that there are two and it must decline -- cannot
+    /// take a truncated list and be right about it.
+    ///
+    /// One pass over the catalogue, with the same letter-bag rejection the
+    /// fuzzy search uses, so a name nothing could match costs nothing to ask
+    /// about.
+    pub fn exactly_named(&self, name: &str) -> Vec<Definition> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let wanted: Vec<char> = name.chars().map(folded).collect();
+        let letters = CharBag::from(&wanted[..]);
+        self.entries
+            .iter()
+            .filter(|entry| entry.letters.is_superset(letters))
+            .filter(|entry| entry.name.as_ref() == name)
+            .map(|entry| self.definition(entry))
+            .collect()
+    }
+
     fn definition(&self, entry: &Entry) -> Definition {
         let held = |from: &[Box<str>], at: u32| {
             from.get(at as usize)
@@ -1460,6 +1485,71 @@ fn folded(letter: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn declared(name: &str, path: &str, kind: &str) -> Definition {
+        Definition {
+            path: path.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            line: 1,
+            language: "go".to_string(),
+        }
+    }
+
+    /// The fuzzy search ranks and truncates, which is right for a search box
+    /// and wrong for a caller that has to know whether a name is declared once
+    /// or twice.
+    #[test]
+    fn every_declaration_of_one_name_comes_back_and_nothing_else_does() {
+        let catalogue = Catalogue::of([
+            declared("Symbol", "internal/models/instrument.go", "type_spec"),
+            declared("Symbol", "internal/models/result.go", "field_identifier"),
+            declared("Symbol", "client/pkg/models/model.go", "type_spec"),
+            declared(
+                "SymbolsReaderFunc",
+                "internal/models/instrument.go",
+                "type_spec",
+            ),
+            declared(
+                "processSymbol",
+                "internal/process/job.go",
+                "method_declaration",
+            ),
+        ]);
+
+        let mut found: Vec<(String, String)> = catalogue
+            .exactly_named("Symbol")
+            .into_iter()
+            .map(|one| (one.path, one.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "client/pkg/models/model.go".to_string(),
+                    "type_spec".to_string()
+                ),
+                (
+                    "internal/models/instrument.go".to_string(),
+                    "type_spec".to_string()
+                ),
+                (
+                    "internal/models/result.go".to_string(),
+                    "field_identifier".to_string()
+                ),
+            ],
+            "a name that merely contains the letters is not this name"
+        );
+    }
+
+    #[test]
+    fn a_name_nothing_declares_comes_back_empty() {
+        let catalogue = Catalogue::of([declared("Symbol", "one.go", "type_spec")]);
+        assert!(catalogue.exactly_named("Sym").is_empty());
+        assert!(catalogue.exactly_named("").is_empty());
+        assert!(catalogue.exactly_named("symbol").is_empty());
+    }
 
     fn facts() -> FileFacts {
         FileFacts {

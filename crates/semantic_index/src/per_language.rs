@@ -1283,7 +1283,11 @@ pub fn declares_a_type(language: &str, kind: &str) -> bool {
             "trait_item",
             "type_item",
         ],
-        "go" => &["type_declaration"],
+        // The outline query puts `@item` on the `type_spec`, not on the
+        // `type_declaration` that holds it, so that a grouped
+        // `type ( A struct{}; B struct{} )` yields two definitions and
+        // not one. The kind recorded is the captured node's.
+        "go" => &["type_spec", "type_alias"],
         "python" => &["class_definition"],
         "typescript" | "tsx" | "javascript" => &[
             "class_declaration",
@@ -1324,9 +1328,86 @@ pub fn declares_a_type(language: &str, kind: &str) -> bool {
     kinds.contains(&kind)
 }
 
+/// Whether a declaration of this grammar kind is written at the top level of a
+/// package or module, rather than inside a type, a function or a block.
+///
+/// This is what makes a qualified name answerable where the bare name is not.
+/// `models.Symbol` can only be a package-level declaration of package
+/// `models`: Go has no other thing that spelling can name. So the field named
+/// `Symbol` in some other struct, and the method named `Symbol` on some type
+/// -- both of which make the bare name ambiguous -- are not candidates at all,
+/// and the one type left is the answer.
+///
+/// Read as an allow-list rather than as "not a member": a kind nobody thought
+/// about must not quietly become an answer.
+///
+/// A kind is not a depth: a `const` written inside a function body is a
+/// `const_spec` like one written at the top of the file, and nothing recorded
+/// per definition says which it is. It cannot be reached through a package
+/// name either, so a project where it is the only candidate is a project that
+/// does not compile -- in code that builds, this answers rightly or not at
+/// all.
+pub fn declares_at_package_level(language: &str, kind: &str) -> bool {
+    let kinds: &[&str] = match language {
+        // `type_spec` and `type_alias` are the two halves of a `type`
+        // declaration; `const_spec` is a `const`; a top-level `var` is
+        // captured on its own identifier, and the query only captures one
+        // under `source_file`, so `identifier` here is a package-level
+        // variable and nothing else. Left out on purpose:
+        // `method_declaration`, `method_elem` and `field_identifier`, which
+        // are reached through a value and never through a package.
+        "go" => &[
+            "type_spec",
+            "type_alias",
+            "function_declaration",
+            "const_spec",
+            "identifier",
+        ],
+        _ => &[],
+    };
+    kinds.contains(&kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Go outline query captures the `type_spec`, not the
+    /// `type_declaration` around it, so that a grouped `type ( A; B )` yields
+    /// two definitions. A list naming the container matched nothing at all.
+    #[test]
+    fn the_kind_a_go_type_is_recorded_under_is_the_one_that_is_captured() {
+        assert!(declares_a_type("go", "type_spec"));
+        assert!(!declares_a_type("go", "type_declaration"));
+        assert!(!declares_a_type("go", "function_declaration"));
+    }
+
+    #[test]
+    fn only_what_a_package_qualifier_can_reach_counts_as_package_level() {
+        for kind in [
+            "type_spec",
+            "function_declaration",
+            "const_spec",
+            "identifier",
+        ] {
+            assert!(
+                declares_at_package_level("go", kind),
+                "{kind} is written at the top of a Go file"
+            );
+        }
+        for kind in ["field_identifier", "method_declaration", "method_elem"] {
+            assert!(
+                !declares_at_package_level("go", kind),
+                "{kind} is reached through a value, never through a package name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_language_whose_qualifiers_are_not_read_claims_nothing() {
+        assert!(!declares_at_package_level("rust", "struct_item"));
+        assert!(!declares_at_package_level("python", "class_definition"));
+    }
 
     fn rust_language() -> Readable {
         let (readable, _) = languages::readable();

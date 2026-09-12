@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, Subscription, Task};
 use project::{Event as ProjectEvent, PathChange, Project, WorktreeId};
 pub use semantic_index::definitions::Definition;
+use semantic_index::go_packages::{self, GoModules};
 use semantic_index::inventory::Inventory;
 use semantic_index::refresh;
 use semantic_index::resolution::WhatItMeans;
@@ -25,6 +26,8 @@ mod the_import_line;
 mod answering_without_a_server;
 #[cfg(test)]
 mod bringing_the_import_line;
+#[cfg(test)]
+mod going_to_a_qualified_name;
 #[cfg(test)]
 mod python_names_from_ty;
 
@@ -85,6 +88,11 @@ pub struct SymbolIndex {
     /// always handed back when it finishes, so two passes can never both hold
     /// a handle to the same files at once.
     stores: Option<(Symbols, Inventory)>,
+    /// Which import path each directory of the project answers for, read from
+    /// the `go.mod` files in the tree. Kept beside the catalogue rather than
+    /// worked out per question: it takes a walk of the project, and the
+    /// question it answers is asked while a reader holds a modifier key down.
+    go_modules: Option<Arc<GoModules>>,
     /// Set when a refresh was asked for while a pass was already running.
     /// Coalesced rather than queued in detail: whatever it was, a whole-
     /// project refresh is a safe superset of it, and is what runs once the
@@ -139,6 +147,7 @@ impl SymbolIndex {
             state: State::NotBuilt,
             catalogue: None,
             stores: None,
+            go_modules: None,
             refresh_pending: false,
             _task: None,
             _subscription: subscription,
@@ -216,6 +225,84 @@ impl SymbolIndex {
             return None;
         }
         Some((self.root.join(&only.path), only))
+    }
+
+    /// Where the project declares `name` as a name of the package that
+    /// `qualifier` stands for in the file whose head is `text`.
+    ///
+    /// This is what a bare name cannot answer. `Symbol` is written in this one
+    /// project as a type, as a field of two other structs and as a method, so
+    /// the name alone is declined -- correctly, because nothing without types
+    /// can tell those apart. `models.Symbol` is not ambiguous at all: Go has
+    /// exactly one thing that spelling can name, a package-level declaration
+    /// of the package `models` names here, and the import line at the top of
+    /// the file says which directory that is.
+    ///
+    /// Read from `text` rather than from the store on purpose: a reader
+    /// editing the import block has not saved it, and the store holds what was
+    /// last saved. The imports the reader can see are the ones that count.
+    ///
+    /// Still one place or none, like every other answer here. Two declarations
+    /// of one name in one package do not compile, but a project halfway
+    /// through an edit can hold them, and picking one would be a confident
+    /// wrong answer.
+    ///
+    /// The three-way answer is what keeps a caller from falling back wrongly.
+    /// `zap.Logger` names a package outside this project, so the name after it
+    /// is that package's `Logger` and not the `Logger` this project happens to
+    /// declare once -- landing a reader on the latter is exactly the confident
+    /// wrong answer the rest of this refuses to give.
+    pub fn where_a_qualified_name_is_declared(
+        &self,
+        language: &str,
+        text: &str,
+        qualifier: &str,
+        name: &str,
+    ) -> WhatTheQualifierSays {
+        // Go alone so far. The shape generalises -- a qualifier that names an
+        // import, resolved to the files that import brings in -- but what a
+        // qualifier may be differs per language, and a language answered by
+        // guesswork would be worse than one not answered.
+        if language != "go" {
+            return WhatTheQualifierSays::NotOfAPackage;
+        }
+        let (Some(modules), Some(catalogue), Some(grammar)) = (
+            self.go_modules.as_ref(),
+            self.catalogue.as_ref(),
+            go_packages::grammar(),
+        ) else {
+            return WhatTheQualifierSays::NotOfAPackage;
+        };
+        let imports = go_packages::imports_of(text, grammar);
+        let Some(import) = go_packages::what_a_qualifier_means(&imports, qualifier) else {
+            // Two imports binding one name is still a package -- a file
+            // halfway through an edit -- and only a qualifier nothing imports
+            // is a value.
+            return if go_packages::any_import_binds(&imports, qualifier) {
+                WhatTheQualifierSays::OfAPackageThisCannotPlace
+            } else {
+                WhatTheQualifierSays::NotOfAPackage
+            };
+        };
+        let Some(directory) = modules.directory_of(&import.path) else {
+            return WhatTheQualifierSays::OfAPackageThisCannotPlace;
+        };
+
+        let mut inside = catalogue
+            .exactly_named(name)
+            .into_iter()
+            .filter(|found| found.language == language)
+            .filter(|found| directory_holding(&found.path) == directory)
+            .filter(|found| {
+                semantic_index::per_language::declares_at_package_level(
+                    &found.language,
+                    &found.kind,
+                )
+            });
+        let (Some(only), None) = (inside.next(), inside.next()) else {
+            return WhatTheQualifierSays::OfAPackageThisCannotPlace;
+        };
+        WhatTheQualifierSays::DeclaredBy(self.root.join(&only.path), only)
     }
 
     /// What the index says a name means, with no language server asked.
@@ -361,9 +448,12 @@ impl SymbolIndex {
                 this.stores = Some((symbols, inventory));
                 this._task = None;
                 match result {
-                    Ok((files_parsed, catalogue)) => {
+                    Ok((files_parsed, catalogue, go_modules)) => {
                         let symbols = catalogue.len();
                         this.catalogue = Some(catalogue);
+                        if let Some(go_modules) = go_modules {
+                            this.go_modules = Some(Arc::new(go_modules));
+                        }
                         this.state = State::Ready {
                             symbols,
                             files_parsed_last_pass: files_parsed,
@@ -398,6 +488,35 @@ impl SymbolIndex {
             .log_err();
         });
         self._task = Some(task);
+    }
+}
+
+/// What the qualifier written before a name says about that name.
+///
+/// Three answers and not two, because "this qualifier names a package and I
+/// cannot say where" is a different thing from "there is no qualifier here":
+/// the first forbids the caller from answering about the bare name, and the
+/// second leaves the bare name the only question there ever was.
+pub enum WhatTheQualifierSays {
+    /// No qualifier, or one that names no import of this file -- which in Go
+    /// means a value, whose members nothing here can resolve.
+    NotOfAPackage,
+    /// The qualifier names a package, and the package declares this name in
+    /// exactly one place.
+    DeclaredBy(PathBuf, Definition),
+    /// The qualifier names a package, and where that package declares the name
+    /// is not something this can say: the package is outside the project, or
+    /// declares the name more than once, or not at all.
+    OfAPackageThisCannotPlace,
+}
+
+/// The directory a path relative to the project root sits in, forward slashes
+/// and no trailing one, which is the empty string for a file at the root. The
+/// shape every path in the store is written in, so the two compare directly.
+fn directory_holding(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((directory, _)) => directory,
+        None => "",
     }
 }
 
@@ -541,7 +660,7 @@ fn run_pass(
     cores: usize,
     symbols: &Symbols,
     inventory: &Inventory,
-) -> Result<(usize, Catalogue)> {
+) -> Result<(usize, Catalogue, Option<GoModules>)> {
     let files_parsed = match pass {
         Pass::InitialBuild => {
             let built = semantic_index::symbols::build(root, cores, symbols)
@@ -563,7 +682,17 @@ fn run_pass(
         }
     };
     let catalogue = Catalogue::read_from(symbols).context("reading the catalogue back")?;
-    Ok((files_parsed, catalogue))
+    // A walk of the project, so it is done when the project is being walked
+    // anyway. A save of one file leaves the map alone unless that file is the
+    // one the map is read from.
+    let go_modules = match pass {
+        Pass::InitialBuild | Pass::WholeProject => Some(GoModules::read(root)),
+        Pass::OneFile(path) => path
+            .file_name()
+            .is_some_and(|name| name == "go.mod")
+            .then(|| GoModules::read(root)),
+    };
+    Ok((files_parsed, catalogue, go_modules))
 }
 
 #[cfg(test)]

@@ -15,6 +15,8 @@ use project::{
 };
 use semantic_index::definitions::Definition;
 use semantic_index::resolution::WhatItMeans;
+
+use crate::WhatTheQualifierSays;
 use text::ToOffset as _;
 
 /// Answers what a language server would, where the project's own index knows,
@@ -128,10 +130,24 @@ impl IndexFirst {
 
         let (path, declared) = {
             let index = index.read(cx);
-            let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
-                return None;
-            };
-            index.where_declared(&name)?
+            // The qualified reading first, where there is one. It is strictly
+            // better informed than the bare name: `models.Symbol` says which
+            // package, and a project where `Symbol` happens to be declared
+            // once would otherwise be sent to that one whatever package the
+            // reader named.
+            match self.what_a_qualified_name_says(index, buffer, &snapshot, range.start, &name, cx)
+            {
+                WhatTheQualifierSays::DeclaredBy(path, declared) => (path, declared),
+                // The name belongs to that package, so nothing else the
+                // project declares under it is an answer to this.
+                WhatTheQualifierSays::OfAPackageThisCannotPlace => return None,
+                WhatTheQualifierSays::NotOfAPackage => {
+                    let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
+                        return None;
+                    };
+                    index.where_declared(&name)?
+                }
+            }
         };
         Some(Declared {
             path,
@@ -141,6 +157,29 @@ impl IndexFirst {
                 range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
             },
         })
+    }
+
+    /// What the qualifier written before the name under the cursor says.
+    ///
+    /// Kept behind the one-character test for a selector dot so that the
+    /// ordinary word -- which is most words, and is asked about on every
+    /// modifier-hover -- costs a character comparison and nothing else.
+    fn what_a_qualified_name_says(
+        &self,
+        index: &crate::SymbolIndex,
+        buffer: &Entity<Buffer>,
+        snapshot: &language::BufferSnapshot,
+        word_starts_at: usize,
+        name: &str,
+        cx: &App,
+    ) -> WhatTheQualifierSays {
+        let (Some(qualifier), Some(language)) = (
+            qualifier_before(snapshot, word_starts_at),
+            language_the_index_calls(buffer, cx),
+        ) else {
+            return WhatTheQualifierSays::NotOfAPackage;
+        };
+        index.where_a_qualified_name_is_declared(language, &the_head_of(snapshot), &qualifier, name)
     }
 
     /// Where the index says a go-to of `kind` should land, or nothing where it
@@ -198,16 +237,28 @@ impl IndexFirst {
 
         let (path, declared) = {
             let index = index.read(cx);
-            // The same gate the underlining goes through, and for the same
-            // reason: the index declines a name that is also bound locally
-            // somewhere, or is a member of a type, because it cannot tell this
-            // occurrence of it from one of those. A card for the project's
-            // `run` shown over a local named `run` is a confident wrong answer,
-            // which is the only kind worth refusing outright.
-            let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
-                return None;
-            };
-            index.where_declared(&name)?
+            // The same gate the underlining and the go-to go through, and for
+            // the same reason: the index declines a name that is also bound
+            // locally somewhere, or is a member of a type, because it cannot
+            // tell this occurrence of it from one of those. A card for the
+            // project's `run` shown over a local named `run` is a confident
+            // wrong answer, which is the only kind worth refusing outright.
+            // A qualified name is not one of those: the qualifier says which
+            // package, so it is read first and answers where the bare name
+            // cannot.
+            match self.what_a_qualified_name_says(index, buffer, &snapshot, range.start, &name, cx)
+            {
+                WhatTheQualifierSays::DeclaredBy(path, declared) => (path, declared),
+                // The name belongs to that package, so nothing else the
+                // project declares under it is an answer to this.
+                WhatTheQualifierSays::OfAPackageThisCannotPlace => return None,
+                WhatTheQualifierSays::NotOfAPackage => {
+                    let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
+                        return None;
+                    };
+                    index.where_declared(&name)?
+                }
+            }
         };
 
         // The store holds what the file said when it was last read from disk.
@@ -763,6 +814,72 @@ pub(crate) fn word_at(
     }
     let name: String = snapshot.text_for_range(start..end).collect();
     Some((start..end, name))
+}
+
+/// The name written immediately before the word under the cursor, where a
+/// selector dot joins the two.
+///
+/// Strict about the dot on purpose: `models.Symbol` has a qualifier and
+/// `models . Symbol` does not, as far as this is concerned. Go writes the
+/// first; reading the second would mean deciding what an arbitrary run of
+/// whitespace between two names meant, which is a question with no answer.
+pub(crate) fn qualifier_before(
+    snapshot: &language::BufferSnapshot,
+    word_starts_at: usize,
+) -> Option<String> {
+    if snapshot.reversed_chars_at(word_starts_at).next()? != '.' {
+        return None;
+    }
+    let before_the_dot = word_starts_at - 1;
+    let (range, qualifier) = word_at(snapshot, before_the_dot)?;
+    // `word_at` grows both ways from where it is asked. Asked at the dot it
+    // can only grow backwards, so a range ending anywhere else means the
+    // character before the dot was not part of a name at all.
+    if range.end != before_the_dot {
+        return None;
+    }
+    Some(qualifier)
+}
+
+/// The language of this buffer, spelled the way the index spells it, for the
+/// languages whose qualifiers this can read.
+///
+/// Taken from the file's own suffix rather than from the buffer's configured
+/// language: the index records a language per file by the same rule, and two
+/// spellings of one language meeting here would be a silent mismatch that
+/// reads as a resolution bug.
+fn language_the_index_calls(buffer: &Entity<Buffer>, cx: &App) -> Option<&'static str> {
+    let path = buffer.read(cx).file()?.path().to_string();
+    match path.rsplit_once('.') {
+        Some((_, "go")) => Some("go"),
+        _ => None,
+    }
+}
+
+/// How much of a file's head is read to find its import lines.
+///
+/// Every import in a Go file comes before the first declaration, and the block
+/// itself is a few dozen lines even in a file of thousands. Copying the whole
+/// buffer per modifier-hover to read it would be paying for the file to say
+/// the same thing.
+const HOW_MUCH_OF_A_FILE_HOLDS_ITS_IMPORTS: usize = 32 * 1024;
+
+fn the_head_of(snapshot: &language::BufferSnapshot) -> String {
+    let whole = snapshot.len();
+    let end = snapshot.clip_offset(
+        HOW_MUCH_OF_A_FILE_HOLDS_ITS_IMPORTS.min(whole),
+        text::Bias::Left,
+    );
+    let mut head: String = snapshot.text_for_range(0..end).collect();
+    // A line cut in half could be an import cut in half, and half an import
+    // path names a directory that is not the one written. Where the file goes
+    // on past what was read, the last line read is dropped.
+    if end < whole
+        && let Some(last) = head.rfind('\n')
+    {
+        head.truncate(last + 1);
+    }
+    head
 }
 
 impl SemanticsProvider for IndexFirst {

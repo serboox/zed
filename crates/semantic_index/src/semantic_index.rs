@@ -1,5 +1,6 @@
 pub mod against_the_server;
 pub mod definitions;
+pub mod go_packages;
 pub mod inventory;
 pub mod languages;
 pub mod measure;
