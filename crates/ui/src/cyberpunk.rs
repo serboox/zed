@@ -58,8 +58,13 @@ pub const LANES: usize = 12;
 pub fn lane(index: usize) -> Hsla {
     const CHROMA: f32 = 0.80;
     const LIGHTNESS: f32 = 0.60;
+    // The circle starts at blue, where the accents this replaced started, so
+    // the branch a reader is on keeps the colour it has always had -- and so
+    // that the first lane of every graph is not red, which in an editor means
+    // something is wrong.
+    const STARTS_AT: f32 = 0.58;
     Hsla {
-        h: (index % LANES) as f32 / LANES as f32,
+        h: (STARTS_AT + (index % LANES) as f32 / LANES as f32).fract(),
         s: CHROMA,
         l: LIGHTNESS,
         a: 1.0,
