@@ -6,7 +6,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_graph::{
-    CommitEntry, GraphColumn, GraphData, GraphMetrics, accent_colors_count, graph_column_width,
+    CommitEntry, GraphColumn, GraphData, GraphMetrics, graph_column_width, lane_colours,
     render_graph_column,
 };
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
@@ -1309,7 +1309,7 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
-                commit_graph: GraphData::new(accent_colors_count(cx.theme().accents())),
+                commit_graph: GraphData::new(lane_colours()),
                 commit_graph_scroll_x: px(0.),
                 commit_graph_source: None,
                 commit_graph_bounds: Rc::default(),
@@ -6257,7 +6257,7 @@ impl GitPanel {
     ///
     /// A fold whose branch cannot be found, or is too large to be worth taking
     /// out at once, is dropped rather than guessed at -- see `side_branch_of`.
-    fn rebuild_folded_history(&mut self, cx: &mut Context<Self>) {
+    fn rebuild_folded_history(&mut self, _cx: &mut Context<Self>) {
         self.folded_counts.clear();
         if self.folded_merges.is_empty() {
             self.folded_graph = None;
@@ -6292,7 +6292,7 @@ impl GitPanel {
             .filter(|(row, _)| !hidden.contains(row))
             .map(|(_, commit)| commit.data.clone())
             .collect();
-        let mut folded = GraphData::new(accent_colors_count(cx.theme().accents()));
+        let mut folded = GraphData::new(lane_colours());
         folded.add_commits(&left);
         self.folded_graph = Some(folded);
     }

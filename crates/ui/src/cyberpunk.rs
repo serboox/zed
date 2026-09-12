@@ -39,6 +39,33 @@ pub const SPACE_14: Pixels = px(14.);
 pub const SPACE_18: Pixels = px(18.);
 pub const SPACE_22: Pixels = px(22.);
 
+/// How many lanes a Git graph can draw before a colour comes round again.
+pub const LANES: usize = 12;
+
+/// The colour a Git graph draws lane `index` in.
+///
+/// A scale of its own rather than the theme's accents, because a lane colour
+/// is data: it is the only thing telling one branch from another down a long
+/// history, and two lanes a reader cannot tell apart are two branches they
+/// cannot tell apart. The shipped accent list is a set of colours picked to
+/// look well beside each other, not to be told apart -- its blue and its cyan
+/// sit closer together than a thin line can carry, and they land on lanes 0
+/// and 8, which any history with nine branches reaches.
+///
+/// So: one chroma, one lightness, and hues spread evenly around the circle.
+/// Nothing here is chosen for taste; every pair is as far from every other
+/// pair as twelve colours can be.
+pub fn lane(index: usize) -> Hsla {
+    const CHROMA: f32 = 0.80;
+    const LIGHTNESS: f32 = 0.60;
+    Hsla {
+        h: (index % LANES) as f32 / LANES as f32,
+        s: CHROMA,
+        l: LIGHTNESS,
+        a: 1.0,
+    }
+}
+
 /// Window background. Never pure black; blue-shifted near-black reads as
 /// "screen" rather than "ink".
 pub fn canvas() -> Hsla {

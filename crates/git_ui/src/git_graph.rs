@@ -50,12 +50,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
     HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, Table, TableInteractionState,
-    Tooltip, WithScrollbar, prelude::*, table_row::TableRow,
+    Tooltip, WithScrollbar, cyberpunk, prelude::*, table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -625,8 +624,13 @@ fn format_timestamp(timestamp: i64) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn accent_colors_count(accents: &AccentColors) -> usize {
-    accents.0.len()
+/// How many colours the lane scale has before one comes round again.
+///
+/// Named here rather than read from the theme: a lane colour is data, drawn
+/// from a scale of this fork's own, and the number of branches that can be
+/// told apart is a property of that scale.
+pub(crate) fn lane_colours() -> usize {
+    cyberpunk::LANES
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -874,7 +878,7 @@ pub(crate) struct GraphData {
     lane_colors: HashMap<ActiveLaneIdx, BranchColor>,
     parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
     next_color: BranchColor,
-    accent_colors_count: usize,
+    lane_colours: usize,
     pub commits: Vec<Rc<CommitEntry>>,
     max_commit_count: AllCommitCount,
     pub max_lanes: usize,
@@ -901,13 +905,13 @@ pub(crate) struct GraphData {
 }
 
 impl GraphData {
-    pub(crate) fn new(accent_colors_count: usize) -> Self {
+    pub(crate) fn new(lane_colours: usize) -> Self {
         GraphData {
             lane_states: SmallVec::default(),
             lane_colors: HashMap::default(),
             parent_to_lanes: HashMap::default(),
             next_color: BranchColor(0),
-            accent_colors_count,
+            lane_colours,
             commits: Vec::default(),
             max_commit_count: AllCommitCount::NotLoaded,
             max_lanes: 0,
@@ -1278,7 +1282,7 @@ impl GraphData {
             return *color;
         }
 
-        let count = self.accent_colors_count.max(1) as u8;
+        let count = self.lane_colours.max(1) as u8;
         let in_use: HashSet<u8> = self.lane_colors.values().map(|color| color.0).collect();
         let mut candidate = self.next_color.0 % count;
         for _ in 0..count {
@@ -1693,7 +1697,6 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
 
             let metrics = GraphMetrics::for_window(window);
             window.paint_layer(bounds, |window| {
-                let accents = cx.theme().accents();
                 let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
                 let selected_bg = match is_focused {
                     true => cx.theme().colors().element_selected,
@@ -1748,11 +1751,10 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                             connector: None,
                             emphasis,
                         },
-                        accents,
                         window,
                     );
 
-                    let colour = accents.color_for_index(commit.color_idx as u32);
+                    let colour = cyberpunk::lane(commit.color_idx);
                     let centre_x = row_bounds.origin.x + metrics.lane_center_in(commit.lane, 0);
                     draw_commit_circle(centre_x, row_y + row_height / 2.0, colour, window);
                 }
@@ -2298,10 +2300,11 @@ pub(crate) fn node_left(
 
 /// Whether this row shows its age.
 ///
-/// A date on every row is noise in a list a reader scans by subject. Where
-/// there is no room for a column of them it earns its place on the row the
-/// reader picked, the row under the pointer, and on anything recent enough that
-/// "when" is the question being asked.
+/// A date on every row is noise in a list a reader scans by subject, so it
+/// earns its place on the row the reader picked, the row under the pointer,
+/// and on anything recent enough that "when" is the question being asked --
+/// whether or not the layout kept a column for it. What the column changes is
+/// where the date is written, not how often.
 pub(crate) fn age_is_shown(
     age: AgeShown,
     is_selected: bool,
@@ -2309,8 +2312,7 @@ pub(crate) fn age_is_shown(
     is_fresh: bool,
 ) -> bool {
     match age {
-        AgeShown::Column => true,
-        AgeShown::WhereItMatters => is_selected || is_hovered || is_fresh,
+        AgeShown::Column | AgeShown::WhereItMatters => is_selected || is_hovered || is_fresh,
         AgeShown::Nowhere => false,
     }
 }
@@ -2398,7 +2400,6 @@ fn paint_row_lanes(
     bounds: Bounds<Pixels>,
     lanes: &[LanePaint],
     row: GraphRowPaint,
-    accents: &AccentColors,
     window: &mut Window,
 ) {
     let GraphRowPaint {
@@ -2424,10 +2425,7 @@ fn paint_row_lanes(
         builder.line_to(point(to_x, center));
         builder.close();
         if let Ok(path) = builder.build() {
-            window.paint_path(
-                path,
-                accents.color_for_index(color_idx as u32).opacity(0.35),
-            );
+            window.paint_path(path, cyberpunk::lane(color_idx).opacity(0.35));
         }
     }
 
@@ -2510,7 +2508,7 @@ fn paint_row_lanes(
     }
 
     for (color_idx, builders) in by_color {
-        let color = accents.color_for_index(color_idx as u32);
+        let color = cyberpunk::lane(color_idx);
         for builder in builders {
             if let Ok(path) = builder.build() {
                 // Each colour gets its own layer so that two lines crossing do
@@ -3795,8 +3793,7 @@ impl GitGraph {
         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
             .detach();
 
-        let accent_colors = cx.theme().accents();
-        let graph = GraphData::new(accent_colors_count(accent_colors));
+        let graph = GraphData::new(lane_colours());
         let log_source = log_source.unwrap_or_default();
         let log_order = LogOrder::default();
 
@@ -4330,10 +4327,7 @@ impl GitGraph {
         } else {
             NodePlace::InLane(node_lane)
         };
-        let node_color = cx
-            .theme()
-            .accents()
-            .color_for_index(commit.color_idx as u32);
+        let node_color = cyberpunk::lane(commit.color_idx);
         let paint = GraphRowPaint {
             metrics,
             first_lane,
@@ -4359,8 +4353,8 @@ impl GitGraph {
             .child(
                 gpui::canvas(
                     |_, _, _| {},
-                    move |bounds, _: (), window: &mut Window, cx: &mut App| {
-                        paint_row_lanes(bounds, &lanes, paint, cx.theme().accents(), window);
+                    move |bounds, _: (), window: &mut Window, _cx: &mut App| {
+                        paint_row_lanes(bounds, &lanes, paint, window);
                     },
                 )
                 .absolute()
@@ -4511,12 +4505,7 @@ impl GitGraph {
                     is_fresh = false;
                 }
 
-                let accent_colors = cx.theme().accents();
-                let accent_color = accent_colors
-                    .0
-                    .get(commit.color_idx)
-                    .copied()
-                    .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
+                let accent_color = cyberpunk::lane(commit.color_idx);
 
                 let is_selected = self.selected_entry_idx == Some(idx);
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
@@ -5447,12 +5436,7 @@ impl GitGraph {
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
 
-        let accent_colors = cx.theme().accents();
-        let accent_color = accent_colors
-            .0
-            .get(commit_entry.color_idx)
-            .copied()
-            .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
+        let accent_color = cyberpunk::lane(commit_entry.color_idx);
 
         let (author_name, author_email, commit_timestamp) = match &data {
             CommitDataState::Loaded(data) => (
@@ -6202,12 +6186,7 @@ impl Render for GitGraph {
                     // look here, and they paint over this.
                     let band = weak.upgrade().and_then(|graph| {
                         let commit = graph.read(cx).graph_data.commits.get(index)?.clone();
-                        Some(
-                            cx.theme()
-                                .accents()
-                                .color_for_index(commit.color_idx as u32)
-                                .opacity(0.05),
-                        )
+                        Some(cyberpunk::lane(commit.color_idx).opacity(0.05))
                     });
 
                     let in_the_question = lit_branch
@@ -10261,19 +10240,62 @@ mod tests {
         assert_eq!(shorten_ref("", LabelMode::Abbreviated).as_ref(), "");
     }
 
+    /// A lane's colour is what tells one branch from another down a long
+    /// history, so it must not come round again before the reader has run out
+    /// of branches to follow. The plan asks for at least ten that can be told
+    /// apart; this checks the theme actually gives them, rather than assuming
+    /// it and finding two branches the same colour on somebody's screen.
+    #[gpui::test]
+    fn test_the_lane_palette_is_a_scale_and_not_a_handful(_cx: &mut TestAppContext) {
+        const AT_LEAST: usize = 10;
+        // Measured: the closest pair of the twelve is 0.32 apart, and the
+        // theme's own accents that this replaced were 0.23 -- its blue and its
+        // cyan, on lanes 0 and 8, which any history with nine branches reaches.
+        const APART: f32 = 0.30;
+
+        assert!(
+            cyberpunk::LANES >= AT_LEAST,
+            "the scale has {} colours; `lane` wraps, so branch {AT_LEAST} would \
+             repeat branch 0",
+            cyberpunk::LANES
+        );
+
+        let colours: Vec<Hsla> = (0..cyberpunk::LANES).map(cyberpunk::lane).collect();
+        for (at, colour) in colours.iter().enumerate() {
+            for (against, other) in colours.iter().enumerate().skip(at + 1) {
+                let apart = how_far_apart(*colour, *other);
+                assert!(
+                    apart > APART,
+                    "lanes {at} and {against} are {apart:.3} apart, which reads as one \
+                     branch: {colour:?} against {other:?}"
+                );
+            }
+        }
+    }
+
+    /// How far apart two lane colours are on screen, as a straight distance
+    /// between what the display actually emits.
+    ///
+    /// Not hue: two accents six degrees apart in hue are a vivid amber and a
+    /// muted gold, which nobody confuses. Not lightness either, on its own.
+    /// The screen mixes all three, so the comparison is made where the mixing
+    /// has already happened.
+    fn how_far_apart(one: Hsla, other: Hsla) -> f32 {
+        let one = gpui::Rgba::from(one);
+        let other = gpui::Rgba::from(other);
+        ((one.r - other.r).powi(2) + (one.g - other.g).powi(2) + (one.b - other.b).powi(2)).sqrt()
+    }
+
     #[gpui::test]
     fn test_where_an_age_earns_its_place(_cx: &mut TestAppContext) {
-        // With a column of its own, every row has one.
-        for row in [(false, false, false), (true, false, false)] {
-            assert!(age_is_shown(AgeShown::Column, row.0, row.1, row.2));
+        // A column decides where the date is written, not how often: an
+        // ordinary row nobody is looking at still shows none.
+        for age in [AgeShown::Column, AgeShown::WhereItMatters] {
+            assert!(!age_is_shown(age, false, false, false));
+            assert!(age_is_shown(age, true, false, false), "the row picked");
+            assert!(age_is_shown(age, false, true, false), "the row hovered");
+            assert!(age_is_shown(age, false, false, true), "a commit from today");
         }
-
-        // Without one, only where the reader is looking or where the commit is
-        // recent enough for "when" to be the question.
-        assert!(!age_is_shown(AgeShown::WhereItMatters, false, false, false));
-        assert!(age_is_shown(AgeShown::WhereItMatters, true, false, false));
-        assert!(age_is_shown(AgeShown::WhereItMatters, false, true, false));
-        assert!(age_is_shown(AgeShown::WhereItMatters, false, false, true));
 
         // And where there is no room at all, nowhere.
         assert!(!age_is_shown(AgeShown::Nowhere, true, true, true));
