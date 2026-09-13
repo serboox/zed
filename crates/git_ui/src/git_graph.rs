@@ -4078,6 +4078,10 @@ impl GitGraph {
             })
             .gap_0p5()
             .items_center()
+            // Without this the pill keeps the width its name asks for, so the
+            // `truncate` on the label never has a narrower box to cut to and a
+            // long name is drawn over the subject beside it.
+            .min_w_0()
             .cursor_pointer()
             .when(is_hidden, |this| this.opacity(0.5))
             .on_drag(
@@ -4264,10 +4268,9 @@ impl GitGraph {
                 h_flex()
                     .h(metrics.label)
                     .items_center()
-                    // Allowed to shrink, so a name too long for the room ends
-                    // in an ellipsis of the chip's own making. Clipped instead
-                    // -- which is what hiding the overflow here did -- it ends
-                    // mid-letter and reads as a rendering fault.
+                    // Without this the pill holds the width its name asks for
+                    // and is drawn over the subject beside it; a name cut short
+                    // reads better than two texts on one another.
                     .min_w_0()
                     .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
@@ -4705,6 +4708,7 @@ impl GitGraph {
                         .children(inline_label)
                         .child(
                             h_flex()
+                                .debug_selector(move || format!("GRAPH_TEXT-{idx}"))
                                 .flex_1()
                                 .min_w_0()
                                 .items_center()
@@ -11139,6 +11143,55 @@ mod tests {
     /// a label that names the wrong commit. Measured rather than reasoned
     /// about: the two are laid out by different parents and only a shared row
     /// height holds them together.
+    /// Two texts drawn over one another is the fault a reader sees first, and
+    /// the one a screenshot cannot be argued with about. Measured rather than
+    /// looked at: the name ends where the subject begins, at every width the
+    /// window can be given.
+    #[gpui::test]
+    async fn a_branch_name_never_paints_over_the_subject(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+
+        let mut width = px(140.);
+        while width <= px(1400.) {
+            let size = gpui::size(width, px(600.));
+            for _ in 0..2 {
+                cx.draw(point(px(0.), px(0.)), size, |_, _| {
+                    git_graph.clone().into_any_element()
+                });
+                cx.run_until_parked();
+            }
+
+            // The chip itself, not the cell holding it: a cell keeps the size
+            // it was given whatever its contents do, so the overflow this is
+            // about does not show in its bounds at all.
+            for (row, name) in [(0usize, "main"), (2, "feature")] {
+                let (Some(chip), Some(cell)) = (
+                    cx.debug_bounds(Box::leak(
+                        format!("GRAPH_CHIP-{row}-{name}").into_boxed_str(),
+                    )),
+                    cx.debug_bounds(selector("GRAPH_REFS", row)),
+                ) else {
+                    continue;
+                };
+                // A chip wider than the cell holding it is a chip drawing past
+                // it, and what lies past it is the subject. The painted extent
+                // itself is not in these bounds -- they are what the layout
+                // gave, not what was drawn -- so this is the shape of the
+                // overflow rather than the overflow.
+                assert!(
+                    chip.size.width <= cell.size.width + px(0.5),
+                    "at {width:?} the name {name} is {:?} wide in a cell of {:?}, \
+                     so it is drawn over what comes after it",
+                    chip.size.width,
+                    cell.size.width
+                );
+            }
+            width += px(40.);
+        }
+    }
+
     /// At the narrowest width the name is written inside the subject, where
     /// there is no column to cross. A name that took the width of the row
     /// there would take the subject with it, and a history of branch names
