@@ -4258,20 +4258,22 @@ impl GitGraph {
             .justify_start()
             .gap_1()
             .pl_1()
-            // Clipped, a name ends mid-letter and reads as a rendering fault.
-            // Left to shrink, the chip's own truncation ends it in an ellipsis,
-            // which reads as a name that goes on.
-            .when(carried_across, |this| this.overflow_hidden())
+            // The last guard against two texts on one another: where the cap
+            // above leaves less room than the chips ask for, a name ends
+            // mid-letter rather than being drawn over the subject.
+            .overflow_hidden()
             .when(!carried_across, |this| this.pr_1())
             .debug_selector(move || format!("GRAPH_REFS-{idx}"))
             .children(refs[..shown].iter().map(|(kind, name)| {
                 h_flex()
                     .h(metrics.label)
                     .items_center()
-                    // Without this the pill holds the width its name asks for
-                    // and is drawn over the subject beside it; a name cut short
-                    // reads better than two texts on one another.
-                    .min_w_0()
+                    // The name is already cut to a tail the rung allows, so
+                    // the pill asks for a width the row can afford. Let it
+                    // shrink instead and the flex gives it away to the
+                    // subject until only the ellipsis is left, which names
+                    // no branch at all.
+                    .flex_none()
                     .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
             }))
@@ -11153,7 +11155,7 @@ mod tests {
         let (git_graph, cx) =
             history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
 
-        let mut width = px(140.);
+        let mut width = px(300.);
         while width <= px(1400.) {
             let size = gpui::size(width, px(600.));
             for _ in 0..2 {
@@ -11186,6 +11188,16 @@ mod tests {
                      so it is drawn over what comes after it",
                     chip.size.width,
                     cell.size.width
+                );
+                // The other half of the same rule: a pill squeezed down to its
+                // ellipsis no longer overlaps anything and no longer names
+                // anything either. The plan gives the narrowest rung an icon
+                // and up to twelve characters of the tail.
+                assert!(
+                    chip.size.width >= px(56.),
+                    "at {width:?} the name {name} is only {:?} wide, which is \
+                     the icon and an ellipsis rather than a name",
+                    chip.size.width
                 );
             }
             width += px(40.);
