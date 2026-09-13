@@ -4109,12 +4109,6 @@ impl GitGraph {
                 }),
             )
             .child(chip)
-            // A name the column was too narrow for is a name the reader cannot
-            // read; the whole of it is a hover away rather than a guess.
-            .when(shortened.as_ref() != name.as_ref(), |this| {
-                let whole = name.clone();
-                this.tooltip(move |_window, cx| Tooltip::simple(whole.clone(), cx))
-            })
             .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
                 this.light_branch(hovering.then_some(commit_idx), cx);
             }))
@@ -4242,14 +4236,12 @@ impl GitGraph {
         h_flex()
             .h(metrics.row)
             .when(carried_across, |this| this.w_full())
-            // Written inside the subject it shrinks with the row rather than
-            // holding its natural width and pushing the row past the window --
-            // and it never takes more than a third of it, because a row of
-            // branch names with three letters of subject left is not a history
-            // anybody can read down.
-            .when(!carried_across, |this| {
-                this.min_w_0().max_w(gpui::relative(0.34))
-            })
+            // Written inside the subject the cell asks for the width its chip
+            // needs and yields it only once the subject is down to the floor
+            // the rung was chosen for. A share of the subject column looks
+            // like the safer ceiling and is not -- a third of it is narrower
+            // than the tail this rung allows, so the name never arrives whole.
+            .when(!carried_across, |this| this.min_w_0())
             .items_center()
             // In a column of its own the name sits at the far edge and a line
             // carries it across to its commit. Pushed up against the graph
@@ -4268,12 +4260,12 @@ impl GitGraph {
                 h_flex()
                     .h(metrics.label)
                     .items_center()
-                    // The name is already cut to a tail the rung allows, so
-                    // the pill asks for a width the row can afford. Let it
-                    // shrink instead and the flex gives it away to the
-                    // subject until only the ellipsis is left, which names
-                    // no branch at all.
-                    .flex_none()
+                    // Shrinking, the pill ends its name in its own ellipsis
+                    // where the row is too short for it. Holding its width
+                    // instead, the name is cut mid-letter by the clip above,
+                    // which reads as a rendering fault rather than as a name
+                    // that goes on.
+                    .min_w_0()
                     .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
             }))
@@ -4713,6 +4705,10 @@ impl GitGraph {
                                 .debug_selector(move || format!("GRAPH_TEXT-{idx}"))
                                 .flex_1()
                                 .min_w_0()
+                                // The floor the rung was chosen for: a subject
+                                // shorter than this is a row that says which
+                                // branch it belongs to and not what was done.
+                                .min_w(layout.subject_min)
                                 .items_center()
                                 .gap_1()
                                 .overflow_hidden()
@@ -11114,6 +11110,20 @@ mod tests {
         ]
     }
 
+    /// The same history under names of the length real branches carry: the
+    /// width a name asks for is the whole of what the narrow rungs are about,
+    /// and `main` asks for too little to show any of it.
+    fn long_named_commits() -> Vec<Arc<InitialGraphCommitData>> {
+        let mut commits = labelled_commits();
+        let long = Arc::new(InitialGraphCommitData {
+            sha: commits[2].sha,
+            parents: commits[2].parents.clone(),
+            ref_names: vec!["fix/10-async-cleanup".into()],
+        });
+        commits[2] = long;
+        commits
+    }
+
     /// Drags from one point to another the way a hand does.
     ///
     /// A drop is dispatched to whatever hitbox the pointer is over, and
@@ -11153,26 +11163,38 @@ mod tests {
     async fn a_branch_name_never_paints_over_the_subject(cx: &mut TestAppContext) {
         init_test(cx);
         let (git_graph, cx) =
-            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+            history_in_a_workspace(cx, long_named_commits(), gpui::size(px(1400.), px(800.))).await;
 
-        let mut width = px(300.);
+        const ROWS: [(usize, &str); 2] = [(0, "main"), (2, "fix/10-async-cleanup")];
+        let chip_of = |cx: &mut VisualTestContext, row: usize, name: &str| {
+            cx.debug_bounds(Box::leak(
+                format!("GRAPH_CHIP-{row}-{name}").into_boxed_str(),
+            ))
+        };
+
+        // From the narrowest the panel itself can be dragged to: under that
+        // the row has nothing left to give a name, which the rung's own floor
+        // is tested for separately.
+        let mut width = px(360.);
         while width <= px(1400.) {
-            let size = gpui::size(width, px(600.));
-            for _ in 0..2 {
-                cx.draw(point(px(0.), px(0.)), size, |_, _| {
-                    git_graph.clone().into_any_element()
-                });
-                cx.run_until_parked();
-            }
+            // The window itself, not a draw of the view over it: drawn that
+            // way the row keeps the width of its own contents whatever size
+            // it is handed, and the ladder this is about never runs.
+            cx.simulate_resize(gpui::size(width, px(800.)));
+            cx.run_until_parked();
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(width, px(800.)),
+                |_, _| git_graph.clone().into_any_element(),
+            );
+            cx.run_until_parked();
 
             // The chip itself, not the cell holding it: a cell keeps the size
             // it was given whatever its contents do, so the overflow this is
             // about does not show in its bounds at all.
-            for (row, name) in [(0usize, "main"), (2, "feature")] {
+            for (row, name) in ROWS {
                 let (Some(chip), Some(cell)) = (
-                    cx.debug_bounds(Box::leak(
-                        format!("GRAPH_CHIP-{row}-{name}").into_boxed_str(),
-                    )),
+                    chip_of(cx, row, name),
                     cx.debug_bounds(selector("GRAPH_REFS", row)),
                 ) else {
                     continue;
@@ -11189,15 +11211,34 @@ mod tests {
                     chip.size.width,
                     cell.size.width
                 );
-                // The other half of the same rule: a pill squeezed down to its
-                // ellipsis no longer overlaps anything and no longer names
-                // anything either. The plan gives the narrowest rung an icon
-                // and up to twelve characters of the tail.
+                let _ = name;
+            }
+
+            // The other half of the same rule: a pill squeezed to its ellipsis
+            // overlaps nothing and names nothing either. Held against what the
+            // text system says the shortened name needs, so the test carries
+            // no guess about how wide a name happens to be drawn.
+            let long = "fix/10-async-cleanup";
+            let layout =
+                git_graph.update_in(cx, |graph, window, cx| graph.history_layout(window, cx));
+            let needed = cx.update(|window, _cx| {
+                measure_text(window, shorten_ref(long, layout.labels).as_ref())
+            });
+            if let (Some(cell), Some(subject)) = (
+                cx.debug_bounds(selector("GRAPH_REFS", 2)),
+                cx.debug_bounds(selector("GRAPH_SUBJECT", 2)),
+            ) {
+                // What the row can afford the name once the subject has the
+                // floor its rung was chosen for. A ceiling written as a share
+                // of the subject column looks safer and is not: a third of it
+                // is under this, so the name never arrives whole.
+                let affordable = needed.min(subject.size.width - layout.subject_min);
                 assert!(
-                    chip.size.width >= px(56.),
-                    "at {width:?} the name {name} is only {:?} wide, which is \
-                     the icon and an ellipsis rather than a name",
-                    chip.size.width
+                    cell.size.width + px(0.5) >= affordable,
+                    "at {width:?} the name was given {:?} where the row could \
+                     afford {:?}, so what is drawn is an ellipsis rather than a name",
+                    cell.size.width,
+                    affordable
                 );
             }
             width += px(40.);
@@ -11213,34 +11254,37 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
-        let size = gpui::size(px(300.), px(800.));
+        let size = gpui::size(px(200.), px(800.));
         let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
 
-        let labels = git_graph.update_in(cx, |graph, window, cx| {
-            graph.history_layout(window, cx).labels
-        });
+        let layout = git_graph.update_in(cx, |graph, window, cx| graph.history_layout(window, cx));
         assert!(
-            !labels.has_a_column(),
+            !layout.labels.has_a_column(),
             "this width was meant to be too narrow for a column of names, but the \
-             layout chose {labels:?}"
+             layout chose {:?}",
+            layout.labels
         );
 
-        let subject = cx
-            .debug_bounds(selector("GRAPH_SUBJECT", 0))
-            .expect("the first row has a subject cell");
+        let text = cx
+            .debug_bounds(selector("GRAPH_TEXT", 0))
+            .expect("the first row writes its subject");
         let label = cx
             .debug_bounds(selector("GRAPH_REFS", 0))
-            .expect("and its name is written inside it");
+            .expect("and its name is written beside it");
 
         assert!(
             cx.debug_bounds(selector("GRAPH_LEAD", 0)).is_none(),
             "there is no column here for a line to cross"
         );
+        // The rung was chosen for a subject of a given length, so the name
+        // beside it may take what is left over and not a pixel of that floor.
         assert!(
-            label.size.width <= subject.size.width * 0.35,
-            "the name takes {:?} of the {:?} the subject has, leaving it nothing",
+            text.size.width + px(0.5) >= layout.subject_min,
+            "the name took {:?} and left the subject {:?}, under the {:?} the \
+             rung was chosen for",
             label.size.width,
-            subject.size.width
+            text.size.width,
+            layout.subject_min
         );
     }
 
