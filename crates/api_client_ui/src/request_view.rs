@@ -250,13 +250,16 @@ gpui::actions!(
 );
 
 /// A row of a table that the reader cannot type into: an auto-generated header.
-/// `toggle` names the one they can still switch off; the two the transport works
-/// out for itself (`Content-Length`, `Host`) carry None.
+///
+/// `switch` carries the name to switch off, which is every one of them except
+/// `Host`: the transport writes that one itself when it is absent, and gives
+/// nothing to say "leave it out" with. Its value can still be overridden by a
+/// `Host` row the reader writes by hand.
 struct FixedRow {
     key: SharedString,
     value: SharedString,
     enabled: bool,
-    toggle: Option<usize>,
+    switch: Option<SharedString>,
 }
 
 /// The descriptions the rows hold now, by the key they belong to. The Bulk Edit
@@ -590,7 +593,11 @@ pub struct RequestView {
         ui::PopoverMenuHandle<picker::Picker<crate::environment_picker::EnvironmentPickerDelegate>>,
     variable_picker_handle: ui::PopoverMenuHandle<ContextMenu>,
     method_selector_handle: ui::PopoverMenuHandle<ContextMenu>,
-    auto_header_enabled: Vec<bool>,
+    /// The auto-generated headers the reader has switched off, by name. The
+    /// names rather than a flag per default: what can be switched off is no
+    /// longer one fixed list, and an index into one would name the wrong
+    /// header the moment that list changed.
+    headers_left_out: Vec<SharedString>,
     show_auto_headers: bool,
     response_fullscreen: bool,
     url_looks_malformed: bool,
@@ -940,15 +947,11 @@ impl RequestView {
             environment_pin_handle: ui::PopoverMenuHandle::default(),
             variable_picker_handle: ui::PopoverMenuHandle::default(),
             method_selector_handle: ui::PopoverMenuHandle::default(),
-            auto_header_enabled: api_client::AUTO_HEADER_DEFAULTS
+            headers_left_out: request
+                .settings
+                .disabled_auto_headers
                 .iter()
-                .map(|(key, _)| {
-                    !request
-                        .settings
-                        .disabled_auto_headers
-                        .iter()
-                        .any(|name| name.trim().eq_ignore_ascii_case(key))
-                })
+                .map(|name| SharedString::from(name.trim().to_string()))
                 .collect(),
             show_auto_headers: true,
             response_fullscreen: false,
@@ -3412,20 +3415,33 @@ impl RequestView {
             )
     }
 
-    fn toggle_auto_header(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(enabled) = self.auto_header_enabled.get_mut(index) {
-            *enabled = !*enabled;
+    fn toggle_auto_header(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        match self
+            .headers_left_out
+            .iter()
+            .position(|left_out| left_out.trim().eq_ignore_ascii_case(name.trim()))
+        {
+            Some(at) => {
+                self.headers_left_out.remove(at);
+            }
+            None => self.headers_left_out.push(name),
         }
         self.persist_disabled_auto_headers(cx);
         cx.notify();
     }
 
-    fn persist_disabled_auto_headers(&self, cx: &mut Context<Self>) {
-        let disabled: Vec<String> = api_client::AUTO_HEADER_DEFAULTS
+    fn sends_auto_header(&self, name: &str) -> bool {
+        !self
+            .headers_left_out
             .iter()
-            .zip(self.auto_header_enabled.iter())
-            .filter(|(_, enabled)| !**enabled)
-            .map(|((key, _), _)| key.to_string())
+            .any(|left_out| left_out.trim().eq_ignore_ascii_case(name.trim()))
+    }
+
+    fn persist_disabled_auto_headers(&self, cx: &mut Context<Self>) {
+        let disabled: Vec<String> = self
+            .headers_left_out
+            .iter()
+            .map(|name| name.to_string())
             .collect();
         let request_id = self.request_id;
         self.store.update(cx, |store, cx| {
@@ -3449,9 +3465,8 @@ impl RequestView {
     fn enabled_auto_headers(&self) -> Vec<(String, String)> {
         api_client::AUTO_HEADER_DEFAULTS
             .iter()
-            .zip(self.auto_header_enabled.iter())
-            .filter(|(_, enabled)| **enabled)
-            .map(|((key, value), _)| (key.to_string(), value.to_string()))
+            .filter(|(key, _)| self.sends_auto_header(key))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
     }
 
@@ -3467,22 +3482,31 @@ impl RequestView {
         }
         let mut rows: Vec<FixedRow> = api_client::AUTO_HEADER_DEFAULTS
             .iter()
-            .enumerate()
-            .map(|(index, (key, value))| FixedRow {
+            .map(|(key, value)| FixedRow {
                 key: SharedString::from(*key),
                 value: SharedString::from(*value),
-                enabled: self.auto_header_enabled.get(index).copied().unwrap_or(true),
-                toggle: Some(index),
+                enabled: self.sends_auto_header(key),
+                switch: Some(SharedString::from(*key)),
             })
             .collect();
-        for key in ["Content-Length", "Host"] {
-            rows.push(FixedRow {
-                key: SharedString::from(key),
-                value: SharedString::from("<calculated when request is sent>"),
-                enabled: true,
-                toggle: None,
-            });
-        }
+        // Switched off, the body goes out chunked: that is the only way HTTP
+        // has of sending one without saying how long it is, and it is what the
+        // transport does as soon as a transfer encoding is written down.
+        rows.push(FixedRow {
+            key: SharedString::from("Content-Length"),
+            value: SharedString::from(match self.sends_auto_header("Content-Length") {
+                true => "<calculated when request is sent>",
+                false => "<not sent; the body goes out chunked>",
+            }),
+            enabled: self.sends_auto_header("Content-Length"),
+            switch: Some(SharedString::from("Content-Length")),
+        });
+        rows.push(FixedRow {
+            key: SharedString::from("Host"),
+            value: SharedString::from("<calculated when request is sent>"),
+            enabled: true,
+            switch: None,
+        });
         // Derived from the body rather than written down when a format is
         // picked. A request opened with a format already chosen was never
         // "picked" in this session, so a header written only on the click was
@@ -3493,8 +3517,8 @@ impl RequestView {
             rows.push(FixedRow {
                 key: SharedString::from("Content-Type"),
                 value: SharedString::from(content_type_header_value(self.body_content_type)),
-                enabled: true,
-                toggle: None,
+                enabled: self.sends_auto_header("Content-Type"),
+                switch: Some(SharedString::from("Content-Type")),
             });
         }
         rows
@@ -3580,7 +3604,7 @@ impl RequestView {
         rows: &[KeyValueRow],
         which: &'static str,
         fixed: Vec<FixedRow>,
-        on_toggle_fixed: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
+        on_toggle_fixed: impl Fn(&mut Self, SharedString, &mut Context<Self>) + 'static + Clone,
         on_toggle: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         on_remove: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         cx: &mut Context<Self>,
@@ -3620,7 +3644,8 @@ impl RequestView {
         for automatic in fixed {
             let on_toggle_fixed = on_toggle_fixed.clone();
             let key = automatic.key.clone();
-            let switchable = automatic.toggle;
+            let switchable = automatic.switch.clone();
+            let can_be_switched = switchable.is_some();
             table = table.child(
                 h_flex()
                     .id(SharedString::from(format!("{which}-fixed-{key}")))
@@ -3644,9 +3669,11 @@ impl RequestView {
                                 let key = key.clone();
                                 move || format!("auto-header-toggle-{key}")
                             })
-                            .when_some(switchable, |cell, index| {
+                            .when_some(switchable, |cell, name| {
                                 cell.cursor_pointer().on_click(cx.listener(
-                                    move |this, _, _window, cx| on_toggle_fixed(this, index, cx),
+                                    move |this, _, _window, cx| {
+                                        on_toggle_fixed(this, name.clone(), cx)
+                                    },
                                 ))
                             })
                             .child(
@@ -3655,12 +3682,12 @@ impl RequestView {
                                     false => IconName::Close,
                                 })
                                 .size(IconSize::XSmall)
-                                .color(match switchable {
-                                    // The two the transport works out for itself are
-                                    // told apart by being dimmer: they are there to
+                                .color(match can_be_switched {
+                                    // The one the transport writes for itself is
+                                    // told apart by being dimmer: it is there to
                                     // be read, not switched.
-                                    None => Color::Disabled,
-                                    Some(_) => Color::Muted,
+                                    false => Color::Disabled,
+                                    true => Color::Muted,
                                 }),
                             ),
                     )
@@ -3682,9 +3709,9 @@ impl RequestView {
                             .py_1()
                             .border_l_1()
                             .border_color(colors.border)
-                            .child(Label::new(automatic.value).color(match switchable {
-                                None => Color::Disabled,
-                                Some(_) => Color::Muted,
+                            .child(Label::new(automatic.value).color(match can_be_switched {
+                                false => Color::Disabled,
+                                true => Color::Muted,
                             })),
                     )
                     .child(
@@ -7764,20 +7791,26 @@ mod tests {
         let (_workspace, _store, _request, modal, mut cx) =
             a_code_window_showing(A_URL_TOO_LONG_FOR_THE_WINDOW, cx).await;
 
+        let wrapped = how_the_code_is_laid_out(&modal, &mut cx);
+
         let checkbox = debug_center(&mut cx, "code-snippet-wrap");
         cx.simulate_click(checkbox, gpui::Modifiers::none());
         cx.run_until_parked();
         draw(&mut cx);
 
         let unwrapped = how_the_code_is_laid_out(&modal, &mut cx);
-        assert_eq!(
-            unwrapped.rows, 1,
-            "with the box unchecked the command is one line again"
+        assert!(
+            unwrapped.rows < wrapped.rows,
+            "with the box unchecked the command stops folding: {} rows against {}",
+            unwrapped.rows,
+            wrapped.rows
         );
-        assert_eq!(
-            unwrapped.longest_row, unwrapped.whole_command,
-            "which puts the whole command on that one row, hanging past the right \
-             edge of the window"
+        assert!(
+            unwrapped.longest_row > wrapped.longest_row,
+            "which lets its longest line run past the right edge of the window \
+             instead of folding: {} characters against {}",
+            unwrapped.longest_row,
+            wrapped.longest_row
         );
 
         let checkbox = debug_center(&mut cx, "code-snippet-wrap");

@@ -108,21 +108,12 @@ fn as_it_was_written(
 ) -> ResolvedRequest {
     let dynamic = SystemDynamicVariableSource;
     let resolver = |text: &str| resolve(text, context, &dynamic, ResolveMode::ForSend);
-    let mut resolved = build_resolved_request_with_files(request, &resolver, files);
-    let written_by_hand: Vec<String> = request
-        .headers
-        .iter()
-        .filter(|header| header.enabled && !header.key.is_empty())
-        .map(|header| resolver(&header.key).trim().to_lowercase())
-        .collect();
-    resolved.headers.retain(|(key, _)| {
-        let name = key.trim().to_lowercase();
-        written_by_hand.contains(&name)
-            || !api_client::AUTO_HEADER_DEFAULTS
-                .iter()
-                .any(|(automatic, _)| automatic.eq_ignore_ascii_case(key.trim()))
-    });
-    resolved
+    // Every header the request sends, the automatic ones included. A snippet
+    // that quietly dropped them would be a command that behaves differently
+    // from the button beside it, which is the one thing a snippet must never
+    // be -- and a reader pastes it into a terminal precisely to find out what
+    // was sent.
+    build_resolved_request_with_files(request, &resolver, files)
 }
 
 /// The exchange as it goes over the wire, which is what a reader pastes into a
@@ -442,13 +433,12 @@ fn php_quoted(value: &str) -> String {
 /// and turns a request with `--data` into a POST on its own, so naming the method
 /// in those two cases is noise.
 fn as_curl(resolved: &ResolvedRequest, body: Option<&str>) -> String {
+    // The method is always written out. `curl` infers POST from `--data` and
+    // GET from its absence, but a reader reading the command should not have
+    // to know that to know what it does.
     let method = resolved.method.to_uppercase();
-    let spelled_out = match (method.as_str(), body.is_some()) {
-        ("GET", false) | ("POST", true) => String::new(),
-        _ => format!("--request {method} "),
-    };
     let mut command = format!(
-        "curl --location {spelled_out}{}",
+        "curl --location --request {method} {}",
         shell_quote(&resolved.url)
     );
     for (key, value) in &resolved.headers {
@@ -668,30 +658,36 @@ mod tests {
         let context = the_global_context(&global);
 
         let curl = generate(Snippet::Curl, &request, &context, &FilesForABody::default());
-        assert_eq!(
-            curl,
-            "curl --location 'https://api.example.com/v1/things' \\\n  \
-             --header 'Accept: application/json'",
-            "only the reader's own header, and theirs wins over ours of the same name"
+        assert!(
+            curl.contains("--header 'Accept: application/json'"),
+            "the reader's own header wins over ours of the same name: {curl}"
+        );
+        assert!(
+            !curl.contains("--header 'Accept: */*'"),
+            "and ours is not sent beside it: {curl}"
         );
 
+        // A snippet is the command this editor would have run. Leaving out the
+        // headers it adds for itself would make it a different request, and a
+        // reader pastes it into a terminal precisely to find out what was sent.
         for snippet in Snippet::ALL {
             let code = generate(snippet, &request, &context, &FilesForABody::default());
             assert!(
-                !code.contains("ZedApiClient"),
-                "{:?} must not tell another tool to call itself this editor:\n{code}",
+                code.contains("ZedApiClient"),
+                "{:?} leaves out a header the request sends:\n{code}",
                 snippet
             );
             assert!(
-                !code.contains("keep-alive") && !code.contains("no-cache"),
-                "{:?} carries a header the reader never set:\n{code}",
+                code.contains("keep-alive") && code.contains("no-cache"),
+                "{:?} leaves out a header the request sends:\n{code}",
                 snippet
             );
         }
     }
 
-    /// The method is named only where `curl` would otherwise get it wrong: it
-    /// sends a GET by default, and `--data` makes it a POST on its own.
+    /// The method is always named. `curl` infers GET from the absence of a
+    /// body and POST from `--data`, but a reader reading the command should not
+    /// have to know that to know what it does.
     #[test]
     fn the_method_is_named_only_where_curl_needs_it() {
         let global = Environment::global();
@@ -704,10 +700,15 @@ mod tests {
             request
         };
 
-        let get = a_request_named("Read", "https://api.example.com/things");
+        let get = request_with_auto_headers_disabled("Read");
+        let get = {
+            let mut get = get;
+            get.url = "https://api.example.com/things".to_string();
+            get
+        };
         assert_eq!(
             generate(Snippet::Curl, &get, &context, &FilesForABody::default()),
-            "curl --location 'https://api.example.com/things'"
+            "curl --location --request GET 'https://api.example.com/things'"
         );
 
         let mut post = a_request_named("Create", "https://api.example.com/things");
@@ -715,8 +716,8 @@ mod tests {
         let post = with_a_body(post);
         let written = generate(Snippet::Curl, &post, &context, &FilesForABody::default());
         assert!(
-            written.starts_with("curl --location 'https://api.example.com/things'"),
-            "a POST with a body needs no --request: {written}"
+            written.starts_with("curl --location --request POST 'https://api.example.com/things'"),
+            "a POST says so, whether or not curl could have worked it out: {written}"
         );
         assert!(written.contains("--data"), "{written}");
 
@@ -755,10 +756,8 @@ mod tests {
     /// nothing that was not asked for.
     #[test]
     fn a_get_with_a_filled_in_path_is_one_plain_line() {
-        let mut request = a_request_named(
-            "Balance sheet",
-            "{{financials-api}}/v1/instruments/:instrument_id/balance-sheet",
-        );
+        let mut request = request_with_auto_headers_disabled("Balance sheet");
+        request.url = "{{financials-api}}/v1/instruments/:instrument_id/balance-sheet".to_string();
         request.params = vec![api_client::QueryParam {
             key: ":instrument_id".to_string(),
             value: "6408".to_string(),
@@ -774,8 +773,8 @@ mod tests {
 
         assert_eq!(
             generate(Snippet::Curl, &request, &context, &FilesForABody::default()),
-            "curl --location 'http://financials.example.com/v1/instruments/6408/balance-sheet'",
-            "nothing else belongs in it: no body, no headers of ours, no --request"
+            "curl --location --request GET 'http://financials.example.com/v1/instruments/6408/balance-sheet'",
+            "nothing else belongs in it: no body, and no headers this request does not send"
         );
     }
 
@@ -790,7 +789,10 @@ mod tests {
             global: &global,
         };
         let curl = generate(Snippet::Curl, &request, &ctx, &FilesForABody::default());
-        assert_eq!(curl, "curl --location 'https://api.example.com/ping'");
+        assert_eq!(
+            curl,
+            "curl --location --request GET 'https://api.example.com/ping'"
+        );
     }
 
     #[test]

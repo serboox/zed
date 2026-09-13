@@ -76,6 +76,12 @@ pub fn parse_curl(command: &str, collection_id: CollectionId) -> Result<Request>
     }
 
     let url = url.context("no URL found in the curl command")?;
+    // A quote that survived the shell's own quoting -- a command pasted from a
+    // place that had already quoted it once, or one whose quotes were mangled
+    // on the way. No address begins or ends with one, and left in place it
+    // travels into every snippet the request generates afterwards, where it
+    // reads as the generator's fault rather than the address's.
+    let url = url.trim().trim_matches(['\'', '"']).to_string();
     let mut request = Request::new(collection_id, url.clone());
     request.url = url;
     request.method = method.unwrap_or_default();
@@ -128,8 +134,20 @@ fn tokenize_shell_command(command: &str) -> Result<Vec<String>> {
     let mut in_double_quotes = false;
     let mut has_token = false;
 
-    for ch in normalized.chars() {
+    let mut characters = normalized.chars().peekable();
+    while let Some(ch) = characters.next() {
         match ch {
+            // A backslash outside single quotes escapes whatever follows it.
+            // This is how a shell carries a single quote through a
+            // single-quoted string -- `'\''` -- which is exactly what this
+            // crate's own cURL snippets are written with, so without it a
+            // snippet this editor produced could not be read back into it.
+            '\\' if !in_single_quotes => {
+                if let Some(escaped) = characters.next() {
+                    current.push(escaped);
+                    has_token = true;
+                }
+            }
             '\'' if !in_double_quotes => {
                 in_single_quotes = !in_single_quotes;
                 has_token = true;
@@ -805,6 +823,26 @@ pub fn parse_openapi_document(json: &str) -> Result<ImportedCollection> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A command whose quotes were already spent once -- pasted from somewhere
+    /// that had quoted it, or mangled on the way -- leaves a quote stuck to the
+    /// address. It then travels into every snippet the request generates, where
+    /// it reads as the generator's fault rather than the address's.
+    #[test]
+    fn a_quote_that_survived_the_shell_is_not_part_of_the_address() {
+        let collection = CollectionId::new_v4();
+        for command in [
+            r#"curl --location ''\''https://api.example.com/v1/token'"#,
+            r#"curl "'https://api.example.com/v1/token'""#,
+            r#"curl 'https://api.example.com/v1/token'"#,
+        ] {
+            let request = parse_curl(command, collection).expect("the command parses");
+            assert_eq!(
+                request.url, "https://api.example.com/v1/token",
+                "from {command}"
+            );
+        }
+    }
     use super::*;
     use uuid::Uuid;
 

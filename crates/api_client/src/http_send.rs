@@ -352,7 +352,22 @@ pub fn build_resolved_request_with_files(
         .collect();
     apply_auto_headers(&mut headers, &request.settings.disabled_auto_headers);
 
+    let left_out = |name: &str| {
+        request
+            .settings
+            .disabled_auto_headers
+            .iter()
+            .any(|disabled| disabled.trim().eq_ignore_ascii_case(name))
+    };
+
     let (body, needs_content_type) = body_to_send(&request.body, resolve, files);
+    // A content type worked out from the body is still a header the reader may
+    // decline to send: some servers guess better from the bytes than from a
+    // type somebody else chose for them.
+    let needs_content_type = match left_out("Content-Type") {
+        true => None,
+        false => needs_content_type,
+    };
     match needs_content_type {
         Some(ContentTypeToSend::UnlessWrittenByHand(content_type)) => {
             if !headers
@@ -367,6 +382,19 @@ pub fn build_resolved_request_with_files(
             headers.push(("Content-Type".to_string(), content_type));
         }
         None => {}
+    }
+
+    // The transport writes the body's length itself, so the only way not to
+    // send one is to send the body chunked instead -- which is what the
+    // transport does as soon as a transfer encoding is written down. Skipped
+    // where the reader wrote one of their own: theirs is the answer.
+    if left_out("Content-Length")
+        && body.is_some()
+        && !headers
+            .iter()
+            .any(|(key, _)| key.trim().eq_ignore_ascii_case("transfer-encoding"))
+    {
+        headers.push(("Transfer-Encoding".to_string(), "chunked".to_string()));
     }
 
     match &request.auth {
