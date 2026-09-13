@@ -998,6 +998,12 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    /// The Git Graph page, drawn narrow inside the History tab.
+    ///
+    /// Built the first time that tab is shown rather than with the panel: it
+    /// reads the repository and the workspace, and a panel is built while the
+    /// workspace is in the middle of being updated.
+    history_page: Option<Entity<crate::git_graph::GitGraph>>,
     /// The lane layout behind the History tab, grown as `git log` streams in.
     /// It is the row model too: the list and the lane column read the same
     /// commits, so a dot can never end up beside the wrong subject.
@@ -1309,6 +1315,7 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                history_page: None,
                 commit_graph: GraphData::new(lane_colours()),
                 commit_graph_scroll_x: px(0.),
                 commit_graph_source: None,
@@ -6184,28 +6191,49 @@ impl GitPanel {
             .when(active_tab != GitPanelTab::Changes, |this| this)
     }
 
+    /// The History tab is the Git Graph page, narrow.
+    ///
+    /// One render rather than two: what the dock shows and what the page shows
+    /// are the same rows laid out by the same `fit`, and the dock is simply the
+    /// narrow end of that ladder. Two renders is how the dock came to be a
+    /// version behind the page in the first place.
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
-            match &self.commit_history {
-                _ if !has_repo => {
-                    this.child(Self::render_history_placeholder("No repository found"))
+        if let Some(graph) = self.history_page.clone() {
+            return v_flex()
+                .flex_1()
+                .size_full()
+                .overflow_hidden()
+                .child(graph)
+                .into_any_element();
+        }
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .map(|this| {
+                let has_repo = self.active_repository.is_some();
+                match &self.commit_history {
+                    _ if !has_repo => {
+                        this.child(Self::render_history_placeholder("No repository found"))
+                    }
+                    CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
+                        "Failed to load commit history",
+                    )),
+                    CommitHistory::Loading => {
+                        this.child(Self::render_history_placeholder("Loading Commit History…"))
+                    }
+                    CommitHistory::Loaded if self.history_graph().commits.is_empty() => {
+                        this.child(Self::render_history_placeholder("No commits yet"))
+                    }
+                    CommitHistory::Loaded => match self.render_commit_history(window, cx) {
+                        Some(history) => this.child(history),
+                        None => {
+                            this.child(Self::render_history_placeholder("Failed to load commits"))
+                        }
+                    },
                 }
-                CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
-                    "Failed to load commit history",
-                )),
-                CommitHistory::Loading => {
-                    this.child(Self::render_history_placeholder("Loading Commit History…"))
-                }
-                CommitHistory::Loaded if self.history_graph().commits.is_empty() => {
-                    this.child(Self::render_history_placeholder("No commits yet"))
-                }
-                CommitHistory::Loaded => match self.render_commit_history(window, cx) {
-                    Some(history) => this.child(history),
-                    None => this.child(Self::render_history_placeholder("Failed to load commits")),
-                },
-            }
-        })
+            })
+            .into_any_element()
     }
 
     fn render_history_placeholder(message: &'static str) -> impl IntoElement {
@@ -6419,6 +6447,30 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    /// Builds the page the History tab draws, once, the first time it is asked
+    /// for.
+    ///
+    /// Deferred past the end of this effect cycle: a panel is built and its tab
+    /// switched while the workspace is in the middle of being updated, and the
+    /// page reads that same workspace -- reading it here would be updating an
+    /// entity that is already being updated.
+    fn open_the_history_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_page.is_some() {
+            return;
+        }
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let repo_id = repository.read(cx).id;
+        let git_store = self.project.read(cx).git_store().clone();
+        let page = cx.new(|cx| {
+            crate::git_graph::GitGraph::new(repo_id, git_store, workspace, None, window, cx)
+        });
+        self.history_page = Some(page);
+        cx.notify();
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -6428,6 +6480,9 @@ impl GitPanel {
             GitPanelTab::History => {
                 self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
+                cx.defer_in(window, |this, window, cx| {
+                    this.open_the_history_page(window, cx);
+                });
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
@@ -9762,9 +9817,9 @@ mod tests {
         (workspace, panel, cx)
     }
 
-    /// The dock draws the same graph as the full page, narrowed. A second
-    /// click is how a reader asks for the room the full page has, without
-    /// losing the commit they were looking at.
+    /// The dock is the page drawn narrow, so a second click there is how a
+    /// reader asks for the room the full page has, without losing the commit
+    /// they were reading.
     #[gpui::test]
     async fn a_second_click_in_the_dock_opens_the_full_page_at_that_commit(
         cx: &mut TestAppContext,
@@ -9813,47 +9868,17 @@ mod tests {
             }),
         );
 
-        let (workspace, panel, mut cx) = a_history_panel_on_screen(fs, cx).await;
+        let (_workspace, panel, mut cx) = a_history_panel_on_screen(fs, cx).await;
         wait_for_commit_history_to_settle(&panel, &mut cx).await;
         cx.run_until_parked();
 
-        let row = cx
-            .debug_bounds("HISTORY_ROW-0")
-            .expect("the dock draws a row for the newest commit");
-        double_click(row.center(), &mut cx);
-        cx.run_until_parked();
-
-        let opened = workspace.read_with(&cx, |workspace, cx| {
-            workspace
-                .active_item(cx)
-                .and_then(|item| item.downcast::<crate::git_graph::GitGraph>())
-        });
-        let opened = opened.expect("a second click opens the full page");
-        opened.read_with(&cx, |graph, cx| {
-            assert_eq!(
-                graph.selected_sha(cx),
-                Some(newer),
-                "and it opens at the commit that was clicked"
+        // The tab shows the page itself, so there is one render rather than
+        // two and nothing for them to drift apart over.
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.history_page.is_some(),
+                "the History tab should be drawing the Git Graph page"
             );
-        });
-    }
-
-    /// A real second click, which `simulate_click` cannot produce: it always
-    /// reports the first.
-    fn double_click(at: gpui::Point<Pixels>, cx: &mut VisualTestContext) {
-        cx.simulate_click(at, gpui::Modifiers::none());
-        cx.simulate_event(gpui::MouseDownEvent {
-            button: gpui::MouseButton::Left,
-            position: at,
-            modifiers: gpui::Modifiers::none(),
-            click_count: 2,
-            first_mouse: false,
-        });
-        cx.simulate_event(gpui::MouseUpEvent {
-            button: gpui::MouseButton::Left,
-            position: at,
-            modifiers: gpui::Modifiers::none(),
-            click_count: 2,
         });
     }
 

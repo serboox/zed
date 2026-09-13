@@ -4264,11 +4264,11 @@ impl GitGraph {
                 h_flex()
                     .h(metrics.label)
                     .items_center()
-                    // Without this the chip keeps its natural width and the row
-                    // overflows to the left, cutting the start of a branch name
-                    // -- the one end of it a reader cannot do without.
+                    // Allowed to shrink, so a name too long for the room ends
+                    // in an ellipsis of the chip's own making. Clipped instead
+                    // -- which is what hiding the overflow here did -- it ends
+                    // mid-letter and reads as a rendering fault.
                     .min_w_0()
-                    .overflow_hidden()
                     .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
             }))
@@ -5152,19 +5152,15 @@ impl GitGraph {
         }
     }
 
-    /// The commit the reader has selected, by its own name.
-    ///
-    /// The row number it is held as means nothing outside this view -- a
-    /// filter or a reload moves it -- so anything asking which commit is
-    /// selected asks for the sha.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn selected_sha(&self, cx: &App) -> Option<Oid> {
-        let row = self.selected_entry_idx?;
+    /// The name of the commit on one row of the history.
+    fn sha_at(&self, row: usize, cx: &App) -> Option<String> {
         let repository = self.get_repository(cx)?;
         let data = repository
             .read(cx)
             .get_graph_data(self.log_source.clone(), self.log_order)?;
-        data.commit_data.get(row).map(|commit| commit.sha)
+        data.commit_data
+            .get(row)
+            .map(|commit| commit.sha.to_string())
     }
 
     pub fn select_commit_by_sha(&mut self, sha: impl TryInto<Oid>, cx: &mut Context<Self>) {
@@ -6028,6 +6024,17 @@ impl GitGraph {
             focus_handle.focus(window, cx);
         }
 
+        // Drawn at the narrow end of the ladder -- which is where the dock
+        // sits -- a second click is how a reader asks for the room the full
+        // page has, without losing the commit they were reading.
+        if event.click_count() > 1
+            && !self.history_layout(window, cx).labels.has_a_column()
+            && let Some(sha) = self.sha_at(entry_idx, cx)
+        {
+            window.dispatch_action(Box::new(OpenAtCommit { sha }), cx);
+            return;
+        }
+
         let modifiers = event.modifiers();
         match (modifiers.shift, modifiers.secondary()) {
             // Shift reaches from the selection to here, which is both the run
@@ -6204,6 +6211,7 @@ impl Render for GitGraph {
             self.search(query, cx);
         }
         let (commit_count, is_loading) = self.commit_count_and_loading_state(cx);
+        let room_for_the_bars = self.history_layout(window, cx).labels.has_a_column();
 
         let error = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
@@ -6461,8 +6469,15 @@ impl Render for GitGraph {
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_search_bar(cx))
-                    .children(self.render_filter_bar(cx))
+                    // At the narrow end of the ladder -- which is where the
+                    // dock sits -- a search field and a filter bar would take
+                    // the room the rows themselves need. The plan puts the
+                    // dock on that rung on purpose: what is left is the
+                    // history, and the searching is done on the full page.
+                    .when(room_for_the_bars, |this| {
+                        this.child(self.render_search_bar(cx))
+                            .children(self.render_filter_bar(cx))
+                    })
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
