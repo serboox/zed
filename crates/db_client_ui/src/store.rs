@@ -835,8 +835,23 @@ impl DatabaseStore {
     /// completion has data offline and right after startup. Never overwrites
     /// live data already fetched from the server.
     fn hydrate_schema_caches(&mut self) {
+        self.hydrate_schema_caches_of(None);
+    }
+
+    /// The same, for one connection: whatever resets a connection throws its
+    /// live maps away, and the snapshot on disk is what a restart would have
+    /// filled them from. Without this the reader has to restart the editor to
+    /// see the contents of a database they have already read once.
+    fn hydrate_schema_cache_of(&mut self, id: ConnectionId) {
+        self.hydrate_schema_caches_of(Some(id));
+    }
+
+    fn hydrate_schema_caches_of(&mut self, only: Option<ConnectionId>) {
         let cache = std::mem::take(&mut self.schema_cache);
         for conn in &mut self.connections {
+            if only.is_some_and(|id| id != conn.config.id) {
+                continue;
+            }
             let Some(snapshot) = cache.get(&conn.config.id) else {
                 continue;
             };
@@ -1394,6 +1409,7 @@ impl DatabaseStore {
         } else {
             return;
         }
+        self.hydrate_schema_cache_of(config_id);
         self.tunnels.remove(&config_id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
@@ -2145,6 +2161,9 @@ impl DatabaseStore {
             epoch,
             ..ActiveConnection::new(conn.config.clone())
         };
+        // The server is gone, not what it holds: put back what was read from
+        // it, the way a restart would.
+        self.hydrate_schema_cache_of(id);
         self.tunnels.remove(&id);
         self.prefetching_schema.remove(&id);
         if self.active_connection_id == Some(id) {
@@ -5164,6 +5183,67 @@ mod tests {
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
             Ok(String::new())
         }
+    }
+
+    /// Disconnecting throws away what was read from the server, and nothing put
+    /// it back: the reader saw an empty database and had to restart the editor,
+    /// because a restart was the only thing that read the snapshot off disk.
+    #[gpui::test]
+    async fn a_connection_that_is_reset_is_refilled_from_what_was_already_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(SchemaMockProvider), cx);
+            store.schema_cache.insert(
+                id,
+                SchemaCache {
+                    databases: vec![db_client::DatabaseInfo {
+                        name: "shop".to_string(),
+                    }],
+                    tables: HashMap::default(),
+                    views: HashMap::default(),
+                    columns: HashMap::default(),
+                    cached_at_unix_ms: None,
+                },
+            );
+            store.hydrate_schema_caches();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store.connections.first().expect("connection present");
+            assert_eq!(
+                conn.databases.as_ref().map(Vec::len),
+                Some(1),
+                "the snapshot should have filled the connection to begin with"
+            );
+        });
+
+        store.update(cx, |store, cx| store.disconnect(id, cx));
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store.connections.first().expect("connection present");
+            let databases = conn
+                .databases
+                .as_ref()
+                .map(|databases| {
+                    databases
+                        .iter()
+                        .map(|database| database.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                databases,
+                vec!["shop".to_string()],
+                "disconnecting emptied what had already been read, and only a \
+                 restart would have put it back"
+            );
+        });
     }
 
     #[gpui::test]
