@@ -1749,6 +1749,10 @@
       "shift-up": "git_graph::SelectFirstChild",
       "ctrl-home": "menu::SelectFirst",
       "ctrl-end": "menu::SelectLast",
+      "ctrl-=": "git_graph::ZoomIn",
+      "ctrl-+": "git_graph::ZoomIn",
+      "ctrl--": "git_graph::ZoomOut",
+      "ctrl-0": "git_graph::ZoomReset",
     },
   },
   {

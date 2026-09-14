@@ -1696,6 +1696,10 @@
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
       "shift-tab": "git_graph::FocusPreviousTabStop",
+      "ctrl-=": "git_graph::ZoomIn",
+      "ctrl-+": "git_graph::ZoomIn",
+      "ctrl--": "git_graph::ZoomOut",
+      "ctrl-0": "git_graph::ZoomReset",
     },
   },
   {

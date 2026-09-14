@@ -591,6 +591,12 @@ actions!(
         SelectFirstParent,
         /// Selects the commit that has the selected one as its first parent.
         SelectFirstChild,
+        /// Draws the history larger.
+        ZoomIn,
+        /// Draws the history smaller, fitting more of it on the screen.
+        ZoomOut,
+        /// Returns the history to the size it is drawn at by default.
+        ZoomReset,
     ]
 );
 
@@ -1695,7 +1701,7 @@ pub(crate) fn render_graph_column(data: &GraphData, column: GraphColumn) -> impl
                 painted_at.set(Some(bounds));
             }
 
-            let metrics = GraphMetrics::for_window(window);
+            let metrics = GraphMetrics::from_row(row_height, window.scale_factor());
             window.paint_layer(bounds, |window| {
                 let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
                 let selected_bg = match is_focused {
@@ -1797,13 +1803,43 @@ impl GraphMetrics {
             node: snap(row * 0.71),
             lane: snap(row * 0.79),
             label: snap(row * 0.64),
-            left_pad: px(8.),
+            left_pad: snap(row * 0.12),
+        }
+    }
+
+    /// The sizes that go with a row of exactly this height.
+    ///
+    /// Everything but the row is a proportion of it, so a host that has already
+    /// decided how tall its rows are -- because a reader zoomed them -- gets the
+    /// rest from here rather than deriving a second, different answer from the
+    /// font.
+    pub(crate) fn from_row(row: Pixels, scale_factor: f32) -> Self {
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        let snap = |value: Pixels| (value * scale).round() / scale;
+        Self {
+            row,
+            node: snap(row * 0.71),
+            lane: snap(row * 0.79),
+            label: snap(row * 0.64),
+            left_pad: snap(row * 0.12),
         }
     }
 
     pub(crate) fn for_window(window: &Window) -> Self {
         let line_height = window.text_style().line_height_in_pixels(window.rem_size());
         Self::new(line_height, window.scale_factor())
+    }
+
+    /// The sizes at the reader's own zoom.
+    pub(crate) fn zoomed(window: &Window, zoom: f32) -> Self {
+        let scale = window.scale_factor();
+        let plain = Self::for_window(window);
+        let snap = |value: Pixels| (value * scale).round() / scale;
+        Self::from_row(snap(plain.row * zoom).max(px(12.)), scale)
     }
 
     /// Where a lane's line runs, measured from the left edge of a graph cell
@@ -2008,9 +2044,23 @@ const RUNGS: [Rung; 4] = [
 ];
 
 /// What the age column takes when it has one.
+/// How strongly a row is tinted by the colour of the branch it belongs to.
+///
+/// A band answers "which branch is this row on" without the reader crossing to
+/// the graph. Loud enough to repaint the row and it starts competing with the
+/// text sitting on it, and a history of a dozen branches becomes a history of
+/// a dozen colours with some words in them.
+pub(crate) const ROW_BAND: f32 = 0.055;
+pub(crate) const ROW_BAND_HOVERED: f32 = 0.095;
+pub(crate) const ROW_BAND_SELECTED: f32 = 0.15;
+
 pub(crate) const AGE_COLUMN_WIDTH: Pixels = px(90.);
-/// A label column narrower than this says nothing, so it is not offered.
-pub(crate) const LABEL_COLUMN_MIN: Pixels = px(120.);
+/// A label column narrower than this has no room left for the line joining a
+/// name to its commit, so it is not offered. It is a floor on what the column
+/// can be dragged or squeezed to, never a width it is given: a history whose
+/// branches are all called `main` spends the width of `main` on them and the
+/// rest on its subjects.
+pub(crate) const LABEL_COLUMN_MIN: Pixels = px(56.);
 /// However long the longest label is, the column stops here.
 pub(crate) const LABEL_COLUMN_MAX_SHARE: f32 = 0.28;
 
@@ -2034,9 +2084,7 @@ impl HistoryContents {
         if wanted <= px(0.) {
             return px(0.);
         }
-        wanted
-            .max(LABEL_COLUMN_MIN)
-            .min(available * LABEL_COLUMN_MAX_SHARE)
+        wanted.min(available * LABEL_COLUMN_MAX_SHARE)
     }
 }
 
@@ -2649,6 +2697,13 @@ pub struct GitGraph {
     /// column is wide is read by pushing this along rather than by squeezing
     /// the lanes until nothing can be told apart.
     graph_first_lane: Rc<Cell<usize>>,
+    /// How much larger or smaller than its own default the history is drawn.
+    ///
+    /// A history is a picture before it is a list: a reader looking for where a
+    /// branch left the trunk wants more rows on the screen, and one reading a
+    /// subject wants fewer and larger. One number, because everything in a row
+    /// is a proportion of its height.
+    zoom: f32,
     /// What the reader dragged the label column to, if they did. Manual beats
     /// automatic until they ask for the automatic back with a double click.
     column_override: Rc<Cell<Option<Pixels>>>,
@@ -2698,12 +2753,89 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
-    fn row_height(window: &Window, _cx: &App) -> Pixels {
-        GraphMetrics::for_window(window).row
+    /// The two buttons that change how large the history is drawn.
+    ///
+    /// A keystroke alone would leave the reader who has never read a keymap
+    /// with a history they cannot resize, and the size is the first thing they
+    /// want to change.
+    fn render_zoom_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let at_default = (self.zoom - 1.0).abs() < f32::EPSILON;
+        h_flex()
+            .flex_none()
+            .gap_px()
+            .child(
+                IconButton::new("git-graph-zoom-out", IconName::Dash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title("Zoom Out", &ZoomOut))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
+                    ),
+            )
+            .child(
+                IconButton::new("git-graph-zoom-in", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title("Zoom In", &ZoomIn))
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
+            )
+            .when(!at_default, |this| {
+                this.child(
+                    IconButton::new("git-graph-zoom-reset", IconName::RotateCcw)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::for_action_title("Reset Zoom", &ZoomReset))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.zoom_reset(&ZoomReset, window, cx)
+                        })),
+                )
+            })
+    }
+
+    fn row_height(&self, window: &Window) -> Pixels {
+        self.metrics(window).row
+    }
+
+    /// The sizes this history draws itself at, the reader's zoom included.
+    fn metrics(&self, window: &Window) -> GraphMetrics {
+        GraphMetrics::zoomed(window, self.zoom)
+    }
+
+    /// The steps the zoom moves in, and the ends it stops at.
+    ///
+    /// Below the first the avatars and the node stop carrying anything; above
+    /// the last a screen holds so few rows that the shape of the history is
+    /// gone, which is the thing a graph is for.
+    const ZOOM_STEP: f32 = 1.15;
+    const ZOOM_CLOSEST: f32 = 0.6;
+    const ZOOM_FURTHEST: f32 = 1.8;
+
+    fn zoom_to(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(Self::ZOOM_CLOSEST, Self::ZOOM_FURTHEST);
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom = zoom;
+        // `uniform_list` keeps the row size it measured last time it was laid
+        // out; left alone it would go on laying the list out on the old height
+        // while the canvas paints on the new one, and the two would drift.
+        self.table_interaction_state.update(cx, |state, _cx| {
+            state.scroll_handle.0.borrow_mut().last_item_size = None;
+        });
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to(self.zoom * Self::ZOOM_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to(self.zoom / Self::ZOOM_STEP, cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to(1.0, cx);
     }
 
     fn visible_row_count(&self, window: &Window, cx: &App) -> usize {
-        let row_height = Self::row_height(window, cx);
+        let row_height = self.row_height(window);
         let viewport_height = self
             .table_interaction_state
             .read(cx)
@@ -2726,7 +2858,7 @@ impl GitGraph {
     /// actually holds.
     fn history_layout(&self, window: &Window, cx: &App) -> HistoryLayout {
         let head = self.head_branch_name(cx);
-        let metrics = GraphMetrics::for_window(window);
+        let metrics = self.metrics(window);
         let character = measure_text(window, "0");
 
         let mut widest_label = [px(0.); 4];
@@ -2765,15 +2897,15 @@ impl GitGraph {
     fn graph_column_width(&self, window: &Window, layout: HistoryLayout) -> Pixels {
         let lanes = layout.lane_cap.min(self.graph_data.max_lanes.max(1));
         let rings = match self.graph_data.max_lanes > layout.lane_cap {
-            true => GraphMetrics::for_window(window).lane,
+            true => self.metrics(window).lane,
             false => px(0.),
         };
-        GraphMetrics::for_window(window).width_for(lanes) + rings
+        self.metrics(window).width_for(lanes) + rings
     }
 
     /// The sizes this history's rows are drawn at.
     fn row_metrics(&self, window: &Window, _cx: &App) -> GraphMetrics {
-        GraphMetrics::for_window(window)
+        self.metrics(window)
     }
 
     fn table_column_widths(
@@ -3823,10 +3955,10 @@ impl GitGraph {
             state
         });
 
-        let mut row_height = Self::row_height(window, cx);
+        let mut row_height = GraphMetrics::for_window(window).row;
 
         cx.observe_global_in::<settings::SettingsStore>(window, move |this, window, cx| {
-            let new_row_height = Self::row_height(window, cx);
+            let new_row_height = GraphMetrics::for_window(window).row;
             if new_row_height != row_height {
                 // The `uniform_list` powering the table caches the item size
                 // from its last layout; invalidate it so it re-measures with
@@ -3856,6 +3988,7 @@ impl GitGraph {
             context_menu: None,
             table_interaction_state,
             filter: HistoryFilter::default(),
+            zoom: 1.0,
             kept_rows: None,
             picked_rows: Vec::new(),
             #[cfg(test)]
@@ -4060,10 +4193,10 @@ impl GitGraph {
             .label_color(Color::Custom(hsla(0., 0., 1., 1.)))
             .map(|chip| match is_head {
                 true => chip
-                    .bg_color(accent_color.opacity(0.75))
+                    .bg_color(cyberpunk::lane_wash(accent_color).opacity(0.85))
                     .border_color(accent_color),
                 false => chip
-                    .bg_color(accent_color.opacity(0.55))
+                    .bg_color(cyberpunk::lane_wash(accent_color).opacity(0.62))
                     .border_color(accent_color.opacity(0.7)),
             });
 
@@ -5408,6 +5541,7 @@ impl GitGraph {
                     )),
             )
             .child(self.render_label_switches(cx))
+            .child(self.render_zoom_controls(cx))
             .child(
                 h_flex()
                     .min_w_64()
@@ -6248,7 +6382,7 @@ impl Render for GitGraph {
             let table_width_config =
                 ColumnWidthConfig::explicit(self.table_column_widths(window, cx, layout));
 
-            let row_height = Self::row_height(window, cx);
+            let row_height = self.row_height(window);
             let selected_entry_idx = self.selected_entry_idx;
             let hovered_entry_idx = self.hovered_entry_idx;
             let context_menu_target_index = self
@@ -6300,7 +6434,7 @@ impl Render for GitGraph {
                         let commit = graph.read(cx).graph_data.commits.get(index)?.clone();
                         Some(cyberpunk::lane(commit.color_idx))
                     });
-                    let band = lane.map(|lane| lane.opacity(0.14));
+                    let band = lane.map(|lane| cyberpunk::lane_wash(lane).opacity(ROW_BAND));
 
                     let in_the_question = lit_branch
                         .as_ref()
@@ -6318,11 +6452,17 @@ impl Render for GitGraph {
                         .when(!in_the_question, |row| row.opacity(0.35))
                         .when_some(band, |row, band| row.bg(band))
                         .when(is_selected || is_context_menu_target, |row| {
-                            row.bg(lane.map_or(selected_bg, |lane| lane.opacity(0.30)))
+                            row.bg(lane.map_or(selected_bg, |lane| {
+                                cyberpunk::lane_wash(lane).opacity(ROW_BAND_SELECTED)
+                            }))
                         })
                         .when(
                             is_hovered && !is_selected && !is_context_menu_target,
-                            |row| row.bg(lane.map_or(hover_bg, |lane| lane.opacity(0.22))),
+                            |row| {
+                                row.bg(lane.map_or(hover_bg, |lane| {
+                                    cyberpunk::lane_wash(lane).opacity(ROW_BAND_HOVERED)
+                                }))
+                            },
                         )
                         .on_hover(move |&is_hovered, _, cx| {
                             weak_for_hover
@@ -6434,6 +6574,9 @@ impl Render for GitGraph {
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::select_first_parent))
             .on_action(cx.listener(Self::select_first_child))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
                 this.open_selected_commit_view(window, cx);
             }))
@@ -7816,6 +7959,109 @@ mod tests {
         }
     }
 
+    /// Zooming changes how much history fits on the screen, which is the whole
+    /// of what it is for. Measured on the drawn rows rather than on the number
+    /// held for them: a zoom the layout ignores is a zoom that did nothing.
+    #[gpui::test]
+    async fn zooming_out_puts_more_of_the_history_on_the_screen(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1200.), px(800.))).await;
+
+        fn row_height(cx: &mut VisualTestContext) -> Pixels {
+            cx.debug_bounds(selector("GRAPH_REFS", 0))
+                .expect("the first row is drawn")
+                .size
+                .height
+        }
+
+        let before = row_height(cx);
+        cx.dispatch_action(ZoomOut);
+        cx.run_until_parked();
+        let after = row_height(cx);
+        assert!(
+            after < before,
+            "zooming out left the row {after:?} tall, where it was {before:?}"
+        );
+
+        cx.dispatch_action(ZoomIn);
+        cx.dispatch_action(ZoomIn);
+        cx.run_until_parked();
+        let larger = row_height(cx);
+        assert!(
+            larger > before,
+            "zooming in twice left the row {larger:?} tall, no larger than the \
+             {before:?} it started at"
+        );
+
+        cx.dispatch_action(ZoomReset);
+        cx.run_until_parked();
+        assert_eq!(
+            row_height(cx),
+            before,
+            "resetting the zoom did not put the row back to the height it is \
+             drawn at by default"
+        );
+    }
+
+    /// A band tints a row; it does not repaint it.
+    ///
+    /// Measured on the colour a band is actually painted in -- the quiet one --
+    /// rather than on the one the lines are drawn in: a lane colour is chosen
+    /// to survive a line a pixel and a half wide, and behind a whole row that
+    /// same colour is the thing being guarded against.
+    ///
+    /// Measured on the row's own ground rather than argued about: the reader's
+    /// eye is on the subject text, and a background that has moved a long way
+    /// from the panel's own is a background competing with it. Twelve of them
+    /// down one list is what turns a history into a colour chart.
+    #[test]
+    fn a_row_band_tints_the_row_rather_than_repainting_it() {
+        /// The panel's own ground, near enough for this: what matters is that
+        /// it is dark and flat, which every theme this fork ships is.
+        const GROUND: Hsla = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.12,
+            a: 1.,
+        };
+        /// How far a band may carry the row's ground from the panel's own.
+        /// Above this the row reads as a coloured row rather than a row of a
+        /// colour, and the text on it loses the contrast it was given.
+        const AT_MOST: f32 = 0.09;
+
+        let shifted = |band: f32| {
+            (0..cyberpunk::LANES)
+                .map(|lane| {
+                    let ink = cyberpunk::lane_wash(cyberpunk::lane(lane));
+                    // What a translucent fill actually leaves behind.
+                    (ink.l * band + GROUND.l * (1. - band) - GROUND.l).abs()
+                })
+                .fold(0f32, f32::max)
+        };
+
+        for (name, band) in [
+            ("at rest", ROW_BAND),
+            ("under the pointer", ROW_BAND_HOVERED),
+            ("selected", ROW_BAND_SELECTED),
+        ] {
+            let moved = shifted(band);
+            assert!(
+                moved <= AT_MOST,
+                "a band {name} carries the row {moved} away from the panel's own \
+                 ground, which is a repaint rather than a tint"
+            );
+            assert!(
+                moved > 0.005,
+                "a band {name} leaves the row the colour it already was, so it \
+                 says nothing about which branch the row is on"
+            );
+        }
+
+        // And the ladder still reads as a ladder.
+        assert!(ROW_BAND < ROW_BAND_HOVERED && ROW_BAND_HOVERED < ROW_BAND_SELECTED);
+    }
+
     #[gpui::test]
     async fn test_empty_nested_repository_graph_stops_loading(cx: &mut TestAppContext) {
         init_test(cx);
@@ -8894,7 +9140,7 @@ mod tests {
             );
 
             let measured_item_height = item_size.contents.height / commit_count as f32;
-            let computed_row_height = GitGraph::row_height(window, cx);
+            let computed_row_height = graph.row_height(window);
 
             assert_eq!(
                 computed_row_height, measured_item_height,
@@ -10325,9 +10571,11 @@ mod tests {
 
     #[gpui::test]
     fn test_the_label_column_is_clamped_at_both_ends(_cx: &mut TestAppContext) {
-        // Narrower than the floor: a column this narrow names nothing.
+        // Short names cost the width of short names. A floor here would be a
+        // hand's width of empty column beside every history whose branches are
+        // all called `main`.
         let tiny = fit(px(1400.), contents_for_test(px(20.), 2));
-        assert_eq!(tiny.label_width, LABEL_COLUMN_MIN);
+        assert_eq!(tiny.label_width, px(20.));
 
         // Wider than the share: the labels stop, the subject keeps the rest.
         let huge = fit(px(1400.), contents_for_test(px(900.), 2));

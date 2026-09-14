@@ -55,6 +55,24 @@ pub const LANES: usize = 12;
 /// So: one chroma, one lightness, and hues spread evenly around the circle.
 /// Nothing here is chosen for taste; every pair is as far from every other
 /// pair as twelve colours can be.
+/// The same lane colour, for the areas rather than the lines.
+///
+/// A lane's colour has to survive being drawn as a line a pixel and a half
+/// wide, which is why it is as saturated as it is. Behind a whole row it is the
+/// opposite problem: the same colour over a few hundred square pixels shouts,
+/// and a list where every row shouts a different hue is a colour chart with
+/// some words in it. The hue is what says which branch; how loudly it is said
+/// is free, so area fills say it quietly.
+pub fn lane_wash(colour: Hsla) -> Hsla {
+    const CHROMA: f32 = 0.30;
+    const LIGHTNESS: f32 = 0.55;
+    Hsla {
+        s: CHROMA,
+        l: LIGHTNESS,
+        ..colour
+    }
+}
+
 pub fn lane(index: usize) -> Hsla {
     const CHROMA: f32 = 0.80;
     const LIGHTNESS: f32 = 0.60;
