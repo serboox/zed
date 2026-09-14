@@ -2003,6 +2003,10 @@ pub(crate) struct HistoryLayout {
     pub subject_min: Pixels,
     /// What the label column ends up with, already clamped.
     pub label_width: Pixels,
+    /// What the age column ends up with: the width of the longest age this
+    /// history actually shows, not the width of the longest one there could
+    /// ever be. `0` where the age has no column.
+    pub age_width: Pixels,
 }
 
 /// One rung of the ladder, richest first.
@@ -2054,7 +2058,11 @@ pub(crate) const ROW_BAND: f32 = 0.055;
 pub(crate) const ROW_BAND_HOVERED: f32 = 0.095;
 pub(crate) const ROW_BAND_SELECTED: f32 = 0.15;
 
+/// The most the age column may take, whatever the longest age in the history
+/// measures.
 pub(crate) const AGE_COLUMN_WIDTH: Pixels = px(90.);
+/// What the age keeps around itself inside its column.
+pub(crate) const AGE_COLUMN_PADDING: Pixels = px(16.);
 /// A label column narrower than this has no room left for the line joining a
 /// name to its commit, so it is not offered. It is a floor on what the column
 /// can be dragged or squeezed to, never a width it is given: a history whose
@@ -2115,6 +2123,10 @@ pub(crate) fn fit(available: Pixels, contents: HistoryContents) -> HistoryLayout
         lane_cap: rung.lane_cap,
         subject_min: contents.character * rung.subject_min_chars,
         label_width: contents.label_width(rung.labels, available),
+        age_width: match rung.age {
+            AgeShown::Column => AGE_COLUMN_WIDTH,
+            _ => px(0.),
+        },
     }
 }
 
@@ -2880,7 +2892,7 @@ impl GitGraph {
             }
         }
 
-        fit(
+        let mut layout = fit(
             self.history_width(window, cx).max(px(1.)),
             HistoryContents {
                 metrics,
@@ -2888,13 +2900,38 @@ impl GitGraph {
                 widest_label,
                 lanes: self.graph_data.max_lanes,
             },
-        )
+        );
+        if layout.age == AgeShown::Column {
+            layout.age_width = self.widest_age(window).min(AGE_COLUMN_WIDTH);
+        }
+        layout
+    }
+
+    /// How wide the age column has to be.
+    ///
+    /// Measured from the longest age the formatter can produce -- four
+    /// characters, `12mo` -- rather than set to a round number. The ages
+    /// themselves arrive one commit at a time and long after the layout is
+    /// decided, so a column sized from them would change under the reader as
+    /// the history loaded.
+    fn widest_age(&self, window: &Window) -> Pixels {
+        /// The longest thing `format_relative_timestamp` writes.
+        const LONGEST: &str = "12mo";
+
+        measure_text(window, LONGEST) + AGE_COLUMN_PADDING
     }
 
     /// How much of the row the lanes get: the step never changes, so the column
     /// is whatever the lanes it shows need. What is past the cap becomes rings
     /// at its edge rather than a graph squeezed until nothing can be told apart.
-    fn graph_column_width(&self, window: &Window, layout: HistoryLayout) -> Pixels {
+    ///
+    /// Sized for the busiest row of the history rather than for the rows on the
+    /// screen. Sizing it to the screen leaves less empty width, and puts the
+    /// node of a row just past the counted window outside its own column --
+    /// the rows are painted from a slightly wider range than any width taken
+    /// from the scroll position can know about.
+    fn graph_column_width(&self, window: &Window, cx: &App, layout: HistoryLayout) -> Pixels {
+        let _ = cx;
         let lanes = layout.lane_cap.min(self.graph_data.max_lanes.max(1));
         let rings = match self.graph_data.max_lanes > layout.lane_cap {
             true => self.metrics(window).lane,
@@ -2915,11 +2952,8 @@ impl GitGraph {
         layout: HistoryLayout,
     ) -> Vec<DefiniteLength> {
         let container = self.history_width(window, cx).max(px(1.));
-        let graph = self.graph_column_width(window, layout);
-        let age = match layout.age {
-            AgeShown::Column => AGE_COLUMN_WIDTH,
-            _ => px(0.),
-        };
+        let graph = self.graph_column_width(window, cx, layout);
+        let age = layout.age_width;
         let labels = self
             .column_override
             .get()
@@ -3017,7 +3051,7 @@ impl GitGraph {
         }
 
         let container = self.history_width(window, cx).max(px(1.));
-        let graph = self.graph_column_width(window, layout);
+        let graph = self.graph_column_width(window, cx, layout);
         let left = self
             .column_override
             .get()
@@ -3135,7 +3169,7 @@ impl GitGraph {
                     div()
                         .relative()
                         .h_full()
-                        .w(self.graph_column_width(window, layout))
+                        .w(self.graph_column_width(window, cx, layout))
                         .flex_none()
                         .overflow_hidden()
                         .child(
@@ -3905,7 +3939,7 @@ impl GitGraph {
             return;
         };
         let layout = self.history_layout(window, cx);
-        let graph = self.graph_column_width(window, layout);
+        let graph = self.graph_column_width(window, cx, layout);
         let widest = (bounds.size.width - graph - layout.subject_min).max(LABEL_COLUMN_MIN);
         let wanted = (at.x - bounds.origin.x).clamp(LABEL_COLUMN_MIN, widest);
 
@@ -8002,6 +8036,36 @@ mod tests {
             "resetting the zoom did not put the row back to the height it is \
              drawn at by default"
         );
+    }
+
+    /// Width a row does not use is width the subject could have had. Both of
+    /// these were reserved for something that is not on the screen: a column
+    /// wide enough for an age nobody writes, and lanes belonging to a fork
+    /// further down the history.
+    #[gpui::test]
+    async fn the_row_reserves_no_width_for_what_it_is_not_showing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1600.), px(900.))).await;
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            let layout = graph.history_layout(window, cx);
+            assert_eq!(layout.age, AgeShown::Column, "this width has room for one");
+
+            // The age column: what `12mo` needs and no more.
+            let needed = measure_text(window, "12mo") + AGE_COLUMN_PADDING;
+            assert_eq!(
+                layout.age_width, needed,
+                "the age column is {:?} wide where its longest age needs {needed:?}",
+                layout.age_width
+            );
+            assert!(
+                layout.age_width < AGE_COLUMN_WIDTH,
+                "the measured width should be under the ceiling, or the ceiling \
+                 is what is being tested"
+            );
+        });
     }
 
     /// A band tints a row; it does not repaint it.
