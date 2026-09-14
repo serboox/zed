@@ -6898,13 +6898,18 @@ impl GitPanel {
                                                 // pointer and the selection
                                                 // are steps up in it rather
                                                 // than a grey laid over it.
-                                                .bg(lane_colour.opacity(0.14))
-                                                .hover(|s| s.bg(lane_colour.opacity(0.22)))
+                                                .bg(ui::cyberpunk::lane_wash(lane_colour).opacity(crate::git_graph::ROW_BAND))
+                                                .hover(|s| {
+                                                    s.bg(ui::cyberpunk::lane_wash(lane_colour)
+                                                        .opacity(crate::git_graph::ROW_BAND_HOVERED))
+                                                })
                                                 .when(is_focused, |this| {
-                                                    this.bg(lane_colour.opacity(0.30))
+                                                    this.bg(ui::cyberpunk::lane_wash(lane_colour)
+                                                        .opacity(crate::git_graph::ROW_BAND_SELECTED))
                                                 })
                                                 .when(is_context_menu_target, |this| {
-                                                    this.bg(lane_colour.opacity(0.30))
+                                                    this.bg(ui::cyberpunk::lane_wash(lane_colour)
+                                                        .opacity(crate::git_graph::ROW_BAND_SELECTED))
                                                 })
                                                 .children(shows_subject.then(|| {
                                                     h_flex()
@@ -7312,13 +7317,92 @@ impl GitPanel {
             .child(content)
     }
 
+    /// A repository this panel is not showing that has changes waiting in it.
+    ///
+    /// The active repository follows whatever file is open, and a worktree
+    /// under the project -- which is how an agent leaves one -- is a
+    /// repository of its own. So a panel showing nothing and a `git status`
+    /// showing changes can both be right about different repositories, and
+    /// saying which one is being read is the whole of the answer.
+    fn changes_waiting_elsewhere(
+        &self,
+        cx: &App,
+    ) -> Option<(Entity<Repository>, SharedString, usize)> {
+        let active = self.active_repository.as_ref()?;
+        let mut best: Option<(Entity<Repository>, SharedString, usize)> = None;
+        for repository in self
+            .project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .values()
+        {
+            if repository == active {
+                continue;
+            }
+            let read = repository.read(cx);
+            let count = read.status_summary().count;
+            if count == 0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, _, most)| count > *most) {
+                best = Some((repository.clone(), read.display_name(), count));
+            }
+        }
+        best
+    }
+
     fn render_no_changes_ui(&self, cx: &Context<Self>) -> AnyElement {
         let show_branch_diff = self.changes_count == 0 && !self.is_on_main_branch(cx);
+        let several = self
+            .project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .len()
+            > 1;
+        let showing = self
+            .active_repository
+            .as_ref()
+            .map(|repository| repository.read(cx).display_name());
+        let elsewhere = match several {
+            true => self.changes_waiting_elsewhere(cx),
+            false => None,
+        };
 
         v_flex()
             .gap_1()
             .items_center()
             .child(Label::new("No changes to commit").color(Color::Muted))
+            .when_some(several.then_some(showing).flatten(), |this, showing| {
+                this.child(
+                    Label::new(format!("in {showing}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when_some(elsewhere, |this, (repository, name, count)| {
+                this.child(
+                    div().debug_selector(|| "GIT_PANEL_ELSEWHERE".into()).child(
+                        Button::new(
+                            "switch_to_repository_with_changes",
+                            match count {
+                                1 => format!("1 change in {name}"),
+                                count => format!("{count} changes in {name}"),
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Outlined)
+                        .on_click(move |_, _, cx| {
+                            repository.update(cx, |repository, cx| {
+                                repository.set_as_active_repository(cx)
+                            });
+                        }),
+                    ),
+                )
+            })
             .when(show_branch_diff, |this| {
                 this.child(
                     Button::new("view_branch_diff", "View Branch Diff")
@@ -13450,5 +13534,73 @@ mod tests {
         panel.update_in(&mut cx, |panel, window, cx| {
             assert!(panel.commit_editor.focus_handle(cx).is_focused(window));
         });
+    }
+
+    /// A project can hold more than one repository -- a worktree under it is
+    /// one, which is how an agent leaves one behind -- and the active one
+    /// follows whatever file is open. A panel showing nothing then says
+    /// nothing about the changes waiting in the repository beside it, which
+    /// reads as a panel that has stopped working.
+    #[gpui::test]
+    async fn an_empty_panel_points_at_the_repository_holding_the_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+                "side": { ".git": {}, "untouched": "untouched\n" },
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", git::status::StatusCode::Modified.worktree())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        cx.executor().run_until_parked();
+
+        // The repository the reader is not looking at is the one with the
+        // changes, which is the whole of the confusion being tested.
+        let side = project.read_with(&cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .values()
+                .find(|repository| {
+                    repository
+                        .read(cx)
+                        .work_directory_abs_path
+                        .ends_with("side")
+                })
+                .cloned()
+                .expect("the worktree under the project is a repository of its own")
+        });
+        side.update(&mut cx, |side, cx| side.set_as_active_repository(cx));
+        cx.executor().run_until_parked();
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(360.), px(700.)),
+            |_, _| panel.clone().into_any_element(),
+        );
+        cx.executor().run_until_parked();
+
+        assert!(
+            cx.debug_bounds("GIT_PANEL_ELSEWHERE").is_some(),
+            "the panel is empty and says nothing about the changes next to it"
+        );
     }
 }
