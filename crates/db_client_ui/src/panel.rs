@@ -8192,6 +8192,35 @@ impl DatabasePanel {
         }
     }
 
+    /// The connection an action about queries belongs to.
+    ///
+    /// A row deeper in the tree -- a database, a table, a column -- names its
+    /// connection as plainly as the connection row does, and a reader who has
+    /// just clicked a table and wants its queries has already said which
+    /// connection they mean. Only the actions that are about the connection
+    /// *itself* (connecting, editing, deleting it) insist on the connection row
+    /// being the selected one, because there a wrong guess is destructive.
+    fn connection_for_queries(&self, cx: &Context<Self>) -> Option<ActiveConnection> {
+        if let Some(selected) = self.selected_connection(cx) {
+            return Some(selected);
+        }
+        let node = self.selected_tree_node.as_ref()?;
+        self.store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|conn| conn.config.id == node.connection_id)
+            .cloned()
+    }
+
+    /// Whether the action bar's queries button does anything if pressed.
+    ///
+    /// The button reads this and nothing else, so a test that asks it is asking
+    /// the button.
+    fn queries_can_be_opened(&self, cx: &Context<Self>) -> bool {
+        self.connection_for_queries(cx).is_some()
+    }
+
     /// Whether the selected connection can move up/down among its siblings
     /// (same folder, ordered by `config.order`) — mirrors the sibling lookup
     /// `DatabaseStore::reorder_connection` does internally, so the button's
@@ -8400,10 +8429,25 @@ impl DatabasePanel {
             .is_some_and(|conn| matches!(conn.status, ConnectionStatus::Connected));
         let driver = selected.as_ref().map(|conn| conn.config.driver);
         let config_for_edit = selected.as_ref().map(|conn| conn.config.clone());
-        let label_for_new_query = selected.as_ref().map(|conn| conn.config.label.clone());
-        let database_for_new_query = selected
+        let for_queries = self.connection_for_queries(cx);
+        let has_query_target = for_queries.is_some();
+        debug_assert_eq!(has_query_target, self.queries_can_be_opened(cx));
+        let id_for_new_query = for_queries.as_ref().map(|conn| conn.config.id);
+        let driver_for_new_query = for_queries.as_ref().map(|conn| conn.config.driver);
+        let label_for_new_query = for_queries.as_ref().map(|conn| conn.config.label.clone());
+        // The database the reader is standing in beats the one the connection
+        // was configured with: having opened a database in the tree, that is
+        // the one they mean.
+        let database_for_new_query = self
+            .selected_tree_node
             .as_ref()
-            .and_then(|conn| conn.config.database.clone())
+            .map(|node| node.database.clone())
+            .filter(|database| !database.is_empty())
+            .or_else(|| {
+                for_queries
+                    .as_ref()
+                    .and_then(|conn| conn.config.database.clone())
+            })
             .unwrap_or_default();
         let label_for_exec = selected.as_ref().map(|conn| conn.config.label.clone());
         let database_for_exec = database_for_new_query.clone();
@@ -8471,16 +8515,18 @@ impl DatabasePanel {
                         .child(
                             IconButton::new("selection-new-query", IconName::File)
                                 .icon_size(IconSize::Small)
-                                .disabled(!has_selection)
+                                .disabled(!has_query_target)
                                 .tooltip(Tooltip::text(
-                                    driver.map_or("SQL Queries", new_query_button_label),
+                                    driver_for_new_query
+                                        .map_or("SQL Queries", new_query_button_label),
                                 ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    let (Some(id), Some(label)) = (id, label_for_new_query.clone())
+                                    let (Some(id), Some(label)) =
+                                        (id_for_new_query, label_for_new_query.clone())
                                     else {
                                         return;
                                     };
-                                    if driver == Some(DatabaseDriver::Aerospike) {
+                                    if driver_for_new_query == Some(DatabaseDriver::Aerospike) {
                                         this.open_new_aerospike_view(
                                             id,
                                             label,
@@ -19487,6 +19533,92 @@ mod tests {
                 panel.selected_entity,
                 Some(SelectedEntity::Folder(folder_id)),
                 "clicking a different row moves the selection to it"
+            );
+        });
+    }
+
+    /// A reader who has clicked a table has already said which connection they
+    /// mean, and the queries file is the connection's. Asking them to climb
+    /// back up the tree and click the connection row first is asking them to
+    /// repeat themselves.
+    #[gpui::test]
+    async fn a_table_in_hand_is_enough_to_open_its_connection_s_queries(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "queries".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+            // A table is in hand, and no connection row is selected: exactly
+            // the state a reader is in after clicking a table.
+            panel.selected_entity = None;
+            panel.selected_tree_node = Some(SelectedTreeNode {
+                connection_id,
+                database: "public".to_string(),
+                table: Some("users".to_string()),
+                column: None,
+            });
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("selection-new-query").is_some(),
+            "the queries button is on the action bar"
+        );
+        // What the button itself reads. Pressing it writes the connection's
+        // queries file to disk and opens it, which a test cannot watch without
+        // writing into the reader's own home, so the check stops at the answer
+        // the button asks for.
+        panel.update(&mut cx, |panel, cx| {
+            assert!(
+                panel.queries_can_be_opened(cx),
+                "a table is in hand and names its connection, but the queries \
+                 button is still waiting for the connection row to be selected"
+            );
+            panel.selected_tree_node = None;
+            assert!(
+                !panel.queries_can_be_opened(cx),
+                "with nothing selected at all there is no connection to open \
+                 queries for"
             );
         });
     }
