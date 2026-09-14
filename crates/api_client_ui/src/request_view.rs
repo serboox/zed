@@ -5172,11 +5172,52 @@ impl Render for RequestView {
 
         // The form (URL/env/tabs) always keeps its natural height
         // (`flex_shrink_0`) -- only the response below it gives up space.
+        // Said once, above the address, where a reader about to send cannot
+        // miss it. The tab cannot carry the mark -- a tab title is plain text
+        // -- and the tree only says it to whoever is looking at the tree.
+        let is_deprecated = self
+            .store
+            .read(cx)
+            .requests
+            .iter()
+            .find(|request| request.id == self.request_id)
+            .is_some_and(|request| request.deprecated);
+        let request_id = self.request_id;
+
         let top_section = v_flex()
             .id("api-client-request-top-section")
             .debug_selector(|| "api-client-request-top-section".to_string())
             .flex_shrink_0()
             .gap_3()
+            .when(is_deprecated, |section| {
+                section.child(
+                    h_flex()
+                        .debug_selector(|| "api-client-request-deprecated-banner".to_string())
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(cx.theme().status().warning_background)
+                        .child(
+                            Label::new("This request is deprecated")
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                        .child(
+                            Button::new("api-client-request-undeprecate", "Not Deprecated")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    this.store.update(cx, |store, cx| {
+                                        store.set_request_deprecated(request_id, false, cx)
+                                    });
+                                })),
+                        ),
+                )
+            })
             .child(url_row)
             .when_some(url_warning, |this, warning| this.child(warning))
             .child(tab_strip);

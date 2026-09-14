@@ -878,6 +878,28 @@ impl ApiClientStore {
         self.persist_collections(cx);
     }
 
+    /// Marks a request as on its way out, or takes the mark off again.
+    ///
+    /// The request keeps working: the mark is about which request somebody
+    /// should reach for next time, not about whether this one still sends.
+    pub fn set_request_deprecated(
+        &mut self,
+        id: RequestId,
+        deprecated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.requests.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        if request.deprecated == deprecated {
+            return;
+        }
+        request.deprecated = deprecated;
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
     pub fn update_request(
         &mut self,
         id: RequestId,

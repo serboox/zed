@@ -1760,6 +1760,13 @@ impl ApiClientPanel {
         cx: &mut App,
     ) -> Entity<ContextMenu> {
         let (can_move_up, can_move_down) = self.request_move_bounds(request_id, cx);
+        let is_deprecated = self
+            .store
+            .read(cx)
+            .requests
+            .iter()
+            .find(|request| request.id == request_id)
+            .is_some_and(|request| request.deprecated);
         ContextMenu::build(window, cx, move |menu, _, _| {
             let menu = if can_move_up {
                 menu.entry("Move Up", None, {
@@ -1812,6 +1819,23 @@ impl ApiClientPanel {
                         });
                     }
                 })
+                .entry(
+                    match is_deprecated {
+                        true => "Not Deprecated",
+                        false => "Mark as Deprecated",
+                    },
+                    None,
+                    {
+                        let panel = panel.clone();
+                        move |_window, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.store.update(cx, |store, cx| {
+                                    store.set_request_deprecated(request_id, !is_deprecated, cx)
+                                });
+                            });
+                        }
+                    },
+                )
                 .separator()
                 .entry("Delete", None, {
                     let panel = panel.clone();
@@ -2413,6 +2437,7 @@ impl ApiClientPanel {
                     let panel = cx.entity();
                     let method_label = request.method.as_str().to_string();
                     let method_color = RequestView::method_color(&request.method);
+                    let deprecated = request.deprecated;
                     let row = h_flex()
                         .id(ElementId::from(SharedString::from(format!(
                             "api-client-request-row-{request_id}"
@@ -2458,7 +2483,34 @@ impl ApiClientPanel {
                             method_color,
                             cx,
                         ))
-                        .child(Label::new(request.name.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(request.name.clone())
+                                .size(LabelSize::Small)
+                                // Struck through rather than hidden or dimmed:
+                                // the request still sends, and whoever is
+                                // moving off it has to be able to read it.
+                                .map(|label| match deprecated {
+                                    true => label.strikethrough().color(Color::Muted),
+                                    false => label,
+                                }),
+                        )
+                        .when(deprecated, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("api-client-request-deprecated-{request_id}")
+                                    })
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().status().warning_background)
+                                    .child(
+                                        Label::new("DEPRECATED")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    ),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected_entity = Some(SelectedEntity::Request(request_id));
                             this.open_request(request_id, window, cx);
@@ -4284,6 +4336,69 @@ mod tests {
     /// Deleting a collection or a folder with contents has always asked first.
     /// Deleting a single request used to be one store call with no way back, so
     /// a mis-aimed context menu silently threw away work.
+    /// A request on its way out has to say so where it is named, and keep
+    /// sending: whoever is moving off it needs it until they have.
+    #[gpui::test]
+    async fn a_deprecated_request_says_so_in_the_tree(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        // A collection is collapsed until it is opened, and a row that is not
+        // drawn says nothing either way.
+        panel.update(&mut cx, |panel, cx| {
+            panel.expanded_collections.insert(collection_id);
+            cx.notify();
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        draw(&mut cx);
+
+        let drawn = |cx: &mut VisualTestContext| draw(cx);
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{request_id}").leak())
+                .is_some(),
+            "the request row has to be on the screen for this to test anything"
+        );
+        let badge = format!("api-client-request-deprecated-{request_id}");
+        assert!(
+            cx.debug_bounds(badge.clone().leak()).is_none(),
+            "nothing has been deprecated yet"
+        );
+
+        store.update(&mut cx, |store, cx| {
+            store.set_request_deprecated(request_id, true, cx)
+        });
+        cx.run_until_parked();
+        drawn(&mut cx);
+        assert!(
+            cx.debug_bounds(badge.clone().leak()).is_some(),
+            "the request is deprecated and the tree says nothing about it"
+        );
+        assert!(
+            store.read_with(&cx, |store, _| store
+                .requests
+                .iter()
+                .any(|request| request.id == request_id)),
+            "deprecating a request must not remove it"
+        );
+
+        store.update(&mut cx, |store, cx| {
+            store.set_request_deprecated(request_id, false, cx)
+        });
+        cx.run_until_parked();
+        drawn(&mut cx);
+        assert!(
+            cx.debug_bounds(badge.leak()).is_none(),
+            "the mark cannot be taken off again"
+        );
+    }
+
     #[gpui::test]
     async fn deleting_a_request_asks_first_and_cancel_keeps_it(cx: &mut TestAppContext) {
         let (_workspace, panel, mut cx) = build_panel(cx).await;

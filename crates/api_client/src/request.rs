@@ -319,6 +319,13 @@ pub struct Request {
     pub test_script: String,
     #[serde(default)]
     pub examples: Vec<SavedExample>,
+    /// Marks a request nobody should be reaching for any more.
+    ///
+    /// It still sends: a deprecated request is one on its way out, not one
+    /// that is gone, and whoever is moving off it needs it to keep working.
+    /// All this does is say so wherever the request is named.
+    #[serde(default)]
+    pub deprecated: bool,
     /// The environment this request runs against, whatever is active
     /// store-wide. Chosen by the reader in the request's own environment
     /// picker; `None` means the request follows the active environment.
@@ -425,6 +432,7 @@ impl Request {
             pre_request_script: String::new(),
             test_script: String::new(),
             examples: Vec::new(),
+            deprecated: false,
             pinned_environment_id: None,
             pinned_environment_ids: Vec::new(),
             compare_with_environment_id: None,
