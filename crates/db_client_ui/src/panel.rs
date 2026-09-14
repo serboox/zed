@@ -116,6 +116,8 @@ enum DbTreeRow {
         transaction_open_since: Option<std::time::Instant>,
         env_color: Option<String>,
         folder_id: Option<FolderId>,
+        /// Marked as on its way out. It still works; saying so is the point.
+        deprecated: bool,
         depth: usize,
     },
     ConnectionError {
@@ -8714,6 +8716,7 @@ impl DatabasePanel {
             transaction_open_since: conn.transaction_open_since,
             env_color: conn.config.env_color.clone(),
             folder_id: conn.config.folder_id,
+            deprecated: conn.config.deprecated,
             depth,
         });
 
@@ -9024,11 +9027,13 @@ impl DatabasePanel {
                 transaction_open_since,
                 env_color,
                 folder_id,
+                deprecated,
                 depth,
             } => {
                 let id = *id;
                 let driver = *driver;
                 let depth = *depth;
+                let deprecated = *deprecated;
                 let in_transaction = transaction_open_since.is_some();
                 let transaction_label = transaction_open_since
                     .map(|opened| {
@@ -9208,8 +9213,30 @@ impl DatabasePanel {
                                     } else {
                                         gpui::FontWeight::NORMAL
                                     })
+                                    // Struck through rather than dimmed: a
+                                    // dimmed row reads as one that is busy or
+                                    // unreachable, and this one works.
+                                    .map(|this| match deprecated {
+                                        true => this.strikethrough().color(Color::Muted),
+                                        false => this,
+                                    })
                                     .single_line(),
                             )
+                            .when(deprecated, |el| {
+                                el.child(
+                                    div()
+                                        .debug_selector(|| format!("conn-deprecated-badge-{id}"))
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(cx.theme().status().warning_background)
+                                        .child(
+                                            Label::new("DEPRECATED")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning),
+                                        ),
+                                )
+                            })
                             .when(in_transaction, |el| {
                                 el.child(
                                     div()
@@ -11570,6 +11597,7 @@ impl DatabasePanel {
         let driver = config.driver;
         let label = config.label.clone();
         let default_database = config.database.clone();
+        let is_deprecated = config.deprecated;
         let panel = cx.entity();
         let workspace = self.workspace.clone();
 
@@ -11596,6 +11624,23 @@ impl DatabasePanel {
                     }
                 })
             })
+            .entry(
+                match is_deprecated {
+                    true => "Not Deprecated",
+                    false => "Mark as Deprecated",
+                },
+                None,
+                {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.set_deprecated(id, !is_deprecated, cx)
+                            });
+                        });
+                    }
+                },
+            )
             .entry(new_query_button_label(driver), None, {
                 let panel = panel.clone();
                 let workspace = workspace.clone();
@@ -19535,6 +19580,111 @@ mod tests {
                 "clicking a different row moves the selection to it"
             );
         });
+    }
+
+    /// A connection on its way out has to say so where it is named, and saying
+    /// so must not disconnect anybody from it: the work of moving off a
+    /// connection needs the connection.
+    #[gpui::test]
+    async fn a_deprecated_connection_says_so_and_keeps_working(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "old-warehouse".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(config, Arc::new(MockProvider::default()), cx);
+            });
+        });
+        cx.run_until_parked();
+        panel.update(&mut cx, |panel, _cx| {
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let drawn = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        };
+        drawn(&mut cx);
+        let badge = format!("conn-deprecated-badge-{connection_id}");
+        assert!(
+            cx.debug_bounds(badge.clone().leak()).is_none(),
+            "nothing has been deprecated yet"
+        );
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.set_deprecated(connection_id, true, cx)
+            });
+        });
+        cx.run_until_parked();
+        drawn(&mut cx);
+        assert!(
+            cx.debug_bounds(badge.clone().leak()).is_some(),
+            "the connection is deprecated and the tree says nothing about it"
+        );
+
+        // The mark is about habits, not access: whoever is connected stays
+        // connected.
+        panel.update(&mut cx, |panel, cx| {
+            let store = panel.store.read(cx);
+            let conn = store
+                .connections()
+                .iter()
+                .find(|conn| conn.config.id == connection_id)
+                .expect("the connection is still there");
+            assert!(
+                matches!(conn.status, ConnectionStatus::Connected),
+                "marking a connection deprecated disconnected it"
+            );
+        });
+
+        // And it comes off again.
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.set_deprecated(connection_id, false, cx)
+            });
+        });
+        cx.run_until_parked();
+        drawn(&mut cx);
+        assert!(
+            cx.debug_bounds(badge.leak()).is_none(),
+            "the mark cannot be taken off again"
+        );
     }
 
     /// A reader who has clicked a table has already said which connection they

@@ -1394,6 +1394,25 @@ impl DatabaseStore {
         self.persist_connections(cx);
     }
 
+    /// Marks a connection as on its way out, or takes the mark off again.
+    ///
+    /// Narrower than `update_connection` on purpose: that one rebuilds the
+    /// connection from its configuration, which drops the provider and
+    /// disconnects. Saying a connection is deprecated must not disconnect
+    /// anybody from it -- the mark is about habits, not about access.
+    pub fn set_deprecated(&mut self, id: ConnectionId, deprecated: bool, cx: &mut Context<Self>) {
+        let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
+            return;
+        };
+        if conn.config.deprecated == deprecated {
+            return;
+        }
+        conn.config.deprecated = deprecated;
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
     pub fn update_connection(&mut self, mut config: ConnectionConfig, cx: &mut Context<Self>) {
         let config_id = config.id;
         if let Some(conn) = self

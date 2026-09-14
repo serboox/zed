@@ -192,6 +192,7 @@ pub struct ConnectionView {
     color_editor: Entity<Editor>,
     auto_connect: bool,
     read_only: bool,
+    deprecated: bool,
     /// Carried through rather than edited here: the value belongs to the
     /// connection and is set in the connections file, and losing it every time
     /// somebody opened this dialog would quietly turn the guard off.
@@ -293,6 +294,7 @@ impl ConnectionView {
             color_editor,
             auto_connect: true,
             read_only: false,
+            deprecated: false,
             transaction_idle_minutes: db_client::ConnectionConfig::default()
                 .transaction_idle_minutes,
             use_ssh: false,
@@ -444,6 +446,7 @@ impl ConnectionView {
             color_editor,
             auto_connect: config.auto_connect,
             read_only: config.read_only,
+            deprecated: config.deprecated,
             transaction_idle_minutes: config.transaction_idle_minutes,
             use_ssh,
             ssh_host_editor,
@@ -734,6 +737,7 @@ impl ConnectionView {
                 order: 0,
                 env_color,
                 read_only: self.read_only,
+                deprecated: self.deprecated,
                 transaction_idle_minutes: self.transaction_idle_minutes,
             });
         }
@@ -789,6 +793,7 @@ impl ConnectionView {
             order: 0,
             env_color,
             read_only: self.read_only,
+            deprecated: self.deprecated,
             transaction_idle_minutes: self.transaction_idle_minutes,
         })
     }
@@ -1020,6 +1025,34 @@ impl ConnectionView {
                             .child(
                                 div().min_w_0().overflow_hidden().child(
                                     Label::new("Read-only (block all writes)")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .debug_selector(|| "deprecated-checkbox".to_string())
+                                    .child(
+                                        Checkbox::new(
+                                            "deprecated",
+                                            match self.deprecated {
+                                                true => ToggleState::Selected,
+                                                false => ToggleState::Unselected,
+                                            },
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _state, _, cx| {
+                                                this.deprecated = !this.deprecated;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div().min_w_0().overflow_hidden().child(
+                                    Label::new("Deprecated")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .truncate(),

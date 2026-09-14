@@ -231,6 +231,15 @@ pub struct ConnectionConfig {
     /// nothing chooses it by default.
     #[serde(default = "default_transaction_idle_minutes")]
     pub transaction_idle_minutes: u64,
+    /// Marks a connection nobody should be reaching for any more.
+    ///
+    /// It still connects and still answers: a deprecated connection is one on
+    /// its way out, not one that is gone, and the work of moving off it needs
+    /// it to keep working. All this does is say so wherever the connection is
+    /// named, so that reaching for it out of habit is a decision rather than
+    /// an accident.
+    #[serde(default)]
+    pub deprecated: bool,
 }
 
 impl ConnectionConfig {
@@ -274,6 +283,7 @@ impl Default for ConnectionConfig {
         Self {
             id: Uuid::new_v4(),
             label: String::from("New Connection"),
+            deprecated: false,
             transaction_idle_minutes: default_transaction_idle_minutes(),
             driver: DatabaseDriver::MySQL,
             host: String::from("localhost"),
