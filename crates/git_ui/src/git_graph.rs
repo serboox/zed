@@ -2110,12 +2110,14 @@ const RUNGS: [Rung; 4] = [
 /// a dozen colours with some words in them.
 /// How the card divides itself when it lies along the bottom.
 ///
-/// Definite shares rather than what the flex leaves over: the message is
-/// Markdown, and this is the panel whose width taffy cannot work out for it.
-/// The remainder goes to the button that opens the commit.
-const IDENTITY_ACROSS: f32 = 0.26;
-const MESSAGE_ACROSS: f32 = 0.38;
-const FILES_ACROSS: f32 = 0.24;
+/// Definite shares for the two that need them: the message is Markdown, and
+/// this is the panel whose width taffy cannot work out for it, while the
+/// author's details are a fixed handful of lines. What is left goes to the
+/// files -- a list reflows without losing anything -- after the button that
+/// opens the commit has taken the width its own label needs. Sharing the whole
+/// card out in fractions was tried and cut that button in half.
+const IDENTITY_ACROSS: f32 = 0.24;
+const MESSAGE_ACROSS: f32 = 0.36;
 
 pub(crate) const ROW_BAND: f32 = 0.055;
 pub(crate) const ROW_BAND_HOVERED: f32 = 0.095;
@@ -6309,10 +6311,7 @@ impl GitGraph {
                     .debug_selector(|| "GRAPH_COMMIT_CARD_FILES".into())
                     .min_w_0()
                     .min_h_0()
-                    .map(|this| match across {
-                        true => this.w(relative(FILES_ACROSS)).flex_none(),
-                        false => this.flex_1(),
-                    })
+                    .flex_1()
                     .overflow_hidden()
                     .child(
                         h_flex()
@@ -6457,6 +6456,7 @@ impl GitGraph {
             })
             .child(
                 v_flex()
+                    .debug_selector(|| "GRAPH_COMMIT_CARD_ACTIONS".into())
                     .p_1p5()
                     .gap_1()
                     .map(|this| match across {
@@ -8591,6 +8591,54 @@ mod tests {
             files.size.width,
             card.size.width
         );
+    }
+
+    /// Along the bottom every part of the card stands beside the others, so
+    /// they all fit only if whatever is left over goes to a part that can give
+    /// it up. The button that opens the commit cannot: it is exactly as wide
+    /// as its own label. Handing the whole card out in definite fractions left
+    /// the button less than that, and the card cut it off at its edge -- which
+    /// only shows once the window is narrow enough for the fractions to run out.
+    #[gpui::test]
+    async fn the_commit_card_keeps_its_button_whole_at_every_width(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+        cx.run_until_parked();
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        cx.run_until_parked();
+
+        // From the narrowest a Zed window can be dragged to, which is where
+        // the definite shares have least to spare.
+        let mut width = px(360.);
+        while width <= px(1400.) {
+            cx.simulate_resize(gpui::size(width, px(800.)));
+            cx.run_until_parked();
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(width, px(800.)),
+                |_, _| git_graph.clone().into_any_element(),
+            );
+            cx.run_until_parked();
+
+            let card = cx
+                .debug_bounds("GRAPH_COMMIT_CARD")
+                .expect("the card is drawn");
+            let actions = cx
+                .debug_bounds("GRAPH_COMMIT_CARD_ACTIONS")
+                .expect("the card's actions are drawn");
+            assert!(
+                actions.right() <= card.right() + px(0.5),
+                "in a window {width:?} across, the card ends at {:?} and the \
+                 button that opens the commit reaches {:?}",
+                card.right(),
+                actions.right()
+            );
+
+            width += px(100.);
+        }
     }
 
     /// A band tints a row; it does not repaint it.
