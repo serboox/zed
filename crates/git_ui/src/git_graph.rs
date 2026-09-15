@@ -53,8 +53,8 @@ use std::{
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, Table, TableInteractionState,
-    Tooltip, WithScrollbar, cyberpunk, prelude::*, table_row::TableRow,
+    HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu, Table,
+    TableInteractionState, Tooltip, WithScrollbar, cyberpunk, prelude::*, table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -547,19 +547,27 @@ impl DetailsAt {
         }
     }
 
-    fn next(self) -> Self {
-        match self {
-            DetailsAt::Bottom => DetailsAt::Right,
-            DetailsAt::Right => DetailsAt::Left,
-            DetailsAt::Left => DetailsAt::Bottom,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             DetailsAt::Bottom => "bottom",
             DetailsAt::Right => "right",
             DetailsAt::Left => "left",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            DetailsAt::Bottom => "Details at the Bottom",
+            DetailsAt::Right => "Details on the Right",
+            DetailsAt::Left => "Details on the Left",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            DetailsAt::Bottom => IconName::ArrowDown,
+            DetailsAt::Right => IconName::ArrowRight,
+            DetailsAt::Left => IconName::ArrowLeft,
         }
     }
 }
@@ -2817,31 +2825,51 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
-    /// Moves the card about the selected commit to the next side of the window.
+    /// The card's own way of saying which side it shows on.
     ///
-    /// Three sides is few enough to step through: a menu for three entries is a
-    /// click to open and a click to choose where this is one click, and the
-    /// tooltip says where the next one puts it.
-    fn render_details_side_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let next = self.details_at.next();
-        IconButton::new(
-            "git-graph-details-side",
-            match self.details_at {
-                DetailsAt::Bottom => IconName::ArrowDown,
-                DetailsAt::Right => IconName::ArrowRight,
-                DetailsAt::Left => IconName::ArrowLeft,
-            },
-        )
-        .icon_size(IconSize::Small)
-        .tooltip(Tooltip::text(format!(
-            "Commit details are on the {}; move them to the {}",
-            self.details_at.name(),
-            next.name()
-        )))
-        .on_click(cx.listener(move |this, _, _window, cx| {
-            this.details_at = next;
-            cx.notify();
-        }))
+    /// On the card rather than only in the toolbar: the reader deciding the
+    /// card is in the way is looking at the card, and a control they have to
+    /// go and find somewhere else is a control they do not know is there.
+    fn render_details_side_menu(
+        &self,
+        at: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let here = self.details_at;
+        let graph = cx.entity();
+        PopoverMenu::new(SharedString::from(format!("details-side-menu-{at}")))
+            .trigger(
+                IconButton::new(
+                    SharedString::from(format!("details-side-{at}")),
+                    here.icon(),
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(format!(
+                    "Commit details are on the {}",
+                    here.name()
+                ))),
+            )
+            .menu(move |window, cx| {
+                let graph = graph.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for side in [DetailsAt::Bottom, DetailsAt::Right, DetailsAt::Left] {
+                        let graph = graph.clone();
+                        menu = menu.toggleable_entry(
+                            side.title(),
+                            side == here,
+                            IconPosition::End,
+                            None,
+                            move |_window, cx| {
+                                graph.update(cx, |graph, cx| {
+                                    graph.details_at = side;
+                                    cx.notify();
+                                });
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 
     /// The two buttons that change how large the history is drawn.
@@ -5737,7 +5765,7 @@ impl GitGraph {
             )
             .child(self.render_label_switches(cx))
             .child(self.render_zoom_controls(cx))
-            .child(self.render_details_side_control(cx))
+            .child(self.render_details_side_menu("toolbar", cx))
             .child(
                 h_flex()
                     .min_w_64()
@@ -5972,14 +6000,22 @@ impl GitGraph {
                 cx.notify();
             }));
 
-        v_flex()
-            .debug_selector(|| "GRAPH_COMMIT_CARD".into())
+        // Down the side the card is a column: who, when, what was written,
+        // which files. Along the bottom that same column would need the height
+        // of the window to show any of it, so the parts stand beside each
+        // other instead and the card stays a strip.
+        let across = self.details_at.axis() == Axis::Vertical;
+        let card = match across {
+            true => h_flex(),
+            false => v_flex(),
+        };
+        card.debug_selector(|| "GRAPH_COMMIT_CARD".into())
             .bg(cx.theme().colors().editor_background)
-            .map(|this| match self.details_at.axis() {
-                Axis::Horizontal => this.min_w(px(300.)).h_full(),
-                // Enough to hold the subject, a line or two of the message and
-                // the first of the files, which is what the card is for.
-                Axis::Vertical => this.min_h(px(160.)).w_full(),
+            .map(|this| match across {
+                false => this.min_w(px(300.)).h_full(),
+                // Enough for the identity beside the subject and the first of
+                // the files, which is what the card is for.
+                true => this.min_h(px(160.)).w_full(),
             })
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
@@ -5987,24 +6023,33 @@ impl GitGraph {
             .child(
                 v_flex()
                     .relative()
-                    .w_full()
+                    .map(|this| match across {
+                        true => this.w(px(380.)).flex_none().overflow_hidden(),
+                        false => this.w_full(),
+                    })
                     .p_2()
                     .gap_2()
                     .child(
-                        div().absolute().top_2().right_2().child(
-                            IconButton::new("close-detail", IconName::Close)
-                                .icon_size(IconSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_entry_idx = None;
-                                    this.selected_commit_diff = None;
-                                    this.selected_commit_diff_stats = None;
-                                    this.selected_commit_message = None;
-                                    this._selected_commit_message_task = None;
-                                    this.changed_files_expanded_dirs.clear();
-                                    this._commit_diff_task = None;
-                                    cx.notify();
-                                })),
-                        ),
+                        h_flex()
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .gap_px()
+                            .child(self.render_details_side_menu("card", cx))
+                            .child(
+                                IconButton::new("close-detail", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.selected_entry_idx = None;
+                                        this.selected_commit_diff = None;
+                                        this.selected_commit_diff_stats = None;
+                                        this.selected_commit_message = None;
+                                        this._selected_commit_message_task = None;
+                                        this.changed_files_expanded_dirs.clear();
+                                        this._commit_diff_task = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         v_flex()
@@ -6324,21 +6369,30 @@ impl GitGraph {
                             .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
                     ),
             )
-            .child(Divider::horizontal())
+            .child(match across {
+                true => Divider::vertical(),
+                false => Divider::horizontal(),
+            })
             .child(
-                h_flex().p_1p5().w_full().child(
-                    Button::new("view-commit", "View Commit")
-                        .full_width()
-                        .start_icon(
-                            Icon::new(IconName::GitCommit)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .style(ButtonStyle::OutlinedGhost)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_selected_commit_view(window, cx);
-                        })),
-                ),
+                h_flex()
+                    .p_1p5()
+                    .map(|this| match across {
+                        true => this.flex_none().items_start(),
+                        false => this.w_full(),
+                    })
+                    .child(
+                        Button::new("view-commit", "View Commit")
+                            .full_width()
+                            .start_icon(
+                                Icon::new(IconName::GitCommit)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .style(ButtonStyle::OutlinedGhost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_selected_commit_view(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -8370,6 +8424,47 @@ mod tests {
              begins at {:?}",
             card.origin.x + card.size.width,
             history.origin.x
+        );
+    }
+
+    /// Down the side the card is a column; along the bottom that same column
+    /// would need the height of the window to show any of it. The parts stand
+    /// beside each other there instead, so the card stays a strip.
+    #[gpui::test]
+    async fn the_commit_card_reads_across_when_it_sits_at_the_bottom(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+        cx.run_until_parked();
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        cx.run_until_parked();
+
+        let shape = |cx: &mut VisualTestContext| {
+            let card = cx
+                .debug_bounds("GRAPH_COMMIT_CARD")
+                .expect("the card is drawn");
+            (card.size.width, card.size.height)
+        };
+
+        let (wide, short) = shape(cx);
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.details_at = DetailsAt::Right;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (narrow, tall) = shape(cx);
+
+        assert!(
+            wide > narrow,
+            "at the bottom the card is {wide:?} across and down the side \
+             {narrow:?}: it is not using the width it has"
+        );
+        assert!(
+            short < tall,
+            "at the bottom the card is {short:?} tall and down the side \
+             {tall:?}: it is still the same column, just turned"
         );
     }
 
@@ -10493,8 +10588,17 @@ mod tests {
             message_scroll_handle.max_offset().y > px(0.),
             "long commit message should be scrollable"
         );
+        // Not "above": which of the two comes first depends on which side the
+        // card is on. What has to hold either way is that they do not sit on
+        // one another.
+        let apart = changed_files_bounds.size.width <= px(0.)
+            || changed_files_bounds.size.height <= px(0.)
+            || message_bounds.bottom() <= changed_files_bounds.top()
+            || changed_files_bounds.bottom() <= message_bounds.top()
+            || message_bounds.right() <= changed_files_bounds.left()
+            || changed_files_bounds.right() <= message_bounds.left();
         assert!(
-            message_bounds.bottom() <= changed_files_bounds.top(),
+            apart,
             "commit message viewport {message_bounds:?} should not overlap changed files {changed_files_bounds:?}"
         );
     }
