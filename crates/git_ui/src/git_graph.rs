@@ -2828,6 +2828,57 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
+    /// The card's own controls: which side it sits on, and closing it.
+    ///
+    /// Down the side they float in the card's corner, where nothing else is.
+    /// Across the bottom that corner belongs to the button that opens the
+    /// commit, so there they stand above it instead of on top of it.
+    fn render_card_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .absolute()
+            .top_2()
+            .right_2()
+            .gap_px()
+            .child(self.render_details_side_menu("card", cx))
+            .child(
+                IconButton::new("close-detail", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_entry_idx = None;
+                        this.selected_commit_diff = None;
+                        this.selected_commit_diff_stats = None;
+                        this.selected_commit_message = None;
+                        this._selected_commit_message_task = None;
+                        this.changed_files_expanded_dirs.clear();
+                        this._commit_diff_task = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// The same two, standing in a row of their own rather than floating.
+    fn render_card_controls_in_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .justify_end()
+            .gap_px()
+            .child(self.render_details_side_menu("card", cx))
+            .child(
+                IconButton::new("close-detail", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_entry_idx = None;
+                        this.selected_commit_diff = None;
+                        this.selected_commit_diff_stats = None;
+                        this.selected_commit_message = None;
+                        this._selected_commit_message_task = None;
+                        this.changed_files_expanded_dirs.clear();
+                        this._commit_diff_task = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
     /// The card's own way of saying which side it shows on.
     ///
     /// On the card rather than only in the toolbar: the reader deciding the
@@ -6033,33 +6084,16 @@ impl GitGraph {
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
             ))
-            .child(
-                h_flex()
-                    .absolute()
-                    .top_2()
-                    .right_2()
-                    .gap_px()
-                    .child(self.render_details_side_menu("card", cx))
-                    .child(
-                        IconButton::new("close-detail", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_entry_idx = None;
-                                this.selected_commit_diff = None;
-                                this.selected_commit_diff_stats = None;
-                                this.selected_commit_message = None;
-                                this._selected_commit_message_task = None;
-                                this.changed_files_expanded_dirs.clear();
-                                this._commit_diff_task = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .when(!across, |this| this.child(self.render_card_controls(cx)))
             .child(
                 v_flex()
+                    .id("commit-card-identity")
                     .relative()
                     .map(|this| match across {
-                        true => this.w(px(380.)).flex_none().min_h_0().overflow_hidden(),
+                        // Scrolled rather than cut: the hash and the address
+                        // are the two things a reader copies out of here, and
+                        // a strip is not tall enough to promise both fit.
+                        true => this.w(px(380.)).flex_none().min_h_0().overflow_y_scroll(),
                         false => this.w_full(),
                     })
                     .p_2()
@@ -6389,11 +6423,15 @@ impl GitGraph {
                 false => Divider::horizontal(),
             })
             .child(
-                h_flex()
+                v_flex()
                     .p_1p5()
+                    .gap_1()
                     .map(|this| match across {
-                        true => this.flex_none().items_start(),
+                        true => this.flex_none().items_end(),
                         false => this.w_full(),
+                    })
+                    .when(across, |this| {
+                        this.child(self.render_card_controls_in_line(cx))
                     })
                     .child(
                         Button::new("view-commit", "View Commit")
