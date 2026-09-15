@@ -6099,6 +6099,7 @@ impl GitGraph {
             .child(
                 v_flex()
                     .id("commit-card-identity")
+                    .debug_selector(|| "GRAPH_COMMIT_CARD_IDENTITY".into())
                     .relative()
                     .map(|this| match across {
                         // Scrolled rather than cut: the hash and the address
@@ -6283,6 +6284,13 @@ impl GitGraph {
                                         },
                                     ),
                                 )
+                            })
+                            // Under the address of the commit, where the reader
+                            // already is. Along the bottom the card has only its
+                            // own width to divide, and a column of its own for
+                            // one button spends that width on nothing else.
+                            .when(across, |this| {
+                                this.child(self.render_view_commit_button(cx))
                             }),
                     ),
             )
@@ -6463,24 +6471,35 @@ impl GitGraph {
                         true => this.flex_none().items_end(),
                         false => this.w_full(),
                     })
-                    .when(across, |this| {
-                        this.child(self.render_card_controls_in_line(cx))
-                    })
-                    .child(
-                        Button::new("view-commit", "View Commit")
-                            .full_width()
-                            .start_icon(
-                                Icon::new(IconName::GitCommit)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .style(ButtonStyle::OutlinedGhost)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_selected_commit_view(window, cx);
-                            })),
-                    ),
+                    .map(|this| match across {
+                        true => this.child(self.render_card_controls_in_line(cx)),
+                        false => this.child(self.render_view_commit_button(cx)),
+                    }),
             )
             .into_any_element()
+    }
+
+    fn render_view_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "GRAPH_COMMIT_CARD_OPEN".into())
+            // The label is fixed, so it is never shortened to fit; the column
+            // it stands in clips it instead of letting it reach the sections
+            // beside it, which only bites at a window narrower than the label.
+            .w_full()
+            .overflow_x_hidden()
+            .child(
+                Button::new("view-commit", "View Commit")
+                    .full_width()
+                    .start_icon(
+                        Icon::new(IconName::GitCommit)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_selected_commit_view(window, cx);
+                    })),
+            )
     }
 
     fn handle_entry_click(
@@ -8593,14 +8612,12 @@ mod tests {
         );
     }
 
-    /// Along the bottom every part of the card stands beside the others, so
-    /// they all fit only if whatever is left over goes to a part that can give
-    /// it up. The button that opens the commit cannot: it is exactly as wide
-    /// as its own label. Handing the whole card out in definite fractions left
-    /// the button less than that, and the card cut it off at its edge -- which
-    /// only shows once the window is narrow enough for the fractions to run out.
+    /// Along the bottom the card has only its own width to divide, so a column
+    /// spent on one button is width the sections that hold text never get. The
+    /// button belongs under the address of the commit, in the author's column,
+    /// and what is left on the right is the card's own chrome -- two icons wide.
     #[gpui::test]
-    async fn the_commit_card_keeps_its_button_whole_at_every_width(cx: &mut TestAppContext) {
+    async fn the_commit_card_spends_no_column_of_its_own_on_its_button(cx: &mut TestAppContext) {
         init_test(cx);
         let (git_graph, cx) =
             history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
@@ -8629,12 +8646,38 @@ mod tests {
             let actions = cx
                 .debug_bounds("GRAPH_COMMIT_CARD_ACTIONS")
                 .expect("the card's actions are drawn");
+            let identity = cx
+                .debug_bounds("GRAPH_COMMIT_CARD_IDENTITY")
+                .expect("the author's column is drawn");
+            let open = cx
+                .debug_bounds("GRAPH_COMMIT_CARD_OPEN")
+                .expect("the button that opens the commit is drawn");
+
             assert!(
                 actions.right() <= card.right() + px(0.5),
-                "in a window {width:?} across, the card ends at {:?} and the \
-                 button that opens the commit reaches {:?}",
+                "in a window {width:?} across, the card ends at {:?} and what \
+                 stands at its right reaches {:?}",
                 card.right(),
                 actions.right()
+            );
+            assert!(
+                open.left() >= identity.left() - px(0.5)
+                    && open.right() <= identity.right() + px(0.5),
+                "in a window {width:?} across, the button that opens the commit \
+                 runs from {:?} to {:?} while the author's column runs from \
+                 {:?} to {:?}: it is not under the address of the commit",
+                open.left(),
+                open.right(),
+                identity.left(),
+                identity.right()
+            );
+            assert!(
+                actions.size.width < open.size.width,
+                "in a window {width:?} across, what stands at the card's right \
+                 is {:?} wide against an author's column of {:?}: it is still \
+                 holding something with a label, not two icons",
+                actions.size.width,
+                open.size.width
             );
 
             width += px(100.);
