@@ -2904,6 +2904,10 @@ impl GitGraph {
         if layout.age == AgeShown::Column {
             layout.age_width = self.widest_age(window).min(AGE_COLUMN_WIDTH);
         }
+        // The cap, not just the column: everything downstream places nodes and
+        // edge rings by it, so narrowing the column alone would leave a node of
+        // a deeper lane drawn outside the column it belongs to.
+        layout.lane_cap = layout.lane_cap.min(self.lanes_on_the_screen(window, cx));
         layout
     }
 
@@ -2938,6 +2942,44 @@ impl GitGraph {
             false => px(0.),
         };
         self.metrics(window).width_for(lanes) + rings
+    }
+
+    /// How many lanes the rows now on the screen actually reach into.
+    ///
+    /// Counted over the rows drawn rather than the rows that exist: a history
+    /// that forks into eight lanes somewhere would otherwise spend the width of
+    /// eight lanes on every screen showing two, and that width is empty on
+    /// every one of those rows.
+    ///
+    /// Counts a few rows past the bottom edge. `uniform_list` draws a little
+    /// beyond what is in view, and a row drawn in a column that was not sized
+    /// for it puts its node outside the column.
+    fn lanes_on_the_screen(&self, window: &Window, cx: &App) -> usize {
+        /// The margin over the rows in view, in rows.
+        const BEYOND_THE_EDGE: usize = 3;
+
+        let first = self
+            .table_interaction_state
+            .read(cx)
+            .scroll_handle
+            .logical_scroll_top_index();
+        let rows = self.rows_in_the_list(self.graph_data.commits.len());
+        let last = (first + self.visible_row_count(window, cx) + BEYOND_THE_EDGE).min(rows);
+        let deepest = |row: usize| {
+            self.graph_data
+                .lanes_at(row)
+                .iter()
+                .map(|lane| lane.from_column.max(lane.to_column) + 1)
+                .max()
+                .unwrap_or(1)
+        };
+        (first..last)
+            .chain(self.selected_entry_idx)
+            .filter_map(|in_the_list| self.row_at(in_the_list))
+            .map(deepest)
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// The sizes this history's rows are drawn at.
@@ -8068,6 +8110,51 @@ mod tests {
         });
     }
 
+    /// The graph takes the width of the lanes on the screen, not the width of
+    /// the deepest fork the history reaches anywhere. A history that is one
+    /// lane wide for its first screens would otherwise spend the width of eight
+    /// on every one of those rows, and that width is empty.
+    #[gpui::test]
+    async fn the_graph_is_sized_for_the_lanes_on_the_screen(cx: &mut TestAppContext) {
+        init_test(cx);
+        // Short enough that the screen holds only the plain run at the top.
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, narrow_then_deep(30, 8), gpui::size(px(1400.), px(300.)))
+                .await;
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            let layout = graph.history_layout(window, cx);
+            let on_the_screen = graph.lanes_on_the_screen(window, cx);
+            assert!(
+                graph.graph_data.max_lanes > on_the_screen,
+                "the fixture was meant to run deeper further down than the screen \
+                 shows, but it reaches {on_the_screen} lanes here and {} anywhere",
+                graph.graph_data.max_lanes
+            );
+            assert_eq!(
+                layout.lane_cap, on_the_screen,
+                "the graph is sized for the whole history rather than for the \
+                 lanes on the screen"
+            );
+            // The lanes on the screen, plus the one the edge rings stand in:
+            // deeper lanes exist further down, and they are drawn as rings
+            // rather than as lanes nobody can see.
+            assert_eq!(
+                graph.graph_column_width(window, cx, layout),
+                graph.metrics(window).width_for(on_the_screen) + graph.metrics(window).lane,
+                "and the column with it"
+            );
+            assert!(
+                graph.graph_column_width(window, cx, layout)
+                    < graph
+                        .metrics(window)
+                        .width_for(graph.graph_data.max_lanes.min(RUNGS[0].lane_cap)),
+                "the column is no narrower than one sized for the whole history"
+            );
+        });
+    }
+
     /// A band tints a row; it does not repaint it.
     ///
     /// Measured on the colour a band is actually painted in -- the quiet one --
@@ -11191,6 +11278,29 @@ mod tests {
     }
 
     /// A history whose lanes run deeper than any column will show.
+    /// A history that is one lane wide for its first screens and forks deep
+    /// further down -- the shape that makes a column sized for the whole
+    /// history spend that width on nothing.
+    fn narrow_then_deep(plain: usize, branches: usize) -> Vec<Arc<InitialGraphCommitData>> {
+        let deep = deep_commits(branches);
+        let mut rng = StdRng::seed_from_u64(31);
+        let chain: Vec<Oid> = (0..plain).map(|_| Oid::random(&mut rng)).collect();
+        let mut commits = Vec::with_capacity(plain + deep.len());
+        for idx in 0..plain {
+            let parent = match idx + 1 < plain {
+                true => chain[idx + 1],
+                false => deep[0].sha,
+            };
+            commits.push(Arc::new(InitialGraphCommitData {
+                sha: chain[idx],
+                parents: smallvec![parent],
+                ref_names: vec![],
+            }));
+        }
+        commits.extend(deep);
+        commits
+    }
+
     fn deep_commits(branches: usize) -> Vec<Arc<InitialGraphCommitData>> {
         let mut rng = StdRng::seed_from_u64(9);
         let trunk: Vec<Oid> = (0..branches + 2).map(|_| Oid::random(&mut rng)).collect();
