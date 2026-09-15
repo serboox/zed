@@ -2783,6 +2783,13 @@ pub struct GitGraph {
     commit_details_split_state: Entity<SplitState>,
     /// Which side the card about the selected commit is shown on.
     details_at: DetailsAt,
+    /// The rows the list drew last time it was laid out, as first and last.
+    ///
+    /// The list decides this itself, and it draws more rows than fit. Guessing
+    /// the range from the scroll position and the row height leaves the rows
+    /// past the guess with lanes the column was not widened for, and those are
+    /// folded onto its last lane -- which piles branches against the subject.
+    rows_drawn: Rc<Cell<Option<(usize, usize)>>>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
@@ -3027,25 +3034,45 @@ impl GitGraph {
     /// beyond what is in view, and a row drawn in a column that was not sized
     /// for it puts its node outside the column.
     fn lanes_on_the_screen(&self, window: &Window, cx: &App) -> usize {
-        /// The margin over the rows in view, in rows.
+        /// The margin over the rows the scroll position says are in view. The
+        /// list draws a little past the edge, and this is what that costs
+        /// before it has drawn once and said so exactly.
         const BEYOND_THE_EDGE: usize = 3;
 
-        // The same number `logical_scroll_top_index` reports, worked out here
-        // because that one is only compiled for tests.
-        let scroll = self
-            .table_interaction_state
-            .read(cx)
-            .scroll_handle
-            .0
-            .borrow();
-        let first = scroll
-            .deferred_scroll_to_item
-            .as_ref()
-            .map(|deferred| deferred.item_index)
-            .unwrap_or_else(|| scroll.base_handle.logical_scroll_top().0);
-        drop(scroll);
         let rows = self.rows_in_the_list(self.graph_data.commits.len());
-        let last = (first + self.visible_row_count(window, cx) + BEYOND_THE_EDGE).min(rows);
+        // Both ranges, not one: what was drawn is known a frame late, and what
+        // the scroll position says is known now but only approximately. Taking
+        // the wider of the two grows the column the moment a deeper lane comes
+        // into view and lets it narrow a frame after the lane has gone, which
+        // is the safe way round -- narrowing early folds the deeper lanes onto
+        // the last one, against the subject.
+        let estimate = {
+            // The same number `logical_scroll_top_index` reports, worked
+            // out here because that one is only compiled for tests.
+            let scroll = self
+                .table_interaction_state
+                .read(cx)
+                .scroll_handle
+                .0
+                .borrow();
+            let first = scroll
+                .deferred_scroll_to_item
+                .as_ref()
+                .map(|deferred| deferred.item_index)
+                .unwrap_or_else(|| scroll.base_handle.logical_scroll_top().0);
+            drop(scroll);
+            (
+                first,
+                (first + self.visible_row_count(window, cx) + BEYOND_THE_EDGE).min(rows),
+            )
+        };
+        let (first, last) = match self.rows_drawn.get() {
+            Some((drawn_first, drawn_last)) => (
+                drawn_first.min(estimate.0),
+                drawn_last.max(estimate.1).min(rows),
+            ),
+            None => estimate,
+        };
         let deepest = |row: usize| {
             self.graph_data
                 .lanes_at(row)
@@ -4168,6 +4195,7 @@ impl GitGraph {
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             details_at: DetailsAt::Bottom,
+            rows_drawn: Rc::new(Cell::new(None)),
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
@@ -4774,6 +4802,15 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Vec<AnyElement>> {
+        // Read a frame late, the way the width the history was laid out at is:
+        // which rows the list draws is only known once it has decided, which
+        // is after the columns were sized. A change asks for one more frame,
+        // and the graph settles on the frame after the one that drew it.
+        let drawn = (range.start, range.end);
+        if self.rows_drawn.get() != Some(drawn) {
+            self.rows_drawn.set(Some(drawn));
+            cx.notify();
+        }
         let repository = self.get_repository(cx);
 
         let head_branch_name = self.head_branch_name(cx);
