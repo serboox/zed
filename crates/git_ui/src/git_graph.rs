@@ -6024,8 +6024,11 @@ impl GitGraph {
             .map(|this| match across {
                 false => this.min_w(px(300.)).h_full(),
                 // Enough for the identity beside the subject and the first of
-                // the files, which is what the card is for.
-                true => this.min_h(px(160.)).w_full(),
+                // the files, which is what the card is for. Stretched, not
+                // centred: a column taller than the strip would otherwise hang
+                // equally off both ends and show the reader its middle, with
+                // the first line of the message above the top edge.
+                true => this.min_h(px(160.)).w_full().items_stretch(),
             })
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
