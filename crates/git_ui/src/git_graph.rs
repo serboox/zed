@@ -563,11 +563,14 @@ impl DetailsAt {
         }
     }
 
+    /// A frame with the side the card takes filled in, rather than an arrow.
+    /// An arrow says a direction; the question here is which edge of the window
+    /// the card is fastened to, and a filled edge says that without being read.
     fn icon(self) -> IconName {
         match self {
-            DetailsAt::Bottom => IconName::ArrowDown,
-            DetailsAt::Right => IconName::ArrowRight,
-            DetailsAt::Left => IconName::ArrowLeft,
+            DetailsAt::Bottom => IconName::PanelDockBottom,
+            DetailsAt::Right => IconName::ThreadsSidebarRightOpen,
+            DetailsAt::Left => IconName::ThreadsSidebarLeftOpen,
         }
     }
 }
@@ -6011,6 +6014,12 @@ impl GitGraph {
         };
         card.debug_selector(|| "GRAPH_COMMIT_CARD".into())
             .relative()
+            // Laid across, the parts are as tall as their own contents, which
+            // is taller than the strip they are in. Without this the message
+            // runs up over the history above and the identity down past the
+            // bottom edge.
+            .overflow_hidden()
+            .min_h_0()
             .bg(cx.theme().colors().editor_background)
             .map(|this| match across {
                 false => this.min_w(px(300.)).h_full(),
@@ -6047,7 +6056,7 @@ impl GitGraph {
                 v_flex()
                     .relative()
                     .map(|this| match across {
-                        true => this.w(px(380.)).flex_none().overflow_hidden(),
+                        true => this.w(px(380.)).flex_none().min_h_0().overflow_hidden(),
                         false => this.w_full(),
                     })
                     .p_2()
@@ -6230,7 +6239,9 @@ impl GitGraph {
             .child(Divider::horizontal())
             .child(
                 v_flex()
+                    .debug_selector(|| "GRAPH_COMMIT_CARD_FILES".into())
                     .min_w_0()
+                    .min_h_0()
                     .flex_1()
                     .overflow_hidden()
                     .child(

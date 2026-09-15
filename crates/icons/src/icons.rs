@@ -200,6 +200,7 @@ pub enum IconName {
     PageDown,
     PageUp,
     Paperclip,
+    PanelDockBottom,
     Pencil,
     PencilUnavailable,
     Person,
