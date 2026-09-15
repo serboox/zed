@@ -342,6 +342,10 @@ actions!(
         SuppressNotification,
         /// Toggles the bottom dock.
         ToggleBottomDock,
+        /// Rolls the bottom dock down to its header strip, or back to the
+        /// height it had. The header stays where it is either way, so whatever
+        /// is in the dock is one click from coming back.
+        ToggleBottomDockRolledUp,
         /// Toggles centered layout mode.
         ToggleCenteredLayout,
         /// Toggles edit prediction feature globally for all files.
@@ -8024,6 +8028,13 @@ impl Workspace {
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ToggleBottomDock, window, cx| {
                     workspace.toggle_dock(DockPosition::Bottom, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &ToggleBottomDockRolledUp, window, cx| {
+                    workspace.bottom_dock.update(cx, |dock, cx| {
+                        dock.toggle_rolled_up(window, cx);
+                    });
                 },
             ))
             .on_action(cx.listener(
@@ -18758,6 +18769,77 @@ mod tests {
             );
             assert!(panel.is_zoomed(window, cx));
         });
+    }
+
+    /// Rolling the bottom dock down to its header has to be a round trip: the
+    /// height it had is the height it comes back to, or the gesture costs the
+    /// reader the layout they had set up.
+    #[gpui::test]
+    async fn the_bottom_dock_rolls_down_to_its_header_and_back(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.set_open(true, window, cx);
+                dock.activate_panel(0, window, cx);
+                dock.resize_active_panel(Some(px(300.)), None, window, cx);
+            });
+        });
+
+        let height = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .bottom_dock()
+                    .read(cx)
+                    .active_panel_size()
+                    .and_then(|size| size.size)
+            })
+        };
+        assert_eq!(height(cx), Some(px(300.)));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .bottom_dock()
+                .update(cx, |dock, cx| dock.toggle_rolled_up(window, cx));
+        });
+        let rolled = height(cx).expect("the dock still has a height");
+        assert!(
+            rolled < px(300.),
+            "the dock was rolled up and stayed {rolled:?} tall"
+        );
+        assert!(
+            rolled > px(0.),
+            "rolled up is not closed: the header stays on the screen"
+        );
+        assert!(
+            workspace.update(cx, |workspace, cx| workspace
+                .bottom_dock()
+                .read(cx)
+                .is_rolled_up()),
+            "the dock does not know it is rolled up, so nothing can bring it back"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .bottom_dock()
+                .update(cx, |dock, cx| dock.toggle_rolled_up(window, cx));
+        });
+        assert_eq!(
+            height(cx),
+            Some(px(300.)),
+            "the dock came back to a different height than it was rolled up from"
+        );
+
+        // And it is still open throughout: rolling up is not closing.
+        assert!(workspace.update(cx, |workspace, cx| {
+            workspace.bottom_dock().read(cx).is_open()
+        }));
     }
 
     #[gpui::test]

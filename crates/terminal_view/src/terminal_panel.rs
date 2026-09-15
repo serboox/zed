@@ -1206,7 +1206,10 @@ pub fn new_terminal_pane(
             project.clone(),
             Default::default(),
             None,
-            workspace::NewTerminal::default().boxed_clone(),
+            // Double-clicking the strip a panel hangs from is how a window
+            // gets rolled up, not how a new one is opened: the gesture is on
+            // the panel's own header, and what it acts on is the panel.
+            workspace::ToggleBottomDockRolledUp.boxed_clone(),
             false,
             window,
             cx,

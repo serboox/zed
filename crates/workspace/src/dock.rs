@@ -276,6 +276,10 @@ pub struct Dock {
     focus_follows_mouse: FocusFollowsMouse,
     pub(crate) serialized_dock: Option<DockData>,
     zoom_layer_open: bool,
+    /// The size the dock had before it was rolled down to its header, or
+    /// `None` when it is not rolled up. Kept here rather than on the panel so
+    /// that switching panels while rolled up does not lose the way back.
+    rolled_up_from: Option<PanelSizeState>,
     modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
 }
@@ -421,6 +425,7 @@ impl Dock {
                 _subscriptions: [focus_subscription, zoom_subscription],
                 serialized_dock: None,
                 zoom_layer_open: false,
+                rolled_up_from: None,
                 modal_layer,
             }
         });
@@ -959,6 +964,46 @@ impl Dock {
         cx.notify();
     }
 
+    /// How tall the dock is while rolled up: one tab strip and the line under
+    /// it, which is the whole of what stays on screen.
+    fn header_height(cx: &App) -> Pixels {
+        ui::Tab::container_height(cx) + px(1.)
+    }
+
+    pub fn is_rolled_up(&self) -> bool {
+        self.rolled_up_from.is_some()
+    }
+
+    /// Rolls the dock down to its header, or back to the height it had.
+    ///
+    /// Rolling up rather than closing: a closed dock takes its tabs with it and
+    /// has to be found again in a menu, where this leaves them where they were
+    /// and one click away.
+    pub fn toggle_rolled_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_open {
+            return;
+        }
+        match self.rolled_up_from.take() {
+            Some(was) => {
+                self.resize_active_panel(was.size, was.flex, window, cx);
+            }
+            None => {
+                let Some(now) = self.active_panel_size() else {
+                    return;
+                };
+                // Nothing to roll up if it is already no taller than its own
+                // header, and remembering that height would lose the way back.
+                let header = Self::header_height(cx);
+                if now.size.is_some_and(|size| size <= header) {
+                    return;
+                }
+                self.rolled_up_from = Some(now);
+                self.resize_active_panel(Some(header), None, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn resize_active_panel(
         &mut self,
         size: Option<Pixels>,
@@ -1188,6 +1233,25 @@ impl Render for Dock {
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
+                })
+                // Rolled up, the dock is its header and nothing else, so a
+                // sheet over the whole of it is a sheet over the header. It
+                // takes the click rather than passing it on: the first thing
+                // a reader wants from a rolled-up panel is the panel back,
+                // not whichever tab or button their pointer landed on.
+                .when(self.is_rolled_up(), |this| {
+                    this.child(
+                        div()
+                            .id("dock-rolled-up-header")
+                            .debug_selector(|| "DOCK_ROLLED_UP_HEADER".into())
+                            .absolute()
+                            .inset_0()
+                            .cursor_pointer()
+                            .occlude()
+                            .on_click(cx.listener(|dock, _, window, cx| {
+                                dock.toggle_rolled_up(window, cx);
+                            })),
+                    )
                 })
         } else {
             div()
