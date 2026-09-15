@@ -1716,6 +1716,135 @@ mod tests {
         }
     }
 
+    /// A pane laid out the way the markdown preview is: the scrollbar hangs off
+    /// the outer element and the thing that scrolls is a child of it, with a
+    /// strip above it. The two are therefore different heights, which is the
+    /// case the thumb has to survive.
+    struct PaneWithAStripAboveIt {
+        handle: ScrollHandle,
+        state: Option<Entity<ScrollbarState<ScrollHandle>>>,
+    }
+
+    /// How tall the strip above the scrolled area is.
+    const STRIP: Pixels = px(60.);
+    const PANE: Size<Pixels> = Size {
+        width: px(400.),
+        height: px(300.),
+    };
+    const CONTENT: Pixels = px(2400.);
+
+    impl Render for PaneWithAStripAboveIt {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let parent_id = cx.entity_id();
+            let state = self.state.get_or_insert_with(|| {
+                cx.new(|cx| {
+                    ScrollbarState::new_from_config(
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.handle),
+                        parent_id,
+                        cx,
+                    )
+                })
+            });
+            let wrapper = cx.new(|_| ScrollbarStateWrapper(state.clone()));
+
+            div()
+                .id("pane")
+                .w(PANE.width)
+                .h(PANE.height)
+                .child(render_scrollbar(
+                    wrapper,
+                    div()
+                        .id("pane-body")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(div().id("strip").w_full().h(STRIP))
+                        .child(
+                            div()
+                                .id("scrolled")
+                                .w_full()
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.handle)
+                                .child(div().w_full().h(CONTENT)),
+                        ),
+                    cx,
+                ))
+        }
+    }
+
+    /// The thumb says where in the document the reader is. Drawn against a
+    /// track that is not the height of what scrolls, it says it about the
+    /// wrong length: it reaches the bottom of its track while the document
+    /// still has most of itself left, and then has nowhere to go.
+    #[gpui::test]
+    fn a_thumb_reaches_the_end_of_its_track_only_when_the_content_ends(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let handle = ScrollHandle::new();
+        let view = cx.add_window(|_window, _cx| PaneWithAStripAboveIt {
+            handle: handle.clone(),
+            state: None,
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
+
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        };
+        draw(cx);
+
+        let thumb_and_track = |cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |frame, _window, cx| {
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    let thumb = state
+                        .thumb_for_axis(ScrollbarAxis::Vertical)
+                        .expect("a vertical thumb");
+                    (thumb.thumb_bounds, thumb.track_bounds)
+                })
+            })
+            .unwrap()
+        };
+
+        let max = handle.max_offset().y;
+        assert!(max > px(0.), "the fixture was meant to be scrollable");
+
+        let (top_thumb, track) = thumb_and_track(cx);
+        assert!(
+            (top_thumb.top() - track.top()).abs() < px(1.),
+            "unscrolled, the thumb starts at {:?} and the track at {:?}",
+            top_thumb.top(),
+            track.top()
+        );
+
+        handle.set_offset(point(px(0.), -max));
+        draw(cx);
+        let (bottom_thumb, track) = thumb_and_track(cx);
+        assert!(
+            (bottom_thumb.bottom() - track.bottom()).abs() < px(1.),
+            "scrolled to the end, the thumb ends at {:?} and its track at {:?}",
+            bottom_thumb.bottom(),
+            track.bottom()
+        );
+
+        // And halfway down the document the thumb is halfway down its track.
+        handle.set_offset(point(px(0.), -max / 2.));
+        draw(cx);
+        let (middle_thumb, track) = thumb_and_track(cx);
+        let room = track.size.height - middle_thumb.size.height;
+        let expected = track.top() + room / 2.;
+        assert!(
+            (middle_thumb.top() - expected).abs() < px(2.),
+            "halfway through the document the thumb is at {:?}, where halfway \
+             down its track is {:?}",
+            middle_thumb.top(),
+            expected
+        );
+    }
+
     // Reproduces the two real E2E findings for the generic (non-uniform-list)
     // `custom_scrollbars` path: scrolling one axis must not move or resize the
     // OTHER axis's thumb, and must not move the SAME axis's thumb along its

@@ -2040,7 +2040,7 @@ mod tests {
     use crate::markdown_preview_view::resolve_preview_image;
     use buffer_diff::BufferDiff;
     use editor::Editor;
-    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle};
+    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle, px};
     use language::Point;
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -2123,6 +2123,108 @@ mod tests {
             let snapshot = editor.snapshot(window, cx);
             assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
         });
+    }
+
+    /// The scrollbar says how much of the document is left, so it can only be
+    /// right if the preview knows how tall the whole document is. Measured on
+    /// the handle the scrollbar reads, and measured again after scrolling: a
+    /// height that is only worked out for the part on screen leaves the thumb
+    /// at the end of its track with most of the document still to come.
+    #[gpui::test]
+    async fn the_preview_knows_the_height_of_the_whole_document(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let mut document = String::from("# A long document\n\n");
+        for section in 1..=120 {
+            document.push_str(&format!(
+                "## Section {section}\n\nParagraph {section}. {}\n\n",
+                "The quick brown fox jumps over the lazy dog. ".repeat(6)
+            ));
+        }
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/dir"), json!({ "long.md": document }))
+            .await;
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/long.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let preview = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let cx = &mut gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        };
+        draw(cx);
+
+        let (viewport, reach) = preview.read_with(cx, |preview, _| {
+            (
+                preview.scroll_handle.bounds().size.height,
+                preview.scroll_handle.max_offset().y,
+            )
+        });
+        assert!(
+            viewport > px(0.),
+            "the preview was never laid out, so there is nothing to measure"
+        );
+        // A hundred and twenty sections of a heading and a wrapped paragraph
+        // each. Whatever the font, that is thousands of pixels; a height worked
+        // out for one screen would be a few hundred.
+        assert!(
+            viewport + reach > px(4000.),
+            "the preview thinks the document is {:?} tall, which is about one \
+             screen of it",
+            viewport + reach
+        );
+
+        // And it does not change under the reader as they move through it.
+        preview.read_with(cx, |preview, _| {
+            preview
+                .scroll_handle
+                .set_offset(gpui::point(px(0.), -reach * 0.2))
+        });
+        draw(cx);
+        let after = preview.read_with(cx, |preview, _| preview.scroll_handle.max_offset().y);
+        assert_eq!(
+            after, reach,
+            "a fifth of the way down, the document is a different height than it \
+             was at the top"
+        );
     }
 
     #[gpui::test]
