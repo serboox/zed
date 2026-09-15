@@ -2108,6 +2108,15 @@ const RUNGS: [Rung; 4] = [
 /// the graph. Loud enough to repaint the row and it starts competing with the
 /// text sitting on it, and a history of a dozen branches becomes a history of
 /// a dozen colours with some words in them.
+/// How the card divides itself when it lies along the bottom.
+///
+/// Definite shares rather than what the flex leaves over: the message is
+/// Markdown, and this is the panel whose width taffy cannot work out for it.
+/// The remainder goes to the button that opens the commit.
+const IDENTITY_ACROSS: f32 = 0.26;
+const MESSAGE_ACROSS: f32 = 0.38;
+const FILES_ACROSS: f32 = 0.24;
+
 pub(crate) const ROW_BAND: f32 = 0.055;
 pub(crate) const ROW_BAND_HOVERED: f32 = 0.095;
 pub(crate) const ROW_BAND_SELECTED: f32 = 0.15;
@@ -6093,7 +6102,11 @@ impl GitGraph {
                         // Scrolled rather than cut: the hash and the address
                         // are the two things a reader copies out of here, and
                         // a strip is not tall enough to promise both fit.
-                        true => this.w(px(380.)).flex_none().min_h_0().overflow_y_scroll(),
+                        true => this
+                            .w(relative(IDENTITY_ACROSS))
+                            .flex_none()
+                            .min_h_0()
+                            .overflow_y_scroll(),
                         false => this.w_full(),
                     })
                     .p_2()
@@ -6271,15 +6284,35 @@ impl GitGraph {
                             }),
                     ),
             )
-            .child(Divider::horizontal())
-            .child(self.render_commit_message(window, cx))
-            .child(Divider::horizontal())
+            .child(match across {
+                true => Divider::vertical(),
+                false => Divider::horizontal(),
+            })
+            .child(
+                div()
+                    // A definite width, not a share of what is left over. The
+                    // message is Markdown, and this panel is the one place
+                    // taffy cannot work a width out for it: left to the flex
+                    // it reflows to a couple of letters a line.
+                    .map(|this| match across {
+                        true => this.w(relative(MESSAGE_ACROSS)).flex_none().min_h_0(),
+                        false => this.w_full(),
+                    })
+                    .child(self.render_commit_message(window, cx)),
+            )
+            .child(match across {
+                true => Divider::vertical(),
+                false => Divider::horizontal(),
+            })
             .child(
                 v_flex()
                     .debug_selector(|| "GRAPH_COMMIT_CARD_FILES".into())
                     .min_w_0()
                     .min_h_0()
-                    .flex_1()
+                    .map(|this| match across {
+                        true => this.w(relative(FILES_ACROSS)).flex_none(),
+                        false => this.flex_1(),
+                    })
                     .overflow_hidden()
                     .child(
                         h_flex()
@@ -8518,6 +8551,45 @@ mod tests {
             short < tall,
             "at the bottom the card is {short:?} tall and down the side \
              {tall:?}: it is still the same column, just turned"
+        );
+    }
+
+    /// Along the bottom the card's parts stand beside each other, so each one
+    /// has to be given a width worth having. Left to the flex, the column
+    /// holding the message collapsed to a couple of letters a line -- the
+    /// panel is the one place taffy cannot work a width out for Markdown.
+    #[gpui::test]
+    async fn the_commit_card_gives_the_message_a_readable_column(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+        cx.run_until_parked();
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        cx.run_until_parked();
+
+        let card = cx
+            .debug_bounds("GRAPH_COMMIT_CARD")
+            .expect("the card is drawn");
+        let files = cx
+            .debug_bounds("GRAPH_COMMIT_CARD_FILES")
+            .expect("the files are drawn");
+
+        // Wide enough to read a sentence in, not a word ladder. A tenth of the
+        // card is about forty pixels here, which is where the collapse landed.
+        assert!(
+            files.size.width > card.size.width * 0.15,
+            "the files column is {:?} of a card {:?} wide",
+            files.size.width,
+            card.size.width
+        );
+        assert!(
+            files.size.width < card.size.width * 0.5,
+            "the files column is {:?} of a card {:?} wide, leaving nothing for \
+             the message beside it",
+            files.size.width,
+            card.size.width
         );
     }
 
