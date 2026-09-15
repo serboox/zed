@@ -1041,7 +1041,19 @@ impl Editor {
                 GoToDefinitionFallback::None => Ok(Navigated::No),
                 GoToDefinitionFallback::FindAllReferences => {
                     match editor.update_in(cx, |editor, window, cx| {
-                        editor.find_all_references(&FindAllReferences::default(), window, cx)
+                        editor.find_all_references(
+                            &FindAllReferences {
+                                // Falling back is not the same as asking for
+                                // the list. The question was "where is this",
+                                // so one answer is navigated to rather than
+                                // listed, and the line the question was asked
+                                // from is not one of the answers.
+                                always_open_multibuffer: false,
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        )
                     })? {
                         Some(references) => references.await,
                         None => Ok(Navigated::No),
@@ -1560,7 +1572,12 @@ impl Editor {
                             });
                         });
                     }
-                    Navigated::No
+                    // It navigated: the caller asked whether anything was gone
+                    // to, and something was. This branch is only reached when
+                    // the caller asked for a single answer to be followed
+                    // rather than listed, so saying otherwise sends them
+                    // looking for a fallback that has already happened.
+                    Navigated::Yes
                 });
             }
 

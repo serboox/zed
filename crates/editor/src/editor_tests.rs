@@ -29492,36 +29492,25 @@ async fn test_goto_definition_with_find_all_references_fallback(cx: &mut TestApp
         Navigated::Yes,
         "Should have navigated to references as a fallback after empty GoToDefinition response"
     );
-    // We should not change the selections in the existing file,
-    // if opening another milti buffer with the references
+    // One reference and nowhere else to go, so it is gone to rather than
+    // listed: a tab holding the line asked from and one other line is a list
+    // nobody reads, they just click the other line.
     cx.assert_editor_state(
-        &r#"fn one() {
+        &r#"fn one()ˇ {
             let mut a = two();
         }
 
-        fn «twoˇ»() {}"#
+        fn two() {}"#
             .unindent(),
     );
     let editors = cx.update_workspace(|workspace, _, cx| {
         workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>()
     });
-    cx.update_editor(|_, _, test_editor_cx| {
-        assert_eq!(
-            editors.len(),
-            2,
-            "After falling back to references search, we open a new editor with the results"
-        );
-        let references_fallback_text = editors
-            .into_iter()
-            .find(|new_editor| *new_editor != test_editor_cx.entity())
-            .expect("Should have one non-test editor now")
-            .read(test_editor_cx)
-            .text(test_editor_cx);
-        assert_eq!(
-            references_fallback_text, "fn one() {\n    let mut a = two();\n}",
-            "Should use the range from the references response and not the GoToDefinition one"
-        );
-    });
+    assert_eq!(
+        editors.len(),
+        1,
+        "A single reference is navigated to in place, so no second editor opens"
+    );
 }
 
 #[gpui::test]
@@ -38490,7 +38479,10 @@ async fn test_find_references_single_case(cx: &mut TestAppContext) {
         .await
         .unwrap();
 
-    assert_eq!(navigated, Navigated::No);
+    // It moved the cursor to the one reference, which is what the caller asked
+    // about. Saying otherwise sends whoever asked looking for a fallback that
+    // has already happened.
+    assert_eq!(navigated, Navigated::Yes);
 
     cx.run_until_parked();
 

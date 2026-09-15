@@ -209,9 +209,18 @@ impl Editor {
                     }
                     match EditorSettings::get_global(cx).go_to_definition_fallback {
                         GoToDefinitionFallback::None => None,
-                        GoToDefinitionFallback::FindAllReferences => {
-                            editor.find_all_references(&FindAllReferences::default(), window, cx)
-                        }
+                        GoToDefinitionFallback::FindAllReferences => editor.find_all_references(
+                            &FindAllReferences {
+                                // A click asks "where is this", not "list
+                                // everywhere it appears": one answer is
+                                // navigated to rather than listed, and the
+                                // line clicked is not one of the answers.
+                                always_open_multibuffer: false,
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        ),
                     }
                 })
                 .ok()
