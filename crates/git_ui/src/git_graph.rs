@@ -19,7 +19,7 @@ use git::{
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
+    Anchor, AnyElement, App, Axis, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollHandle,
     ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
@@ -526,6 +526,44 @@ struct SearchState {
     selected_index: Option<usize>,
 }
 
+/// Which side of the window the card about the selected commit is shown on.
+///
+/// The bottom by default: a commit's subject, its message and the files it
+/// touched are all lines of text, and lines of text want width. Taken from the
+/// side, the history loses the width its own subjects were using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailsAt {
+    Bottom,
+    Right,
+    Left,
+}
+
+impl DetailsAt {
+    /// The direction the history and the card are laid out along.
+    fn axis(self) -> Axis {
+        match self {
+            DetailsAt::Bottom => Axis::Vertical,
+            DetailsAt::Right | DetailsAt::Left => Axis::Horizontal,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            DetailsAt::Bottom => DetailsAt::Right,
+            DetailsAt::Right => DetailsAt::Left,
+            DetailsAt::Left => DetailsAt::Bottom,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            DetailsAt::Bottom => "bottom",
+            DetailsAt::Right => "right",
+            DetailsAt::Left => "left",
+        }
+    }
+}
+
 struct SplitState {
     left_ratio: f32,
     visible_left_ratio: f32,
@@ -545,18 +583,23 @@ impl SplitState {
 
     fn on_drag_move(
         &mut self,
+        along: Axis,
         drag_event: &DragMoveEvent<DraggedSplitHandle>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
         let drag_position = drag_event.event.position;
         let bounds = drag_event.bounds;
-        let bounds_width = bounds.right() - bounds.left();
 
         let min_ratio = 0.1;
         let max_ratio = 0.9;
 
-        let new_ratio = (drag_position.x - bounds.left()) / bounds_width;
+        let new_ratio = match along {
+            Axis::Horizontal => {
+                (drag_position.x - bounds.left()) / (bounds.right() - bounds.left())
+            }
+            Axis::Vertical => (drag_position.y - bounds.top()) / (bounds.bottom() - bounds.top()),
+        };
         self.visible_left_ratio = new_ratio.clamp(min_ratio, max_ratio);
     }
 
@@ -2738,6 +2781,8 @@ pub struct GitGraph {
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
+    /// Which side the card about the selected commit is shown on.
+    details_at: DetailsAt,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
@@ -2765,6 +2810,33 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
+    /// Moves the card about the selected commit to the next side of the window.
+    ///
+    /// Three sides is few enough to step through: a menu for three entries is a
+    /// click to open and a click to choose where this is one click, and the
+    /// tooltip says where the next one puts it.
+    fn render_details_side_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let next = self.details_at.next();
+        IconButton::new(
+            "git-graph-details-side",
+            match self.details_at {
+                DetailsAt::Bottom => IconName::ArrowDown,
+                DetailsAt::Right => IconName::ArrowRight,
+                DetailsAt::Left => IconName::ArrowLeft,
+            },
+        )
+        .icon_size(IconSize::Small)
+        .tooltip(Tooltip::text(format!(
+            "Commit details are on the {}; move them to the {}",
+            self.details_at.name(),
+            next.name()
+        )))
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.details_at = next;
+            cx.notify();
+        }))
+    }
+
     /// The two buttons that change how large the history is drawn.
     ///
     /// A keystroke alone would leave the reader who has never read a keymap
@@ -4086,6 +4158,7 @@ impl GitGraph {
             log_source,
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
+            details_at: DetailsAt::Bottom,
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
@@ -5618,6 +5691,7 @@ impl GitGraph {
             )
             .child(self.render_label_switches(cx))
             .child(self.render_zoom_controls(cx))
+            .child(self.render_details_side_control(cx))
             .child(
                 h_flex()
                     .min_w_64()
@@ -5853,9 +5927,14 @@ impl GitGraph {
             }));
 
         v_flex()
-            .min_w(px(300.))
-            .h_full()
+            .debug_selector(|| "GRAPH_COMMIT_CARD".into())
             .bg(cx.theme().colors().editor_background)
+            .map(|this| match self.details_at.axis() {
+                Axis::Horizontal => this.min_w(px(300.)).h_full(),
+                // Enough to hold the subject, a line or two of the message and
+                // the first of the files, which is what the card is for.
+                Axis::Vertical => this.min_h(px(160.)).w_full(),
+            })
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
             ))
@@ -6333,21 +6412,32 @@ impl GitGraph {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let along = self.details_at.axis();
         div()
             .id("commit-view-split-resize-container")
             .relative()
-            .h_full()
             .flex_shrink_0()
-            .w(px(1.))
             .bg(cx.theme().colors().border_variant)
+            .map(|this| match along {
+                Axis::Horizontal => this.h_full().w(px(1.)),
+                Axis::Vertical => this.w_full().h(px(1.)),
+            })
             .child(
                 div()
                     .id("commit-view-split-resize-handle")
                     .absolute()
-                    .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
-                    .w(px(RESIZE_HANDLE_WIDTH))
-                    .h_full()
-                    .cursor_col_resize()
+                    .map(|this| match along {
+                        Axis::Horizontal => this
+                            .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                            .w(px(RESIZE_HANDLE_WIDTH))
+                            .h_full()
+                            .cursor_col_resize(),
+                        Axis::Vertical => this
+                            .top(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                            .h(px(RESIZE_HANDLE_WIDTH))
+                            .w_full()
+                            .cursor_row_resize(),
+                    })
                     .block_mouse_except_scroll()
                     .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
                         if event.click_count() >= 2 {
@@ -6599,37 +6689,43 @@ impl Render for GitGraph {
                     cx.processor(Self::render_table_rows),
                 );
 
-            h_flex()
+            let history = v_flex()
+                .flex_1()
+                .min_w_0()
                 .size_full()
+                .children(self.render_working_tree_row(layout, window, cx))
                 .child(
-                    v_flex()
+                    div()
+                        .relative()
                         .flex_1()
-                        .min_w_0()
-                        .size_full()
-                        .children(self.render_working_tree_row(layout, window, cx))
+                        .w_full()
+                        .overflow_hidden()
+                        .on_scroll_wheel(cx.listener(Self::handle_lane_scroll))
+                        .child(self.measure_history_width())
                         .child(
                             div()
-                                .relative()
-                                .flex_1()
-                                .w_full()
-                                .overflow_hidden()
-                                .on_scroll_wheel(cx.listener(Self::handle_lane_scroll))
-                                .child(self.measure_history_width())
-                                .child(
-                                    div()
-                                        .tab_index(2)
-                                        .tab_group()
-                                        .tab_stop(false)
-                                        .size_full()
-                                        .child(commits_table),
-                                )
-                                .children(self.render_label_divider(layout, cx))
-                                .children(self.render_lane_scrollbar(layout, window, cx)),
-                        ),
-                )
+                                .tab_index(2)
+                                .tab_group()
+                                .tab_stop(false)
+                                .size_full()
+                                .child(commits_table),
+                        )
+                        .children(self.render_label_divider(layout, cx))
+                        .children(self.render_lane_scrollbar(layout, window, cx)),
+                );
+
+            // Where the details sit decides both the direction the two are
+            // laid out in and which of them comes first.
+            let laid_out = match self.details_at {
+                DetailsAt::Bottom => v_flex(),
+                DetailsAt::Right | DetailsAt::Left => h_flex(),
+            };
+            laid_out
+                .size_full()
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
+                    let along = this.details_at.axis();
                     this.commit_details_split_state.update(cx, |state, cx| {
-                        state.on_drag_move(event, window, cx);
+                        state.on_drag_move(along, event, window, cx);
                     });
                 }))
                 .on_drop::<DraggedSplitHandle>(cx.listener(|this, _event, _window, cx| {
@@ -6637,10 +6733,19 @@ impl Render for GitGraph {
                         state.commit_ratio();
                     });
                 }))
-                .when(self.selected_entry_idx.is_some(), |this| {
-                    this.child(self.render_commit_view_resize_handle(window, cx))
-                        .child(self.render_commit_detail_panel(window, cx))
-                })
+                .map(
+                    |this| match (self.details_at, self.selected_entry_idx.is_some()) {
+                        (_, false) => this.child(history),
+                        (DetailsAt::Left, true) => this
+                            .child(self.render_commit_detail_panel(window, cx))
+                            .child(self.render_commit_view_resize_handle(window, cx))
+                            .child(history),
+                        (_, true) => this
+                            .child(history)
+                            .child(self.render_commit_view_resize_handle(window, cx))
+                            .child(self.render_commit_detail_panel(window, cx)),
+                    },
+                )
         };
 
         div()
@@ -8153,6 +8258,73 @@ mod tests {
                 "the column is no narrower than one sized for the whole history"
             );
         });
+    }
+
+    /// The card about a commit is a column of text -- subject, message, the
+    /// files touched -- and text wants width. Taken from the side it costs the
+    /// history the width its own subjects were using, so it starts underneath.
+    #[gpui::test]
+    async fn the_commit_card_starts_under_the_history_and_can_be_moved(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            history_in_a_workspace(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            assert_eq!(
+                graph.details_at,
+                DetailsAt::Bottom,
+                "the card should start under the history"
+            );
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        cx.run_until_parked();
+
+        let where_they_are = |cx: &mut VisualTestContext| {
+            let history = cx
+                .debug_bounds(selector("GRAPH_SUBJECT", 0))
+                .expect("a row of the history is drawn");
+            let card = cx
+                .debug_bounds("GRAPH_COMMIT_CARD")
+                .expect("the card is drawn for the selected commit");
+            (history, card)
+        };
+
+        let (history, card) = where_they_are(cx);
+        assert!(
+            card.origin.y >= history.origin.y + history.size.height,
+            "the card starts at {:?} where the history reaches {:?}: it is beside \
+             the history rather than under it",
+            card.origin.y,
+            history.origin.y + history.size.height
+        );
+
+        // And it can be moved round the window.
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.details_at = DetailsAt::Right;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (history, card) = where_they_are(cx);
+        assert!(
+            card.origin.x >= history.origin.x + history.size.width,
+            "moved to the right, the card still starts at {:?}",
+            card.origin.x
+        );
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.details_at = DetailsAt::Left;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (history, card) = where_they_are(cx);
+        assert!(
+            card.origin.x + card.size.width <= history.origin.x,
+            "moved to the left, the card still ends at {:?} where the history \
+             begins at {:?}",
+            card.origin.x + card.size.width,
+            history.origin.x
+        );
     }
 
     /// A band tints a row; it does not repaint it.
