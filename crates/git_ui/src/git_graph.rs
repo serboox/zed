@@ -3030,11 +3030,20 @@ impl GitGraph {
         /// The margin over the rows in view, in rows.
         const BEYOND_THE_EDGE: usize = 3;
 
-        let first = self
+        // The same number `logical_scroll_top_index` reports, worked out here
+        // because that one is only compiled for tests.
+        let scroll = self
             .table_interaction_state
             .read(cx)
             .scroll_handle
-            .logical_scroll_top_index();
+            .0
+            .borrow();
+        let first = scroll
+            .deferred_scroll_to_item
+            .as_ref()
+            .map(|deferred| deferred.item_index)
+            .unwrap_or_else(|| scroll.base_handle.logical_scroll_top().0);
+        drop(scroll);
         let rows = self.rows_in_the_list(self.graph_data.commits.len());
         let last = (first + self.visible_row_count(window, cx) + BEYOND_THE_EDGE).min(rows);
         let deepest = |row: usize| {
