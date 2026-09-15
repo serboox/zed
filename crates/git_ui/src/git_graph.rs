@@ -6010,6 +6010,7 @@ impl GitGraph {
             false => v_flex(),
         };
         card.debug_selector(|| "GRAPH_COMMIT_CARD".into())
+            .relative()
             .bg(cx.theme().colors().editor_background)
             .map(|this| match across {
                 false => this.min_w(px(300.)).h_full(),
@@ -6021,6 +6022,28 @@ impl GitGraph {
                 self.commit_details_split_state.read(cx).right_ratio(),
             ))
             .child(
+                h_flex()
+                    .absolute()
+                    .top_2()
+                    .right_2()
+                    .gap_px()
+                    .child(self.render_details_side_menu("card", cx))
+                    .child(
+                        IconButton::new("close-detail", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected_entry_idx = None;
+                                this.selected_commit_diff = None;
+                                this.selected_commit_diff_stats = None;
+                                this.selected_commit_message = None;
+                                this._selected_commit_message_task = None;
+                                this.changed_files_expanded_dirs.clear();
+                                this._commit_diff_task = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
                 v_flex()
                     .relative()
                     .map(|this| match across {
@@ -6029,28 +6052,6 @@ impl GitGraph {
                     })
                     .p_2()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .gap_px()
-                            .child(self.render_details_side_menu("card", cx))
-                            .child(
-                                IconButton::new("close-detail", IconName::Close)
-                                    .icon_size(IconSize::Small)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.selected_entry_idx = None;
-                                        this.selected_commit_diff = None;
-                                        this.selected_commit_diff_stats = None;
-                                        this.selected_commit_message = None;
-                                        this._selected_commit_message_task = None;
-                                        this.changed_files_expanded_dirs.clear();
-                                        this._commit_diff_task = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
                     .child(
                         v_flex()
                             .py_1()
