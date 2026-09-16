@@ -304,7 +304,19 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         },
     ];
 
+    // A language is registered by name and its files are read from the
+    // embedded set under that name. The two are written in different places,
+    // so they can disagree -- and reading a name that is not there used to
+    // take the whole editor down before it opened a window.
+    let embedded = grammars::embedded_languages();
     for registration in built_in_languages {
+        if !embedded.iter().any(|name| name == registration.name) {
+            log::error!(
+                "no embedded files for language {:?}; it will not be available",
+                registration.name
+            );
+            continue;
+        }
         register_language(
             &languages,
             registration.name,
