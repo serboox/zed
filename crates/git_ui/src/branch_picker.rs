@@ -16,6 +16,7 @@ use project::git_store::{Repository, RepositoryEvent};
 use project::project_settings::ProjectSettings;
 use settings::Settings;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use ui::{
@@ -1566,11 +1567,26 @@ impl PickerDelegate for BranchListDelegate {
                 };
 
                 let branch = branch.clone();
-                cx.spawn(async move |_, cx| {
-                    repo.update(cx, |repo, _| repo.change_branch(branch.name().to_string()))
-                        .await??;
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    let switched = async {
+                        repo.update(cx, |repo, _| repo.change_branch(branch.name().to_string()))
+                            .await??;
 
-                    anyhow::Ok(())
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    let Err(error) = switched else {
+                        return anyhow::Ok(());
+                    };
+                    // A branch git refuses to check out because another
+                    // worktree holds it is not a failure with nothing to do
+                    // about it, so it is not reported as one.
+                    let Some(held_at) = worktree_holding_the_branch(&error) else {
+                        return Err(error);
+                    };
+                    offer_the_worktree(workspace, repo, branch, held_at, cx).await
                 })
                 .detach_and_prompt_err(
                     "Failed to change branch",
@@ -2138,8 +2154,125 @@ impl PickerDelegate for BranchListDelegate {
     }
 }
 
+/// The worktree git named as already holding a branch, if that is what it
+/// refused for.
+///
+/// Git says `'<branch>' is already used by worktree at '<path>'`, and the path
+/// is the whole of what the reader needs: it is either somewhere they want to
+/// go, or something they are done with. Read out of the message because git
+/// gives it nowhere else -- there is no exit code for this refusal.
+fn worktree_holding_the_branch(error: &anyhow::Error) -> Option<PathBuf> {
+    const HELD: &str = "is already used by worktree at ";
+    let said = format!("{error:#}");
+    let after = said.split_once(HELD)?.1.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let path = after[quote.len_utf8()..].split(quote).next()?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// What to do about the worktree standing in the way.
+///
+/// Three things a reader might mean by asking for a branch that is already
+/// checked out elsewhere: they want that worktree, they are finished with it,
+/// or they picked the wrong branch. An alert with only OK serves none of them.
+async fn offer_the_worktree(
+    workspace: WeakEntity<Workspace>,
+    repo: Entity<Repository>,
+    branch: Branch,
+    held_at: PathBuf,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let name = branch.name().to_string();
+    let shown = held_at.display().to_string();
+    let answer = cx
+        .update(|window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                &format!("{name} is checked out in another worktree"),
+                Some(&format!(
+                    "Git keeps a branch in one place at a time, and this one is \
+                 held by the worktree at {shown}."
+                )),
+                &["Open That Worktree", "Delete It and Switch Here", "Cancel"],
+                cx,
+            )
+        })?
+        .await;
+
+    match answer {
+        Ok(0) => {
+            let display_name = held_at
+                .file_name()
+                .map_or_else(|| shown.clone(), |name| name.to_string_lossy().into_owned());
+            workspace.update_in(cx, |workspace, window, cx| {
+                crate::worktree_service::handle_switch_worktree(
+                    workspace,
+                    &zed_actions::SwitchWorktree {
+                        path: held_at,
+                        display_name,
+                    },
+                    window,
+                    None,
+                    cx,
+                );
+            })
+        }
+        Ok(1) => {
+            // Not forced: git refuses to remove a worktree holding work that
+            // is not committed anywhere, and that refusal is worth showing
+            // rather than driving over.
+            repo.update(cx, |repo, _| repo.remove_worktree(held_at, false))
+                .await??;
+            repo.update(cx, |repo, _| repo.change_branch(name))
+                .await??;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::worktree_holding_the_branch;
+
+    /// The path is read out of git's own words because git offers it nowhere
+    /// else: the refusal has no exit code of its own, and without the path
+    /// there is nothing to offer the reader but an alert.
+    #[test]
+    fn git_names_the_worktree_that_holds_a_branch() {
+        let said = anyhow::anyhow!(
+            "Git command failed: fatal: 'pd_5106_reset' is already used by \
+             worktree at '/home/user/project/worktrees/pd_5106_reset'"
+        );
+        assert_eq!(
+            worktree_holding_the_branch(&said),
+            Some(std::path::PathBuf::from(
+                "/home/user/project/worktrees/pd_5106_reset"
+            ))
+        );
+    }
+
+    /// Every other failure is still a failure, and is reported as one.
+    #[test]
+    fn another_failure_names_no_worktree() {
+        let said = anyhow::anyhow!("Git command failed: fatal: not a git repository");
+        assert_eq!(worktree_holding_the_branch(&said), None);
+    }
+
+    /// A path with a space in it ends at the closing quote, not at the space.
+    #[test]
+    fn a_path_with_a_space_in_it_is_read_whole() {
+        let said =
+            anyhow::anyhow!("fatal: 'wip' is already used by worktree at '/home/user/My Work/wip'");
+        assert_eq!(
+            worktree_holding_the_branch(&said),
+            Some(std::path::PathBuf::from("/home/user/My Work/wip"))
+        );
+    }
+
     use std::collections::HashSet;
 
     use super::*;
