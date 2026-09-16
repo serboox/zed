@@ -1687,6 +1687,13 @@ impl ApiClientPanel {
         cx: &mut App,
     ) -> Entity<ContextMenu> {
         let (can_move_up, can_move_down) = self.folder_move_bounds(folder_id, cx);
+        let is_deprecated = self
+            .store
+            .read(cx)
+            .folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .is_some_and(|folder| folder.deprecated);
         ContextMenu::build(window, cx, move |menu, _, _| {
             let menu = menu
                 .entry("New Folder", None, {
@@ -1735,6 +1742,24 @@ impl ApiClientPanel {
                 menu
             };
             menu.separator()
+                .entry(
+                    match is_deprecated {
+                        true => "Not Deprecated",
+                        false => "Mark as Deprecated",
+                    },
+                    None,
+                    {
+                        let panel = panel.clone();
+                        move |_window, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.store.update(cx, |store, cx| {
+                                    store.set_folder_deprecated(folder_id, !is_deprecated, cx)
+                                });
+                            });
+                        }
+                    },
+                )
+                .separator()
                 .entry("Rename", None, {
                     let panel = panel.clone();
                     move |window, cx| {
@@ -2374,7 +2399,34 @@ impl ApiClientPanel {
                             .size(IconSize::XSmall),
                         )
                         .child(Icon::new(IconName::Folder).size(IconSize::XSmall))
-                        .child(Label::new(folder.name.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(folder.name.clone())
+                                .size(LabelSize::Small)
+                                // Struck through rather than dimmed, as a
+                                // request is: a dimmed row reads as one that is
+                                // broken, and everything under this one sends.
+                                .map(|label| match folder.deprecated {
+                                    true => label.strikethrough().color(Color::Muted),
+                                    false => label,
+                                }),
+                        )
+                        .when(folder.deprecated, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("api-client-folder-deprecated-{folder_id}")
+                                    })
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().status().warning_background)
+                                    .child(
+                                        Label::new("DEPRECATED")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    ),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Folder(folder_id));
                             this.toggle_folder_expanded(folder_id, cx);

@@ -6059,6 +6059,7 @@ impl DatabasePanel {
     ) -> AnyElement {
         let folder_id = folder.id;
         let name = folder.name.clone();
+        let deprecated = folder.deprecated;
         let entity = cx.entity();
         let is_reparent_target = self.drag_target == Some(DropTarget::Folder(folder_id));
         let is_before_target = self.drag_target == Some(DropTarget::BeforeFolder(folder_id));
@@ -6171,8 +6172,30 @@ impl DatabasePanel {
             .child(
                 Label::new(name.clone())
                     .size(LabelSize::Small)
+                    // Struck through rather than dimmed, as a connection is: a
+                    // dimmed row reads as one that is unreachable, and every
+                    // connection under this one still works.
+                    .map(|this| match deprecated {
+                        true => this.strikethrough().color(Color::Muted),
+                        false => this,
+                    })
                     .single_line(),
-            );
+            )
+            .when(deprecated, |el| {
+                el.child(
+                    div()
+                        .debug_selector(|| format!("folder-deprecated-badge-{folder_id}"))
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(cx.theme().status().warning_background)
+                        .child(
+                            Label::new("DEPRECATED")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        ),
+                )
+            });
 
         right_click_menu(ElementId::from(SharedString::from(format!(
             "folder-menu-{folder_id}"
@@ -6219,6 +6242,24 @@ impl DatabasePanel {
                         });
                     })
                 })
+                .separator()
+                .entry(
+                    match deprecated {
+                        true => "Not Deprecated",
+                        false => "Mark as Deprecated",
+                    },
+                    None,
+                    {
+                        let entity = entity.clone();
+                        move |_, cx| {
+                            entity.update(cx, |panel, cx| {
+                                panel.store.update(cx, |store, cx| {
+                                    store.set_folder_deprecated(folder_id, !deprecated, cx);
+                                });
+                            });
+                        }
+                    },
+                )
                 .separator()
                 .entry("Rename", None, {
                     let entity = entity.clone();

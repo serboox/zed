@@ -19,6 +19,14 @@ pub struct Folder {
     pub parent_id: Option<FolderId>,
     #[serde(default)]
     pub order: i64,
+    /// Everything the folder holds is on its way out, the folder included.
+    ///
+    /// Held on the folder as well as on each connection under it, rather than
+    /// worked out from them: a folder with nothing in it can be deprecated
+    /// too, and a connection moved into a deprecated folder should keep
+    /// whatever it was marked as until someone says otherwise.
+    #[serde(default)]
+    pub deprecated: bool,
 }
 
 impl Folder {
@@ -28,6 +36,7 @@ impl Folder {
             name,
             parent_id,
             order,
+            deprecated: false,
         }
     }
 }

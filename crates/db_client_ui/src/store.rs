@@ -1729,6 +1729,70 @@ impl DatabaseStore {
         Some(id)
     }
 
+    /// Marks `id` and everything under it, folders and connections alike.
+    ///
+    /// A folder is a statement about what it holds, so marking one has to
+    /// reach the whole subtree; leaving the connections alone would put a
+    /// struck-through folder above rows that say they are current.
+    pub fn set_folder_deprecated(
+        &mut self,
+        id: FolderId,
+        deprecated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let subtree = self.folder_subtree(id);
+        let mut changed = false;
+
+        for folder in self
+            .folders
+            .iter_mut()
+            .filter(|folder| subtree.contains(&folder.id))
+        {
+            changed |= folder.deprecated != deprecated;
+            folder.deprecated = deprecated;
+        }
+        for conn in self.connections.iter_mut().filter(|conn| {
+            conn.config
+                .folder_id
+                .is_some_and(|folder_id| subtree.contains(&folder_id))
+        }) {
+            changed |= conn.config.deprecated != deprecated;
+            conn.config.deprecated = deprecated;
+        }
+
+        if !changed {
+            return;
+        }
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
+    /// `id` together with every folder below it.
+    fn folder_subtree(&self, id: FolderId) -> HashSet<FolderId> {
+        let mut subtree = HashSet::from_iter([id]);
+        // The tree is stored as parent links, so a pass that adds nothing is
+        // the only way to know the whole subtree has been reached. A cycle in
+        // the stored data cannot make this run forever: a pass only ever adds.
+        loop {
+            let found: Vec<FolderId> = self
+                .folders
+                .iter()
+                .filter(|folder| {
+                    folder
+                        .parent_id
+                        .is_some_and(|parent| subtree.contains(&parent))
+                })
+                .map(|folder| folder.id)
+                .collect();
+            let before = subtree.len();
+            subtree.extend(found);
+            if subtree.len() == before {
+                return subtree;
+            }
+        }
+    }
+
     pub fn rename_folder(&mut self, id: FolderId, name: String, cx: &mut Context<Self>) {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -5202,6 +5266,85 @@ mod tests {
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
             Ok(String::new())
         }
+    }
+
+    /// Disconnecting throws away what was read from the server, and nothing put
+    /// it back: the reader saw an empty database and had to restart the editor,
+    /// Marking a folder is a statement about everything it holds, so it has to
+    /// reach the connections and the folders below it, and taking the mark off
+    /// has to reach just as far.
+    #[gpui::test]
+    fn marking_a_folder_reaches_everything_under_it(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let (outer, inner, near, deep, elsewhere) = store.update(cx, |store, cx| {
+            let outer = store.add_folder("v1".into(), None, cx).expect("folder");
+            let inner = store
+                .add_folder("reports".into(), Some(outer), cx)
+                .expect("nested folder");
+            let other = store.add_folder("v2".into(), None, cx).expect("sibling");
+
+            let mut placed = |folder: FolderId| {
+                let mut config = ConnectionConfig::default();
+                config.id = uuid::Uuid::new_v4();
+                config.folder_id = Some(folder);
+                let id = config.id;
+                store.add_connected_for_test(config, Arc::new(SchemaMockProvider), cx);
+                id
+            };
+            let near = placed(outer);
+            let deep = placed(inner);
+            let elsewhere = placed(other);
+            (outer, inner, near, deep, elsewhere)
+        });
+
+        let marked = |store: &DatabaseStore| {
+            (
+                store.folders.iter().filter(|f| f.deprecated).count(),
+                store
+                    .connections
+                    .iter()
+                    .filter(|conn| conn.config.deprecated)
+                    .map(|conn| conn.config.id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        store.update(cx, |store, cx| store.set_folder_deprecated(outer, true, cx));
+        store.read_with(cx, |store, _| {
+            let (folders, connections) = marked(store);
+            assert_eq!(
+                folders, 2,
+                "the folder it was asked about and the one in it"
+            );
+            assert!(
+                connections.contains(&near) && connections.contains(&deep),
+                "a connection under the folder, however deep, is on its way out too"
+            );
+            assert!(
+                !connections.contains(&elsewhere),
+                "a connection in another folder has nothing to do with this one"
+            );
+            assert!(
+                store
+                    .folders
+                    .iter()
+                    .find(|folder| folder.id == inner)
+                    .is_some_and(|folder| folder.deprecated),
+                "the folder inside is marked, not only the one clicked"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_folder_deprecated(outer, false, cx)
+        });
+        store.read_with(cx, |store, _| {
+            let (folders, connections) = marked(store);
+            assert_eq!(
+                folders, 0,
+                "taking the mark off reaches as far as putting it on"
+            );
+            assert!(connections.is_empty(), "and so do the connections under it");
+        });
     }
 
     /// Disconnecting throws away what was read from the server, and nothing put

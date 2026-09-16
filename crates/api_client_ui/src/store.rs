@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -900,6 +901,70 @@ impl ApiClientStore {
         self.persist_collections(cx);
     }
 
+    /// Marks `id` and everything under it, folders and requests alike.
+    ///
+    /// A folder is a statement about what it holds, so marking one has to
+    /// reach the whole subtree; leaving the requests alone would put a
+    /// struck-through folder above rows that say they are current.
+    pub fn set_folder_deprecated(
+        &mut self,
+        id: FolderId,
+        deprecated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let subtree = self.folder_subtree(id);
+        let mut changed = false;
+
+        for folder in self
+            .folders
+            .iter_mut()
+            .filter(|folder| subtree.contains(&folder.id))
+        {
+            changed |= folder.deprecated != deprecated;
+            folder.deprecated = deprecated;
+        }
+        for request in self.requests.iter_mut().filter(|request| {
+            request
+                .folder_id
+                .is_some_and(|folder_id| subtree.contains(&folder_id))
+        }) {
+            changed |= request.deprecated != deprecated;
+            request.deprecated = deprecated;
+        }
+
+        if !changed {
+            return;
+        }
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
+    /// `id` together with every folder below it.
+    fn folder_subtree(&self, id: FolderId) -> HashSet<FolderId> {
+        let mut subtree = HashSet::from_iter([id]);
+        // The tree is stored as parent links, so a pass that adds nothing is
+        // the only way to know the whole subtree has been reached. A cycle in
+        // the stored data cannot make this run forever: a pass only ever adds.
+        loop {
+            let found: Vec<FolderId> = self
+                .folders
+                .iter()
+                .filter(|folder| {
+                    folder
+                        .parent_id
+                        .is_some_and(|parent| subtree.contains(&parent))
+                })
+                .map(|folder| folder.id)
+                .collect();
+            let before = subtree.len();
+            subtree.extend(found);
+            if subtree.len() == before {
+                return subtree;
+            }
+        }
+    }
+
     pub fn update_request(
         &mut self,
         id: RequestId,
@@ -1476,6 +1541,86 @@ mod tests {
 
     fn new_store(cx: &mut TestAppContext) -> Entity<ApiClientStore> {
         cx.new(|cx| ApiClientStore::new(cx))
+    }
+
+    /// Marking a folder is a statement about everything it holds, so it has to
+    /// reach the requests and the folders below it, and taking the mark off
+    /// has to reach just as far.
+    #[gpui::test]
+    fn marking_a_folder_reaches_everything_under_it(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (outer, inner, near, deep, elsewhere) = store.update(cx, |store, cx| {
+            let collection = store.create_collection("Bot".into(), cx);
+            let outer = store
+                .create_folder(collection, "v1".into(), None, cx)
+                .expect("folder");
+            let inner = store
+                .create_folder(collection, "posts".into(), Some(outer), cx)
+                .expect("nested folder");
+            let other = store
+                .create_folder(collection, "v2".into(), None, cx)
+                .expect("sibling folder");
+            (
+                outer,
+                inner,
+                store.create_request(collection, "list".into(), Some(outer), cx),
+                store.create_request(collection, "publish".into(), Some(inner), cx),
+                store.create_request(collection, "current".into(), Some(other), cx),
+            )
+        });
+
+        let marked = |store: &ApiClientStore| {
+            (
+                store
+                    .folders
+                    .iter()
+                    .filter(|folder| folder.deprecated)
+                    .count(),
+                store
+                    .requests
+                    .iter()
+                    .filter(|request| request.deprecated)
+                    .map(|request| request.id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        store.update(cx, |store, cx| store.set_folder_deprecated(outer, true, cx));
+        store.read_with(cx, |store, _| {
+            let (folders, requests) = marked(store);
+            assert_eq!(
+                folders, 2,
+                "the folder it was asked about and the one in it"
+            );
+            assert!(
+                requests.contains(&near) && requests.contains(&deep),
+                "a request under the folder, however deep, is on its way out too"
+            );
+            assert!(
+                !requests.contains(&elsewhere),
+                "a request in another folder has nothing to do with this one"
+            );
+            assert!(
+                store
+                    .folders
+                    .iter()
+                    .find(|folder| folder.id == inner)
+                    .is_some_and(|folder| folder.deprecated),
+                "the folder inside is marked, not only the one clicked"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_folder_deprecated(outer, false, cx)
+        });
+        store.read_with(cx, |store, _| {
+            let (folders, requests) = marked(store);
+            assert_eq!(
+                folders, 0,
+                "taking the mark off reaches as far as putting it on"
+            );
+            assert!(requests.is_empty(), "and so do the requests under it");
+        });
     }
 
     /// A reader deleting a full collection means the whole thing. The guarded
