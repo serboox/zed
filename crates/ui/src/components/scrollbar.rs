@@ -500,6 +500,19 @@ enum AnimationState {
 
 const DELTA_MAX: f32 = 1.0;
 
+/// How much of a document is on screen, and how far down it the reader is.
+///
+/// Both are fractions of the whole, so they mean the same thing whatever the
+/// track they are drawn along turns out to be.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ThumbShare {
+    /// The share of the document the viewport holds, which is the share of the
+    /// track the thumb takes.
+    on_screen: f32,
+    /// How far through the scrollable distance the reader is, from 0 to 1.
+    scrolled: f32,
+}
+
 impl VisibilityState {
     fn from_behavior(behavior: ShowBehavior) -> Self {
         match behavior {
@@ -845,10 +858,18 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
             .and_then(|state| state.thumbs.iter().find(|thumb| thumb.axis == axis))
     }
 
+    /// What each axis's thumb should say, in fractions of nothing in
+    /// particular: how much of the document is on screen, and how far down it
+    /// the reader is.
+    ///
+    /// Fractions rather than pixels because the track the thumb is laid along
+    /// is not the viewport it describes -- the scrollbar is attached to one
+    /// element and reads another's handle, and the two need not be the same
+    /// height. Measured in the viewport and then laid along the track, the
+    /// thumb moves at the wrong speed by exactly the ratio between them.
     fn thumb_ranges(
         &self,
-    ) -> impl Iterator<Item = (ScrollbarAxis, Range<f32>, ReservedSpace)> + '_ {
-        const MINIMUM_THUMB_SIZE: Pixels = px(25.);
+    ) -> impl Iterator<Item = (ScrollbarAxis, ThumbShare, ReservedSpace)> + '_ {
         let max_offset = self.scroll_handle().max_offset();
         let viewport_size = self.scroll_handle().viewport().size;
         let current_offset = self.scroll_handle().offset();
@@ -863,21 +884,16 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
                     return None;
                 }
                 let content_size = viewport_size + max_offset;
-                let visible_percentage = viewport_size / content_size;
-                let thumb_size = MINIMUM_THUMB_SIZE.max(viewport_size * visible_percentage);
-                if thumb_size > viewport_size {
-                    return None;
-                }
                 let current_offset = current_offset
                     .along(axis)
                     .clamp(-max_offset, Pixels::ZERO)
                     .abs();
-                let start_offset = (current_offset / max_offset) * (viewport_size - thumb_size);
-                let thumb_percentage_start = start_offset / viewport_size;
-                let thumb_percentage_end = (start_offset + thumb_size) / viewport_size;
                 Some((
                     axis,
-                    thumb_percentage_start..thumb_percentage_end,
+                    ThumbShare {
+                        on_screen: viewport_size / content_size,
+                        scrolled: current_offset / max_offset,
+                    },
                     self.visibility.along(axis),
                 ))
             })
@@ -1253,11 +1269,22 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                                     ScrollbarStyle::Editor => scroll_track_bounds,
                                 };
 
+                                const MINIMUM_THUMB_SIZE: Pixels = px(25.);
                                 let available_space =
                                     thumb_container_bounds.size.along(axis) - additional_padding;
 
-                                let thumb_offset = thumb_range.start * available_space;
-                                let thumb_end = thumb_range.end * available_space;
+                                // Both in the track's own pixels: the thumb is
+                                // the share of the track the viewport is of the
+                                // document, and it slides along whatever room
+                                // that leaves. The floor is applied here too,
+                                // so a thumb that had to be made bigger still
+                                // stops at the end rather than past it.
+                                let thumb_size = MINIMUM_THUMB_SIZE
+                                    .max(available_space * thumb_range.on_screen)
+                                    .min(available_space);
+                                let thumb_offset =
+                                    (available_space - thumb_size) * thumb_range.scrolled;
+                                let thumb_end = thumb_offset + thumb_size;
                                 let thumb_bounds = Bounds::new(
                                     thumb_container_bounds
                                         .origin
@@ -1772,6 +1799,101 @@ mod tests {
                     cx,
                 ))
         }
+    }
+
+    struct APaneScrolledInASliver {
+        handle: ScrollHandle,
+        state: Option<Entity<ScrollbarState<ScrollHandle>>>,
+    }
+
+    /// Shorter than the thumb is allowed to be.
+    const SLIVER: Pixels = px(20.);
+
+    impl Render for APaneScrolledInASliver {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let parent_id = cx.entity_id();
+            let state = self.state.get_or_insert_with(|| {
+                cx.new(|cx| {
+                    ScrollbarState::new_from_config(
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.handle),
+                        parent_id,
+                        cx,
+                    )
+                })
+            });
+            let wrapper = cx.new(|_| ScrollbarStateWrapper(state.clone()));
+
+            div()
+                .id("pane")
+                .w(PANE.width)
+                .h(PANE.height)
+                .child(render_scrollbar(
+                    wrapper,
+                    div()
+                        .id("pane-body")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .id("scrolled")
+                                .w_full()
+                                .h(SLIVER)
+                                .overflow_y_scroll()
+                                .track_scroll(&self.handle)
+                                .child(div().w_full().h(CONTENT)),
+                        )
+                        .child(div().id("rest").w_full().flex_1()),
+                    cx,
+                ))
+        }
+    }
+
+    /// A thumb has a floor so it stays big enough to grab. That floor belongs
+    /// to the track it is drawn on, not to the viewport it describes: measured
+    /// against a viewport shorter than the floor, the scrollbar decided the
+    /// thumb would not fit and drew nothing at all -- on a document long
+    /// enough to need it most.
+    #[gpui::test]
+    fn a_thumb_is_drawn_even_when_what_scrolls_is_shorter_than_the_thumb(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let handle = ScrollHandle::new();
+        let view = cx.add_window(|_window, _cx| APaneScrolledInASliver {
+            handle: handle.clone(),
+            state: None,
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            handle.max_offset().y > px(0.),
+            "the fixture was meant to be scrollable"
+        );
+
+        let drawn = view
+            .update(cx, |frame, _window, cx| {
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    state
+                        .thumb_for_axis(ScrollbarAxis::Vertical)
+                        .map(|thumb| (thumb.thumb_bounds, thumb.track_bounds))
+                })
+            })
+            .unwrap();
+
+        let (thumb, track) = drawn.expect(
+            "a document this long is exactly when a reader needs a thumb, and none was drawn",
+        );
+        assert!(
+            thumb.size.height <= track.size.height + px(0.5),
+            "the thumb is {:?} tall on a track of {:?}",
+            thumb.size.height,
+            track.size.height
+        );
     }
 
     /// The thumb says where in the document the reader is. Drawn against a
