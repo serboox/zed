@@ -272,6 +272,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![yaml_lsp_adapter],
             ..Default::default()
         },
+        // No adapter on purpose: a YAML language server reads a chart template
+        // as YAML and calls every template action a fault.
+        LanguageInfo {
+            name: "helm",
+            adapters: vec![],
+            ..Default::default()
+        },
         LanguageInfo {
             name: "gitcommit",
             ..Default::default()

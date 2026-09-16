@@ -3,12 +3,13 @@ use std::ops::Range;
 use gpui::{App, actions};
 use jsonschema::Validator;
 use schema_documents::{
-    Complaint, Reads, diagnostics_from, diagnostics_from_source, unreadable_is_one_complaint,
-    what_the_schema_said,
+    Complaint, Reads, Unreadable, diagnostics_from, diagnostics_from_source,
+    unreadable_is_one_complaint, what_the_schema_said,
 };
 
 mod completing;
 mod reading;
+mod templating;
 
 pub use reading::read;
 
@@ -33,7 +34,10 @@ const YAML_SERVER_ID: language::LanguageServerId = language::LanguageServerId(us
 const SOURCE: &str = "yaml";
 
 static YAML: Reads = Reads {
-    languages: &["YAML"],
+    // A chart template is read here too. Nothing else checks it: the language
+    // server that would is not attached to it, because it reads the template
+    // actions as YAML and calls every one of them a fault.
+    languages: &["YAML", "Helm"],
     server_id: YAML_SERVER_ID,
     diagnostics: diagnostics_for,
     faults: Some(faults),
@@ -70,9 +74,28 @@ pub fn faults(text: &str) -> Vec<lsp::Diagnostic> {
 /// One, not many: past the first such place everything further is a
 /// consequence of the first mistake rather than a second one.
 pub fn what_the_grammar_said(text: &str) -> Vec<(Range<usize>, Complaint)> {
-    match read(text) {
+    match read_around_any_template(text) {
         Err(unreadable) => vec![unreadable_is_one_complaint(unreadable)],
         Ok(_) => Vec::new(),
+    }
+}
+
+/// The documents in a text, reading it as a template only when it will not
+/// read as YAML.
+///
+/// A file that reads is read as it stands, so nothing about plain YAML
+/// changes. One that does not is tried again with its `{{ ... }}` set aside:
+/// if that reads, the faults were the actions rather than the reader's YAML,
+/// and what comes back describes the shape around them. If it still does not
+/// read, the fault is a real one and its place is exact -- setting the actions
+/// aside keeps every byte offset.
+fn read_around_any_template(text: &str) -> Result<Vec<schema_documents::Document>, Unreadable> {
+    let Err(unreadable) = read(text) else {
+        return read(text);
+    };
+    match templating::set_actions_aside(text) {
+        None => Err(unreadable),
+        Some(masked) => read(&masked.text),
     }
 }
 
@@ -88,16 +111,24 @@ pub fn what_the_grammar_said(text: &str) -> Vec<(Range<usize>, Complaint)> {
 /// reader's value any more, so everything the schema would say about it is
 /// about a document nobody wrote.
 pub fn diagnostics_for(text: &str, validator: &Validator) -> Vec<lsp::Diagnostic> {
-    let Ok(documents) = read(text) else {
+    let Ok(documents) = read_around_any_template(text) else {
         return Vec::new();
     };
-    diagnostics_from(
-        text,
-        documents
-            .iter()
-            .flat_map(|document| what_the_schema_said(text, document, validator))
-            .collect(),
-    )
+    // What an action will produce is not known until the chart is rendered, so
+    // the schema has nothing to say about the place it stands in. It still has
+    // plenty to say about the rest: a key that does not belong, a value written
+    // out in full that is of the wrong kind.
+    let template = templating::set_actions_aside(text);
+    let said = documents
+        .iter()
+        .flat_map(|document| what_the_schema_said(text, document, validator))
+        .filter(|(range, _)| {
+            template
+                .as_ref()
+                .is_none_or(|template| !template.covers(range))
+        })
+        .collect();
+    diagnostics_from(text, said)
 }
 
 #[cfg(test)]
@@ -129,6 +160,52 @@ mod tests {
 
     fn checked(text: &str) -> Vec<lsp::Diagnostic> {
         checked_against(&a_schema(), text)
+    }
+
+    /// The line that started this: a chart template is a Go template, and the
+    /// reader used to call the action in it a broken flow mapping.
+    #[test]
+    fn a_chart_template_is_not_broken_yaml() {
+        let template = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include \"service.name\" . }}-api
+spec:
+{{- if .Values.replicas }}
+  replicas: {{ .Values.replicas }}
+{{- end }}
+";
+        assert_eq!(faults(template), Vec::new(), "a chart template reads");
+    }
+
+    /// Setting the actions aside is not a way of saying nothing. YAML that is
+    /// broken around them is still broken, and the place has to be right.
+    #[test]
+    fn a_real_fault_beside_an_action_is_still_found() {
+        let broken = "name: {{ .Values.name }}\nport: [8080\n";
+        assert_eq!(
+            faults(broken).len(),
+            1,
+            "an unclosed flow sequence is a fault whatever stands above it"
+        );
+    }
+
+    /// What an action will produce is not known until the chart is rendered,
+    /// so a schema has no grounds to call it the wrong kind of value.
+    #[test]
+    fn the_schema_says_nothing_about_a_value_an_action_will_produce() {
+        assert_eq!(
+            checked("name: api\ntab_size: {{ .Values.tabs }}\n"),
+            Vec::new()
+        );
+    }
+
+    /// It still has plenty to say about everything written out in full.
+    #[test]
+    fn the_schema_still_reads_the_values_that_are_really_there() {
+        let (_, message) = only("name: {{ .Values.name }}\ntab_size: wide\n");
+        assert!(message.contains("integer"), "{message}");
     }
 
     /// Where the complaint lands is the whole point: a message with the wrong

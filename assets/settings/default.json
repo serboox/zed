@@ -2202,6 +2202,17 @@
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
     "Shell Script": [".env.*"],
+    // A chart's templates hold Go template actions, which no YAML reader can
+    // follow. They are their own language so that a YAML language server is
+    // not attached to them and does not report every action as a fault.
+    "Helm": [
+      "**/templates/**/*.yaml",
+      "**/templates/**/*.yml",
+      "**/templates/**/*.tpl",
+      "**/charts/**/templates/**/*",
+      "helmfile.yaml",
+      "helmfile.yml",
+    ],
   },
   // Settings for which version of Node.js and NPM to use when installing
   // language servers and Copilot.
