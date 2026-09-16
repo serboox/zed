@@ -6358,11 +6358,25 @@ impl GitGraph {
                                     .child(Divider::vertical())
                                     .child(view_toggle),
                             )
-                            .child(DiffStat::new(
-                                "commit-diff-stat",
-                                total_lines_added,
-                                total_lines_removed,
-                            )),
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(DiffStat::new(
+                                        "commit-diff-stat",
+                                        total_lines_added,
+                                        total_lines_removed,
+                                    ))
+                                    // The far end of a row that is already
+                                    // drawn. A column of its own for two icons
+                                    // leaves the height of the card below them
+                                    // empty, and that emptiness is width the
+                                    // list of files could have had.
+                                    .when(across, |this| {
+                                        this.child(Divider::vertical())
+                                            .child(self.render_card_controls_in_line(cx))
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -6458,24 +6472,16 @@ impl GitGraph {
                             .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
                     ),
             )
-            .child(match across {
-                true => Divider::vertical(),
-                false => Divider::horizontal(),
+            .when(!across, |this| {
+                this.child(Divider::horizontal()).child(
+                    v_flex()
+                        .debug_selector(|| "GRAPH_COMMIT_CARD_ACTIONS".into())
+                        .p_1p5()
+                        .gap_1()
+                        .w_full()
+                        .child(self.render_view_commit_button(cx)),
+                )
             })
-            .child(
-                v_flex()
-                    .debug_selector(|| "GRAPH_COMMIT_CARD_ACTIONS".into())
-                    .p_1p5()
-                    .gap_1()
-                    .map(|this| match across {
-                        true => this.flex_none().items_end(),
-                        false => this.w_full(),
-                    })
-                    .map(|this| match across {
-                        true => this.child(self.render_card_controls_in_line(cx)),
-                        false => this.child(self.render_view_commit_button(cx)),
-                    }),
-            )
             .into_any_element()
     }
 
@@ -8612,6 +8618,9 @@ mod tests {
         );
     }
 
+    /// What the card keeps between its own edge and the sections inside it.
+    const CARD_EDGE: Pixels = px(16.);
+
     /// Along the bottom the card has only its own width to divide, so a column
     /// spent on one button is width the sections that hold text never get. The
     /// button belongs under the address of the commit, in the author's column,
@@ -8643,23 +8652,16 @@ mod tests {
             let card = cx
                 .debug_bounds("GRAPH_COMMIT_CARD")
                 .expect("the card is drawn");
-            let actions = cx
-                .debug_bounds("GRAPH_COMMIT_CARD_ACTIONS")
-                .expect("the card's actions are drawn");
             let identity = cx
                 .debug_bounds("GRAPH_COMMIT_CARD_IDENTITY")
                 .expect("the author's column is drawn");
+            let files = cx
+                .debug_bounds("GRAPH_COMMIT_CARD_FILES")
+                .expect("the changed files are drawn");
             let open = cx
                 .debug_bounds("GRAPH_COMMIT_CARD_OPEN")
                 .expect("the button that opens the commit is drawn");
 
-            assert!(
-                actions.right() <= card.right() + px(0.5),
-                "in a window {width:?} across, the card ends at {:?} and what \
-                 stands at its right reaches {:?}",
-                card.right(),
-                actions.right()
-            );
             assert!(
                 open.left() >= identity.left() - px(0.5)
                     && open.right() <= identity.right() + px(0.5),
@@ -8672,12 +8674,17 @@ mod tests {
                 identity.right()
             );
             assert!(
-                actions.size.width < open.size.width,
-                "in a window {width:?} across, what stands at the card's right \
-                 is {:?} wide against an author's column of {:?}: it is still \
-                 holding something with a label, not two icons",
-                actions.size.width,
-                open.size.width
+                cx.debug_bounds("GRAPH_COMMIT_CARD_ACTIONS").is_none(),
+                "in a window {width:?} across, the card still keeps a block of \
+                 its own at the right: below the two icons in it there is \
+                 nothing but the height of the card"
+            );
+            assert!(
+                files.right() >= card.right() - CARD_EDGE,
+                "in a window {width:?} across, the files reach {:?} while the \
+                 card ends at {:?}: the difference is space nothing is drawn in",
+                files.right(),
+                card.right()
             );
 
             width += px(100.);
