@@ -21,6 +21,11 @@ pub struct Collection {
     /// `Folder::order`/`Request::order`'s own backward-compatible default.
     #[serde(default)]
     pub order: i64,
+    /// Everything the collection holds is on its way out, the collection
+    /// included. Held here as well as on each folder and request under it, for
+    /// the reasons given on `Folder::deprecated`.
+    #[serde(default)]
+    pub deprecated: bool,
 }
 
 /// How a tree of collections is ordered on screen.
@@ -57,6 +62,7 @@ impl Collection {
             description: None,
             variables: Vec::new(),
             order: 0,
+            deprecated: false,
         }
     }
 }

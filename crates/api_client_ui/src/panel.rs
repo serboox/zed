@@ -1595,6 +1595,13 @@ impl ApiClientPanel {
         cx: &mut App,
     ) -> Entity<ContextMenu> {
         let (can_move_up, can_move_down) = self.collection_move_bounds(collection_id, cx);
+        let is_deprecated = self
+            .store
+            .read(cx)
+            .collections
+            .iter()
+            .find(|collection| collection.id == collection_id)
+            .is_some_and(|collection| collection.deprecated);
         ContextMenu::build(window, cx, move |menu, _, _| {
             let menu = menu
                 .entry("New Folder", None, {
@@ -1659,6 +1666,28 @@ impl ApiClientPanel {
                 menu
             };
             menu.separator()
+                .entry(
+                    match is_deprecated {
+                        true => "Not Deprecated",
+                        false => "Mark as Deprecated",
+                    },
+                    None,
+                    {
+                        let panel = panel.clone();
+                        move |_window, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.store.update(cx, |store, cx| {
+                                    store.set_collection_deprecated(
+                                        collection_id,
+                                        !is_deprecated,
+                                        cx,
+                                    )
+                                });
+                            });
+                        }
+                    },
+                )
+                .separator()
                 .entry("Rename", None, {
                     let panel = panel.clone();
                     move |window, cx| {
@@ -2289,7 +2318,31 @@ impl ApiClientPanel {
                             .size(IconSize::XSmall),
                         )
                         .child(Icon::new(IconName::FileTree).size(IconSize::XSmall))
-                        .child(Label::new(collection.name.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(collection.name.clone())
+                                .size(LabelSize::Small)
+                                .map(|label| match collection.deprecated {
+                                    true => label.strikethrough().color(Color::Muted),
+                                    false => label,
+                                }),
+                        )
+                        .when(collection.deprecated, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("api-client-collection-deprecated-{collection_id}")
+                                    })
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().status().warning_background)
+                                    .child(
+                                        Label::new("DEPRECATED")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    ),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Collection(collection_id));
                             this.toggle_collection_expanded(collection_id, cx);

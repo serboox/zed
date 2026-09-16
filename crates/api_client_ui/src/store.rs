@@ -940,6 +940,50 @@ impl ApiClientStore {
         self.persist_collections(cx);
     }
 
+    /// Marks `id` and everything in it: its folders, however deep, and its
+    /// requests, including the ones that sit in no folder at all.
+    ///
+    /// A collection is the outermost folder of this panel, so the row a reader
+    /// right-clicks at the top level is this one.
+    pub fn set_collection_deprecated(
+        &mut self,
+        id: CollectionId,
+        deprecated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+
+        if let Some(collection) = self.collections.iter_mut().find(|c| c.id == id) {
+            changed |= collection.deprecated != deprecated;
+            collection.deprecated = deprecated;
+        } else {
+            return;
+        }
+        for folder in self
+            .folders
+            .iter_mut()
+            .filter(|folder| folder.collection_id == id)
+        {
+            changed |= folder.deprecated != deprecated;
+            folder.deprecated = deprecated;
+        }
+        for request in self
+            .requests
+            .iter_mut()
+            .filter(|request| request.collection_id == id)
+        {
+            changed |= request.deprecated != deprecated;
+            request.deprecated = deprecated;
+        }
+
+        if !changed {
+            return;
+        }
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
     /// `id` together with every folder below it.
     fn folder_subtree(&self, id: FolderId) -> HashSet<FolderId> {
         let mut subtree = HashSet::from_iter([id]);
@@ -1541,6 +1585,71 @@ mod tests {
 
     fn new_store(cx: &mut TestAppContext) -> Entity<ApiClientStore> {
         cx.new(|cx| ApiClientStore::new(cx))
+    }
+
+    /// A collection is the outermost folder of this panel, and the row a reader
+    /// right-clicks at the top level, so it takes the mark the same way -- down
+    /// to the requests that sit in no folder at all.
+    #[gpui::test]
+    fn marking_a_collection_reaches_everything_in_it(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (collection, loose, foldered, elsewhere) = store.update(cx, |store, cx| {
+            let collection = store.create_collection("Bot".into(), cx);
+            let folder = store
+                .create_folder(collection, "posts".into(), None, cx)
+                .expect("folder");
+            let other = store.create_collection("Kept".into(), cx);
+            (
+                collection,
+                store.create_request(collection, "ping".into(), None, cx),
+                store.create_request(collection, "publish".into(), Some(folder), cx),
+                store.create_request(other, "current".into(), None, cx),
+            )
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_collection_deprecated(collection, true, cx)
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                store
+                    .collections
+                    .iter()
+                    .find(|c| c.id == collection)
+                    .is_some_and(|c| c.deprecated),
+                "the collection itself carries the mark"
+            );
+            assert!(
+                store.folders.iter().all(|folder| folder.deprecated),
+                "so does the folder in it"
+            );
+            let marked: Vec<_> = store
+                .requests
+                .iter()
+                .filter(|request| request.deprecated)
+                .map(|request| request.id)
+                .collect();
+            assert!(
+                marked.contains(&loose) && marked.contains(&foldered),
+                "a request in the collection is on its way out whether or not \
+                 it sits in a folder"
+            );
+            assert!(
+                !marked.contains(&elsewhere),
+                "another collection has nothing to do with this one"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_collection_deprecated(collection, false, cx)
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.requests.iter().all(|request| !request.deprecated)
+                    && store.folders.iter().all(|folder| !folder.deprecated),
+                "taking the mark off reaches as far as putting it on"
+            );
+        });
     }
 
     /// Marking a folder is a statement about everything it holds, so it has to
