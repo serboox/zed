@@ -640,12 +640,56 @@ impl Render for ProjectSearchView {
                 .justify_center()
                 .child(Label::new(heading_text).size(LabelSize::Large));
 
+            // A search that skipped the ignored files and found nothing has
+            // not looked everywhere, and saying only "no results" reads as if
+            // it had. This is the difference a reader runs into when grep finds
+            // the text and the editor does not: a worktree, a vendored
+            // dependency, a build directory -- ignored by git, and so passed
+            // over here.
+            let skipped_the_ignored = !self.search_options.contains(SearchOptions::INCLUDE_IGNORED);
+
             let page_content: Option<AnyElement> = match model.search_state {
                 SearchState::Idle => Some(self.landing_text_minor(cx).into_any_element()),
-                SearchState::Completed(SearchCompletion::NoResults) => Some(
-                    Label::new("No results found in this project for the provided query")
-                        .size(LabelSize::Small)
+                SearchState::Completed(SearchCompletion::NoResults) if skipped_the_ignored => Some(
+                    v_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new(
+                                "No results among the files this project tracks. \
+                                 The ones git ignores were not searched.",
+                            )
+                            .size(LabelSize::Small),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "SEARCH_THE_IGNORED_TOO".into())
+                                .child(
+                                    Button::new(
+                                        "search-the-ignored-too",
+                                        "Search Ignored Files Too",
+                                    )
+                                    .style(ButtonStyle::OutlinedGhost)
+                                    .key_binding(KeyBinding::for_action(&ToggleIncludeIgnored, cx))
+                                    .on_click(cx.listener(
+                                        |_, _, window, cx| {
+                                            window.dispatch_action(
+                                                ToggleIncludeIgnored.boxed_clone(),
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        )
                         .into_any_element(),
+                ),
+                SearchState::Completed(SearchCompletion::NoResults) => Some(
+                    Label::new(
+                        "No results for the provided query, in the files this project \
+                         tracks or in the ones it ignores.",
+                    )
+                    .size(LabelSize::Small)
+                    .into_any_element(),
                 ),
                 _ => None,
             };
@@ -3011,6 +3055,65 @@ pub mod tests {
                 })
                 .unwrap(),
             2
+        );
+    }
+
+    /// The case a reader runs into when grep finds the text and the editor
+    /// does not: it is in a file git ignores -- a worktree, a vendored
+    /// dependency, a build directory -- which the search passed over. Saying
+    /// only "no results" reads as if it had looked everywhere.
+    #[gpui::test]
+    async fn an_empty_search_says_the_ignored_files_were_passed_over(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                ".gitignore": "worktrees\n",
+                "kept.txt": "nothing to find here",
+                "worktrees": {
+                    "wip.txt": "forceFullTs1ResetEnable: false",
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project, cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search, window, cx, None)
+        });
+
+        perform_search(search_view, "forceFullTs1ResetEnable", cx);
+        assert_eq!(
+            search_view
+                .update(cx, |search_view, _, cx| {
+                    search_view.entity.read(cx).match_ranges.len()
+                })
+                .unwrap(),
+            0,
+            "the text is only in a file git ignores, so the search finds nothing"
+        );
+
+        // That the offer is worth taking -- the text really is in the ignored
+        // file -- is what `test_nested_gitignore_results_follow_include_ignored_option`
+        // already settles. What matters here is that the reader is told.
+        let drawn = &mut VisualTestContext::from_window(search_view.into(), cx);
+        drawn.run_until_parked();
+        drawn.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        drawn.run_until_parked();
+        assert!(
+            drawn.debug_bounds("SEARCH_THE_IGNORED_TOO").is_some(),
+            "a search that passed over the ignored files has to offer them"
         );
     }
 
