@@ -572,7 +572,7 @@ impl ConnectionView {
 
     fn run_test_connection(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.build_config(cx) else {
-            self.test_state = TestState::Failure("Enter host and username first.".to_string());
+            self.test_state = TestState::Failure("Enter a host first.".to_string());
             cx.notify();
             return;
         };
@@ -748,7 +748,12 @@ impl ConnectionView {
         let password = Self::read_text(&self.password_editor, cx);
         let database_raw = Self::read_text(&self.database_editor, cx);
 
-        if host.is_empty() || username.is_empty() {
+        // A host is the one thing a connection cannot be made without. Servers
+        // reached with no credentials at all are ordinary -- a local instance
+        // with trust authentication, a read-only replica open to the network --
+        // and every provider already leaves the credentials out of the URI when
+        // there is no user to put in it.
+        if host.is_empty() {
             return None;
         }
         let port: u16 = port_str.parse().unwrap_or_else(|_| driver.default_port());
@@ -756,7 +761,10 @@ impl ConnectionView {
         Some(ConnectionConfig {
             id: Uuid::new_v4(),
             label: if label_raw.is_empty() {
-                format!("{}@{}", username, host)
+                match username.is_empty() {
+                    true => host.clone(),
+                    false => format!("{}@{}", username, host),
+                }
             } else {
                 label_raw
             },
@@ -2072,6 +2080,39 @@ mod tests {
         assert_eq!(config.password, "secret");
         assert_eq!(config.database.as_deref(), Some("shop"));
         assert!(config.ssh_host.is_none());
+    }
+
+    /// A server reached with no credentials at all is ordinary: a local
+    /// instance with trust authentication, a replica open to the network.
+    /// Every provider already leaves the credentials out of the URI when there
+    /// is no user to put in it, so the form has no reason to refuse one.
+    #[gpui::test]
+    async fn a_connection_needs_no_user_and_no_password(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.set_driver(DatabaseDriver::PostgreSQL, window, cx);
+                view.host_editor
+                    .update(cx, |ed, cx| ed.set_text("localhost", window, cx));
+                // The form offers a user to start from; this is a reader
+                // clearing it because the server asks for none.
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("", window, cx));
+            })
+            .unwrap();
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("a host on its own is enough to describe a connection");
+
+        assert_eq!(config.host, "localhost");
+        assert!(config.username.is_empty());
+        assert!(config.password.is_empty());
+        // Named after what it reaches, since there is no user to name it after.
+        assert_eq!(config.label, "localhost");
     }
 
     #[gpui::test]
