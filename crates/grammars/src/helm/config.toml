@@ -1,11 +1,15 @@
 # A chart template is a Go template that produces YAML, not YAML. It is read
-# with the YAML grammar because everything around the template actions is YAML
-# and that is what a reader wants coloured, but it is a language of its own so
-# that a YAML language server -- which cannot follow `{{ ... }}` and reports
-# every one of them as a fault -- is not attached to it. What checks these
-# files is the editor's own reader, which knows to set the actions aside.
+# with the Go template grammar, which knows what an action is, and the text
+# between the actions is handed to the YAML grammar as one document. Read as
+# YAML alone the file falls apart at the first `{{- if }}`, and everything
+# below it loses its colour.
+#
+# It is a language of its own so that a YAML language server -- which cannot
+# follow an action either, and reports every one of them as a fault -- is not
+# attached to it. What checks these files is the editor's own reader, which
+# knows to set the actions aside.
 name = "Helm"
-grammar = "yaml"
+grammar = "gotmpl"
 path_suffixes = ["tpl", "gotmpl"]
 line_comments = ["# "]
 autoclose_before = ",]}"

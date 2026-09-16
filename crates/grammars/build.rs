@@ -9,6 +9,24 @@ use std::path::Path;
 /// config that was not there.
 fn main() {
     watch(Path::new("src"));
+    build_the_go_template_parser();
+}
+
+/// Compile the Go template parser that lives under `vendor/`.
+///
+/// The crate published beside that grammar pins `tree-sitter` 0.19, whose
+/// `Language` is a different type from the 0.26 this workspace uses, so the
+/// parser is built here and declared against the workspace's own.
+fn build_the_go_template_parser() {
+    let vendor = Path::new("../../vendor/tree-sitter-gotmpl/src");
+    println!("cargo:rerun-if-changed={}", vendor.display());
+    cc::Build::new()
+        .include(vendor)
+        .file(vendor.join("parser.c"))
+        // The generated parser is not written to any project's warning
+        // settings, and its warnings are not ours to act on.
+        .warnings(false)
+        .compile("tree_sitter_gotmpl");
 }
 
 fn watch(directory: &Path) {

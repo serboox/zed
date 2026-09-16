@@ -10,6 +10,9 @@ workspace = true
 [lib]
 path = "src/grammars.rs"
 
+[build-dependencies]
+cc.workspace = true
+
 [dependencies]
 language_core.workspace = true
 rust-embed.workspace = true
@@ -17,6 +20,7 @@ anyhow.workspace = true
 toml.workspace = true
 
 tree-sitter = { workspace = true, optional = true }
+tree-sitter-language = { workspace = true, optional = true }
 arborium-cobol = { workspace = true, optional = true }
 tree-sitter-bash = { workspace = true, optional = true }
 tree-sitter-c = { workspace = true, optional = true }
@@ -53,6 +57,7 @@ tree-sitter-yaml = { workspace = true, optional = true }
 [features]
 load-grammars = [
     "tree-sitter",
+    "tree-sitter-language",
     "arborium-cobol",
     "tree-sitter-bash",
     "tree-sitter-c",

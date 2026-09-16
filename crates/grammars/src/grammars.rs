@@ -24,6 +24,7 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
         ("diff", tree_sitter_diff::LANGUAGE.into()),
         ("go", tree_sitter_go::LANGUAGE.into()),
         ("gomod", tree_sitter_go_mod::LANGUAGE.into()),
+        ("gotmpl", gotmpl()),
         ("gowork", tree_sitter_gowork::LANGUAGE.into()),
         ("java", tree_sitter_java::LANGUAGE.into()),
         ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
@@ -55,6 +56,22 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
         ("yaml", tree_sitter_yaml::LANGUAGE.into()),
         ("gitcommit", tree_sitter_gitcommit::LANGUAGE.into()),
     ]
+}
+
+/// The Go template grammar, compiled from the parser vendored under
+/// `vendor/tree-sitter-gotmpl`.
+///
+/// Declared here rather than taken from the crate published beside that
+/// grammar: that crate pins `tree-sitter` 0.19, whose `Language` is a
+/// different type from the one this workspace uses.
+#[cfg(feature = "load-grammars")]
+fn gotmpl() -> tree_sitter::Language {
+    unsafe extern "C" {
+        fn tree_sitter_gotmpl() -> *const ();
+    }
+    // Safe because the symbol is the one the vendored parser exports, and it
+    // is what a tree-sitter grammar's entry point always is.
+    unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_gotmpl) }.into()
 }
 
 /// Every language whose files are embedded here, by the directory name its

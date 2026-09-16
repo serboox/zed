@@ -299,6 +299,7 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+cc = "1"
 
 #
 # Workspace member crates
@@ -948,6 +949,7 @@ toml_edit = { version = "0.22", default-features = false, features = [
 ] }
 tower-http = "0.4.4"
 tree-sitter = "0.26.9"
+tree-sitter-language = "0.1.8"
 # COBOL, packaged under the arborium name: the `tree-sitter-cobol` crate is an
 # empty placeholder, and this one ships the same upstream grammar regenerated
 # for a current ABI.
