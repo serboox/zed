@@ -85,8 +85,22 @@ jobs:
           esac
           echo "macos=$macos" >> "$GITHUB_OUTPUT"
 
+  # Nothing is packaged from a tree whose tests do not pass. An artifact that
+  # installs and then misbehaves costs more than one that was never built, and
+  # the three packaging jobs together run for hours -- this is the cheapest
+  # place to find out.
+  tests:
+    name: Run the whole suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the editor's build dependencies
+        run: script/linux
+      - uses: ./.github/actions/run_tests
+
   linux:
-    needs: plan
+    needs: [plan, tests]
     if: needs.plan.outputs.linux == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -139,8 +153,21 @@ jobs:
           set -euo pipefail
           sudo dpkg -i target/fork-packages/zed-fork_*.deb
           zed-fork --version
-          rpm -qlp target/fork-packages/zed-fork-*.rpm | head -20
           sudo dpkg -r zed-fork
+
+      # The .rpm was only ever listed, never installed, so nothing said whether
+      # it would install at all. It is installed on the distribution that reads
+      # it -- a container, since this runner is Debian -- and the editor is
+      # asked its version from where the package put it.
+      - name: Install the .rpm in a Fedora container and ask the same
+        run: |
+          set -euo pipefail
+          rpm="$(ls target/fork-packages/zed-fork-*.rpm)"
+          docker run --rm -v "$PWD:/work" -w /work fedora:latest bash -euxc "
+            dnf install -y '$rpm'
+            zed-fork --version
+            rpm -e zed-fork
+          "
 
       - name: Test the HTML engine
         if: steps.engine.outcome == 'success'
@@ -154,7 +181,7 @@ jobs:
         run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
 
   windows:
-    needs: plan
+    needs: [plan, tests]
     if: needs.plan.outputs.windows == 'yes'
     runs-on: windows-latest
     timeout-minutes: 350
@@ -270,6 +297,63 @@ jobs:
           path: target/release-fast/zed.exe
           if-no-files-found: error
 
+      # An executable is not an install. The repository's own bundler is what
+      # assembles everything the editor needs beside it -- the console host the
+      # terminal talks to, the shell integration, the uninstaller -- and it
+      # skips code signing on its own when the secrets for it are absent, which
+      # they are here. It builds the `release` profile itself, so this is a
+      # second build rather than a wrapper around the one above.
+      - name: Build the installer
+        id: installer
+        continue-on-error: true
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Say what the installer did
+        if: always()
+        shell: pwsh
+        run: |
+          $found = Get-ChildItem -Path target -Recurse -Filter '*.exe' |
+            Where-Object { $_.Name -like '*Setup*' -or $_.Name -like '*setup*' }
+          if ('${{ steps.installer.outcome }}' -ne 'success' -or -not $found) {
+            Add-Content $env:GITHUB_STEP_SUMMARY 'installer: not built'
+            exit 0
+          }
+          foreach ($one in $found) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "installer: $($one.Name), $($one.Length) bytes"
+          }
+
+      # It has to install where it will be installed. Inno Setup's own silent
+      # mode does the whole thing without a window, and the editor is then
+      # asked for its usage from where it landed, which a build alone never
+      # proves.
+      - name: Install it and ask the editor its usage
+        if: steps.installer.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path target -Recurse -Filter '*.exe' |
+            Where-Object { $_.Name -like '*Setup*' -or $_.Name -like '*setup*' } |
+            Select-Object -First 1
+          if (-not $setup) { throw 'no installer to run' }
+          Start-Process -FilePath $setup.FullName `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $installed = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles" `
+            -Recurse -Filter 'Zed.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $installed) { throw 'the installer left no Zed.exe behind' }
+          & $installed.FullName --help
+          Add-Content $env:GITHUB_STEP_SUMMARY "installed and ran: $($installed.FullName)"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.installer.outcome == 'success'
+        with:
+          name: zed-windows-x86_64-installer
+          path: |
+            target/**/*Setup*.exe
+            target/**/*setup*.exe
+          if-no-files-found: warn
+
       # Under bash, so that a failing test fails the step: PowerShell's own
       # pipeline swallows the exit code of whatever wrote into it, and merging
       # cargo's stderr there turns every progress line into an error.
@@ -297,7 +381,7 @@ jobs:
           exit 1
 
   macos:
-    needs: plan
+    needs: [plan, tests]
     if: needs.plan.outputs.macos != '[]'
     strategy:
       fail-fast: false
@@ -362,16 +446,50 @@ jobs:
           plutil -lint "$app/Contents/Info.plist"
           codesign --force --deep --sign - "$app"
           ditto -c -k --keepParent "$app" "target/Zed-macos-${{ matrix.target.arch }}.app.zip"
+
+          # A disk image is how a Mac expects to be given an application: it
+          # opens to the app beside a link to Applications, and dragging one
+          # onto the other is the install. The zip stays for anyone who would
+          # rather unpack it.
+          dmg="target/Zed-macos-${{ matrix.target.arch }}.dmg"
+          staging="$(mktemp -d)"
+          ditto "$app" "$staging/Zed.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname Zed -srcfolder "$staging" -ov -format UDZO "$dmg"
+          rm -rf "$staging"
+
           if [ '${{ steps.engine.outcome }}' = 'success' ]; then engine=yes; else engine=no; fi
           {
             echo "size: $(du -h "target/Zed-macos-${{ matrix.target.arch }}.app.zip" | cut -f1)"
+            echo "disk image: $(du -h "$dmg" | cut -f1)"
             echo "HTML engine compiled in: $engine"
+            echo
+            echo "The app is signed ad-hoc, not notarised, so the first launch"
+            echo "needs Open from the right-click menu, or"
+            echo '`xattr -dr com.apple.quarantine /Applications/Zed.app`.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # It has to open where it will be opened. A disk image that will not
+      # mount, or mounts without the app in it, is worth knowing about here
+      # rather than on the reader's machine.
+      - name: Mount the disk image and look inside it
+        run: |
+          set -euo pipefail
+          dmg="target/Zed-macos-${{ matrix.target.arch }}.dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -quiet -nobrowse -mountpoint "$mount" "$dmg"
+          test -x "$mount/Zed.app/Contents/MacOS/zed"
+          test -L "$mount/Applications"
+          plutil -lint "$mount/Zed.app/Contents/Info.plist"
+          hdiutil detach -quiet "$mount"
+          echo "the disk image mounts and holds the app" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
           name: zed-macos-${{ matrix.target.arch }}
-          path: target/Zed-macos-${{ matrix.target.arch }}.app.zip
+          path: |
+            target/Zed-macos-${{ matrix.target.arch }}.app.zip
+            target/Zed-macos-${{ matrix.target.arch }}.dmg
           if-no-files-found: error
 
       - name: Test the HTML engine
