@@ -6,6 +6,7 @@ use crate::{
     git_status_icon,
     project_diff::ProjectDiff,
 };
+use askpass::AskPassDelegate;
 use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
@@ -2248,6 +2249,10 @@ pub(crate) enum DropOffer {
     CommitsOnBranch {
         count: usize,
     },
+    Push {
+        branch: SharedString,
+        onto: SharedString,
+    },
 }
 
 /// A label being dragged somewhere.
@@ -3532,10 +3537,84 @@ impl GitGraph {
     /// The menu appears where the label was dropped rather than acting at once:
     /// merge, rebase and fast-forward are three different answers to the same
     /// gesture, and guessing which one was meant is not a guess worth making.
+    /// Pushes one branch by name to the remote its dropped-on ref belongs to.
+    ///
+    /// Not the `git::Push` action: that pushes whatever branch is checked out,
+    /// and the whole point of the gesture is that the reader named a different
+    /// one. `Repository::push` takes the branch, so git never has to check it
+    /// out to send it.
+    fn push_branch_to(
+        &mut self,
+        branch: SharedString,
+        onto: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        // `origin/main` names the remote before the first slash and the branch
+        // on it after; the branch is the one that was dragged.
+        let Some((remote, _)) = onto.as_ref().split_once('/') else {
+            return;
+        };
+        let remote: SharedString = remote.to_string().into();
+        let askpass = self.askpass_delegate(format!("git push {remote} {branch}"), window, cx);
+        let push = repository.update(cx, |repository, cx| {
+            repository.push(
+                branch.clone(),
+                branch.clone(),
+                remote.clone(),
+                None,
+                askpass,
+                cx,
+            )
+        });
+        cx.spawn(async move |_, _| match push.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => log::error!("git push {remote} {branch} failed: {error}"),
+            Err(error) => log::error!("git push {remote} {branch} was dropped: {error}"),
+        })
+        .detach();
+    }
+
+    /// The window that asks for a passphrase when git needs one.
+    ///
+    /// The same shape the git panel uses, because it is the same modal: a
+    /// remote command that cannot ask has no way to finish.
+    fn askpass_delegate(
+        &self,
+        operation: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AskPassDelegate {
+        let workspace = self.workspace.clone();
+        let operation = operation.into();
+        let window = window.window_handle();
+        AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            crate::askpass_modal::AskPassModal::new(
+                                operation.clone(),
+                                prompt.into(),
+                                tx,
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                })
+                .ok();
+        })
+    }
+
     fn offer_ref_onto_ref(
         &mut self,
         dragged: DraggedRef,
         onto: SharedString,
+        onto_kind: RefKind,
         at: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3555,16 +3634,45 @@ impl GitGraph {
         }
 
         // A local branch dropped on the remote-tracking ref of the same branch
-        // is the one gesture with a single meaning.
-        let is_its_own_remote = dragged.kind == RefKind::Remote
+        // is the one gesture with a single meaning. Both sides have to be
+        // named for it: a local branch called `origin/main` is not a remote,
+        // and a remote whose last segment merely looks alike is not this
+        // branch's.
+        // The checked-out branch is a local branch too, and dragging it onto
+        // its remote is the commonest push there is.
+        let is_its_own_remote = matches!(dragged.kind, RefKind::Branch | RefKind::Head)
+            && onto_kind == RefKind::Remote
             && onto
                 .as_ref()
-                .rsplit('/')
-                .next()
-                .is_some_and(|tail| tail == dragged.name.as_ref())
-            || onto.as_ref().ends_with(&format!("/{}", dragged.name));
-        if dragged.kind != RefKind::Remote && is_its_own_remote {
-            window.dispatch_action(Box::new(git::Push), cx);
+                .rsplit_once('/')
+                .is_some_and(|(_, tail)| tail == dragged.name.as_ref());
+        if is_its_own_remote {
+            #[cfg(test)]
+            {
+                self.last_drop_offer = Some(DropOffer::Push {
+                    branch: dragged.name.clone(),
+                    onto: onto.clone(),
+                });
+            }
+            let focus_handle = self.focus_handle.clone();
+            let branch = dragged.name;
+            let graph = cx.weak_entity();
+            // Asked rather than sent: what reaches a remote does not come back
+            // with a button, which is the fork's line for when to ask.
+            let menu = ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                let sending = (branch.clone(), onto.clone(), graph.clone());
+                menu.context(focus_handle)
+                    .header(format!("{branch} onto {onto}"))
+                    .entry("Push", None, move |window, cx| {
+                        let (branch, onto, graph) = sending.clone();
+                        graph
+                            .update(cx, |graph, cx| {
+                                graph.push_branch_to(branch, onto, window, cx);
+                            })
+                            .ok();
+                    })
+            });
+            self.set_context_menu(menu, at, None, window, cx);
             return;
         }
 
@@ -4003,7 +4111,11 @@ impl GitGraph {
             true => self.picked_rows.clone(),
             false => vec![idx],
         };
-        rows.sort_unstable();
+        // Oldest first, which is the order the commands below are written for:
+        // cherry-pick replays them in the order they were made, and revert
+        // turns that round itself to undo the newest one first. Row 0 is the
+        // newest commit, so oldest first is the highest row first.
+        rows.sort_unstable_by(|left, right| right.cmp(left));
         rows.iter()
             .filter_map(|row| self.graph_data.commits.get(*row))
             .map(|commit| commit.data.sha)
@@ -4511,16 +4623,36 @@ impl GitGraph {
                     cx.new(|_| DraggedRefLabel { dragged })
                 },
             )
+            // A target that will act lights up; one that will not stays as it
+            // is, which is the only way a reader can tell them apart before
+            // letting go.
+            .drag_over::<DraggedRef>({
+                let onto = name.clone();
+                move |style, dragged: &DraggedRef, _window, cx| match dragged.name == onto {
+                    true => style,
+                    false => style.bg(cx.theme().colors().drop_target_background),
+                }
+            })
+            .drag_over::<DraggedCommits>(move |style, _, _window, cx| match kind {
+                RefKind::Head => style.bg(cx.theme().colors().drop_target_background),
+                _ => style,
+            })
             .on_drop(cx.listener({
                 let onto = name.clone();
                 move |this, dragged: &DraggedRef, window, cx| {
                     let at = window.mouse_position();
-                    this.offer_ref_onto_ref(dragged.clone(), onto.clone(), at, window, cx);
+                    this.offer_ref_onto_ref(dragged.clone(), onto.clone(), kind, at, window, cx);
                 }
             }))
             .on_drop(
                 cx.listener(move |this, dragged: &DraggedCommits, _window, cx| {
-                    this.cherry_pick_onto(dragged.clone(), cx);
+                    // Cherry-pick replays onto the branch that is checked out,
+                    // whichever label was under the cursor. Accepting the drop
+                    // anywhere else would do something other than what it looks
+                    // like, so only the checked-out branch takes it.
+                    if kind == RefKind::Head {
+                        this.cherry_pick_onto(dragged.clone(), cx);
+                    }
                 }),
             )
             .child(chip)
@@ -5324,9 +5456,18 @@ impl GitGraph {
                 }
 
                 this.update(cx, |this, cx| {
+                    // Search looks through the whole history, and the filter
+                    // decides what the reader is looking at. A match on a row
+                    // the filter took away cannot be shown or stepped to, so
+                    // it is not one of the matches.
+                    pending_oids.retain(|oid| this.filter_keeps(*oid, cx));
+                    let Some(&first_shown) = pending_oids.first() else {
+                        return;
+                    };
+
                     if this.search_state.selected_index.is_none() {
                         this.search_state.selected_index = Some(0);
-                        this.select_commit_by_sha(first_oid, cx);
+                        this.select_commit_by_sha(first_shown, cx);
                     }
 
                     this.search_state.matches.extend(pending_oids);
@@ -5411,10 +5552,18 @@ impl GitGraph {
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
-        self.table_interaction_state.update(cx, |state, cx| {
-            state.scroll_handle.scroll_to_item(idx, scroll_strategy);
-            cx.notify();
-        });
+        // The list holds the rows the filter kept, so a row of the history is
+        // not a place in it. Handed the history's own number, a scroll under a
+        // filter lands somewhere else entirely -- further down the more rows
+        // are hidden above.
+        if let Some(in_the_list) = self.list_row_of(idx) {
+            self.table_interaction_state.update(cx, |state, cx| {
+                state
+                    .scroll_handle
+                    .scroll_to_item(in_the_list, scroll_strategy);
+                cx.notify();
+            });
+        }
 
         let Some(commit) = self.graph_data.commits.get(idx) else {
             return;
@@ -5587,6 +5736,25 @@ impl GitGraph {
         data.commit_data
             .get(row)
             .map(|commit| commit.sha.to_string())
+    }
+
+    /// Whether the filter leaves this commit on screen.
+    ///
+    /// A commit the history has not loaded yet counts as shown: nothing says
+    /// otherwise, and dropping it would lose a match for a row that is on its
+    /// way in.
+    fn filter_keeps(&self, oid: Oid, cx: &App) -> bool {
+        let Some(repository) = self.get_repository(cx) else {
+            return true;
+        };
+        let row = repository
+            .read(cx)
+            .get_graph_data(self.log_source.clone(), self.log_order)
+            .and_then(|data| data.commit_oid_to_index.get(&oid).copied());
+        match row {
+            None => true,
+            Some(row) => self.list_row_of(row).is_some(),
+        }
     }
 
     pub fn select_commit_by_sha(&mut self, sha: impl TryInto<Oid>, cx: &mut Context<Self>) {
@@ -6887,6 +7055,11 @@ impl Render for GitGraph {
                                     .ok();
                             },
                         )
+                        // Every row takes a branch: dropping one here resets
+                        // it to this commit, so every row lights up for it.
+                        .drag_over::<DraggedRef>(|style, _, _window, cx| {
+                            style.bg(cx.theme().colors().drop_target_background)
+                        })
                         .on_drop({
                             let weak = weak_for_drop;
                             move |dragged: &DraggedRef, window, cx| {
@@ -12355,6 +12528,76 @@ mod tests {
         );
     }
 
+    /// Dropping a branch on its own remote means one thing and one thing only,
+    /// and it has to be read from both sides: a local branch that happens to be
+    /// called `origin/main` is not a remote, and a remote whose last segment
+    /// merely looks alike belongs to some other branch.
+    #[gpui::test]
+    async fn test_dragging_a_branch_onto_its_own_remote_offers_a_push(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        // `origin/main` is a remote only to a repository that knows a remote
+        // called `origin`; without that it is a branch with a slash in it.
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.remote_names = vec!["origin".into()];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let from = cx
+            .debug_bounds("GRAPH_CHIP-0-main")
+            .expect("main should carry a label to drag");
+        let onto = cx
+            .debug_bounds("GRAPH_CHIP-0-origin/main")
+            .expect("its remote should carry one to drop onto");
+
+        drag_between(cx, from.center(), onto.center());
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.last_drop_offer,
+                Some(DropOffer::Push {
+                    branch: "main".into(),
+                    onto: "origin/main".into()
+                }),
+                "the gesture was read as something other than a push"
+            );
+            assert!(
+                graph.context_menu.is_some(),
+                "a push reaches a remote, so it is offered rather than sent"
+            );
+        });
+    }
+
+    /// Cherry-pick replays onto whatever branch is checked out, so a drop on
+    /// any other label would do something other than what it looks like.
+    #[gpui::test]
+    async fn test_commits_are_only_taken_by_the_checked_out_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, labelled_commits(), size).await;
+
+        let node = cx.debug_bounds("GRAPH_NODE-3").expect("a commit to drag");
+        let elsewhere = cx
+            .debug_bounds("GRAPH_CHIP-2-feature")
+            .expect("a branch that is not checked out");
+
+        drag_between(cx, node.center(), elsewhere.center());
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.last_drop_offer, None,
+                "a branch that is not checked out took commits it cannot hold"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_dragging_one_label_onto_another(cx: &mut TestAppContext) {
         init_test(cx);
@@ -12452,6 +12695,61 @@ mod tests {
         });
     }
 
+    /// The list holds the rows the filter kept, so a row of the history is not
+    /// a place in it. A match the filter took away cannot be shown or stepped
+    /// to, and searching the whole history for it only moves the reader to a
+    /// row that is not there.
+    #[gpui::test]
+    async fn test_a_filter_decides_what_a_search_can_find(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (git_graph, cx) =
+            drawn_history(cx, labelled_commits(), gpui::size(px(1400.), px(800.))).await;
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            let all = graph.graph_data.commits.len();
+            let sha_at = |graph: &GitGraph, row: usize| graph.graph_data.commits[row].data.sha;
+
+            // With nothing hidden, every commit is one the reader can be taken
+            // to, and the list is the history.
+            for row in 0..all {
+                assert!(graph.filter_keeps(sha_at(graph, row), cx), "row {row}");
+                assert_eq!(graph.list_row_of(row), Some(row));
+            }
+
+            // Hiding the side branch leaves rows 0 and 1, and the rows it took
+            // are no longer anywhere a search could land.
+            graph.toggle_hidden("feature".into(), cx);
+            assert!(graph.filter_keeps(sha_at(graph, 0), cx));
+            assert!(
+                !graph.filter_keeps(sha_at(graph, 2), cx),
+                "a row the filter took away is still offered as a match"
+            );
+            assert_eq!(
+                graph.list_row_of(2),
+                None,
+                "a hidden row still claims a place in the list"
+            );
+
+            // And the scroll is told where the commit is in the list, not where
+            // it is in the history. Soloing the side branch leaves rows 2, 3, 4
+            // and 5, so the history's row 4 is the third thing in the list --
+            // handed the history's own number the view lands two rows past it.
+            graph.toggle_hidden("feature".into(), cx);
+            graph.toggle_solo("feature".into(), cx);
+            graph.select_entry(4, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.list_row_of(4), Some(2));
+            assert_eq!(
+                graph
+                    .table_interaction_state
+                    .read(cx)
+                    .scroll_handle
+                    .logical_scroll_top_index(),
+                2,
+                "the scroll was told the history's row rather than the list's"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_soloing_a_branch_leaves_only_it(cx: &mut TestAppContext) {
         init_test(cx);
@@ -12531,23 +12829,24 @@ mod tests {
             // With nothing picked, a command is about the row it was opened on.
             assert_eq!(graph.picked_commits(3), vec![sha_at(graph, 3)]);
 
-            // Ctrl adds rows one at a time, and a command gets them oldest last
-            // -- the order the history is drawn in, which is the order they
-            // have to be replayed in.
+            // Ctrl adds rows one at a time, and a command gets them oldest
+            // first -- the order they were made, which is the order cherry-pick
+            // replays them in and the order revert turns round for itself. Row
+            // 0 is the newest commit, so that is the highest row first.
             graph.select_entry(2, ScrollStrategy::Nearest, cx);
             graph.toggle_picked(5);
             graph.toggle_picked(2);
             graph.toggle_picked(8);
             assert_eq!(
                 graph.picked_commits(5),
-                vec![sha_at(graph, 2), sha_at(graph, 5), sha_at(graph, 8)]
+                vec![sha_at(graph, 8), sha_at(graph, 5), sha_at(graph, 2)]
             );
 
             // Picking the same row again puts it back.
             graph.toggle_picked(5);
             assert_eq!(
                 graph.picked_commits(2),
-                vec![sha_at(graph, 2), sha_at(graph, 8)]
+                vec![sha_at(graph, 8), sha_at(graph, 2)]
             );
 
             // Shift reaches from the selection to the row, whichever way round.
@@ -12556,10 +12855,10 @@ mod tests {
             assert_eq!(
                 graph.picked_commits(4),
                 vec![
-                    sha_at(graph, 3),
-                    sha_at(graph, 4),
+                    sha_at(graph, 6),
                     sha_at(graph, 5),
-                    sha_at(graph, 6)
+                    sha_at(graph, 4),
+                    sha_at(graph, 3)
                 ]
             );
 
