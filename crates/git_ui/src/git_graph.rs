@@ -2117,6 +2117,9 @@ const RUNGS: [Rung; 4] = [
 /// opens the commit has taken the width its own label needs. Sharing the whole
 /// card out in fractions was tried and cut that button in half.
 const IDENTITY_ACROSS: f32 = 0.24;
+
+/// What the card keeps above its columns when it lies along the bottom.
+const CARD_ABOVE: Pixels = px(6.);
 const MESSAGE_ACROSS: f32 = 0.36;
 
 pub(crate) const ROW_BAND: f32 = 0.055;
@@ -6090,7 +6093,10 @@ impl GitGraph {
                 // centred: a column taller than the strip would otherwise hang
                 // equally off both ends and show the reader its middle, with
                 // the first line of the message above the top edge.
-                true => this.min_h(px(160.)).w_full().items_stretch(),
+                // Room above the three columns at once. Each of them pads
+                // itself, but that padding starts where the strip starts, so
+                // the first line of every one of them sits on the top edge.
+                true => this.min_h(px(160.)).w_full().items_stretch().pt(CARD_ABOVE),
             })
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
@@ -8678,6 +8684,13 @@ mod tests {
                 "in a window {width:?} across, the card still keeps a block of \
                  its own at the right: below the two icons in it there is \
                  nothing but the height of the card"
+            );
+            assert!(
+                identity.top() >= card.top() + CARD_ABOVE - px(0.5),
+                "in a window {width:?} across, the author's column starts at \
+                 {:?} and the card at {:?}: its first line sits on the top edge",
+                identity.top(),
+                card.top()
             );
             assert!(
                 files.right() >= card.right() - CARD_EDGE,
