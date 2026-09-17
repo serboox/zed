@@ -217,6 +217,28 @@ impl ShellKind {
         }
     }
 
+    /// One argument, written so the shell reads it as one.
+    ///
+    /// Double quotes rather than single: an argument may still name a variable
+    /// the shell is meant to expand, and single quotes would hand it the dollar
+    /// itself. What has to be escaped inside double quotes is the quote, the
+    /// backslash and the backtick -- the dollar is deliberately left alive.
+    ///
+    /// Shells that do not read double quotes this way keep what they had: their
+    /// own quoting is the caller's to do.
+    pub fn one_argument(self, input: &str) -> String {
+        match self {
+            Self::Posix | Self::Fish | Self::Csh | Self::Tcsh | Self::Rc | Self::Elvish => {
+                let escaped = input
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('`', "\\`");
+                format!("\"{escaped}\"")
+            }
+            _ => input.to_owned(),
+        }
+    }
+
     pub fn to_shell_variable(self, input: &str) -> String {
         match self {
             Self::PowerShell | Self::Pwsh => Self::to_powershell_variable(input),

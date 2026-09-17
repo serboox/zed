@@ -1177,7 +1177,18 @@ pub fn prepare_task_for_spawn(
     is_windows: bool,
 ) -> SpawnInTerminal {
     let builder = ShellBuilder::new(shell, is_windows);
-    let command_label = builder.command_label(task.command.as_deref().unwrap_or(""));
+    // The whole line, arguments included. Shown the command alone, a reader
+    // looking for why a task did what it did is handed something that is not
+    // what ran -- and for a task whose argument is a script, that is the only
+    // part worth reading.
+    let command_label = builder.command_label(&task.args.iter().fold(
+        task.command.clone().unwrap_or_default(),
+        |mut line, arg| {
+            line.push(' ');
+            line.push_str(arg);
+            line
+        },
+    ));
     let (command, args) = builder.build_no_quote(task.command.clone(), &task.args);
 
     SpawnInTerminal {

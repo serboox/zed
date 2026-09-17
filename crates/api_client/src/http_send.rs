@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use rand::RngCore;
 
-use crate::request::{ApiKeyPlacement, AuthConfig, FormDataValue, Request, RequestBody};
+use crate::request::{
+    ApiKeyPlacement, AuthConfig, FormDataValue, RawBodyContentType, Request, RequestBody,
+};
 
 /// The concrete HTTP request that will be sent, after variable resolution,
 /// query-param merging, and auth have all been applied. Pure and
@@ -161,15 +163,33 @@ fn between_quotes(text: &str) -> String {
 /// The bytes of a file body -- `Binary`, or a `FormData` field holding a file --
 /// come from `files`, read before this was called; see [`FilesForABody`] for
 /// why they are not read here.
+/// What a body written in one of the raw languages is sent as.
+fn raw_body_content_type(content_type: RawBodyContentType) -> &'static str {
+    match content_type {
+        RawBodyContentType::Json => "application/json",
+        RawBodyContentType::Xml => "application/xml",
+        RawBodyContentType::Html => "text/html",
+        RawBodyContentType::JavaScript => "application/javascript",
+        RawBodyContentType::Text => "text/plain",
+    }
+}
+
 fn body_to_send(
     body: &RequestBody,
     resolve: &impl Fn(&str) -> String,
     files: &FilesForABody,
 ) -> (Option<Vec<u8>>, Option<ContentTypeToSend>) {
     match body {
-        RequestBody::Raw { text, .. } if !text.is_empty() => {
-            (Some(resolve(text).into_bytes()), None)
-        }
+        RequestBody::Raw { content_type, text } if !text.is_empty() => (
+            Some(resolve(text).into_bytes()),
+            // The reader picked a language for this body, and that choice is
+            // what the type is: a server handed JSON with no type of its own
+            // guesses, and most guess `application/x-www-form-urlencoded`.
+            // Written by hand it stays theirs -- the picker only fills a gap.
+            Some(ContentTypeToSend::UnlessWrittenByHand(
+                raw_body_content_type(*content_type).to_string(),
+            )),
+        ),
         RequestBody::UrlEncoded(pairs) => {
             let written: Vec<String> = pairs
                 .iter()

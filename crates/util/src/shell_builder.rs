@@ -128,7 +128,13 @@ impl ShellBuilder {
         (self.program, self.args)
     }
 
-    // This should not exist, but our task infra is broken beyond repair right now
+    /// The same as [`Self::build`], but the command itself is left as written.
+    ///
+    /// A task names its program with the reader's own variables in it --
+    /// `$HOME/.envs/with-env` -- and quoting that would hand the shell a path
+    /// with a literal dollar in it. The arguments are another matter: pasted in
+    /// bare, an argument holding spaces is split into several, so a task whose
+    /// argument is a whole script ran only the first word of it.
     #[doc(hidden)]
     pub fn build_no_quote(
         mut self,
@@ -136,9 +142,10 @@ impl ShellBuilder {
         task_args: &[String],
     ) -> (String, Vec<String>) {
         if let Some(task_command) = task_command {
+            let kind = self.kind;
             let mut combined_command = task_args.iter().fold(task_command, |mut command, arg| {
                 command.push(' ');
-                command.push_str(&self.kind.to_shell_variable(arg));
+                command.push_str(&kind.one_argument(&kind.to_shell_variable(arg)));
                 command
             });
             if self.redirect_stdin {
@@ -320,6 +327,36 @@ mod test {
     }
 
     #[test]
+    /// An argument is one argument. Pasted into the shell line bare, one that
+    /// holds spaces is split into several, and a task whose argument is a whole
+    /// script ran only its first word -- `sh -c mkdir`, with the operand gone.
+    #[test]
+    fn an_argument_holding_a_script_stays_one_argument() {
+        let shell = Shell::Program("bash".to_owned());
+        let builder = ShellBuilder::new(&shell, false);
+
+        let (_, args) = builder.build_no_quote(
+            Some("$HOME/.envs/with-env".into()),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p \"/p/bin\" && go build".to_string(),
+            ],
+        );
+
+        let line = args.last().expect("the shell is given a line to run");
+        // The command keeps its variable: quoting it would hand the shell a
+        // path with a dollar in it.
+        assert!(
+            line.starts_with("$HOME/.envs/with-env "),
+            "the command was rewritten: {line}"
+        );
+        assert!(
+            line.contains(r#""mkdir -p \"/p/bin\" && go build""#),
+            "the script was not kept as one argument: {line}"
+        );
+    }
+
     fn does_not_quote_sole_command_only() {
         let shell = Shell::Program("fish".to_owned());
         let shell_builder = ShellBuilder::new(&shell, false);

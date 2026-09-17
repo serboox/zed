@@ -593,11 +593,46 @@ impl ConfigurationsToolbar {
         None
     }
 
+    /// The debug session this configuration started, while it is still alive.
+    ///
+    /// A run started through the debugger lives in the debugger, not in a
+    /// terminal, so looking only there answers "nothing is running" about a
+    /// program the reader can plainly see running.
+    fn the_session_it_points_at(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<project::debugger::session::Session>> {
+        let pointing = self.pointing.as_ref()?;
+        let scenario = self.scenario_at(pointing, cx)?;
+        let project = self.workspace.upgrade()?.read(cx).project().clone();
+        project
+            .read(cx)
+            .dap_store()
+            .read(cx)
+            .sessions()
+            .find(|session| {
+                let session = session.read(cx);
+                !session.is_terminated()
+                    && session.label().is_some_and(|label| label == scenario.label)
+            })
+            .cloned()
+    }
+
+    /// Whether what this points at is running, by either way of starting it.
+    fn it_is_running(&self, cx: &App) -> bool {
+        self.the_run_it_points_at(cx).is_some() || self.the_session_it_points_at(cx).is_some()
+    }
+
     fn stop(&mut self, cx: &mut Context<Self>) {
-        let Some((terminal, _)) = self.the_run_it_points_at(cx) else {
+        if let Some((terminal, _)) = self.the_run_it_points_at(cx) {
+            terminal.update(cx, |terminal, _| terminal.kill_active_task());
             return;
-        };
-        terminal.update(cx, |terminal, _| terminal.kill_active_task());
+        }
+        if let Some(session) = self.the_session_it_points_at(cx) {
+            session
+                .update(cx, |session, cx| session.shutdown(cx))
+                .detach();
+        }
     }
 
     /// Stops the run, waits for the process to be gone, and only then starts the
@@ -718,12 +753,10 @@ impl Render for ConfigurationsToolbar {
         // beside the plaque give no hint that either is pressable, and a frame
         // each reads as a fence. Two segments either way, so nothing on the bar
         // moves when a run starts or ends.
-        let pair = pointing_at
-            .as_ref()
-            .map(|_| match self.the_run_it_points_at(cx).is_some() {
-                true => self.stop_and_restart(cx),
-                false => self.run_and_debug(cannot_be_debugged, cx),
-            });
+        let pair = pointing_at.as_ref().map(|_| match self.it_is_running(cx) {
+            true => self.stop_and_restart(cx),
+            false => self.run_and_debug(cannot_be_debugged, cx),
+        });
 
         h_flex()
             .id("run-configurations-toolbar")
