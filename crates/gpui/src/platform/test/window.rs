@@ -35,6 +35,11 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    /// The files of every drag this window handed to the platform, in order.
+    pub(crate) dragged_out: Vec<Vec<std::path::PathBuf>>,
+    /// Stands for a platform that cannot start a drag of its own, which is what
+    /// every platform gpui does not implement one for does.
+    pub(crate) refuse_file_drags: bool,
 }
 
 #[derive(Clone)]
@@ -87,6 +92,8 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            dragged_out: Vec::new(),
+            refuse_file_drags: false,
         })))
     }
 
@@ -333,6 +340,15 @@ impl PlatformWindow for TestWindow {
 
     fn start_window_move(&self) {
         unimplemented!()
+    }
+
+    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+        let mut this = self.0.lock();
+        if this.refuse_file_drags {
+            return false;
+        }
+        this.dragged_out.push(paths.to_vec());
+        true
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

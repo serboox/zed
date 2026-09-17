@@ -876,6 +876,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn request_decorations(&self, _decorations: WindowDecorations) {}
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
+    /// Hands the pointer, and a drag carrying `paths`, to the platform, so that
+    /// the drag can be dropped anywhere else on the desktop.
+    ///
+    /// Says whether the platform took it. A platform that cannot start such a
+    /// drag -- or one that refused this one -- says so, and the drag goes on
+    /// being the window's own rather than disappearing into nothing.
+    fn start_file_drag(&self, _paths: &[std::path::PathBuf]) -> bool {
+        false
+    }
     fn start_window_resize(&self, _edge: ResizeEdge) {}
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]

@@ -586,6 +586,24 @@ impl Interactivity {
             }));
     }
 
+    /// What the files a drag started on this element stands for outside this
+    /// window are, worked out when the drag starts rather than when the element
+    /// is drawn.
+    ///
+    /// Given these, a drag that leaves the window is handed to the platform and
+    /// arrives in the file manager, the terminal or another application as those
+    /// files. Inside the window the drag is unchanged, so whatever
+    /// [`Self::on_drag`] set still reaches this window's own drop handlers with
+    /// all of its meaning.
+    ///
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_drag_files`].
+    pub fn on_drag_files<I>(&mut self, files: impl Fn(&mut App) -> I + 'static)
+    where
+        I: IntoIterator<Item = std::path::PathBuf>,
+    {
+        self.drag_files = Some(Box::new(move |cx| files(cx).into_iter().collect()));
+    }
+
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
     /// drag and drop operation. This API should also be used as the equivalent of 'on drag start' with
     /// the [`Self::on_drag_move`] API.
@@ -1519,6 +1537,22 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// What the files a drag started on this element stands for outside this
+    /// window are, so that a drag carried past the window's edge arrives in the
+    /// file manager as those files. Inside the window nothing changes.
+    ///
+    /// The closure is called when a drag starts, not when the element is drawn.
+    ///
+    /// The fluent API equivalent to [`Interactivity::on_drag_files`].
+    fn on_drag_files<I>(mut self, files: impl Fn(&mut App) -> I + 'static) -> Self
+    where
+        Self: Sized,
+        I: IntoIterator<Item = std::path::PathBuf>,
+    {
+        self.interactivity().on_drag_files(files);
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// The fluent API equivalent to [`Interactivity::on_hover`].
@@ -1588,6 +1622,9 @@ pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 
 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
+
+pub(crate) type DragFilesListener =
+    Box<dyn Fn(&mut App) -> SmallVec<[std::path::PathBuf; 2]> + 'static>;
 
 type DropListener = Box<dyn Fn(&dyn Any, &mut Window, &mut App) + 'static>;
 
@@ -1995,6 +2032,11 @@ pub struct Interactivity {
     pub(crate) click_listeners: Vec<ClickListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
+    /// What the files a drag started here stands for outside this window are,
+    /// asked only once a drag actually starts. A list worked out for every row
+    /// of a list on every frame is a list worked out thousands of times for the
+    /// one drag that eventually happens.
+    pub(crate) drag_files: Option<DragFilesListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
@@ -2682,6 +2724,7 @@ impl Interactivity {
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
+        let drag_files = mem::take(&mut self.drag_files);
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
@@ -2774,9 +2817,14 @@ impl Interactivity {
                             let cursor_offset = event.position - hitbox.origin;
                             let drag =
                                 (drag_listener)(drag_value.as_ref(), cursor_offset, window, cx);
+                            let files = drag_files
+                                .as_ref()
+                                .map(|files| files(cx))
+                                .unwrap_or_default();
                             cx.active_drag = Some(AnyDrag {
                                 view: drag,
                                 value: drag_value,
+                                files,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                             });
@@ -4116,8 +4164,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
+        MouseMoveEvent, TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -4898,5 +4946,216 @@ mod tests {
             .unwrap();
 
         assert_eq!(focused, Some(item_b.id));
+    }
+
+    struct DragGhost;
+
+    impl Render for DragGhost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct DraggableView {
+        files: Vec<std::path::PathBuf>,
+        /// Where the drag was last reported to be, so a test can say whether the
+        /// move that left the window was delivered before the drag was handed
+        /// over.
+        moved_to: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl Render for DraggableView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let moved_to = self.moved_to.clone();
+            div()
+                .size_full()
+                .on_drag_move::<String>(move |event: &DragMoveEvent<String>, _, _| {
+                    moved_to.set(Some(event.event.position));
+                })
+                .child(
+                    div()
+                        .id("draggable")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size(px(100.))
+                        .on_drag("what is being dragged".to_string(), |_, _, _, cx| {
+                            cx.new(|_| DragGhost)
+                        })
+                        .on_drag_files({
+                            let files = self.files.clone();
+                            move |_| files.clone()
+                        }),
+                )
+        }
+    }
+
+    fn a_draggable_window(
+        files: Vec<std::path::PathBuf>,
+        cx: &mut TestAppContext,
+    ) -> (Rc<Cell<Option<Point<Pixels>>>>, crate::VisualTestContext) {
+        let moved_to = Rc::new(Cell::new(None));
+        let (_view, mut cx) = cx.add_window_view({
+            let moved_to = moved_to.clone();
+            |_, _| DraggableView { files, moved_to }
+        });
+        cx.simulate_resize(size(px(400.), px(300.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+        (moved_to, cx.clone())
+    }
+
+    /// A drag carried past the edge of the window is no longer this window's:
+    /// the pointer is still held, so nothing else would ever hear about it, and
+    /// dropping it on the file manager would do nothing at all.
+    #[gpui::test]
+    async fn a_drag_that_names_files_is_handed_over_when_it_leaves_the_window(
+        cx: &mut TestAppContext,
+    ) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (moved_to, mut cx) = a_draggable_window(vec![file.clone()], cx);
+
+        cx.simulate_mouse_down(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(40.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert!(
+            cx.update(|_, cx| cx.has_active_drag()),
+            "the drag starts inside the window, where it means what this window says it means"
+        );
+        assert!(
+            cx.drags_handed_to_the_platform().is_empty(),
+            "and while it is inside the window it is nobody else's"
+        );
+
+        cx.simulate_mouse_move(
+            point(px(-30.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+
+        assert_eq!(
+            cx.drags_handed_to_the_platform(),
+            vec![vec![file]],
+            "past the edge the drag is handed to the platform, carrying the file"
+        );
+        assert!(
+            !cx.update(|_, cx| cx.has_active_drag()),
+            "and it stops being this window's drag, so nothing is left following a pointer \
+             this window no longer hears from"
+        );
+        assert_eq!(
+            moved_to.get(),
+            Some(point(px(-30.), px(40.))),
+            "the move that left was delivered first, so whatever the drag was over \
+             heard that it had gone and could stop showing itself as a target"
+        );
+    }
+
+    /// A platform that cannot start a drag of its own must leave the drag where
+    /// it is. Ending it there would take the drag away from a reader who is
+    /// still holding the button, with nothing anywhere to show for it.
+    #[gpui::test]
+    async fn a_platform_that_will_not_take_the_drag_leaves_it_alone(cx: &mut TestAppContext) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file], cx);
+        cx.refuse_file_drags();
+
+        cx.simulate_mouse_down(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(40.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(-30.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+
+        assert!(
+            cx.drags_handed_to_the_platform().is_empty(),
+            "nothing was taken"
+        );
+        assert!(
+            cx.update(|_, cx| cx.has_active_drag()),
+            "so the drag is still this window's, and still under the pointer"
+        );
+    }
+
+    /// Releasing the button outside the window ends the drag; it does not start
+    /// a new one. A drag handed to the platform with nothing held would follow
+    /// the pointer with no way to drop it.
+    #[gpui::test]
+    async fn a_drag_let_go_outside_the_window_is_not_handed_over(cx: &mut TestAppContext) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file], cx);
+
+        cx.simulate_mouse_down(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(40.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(-30.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+
+        assert!(
+            cx.drags_handed_to_the_platform().is_empty(),
+            "a button already let go carries nothing anywhere"
+        );
+    }
+
+    /// A drag that means nothing outside this window -- a tab being reordered --
+    /// must go on meaning what it meant when it is carried off the edge, rather
+    /// than becoming a drag of no files at all.
+    #[gpui::test]
+    async fn a_drag_that_names_no_files_stays_inside_the_window(cx: &mut TestAppContext) {
+        let (_moved_to, mut cx) = a_draggable_window(Vec::new(), cx);
+
+        cx.simulate_mouse_down(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(40.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(-30.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+
+        assert!(
+            cx.drags_handed_to_the_platform().is_empty(),
+            "nothing was handed over, because there was nothing to hand over"
+        );
+        assert!(
+            cx.update(|_, cx| cx.has_active_drag()),
+            "and the drag is still this window's"
+        );
     }
 }

@@ -801,6 +801,23 @@ impl VisualTestContext {
         self.cx.simulate_input(self.window, input)
     }
 
+    /// The files of every drag this window has handed to the platform, oldest
+    /// first. A drag that never left the window handed over nothing.
+    pub fn drags_handed_to_the_platform(&self) -> Vec<Vec<std::path::PathBuf>> {
+        self.cx
+            .test_window(self.window)
+            .0
+            .lock()
+            .dragged_out
+            .clone()
+    }
+
+    /// Makes this window's platform one that cannot start a drag of its own, the
+    /// way a platform gpui has no implementation for behaves.
+    pub fn refuse_file_drags(&self) {
+        self.cx.test_window(self.window).0.lock().refuse_file_drags = true;
+    }
+
     /// Simulate a mouse move event to the given point
     pub fn simulate_mouse_move(
         &mut self,

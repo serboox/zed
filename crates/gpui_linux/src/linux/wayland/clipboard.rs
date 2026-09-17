@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Write},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    path::PathBuf,
 };
 
 use calloop::{LoopHandle, PostAction};
@@ -205,6 +206,23 @@ impl Clipboard {
         if let Some(bytes) = contents_bytes_for_mime(self.contents.as_ref(), &mime_type) {
             self.send_internal(fd, bytes);
         }
+    }
+
+    /// Answers a request for the files of a drag this window started. The drag
+    /// carries paths rather than a clipboard item, so it does not go through the
+    /// clipboard's own contents, but the writing is the same non-blocking write.
+    pub fn send_paths(&self, mime_type: &str, paths: &[PathBuf], fd: OwnedFd) {
+        let bytes = match mime_type {
+            GNOME_COPIED_FILES_MIME_TYPE => serialize_gnome_copied_files(paths, false).into_bytes(),
+            FILE_LIST_MIME_TYPE => serialize_uri_list(paths).into_bytes(),
+            _ => paths
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+        };
+        self.send_internal(fd, bytes);
     }
 
     pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {

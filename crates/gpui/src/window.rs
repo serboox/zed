@@ -2386,6 +2386,16 @@ impl Window {
         self.platform_window.start_window_move()
     }
 
+    /// Hands a drag to the platform, carrying `paths`, so that it can be dropped
+    /// on anything else on the desktop -- a file manager, a terminal, another
+    /// application.
+    ///
+    /// The window stops receiving ordinary pointer events for the rest of the
+    /// drag: from here the platform owns it.
+    pub fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+        self.platform_window.start_file_drag(paths)
+    }
+
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
@@ -4731,12 +4741,21 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // Whether this event is one a drag could be carried out of the window
+        // by: the pointer moving while the button that started the drag is
+        // still held, and nothing else.
+        let mut may_leave = false;
+
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
                 self.mouse_position = mouse_move.position;
                 self.modifiers = mouse_move.modifiers;
+                // Only while the button is still held: a drag is handed over so
+                // that the platform can carry it to whatever it is dropped on,
+                // and there is nothing left to carry once it has been let go.
+                may_leave = mouse_move.pressed_button == Some(MouseButton::Left);
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
@@ -4780,6 +4799,11 @@ impl Window {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
+                            // A drag that came from the platform is already the
+                            // platform's; handing it back out while it is still
+                            // being delivered would start a second drag inside
+                            // the first.
+                            files: Default::default(),
                             cursor_offset: position,
                             cursor_style: None,
                         });
@@ -4819,6 +4843,12 @@ impl Window {
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
+            // After the move has been dispatched, never before it: what the drag
+            // was over last has to hear that the pointer left, or the row it lit
+            // up stays lit with nothing on it.
+            if may_leave {
+                self.hand_a_leaving_drag_to_the_platform(cx);
+            }
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
         }
@@ -4837,6 +4867,42 @@ impl Window {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
         }
+    }
+
+    /// A drag that stands for files and has been carried past the edge of this
+    /// window belongs to the desktop from here, not to this window.
+    ///
+    /// The pointer is still held, so the platform keeps reporting where it is
+    /// even outside the window -- which is what makes leaving the window
+    /// something this window can notice at all. What it cannot notice is a drop
+    /// on another application, so at the edge the drag is handed over: the
+    /// platform carries it from there, and the drag inside this window ends.
+    ///
+    /// Only a drag that named files is handed over. A tab being reordered or a
+    /// column being widened means nothing to anything else on the desktop, and
+    /// dragging one off the edge must go on meaning what it meant.
+    fn hand_a_leaving_drag_to_the_platform(&mut self, cx: &mut App) {
+        let Some(drag) = cx.active_drag.as_ref() else {
+            return;
+        };
+        if drag.files.is_empty() {
+            return;
+        }
+        let inside = Bounds {
+            origin: Point::default(),
+            size: self.viewport_size,
+        };
+        if inside.contains(&self.mouse_position) {
+            return;
+        }
+        // The drag is given up only once the platform has taken it. A platform
+        // that cannot start such a drag leaves it exactly where it was, rather
+        // than ending it and leaving the reader holding nothing.
+        if !self.platform_window.start_file_drag(&drag.files) {
+            return;
+        }
+        cx.active_drag.take();
+        self.refresh();
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {

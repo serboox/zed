@@ -314,6 +314,10 @@ pub(crate) struct WaylandClientState {
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
+    /// The files of a drag this client started and the desktop has not finished
+    /// with yet. Kept here rather than on the data source, because the source
+    /// only ever hands back the mime type it is being asked for.
+    dragged_files: Vec<PathBuf>,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
@@ -414,6 +418,39 @@ impl WaylandClientStatePtr {
 
     pub fn get_serial(&self, kind: SerialKind) -> u32 {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
+    }
+
+    /// Hands a drag carrying `paths` to the compositor, starting from `surface`.
+    ///
+    /// From here the compositor owns the drag: it decides what it lands on, and
+    /// this client only hears back when something asks for the files or when the
+    /// drag ends. The serial is the one of the press that is still held -- a
+    /// compositor declines a drag started from any other, which is what keeps a
+    /// drag from being started by a window nobody is touching.
+    pub fn start_file_drag(&self, surface: &wl_surface::WlSurface, paths: &[PathBuf]) -> bool {
+        let Some(client) = self.0.upgrade() else {
+            return false;
+        };
+        let mut state = client.borrow_mut();
+        let (Some(data_device_manager), Some(data_device)) = (
+            state.globals.data_device_manager.clone(),
+            state.data_device.clone(),
+        ) else {
+            return false;
+        };
+        let serial = state.serial_tracker.get(SerialKind::MousePress);
+        state.dragged_files = paths.to_vec();
+        let data_source = data_device_manager.create_data_source(&state.globals.qh, DraggedOut);
+        data_source.offer(FILE_LIST_MIME_TYPE.to_string());
+        data_source.offer(GNOME_COPIED_FILES_MIME_TYPE.to_string());
+        // Saying which actions are on offer is only part of the protocol from
+        // version three; an older compositor works out the action itself, and
+        // asking it here would be a protocol error rather than a refusal.
+        if data_source.version() >= 3 {
+            data_source.set_actions(DndAction::Copy);
+        }
+        data_device.start_drag(Some(&data_source), surface, None, serial);
+        true
     }
 
     pub fn set_pending_activation(&self, window: ObjectId) {
@@ -784,6 +821,7 @@ impl WaylandClient {
             pinch_scale: 1.0,
             cursor_shape_device: None,
             data_device,
+            dragged_files: Vec::new(),
             primary_selection,
             text_input: None,
             pre_edit_text: None,
@@ -2607,6 +2645,39 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
             {
                 offer.add_mime_type(mime_type);
             }
+        }
+    }
+}
+
+/// Marks the `wl_data_source` of a drag this window started, so that what it is
+/// asked to send is the dragged files rather than whatever is on the clipboard.
+pub(crate) struct DraggedOut;
+
+impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        data_source: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &DraggedOut,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                let paths = state.dragged_files.clone();
+                state.clipboard.send_paths(&mime_type, &paths, fd);
+            }
+            // Either the drop landed somewhere and that application has taken
+            // what it wanted, or nothing accepted it. The drag is over both ways,
+            // and what it carried is no longer anybody's.
+            wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled => {
+                state.dragged_files.clear();
+                data_source.destroy();
+            }
+            _ => {}
         }
     }
 }

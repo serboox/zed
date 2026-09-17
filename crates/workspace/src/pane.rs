@@ -2960,6 +2960,19 @@ impl Pane {
                 },
                 |tab, _, _, cx| cx.new(|_| tab.clone()),
             )
+            // Carried out of the window, a tab is the file it has open. A tab
+            // with no file behind it -- a settings page, a terminal -- carries
+            // nothing, and dragging one off the edge goes on meaning nothing.
+            .on_drag_files({
+                let project = self.project.clone();
+                let item = item.boxed_clone();
+                move |cx: &mut App| {
+                    project.upgrade().and_then(|project| {
+                        let path = item.project_path(cx)?;
+                        project.read(cx).absolute_path(&path, cx)
+                    })
+                }
+            })
             .drag_over::<DraggedTab>(move |tab, dragged_tab: &DraggedTab, _, cx| {
                 let mut styled_tab = tab
                     .bg(cx.theme().colors().drop_target_background)

@@ -439,6 +439,17 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             sel!(concludeDragOperation:),
             conclude_drag_operation as extern "C" fn(&Object, Sel, id),
         );
+        // The window answers as the source of a drag as well as its destination.
+        // Without this AppKit refuses to start a session at all, since a source
+        // that will not say what it allows allows nothing.
+        if let Some(dragging_source) = Protocol::get("NSDraggingSource") {
+            decl.add_protocol(dragging_source);
+        }
+        decl.add_method(
+            sel!(draggingSession:sourceOperationMaskForDraggingContext:),
+            dragging_source_operation_mask
+                as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
+        );
 
         decl.add_method(
             sel!(addTitlebarAccessoryViewController:),
@@ -1849,6 +1860,77 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let this = self.0.lock();
+        let window = this.native_window;
+        drop(this);
+
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            // The press that is still held. AppKit begins a session from a mouse
+            // event and from nothing else, so an event of any other kind is
+            // refused here rather than by a raise inside AppKit.
+            let event: id = msg_send![app, currentEvent];
+            if event == nil {
+                return false;
+            }
+            let kind: NSUInteger = msg_send![event, type];
+            const NS_LEFT_MOUSE_DOWN: NSUInteger = 1;
+            const NS_LEFT_MOUSE_DRAGGED: NSUInteger = 6;
+            if kind != NS_LEFT_MOUSE_DOWN && kind != NS_LEFT_MOUSE_DRAGGED {
+                return false;
+            }
+            let view: id = window.contentView();
+            if view == nil {
+                return false;
+            }
+            let at: NSPoint = msg_send![event, locationInWindow];
+            let at: NSPoint = msg_send![view, convertPoint: at fromView: nil];
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let items: id = msg_send![class!(NSMutableArray), array];
+            for path in paths {
+                let name = ns_string(&path.to_string_lossy());
+                let url: id = msg_send![class!(NSURL), fileURLWithPath: name];
+                if url == nil {
+                    continue;
+                }
+                let item: id = msg_send![class!(NSDraggingItem), alloc];
+                let item: id = msg_send![item, initWithPasteboardWriter: url];
+                if item == nil {
+                    continue;
+                }
+                // The icon the file already has, so the drag looks like what is
+                // being dragged rather than like nothing at all.
+                let icon: id = msg_send![workspace, iconForFile: name];
+                let size: NSSize = match icon == nil {
+                    true => NSSize::new(32., 32.),
+                    false => msg_send![icon, size],
+                };
+                let frame = NSRect::new(
+                    NSPoint::new(at.x - size.width / 2., at.y - size.height / 2.),
+                    size,
+                );
+                let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
+                let _: () = msg_send![items, addObject: item];
+                let _: () = msg_send![item, release];
+            }
+            let count: NSUInteger = msg_send![items, count];
+            if count == 0 {
+                return false;
+            }
+            let session: id = msg_send![
+                view,
+                beginDraggingSessionWithItems: items
+                event: event
+                source: window
+            ];
+            session != nil
+        }
+    }
+
     fn play_system_bell(&self) {
         NSBeep()
     }
@@ -2948,6 +3030,19 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     } else {
         NSDragOperationNone
     }
+}
+
+/// What a drag started by this window allows wherever it is being carried. It
+/// is the same answer inside the application and outside it: a file dragged out
+/// of the editor is copied, never moved, because moving it would be a change to
+/// the project nobody asked for.
+extern "C" fn dragging_source_operation_mask(
+    _: &Object,
+    _: Sel,
+    _: id,
+    _context: NSInteger,
+) -> NSDragOperation {
+    NSDragOperationCopy
 }
 
 extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {

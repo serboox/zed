@@ -3,6 +3,7 @@
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroIsize,
+    os::windows::ffi::OsStrExt,
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
@@ -21,7 +22,12 @@ use windows::{
         Graphics::Dwm::*,
         Graphics::Gdi::*,
         System::{
-            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Com::*,
+            Diagnostics::Debug::MessageBeep,
+            LibraryLoader::*,
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+            Ole::*,
+            SystemServices::*,
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -101,6 +107,12 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    /// The files of a drag asked for but not started yet. The shell's drag runs
+    /// a loop of its own that does not come back until the drag is over, and
+    /// that cannot happen inside the handling of the pointer event that asked
+    /// for it: the editor's own state is held open across it and every redraw
+    /// in the meantime would find it so.
+    pending_file_drag: RefCell<Vec<std::path::PathBuf>>,
 }
 
 impl WindowsWindowState {
@@ -272,6 +284,7 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            pending_file_drag: RefCell::new(Vec::new()),
         }))
     }
 
@@ -592,6 +605,85 @@ impl Drop for WindowsWindow {
                 }
             })
             .detach();
+    }
+}
+
+/// Runs the drag the window was asked for, once the editor's own handling of the
+/// pointer event that asked for it is over.
+pub(crate) fn run_pending_file_drag(inner: &WindowsWindowInner) -> Option<isize> {
+    let paths = std::mem::take(&mut *inner.pending_file_drag.borrow_mut());
+    if !paths.is_empty() {
+        start_file_drag(inner.hwnd, &paths).log_err();
+    }
+    Some(0)
+}
+
+/// Hands a drag carrying `paths` to the shell, so it can be dropped on Explorer
+/// or on any other application.
+///
+/// The shell provides both halves of the source side: `SHCreateDataObject` gives
+/// a data object that only has to be told what it holds, and `SHDoDragDrop` with
+/// no drop source of its own uses the standard one, which is the one every other
+/// application's drags already behave like.
+fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let data: IDataObject = SHCreateDataObject(None, None, None::<&IDataObject>)?;
+        let format = FORMATETC {
+            cfFormat: CF_HDROP.0,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let global = dropfiles_of(paths)?;
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: *global },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        // The data object takes the memory: `fRelease` is what says so, and
+        // releasing it here as well would free it twice.
+        data.SetData(&format, &medium, BOOL::from(true))?;
+        std::mem::forget(global);
+        // No drop source of our own: without one the shell uses the standard
+        // one, which is how every other application's drags already behave.
+        SHDoDragDrop(hwnd, &data, None::<&IDropSource>, DROPEFFECT_COPY)?;
+    }
+    Ok(())
+}
+
+/// `paths` as a `DROPFILES` block: the header, then every path as wide
+/// characters, each ending in a nul, and one more nul after the last of them.
+fn dropfiles_of(paths: &[std::path::PathBuf]) -> Result<Owned<HGLOBAL>> {
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.as_os_str().encode_wide());
+        names.push(0);
+    }
+    names.push(0);
+
+    let header = DROPFILES {
+        pFiles: std::mem::size_of::<DROPFILES>() as u32,
+        pt: POINT { x: 0, y: 0 },
+        fNC: false.into(),
+        fWide: true.into(),
+    };
+    let bytes = std::mem::size_of::<DROPFILES>() + std::mem::size_of_val(names.as_slice());
+    unsafe {
+        let global = Owned::new(GlobalAlloc(GMEM_MOVEABLE, bytes)?);
+        let at = GlobalLock(*global);
+        anyhow::ensure!(!at.is_null(), "GlobalLock returned null");
+        std::ptr::write_unaligned(at as *mut DROPFILES, header);
+        std::ptr::copy_nonoverlapping(
+            names.as_ptr(),
+            (at as *mut u8).add(std::mem::size_of::<DROPFILES>()) as *mut u16,
+            names.len(),
+        );
+        GlobalUnlock(*global).ok();
+        Ok(global)
     }
 }
 
@@ -988,6 +1080,23 @@ impl PlatformWindow for WindowsWindow {
 
     fn get_raw_handle(&self) -> HWND {
         self.0.hwnd
+    }
+
+    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        *self.0.pending_file_drag.borrow_mut() = paths.to_vec();
+        unsafe {
+            PostMessageW(
+                Some(self.0.hwnd),
+                WM_GPUI_START_FILE_DRAG,
+                WPARAM::default(),
+                LPARAM::default(),
+            )
+            .log_err()
+            .is_some()
+        }
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

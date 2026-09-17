@@ -2794,6 +2794,13 @@ pub struct AnyDrag {
     /// The value of the dragged item, to be dropped
     pub value: Arc<dyn Any>,
 
+    /// The files this drag stands for, for the rest of the desktop. Empty when
+    /// the drag means nothing outside this window -- a tab being reordered, a
+    /// column being widened -- and those never leave it. When it is not empty
+    /// and the pointer crosses the edge of the window, the drag is handed to
+    /// the platform and carries these paths into whatever it lands on.
+    pub files: SmallVec<[std::path::PathBuf; 2]>,
+
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
     pub cursor_offset: Point<Pixels>,
