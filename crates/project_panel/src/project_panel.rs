@@ -8195,6 +8195,18 @@ mod refresh_coalescing_tests {
     #[gpui::test]
     async fn coalesces_background_refresh_events(cx: &mut gpui::TestAppContext) {
         crate::project_panel_tests::init_test(cx);
+        // The debounce is the whole point here, so this one test asks for the
+        // mode that has one back.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project_panel
+                        .get_or_insert_default()
+                        .tree_performance = Some(ProjectPanelTreePerformance::Balanced);
+                });
+            });
+        });
 
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({ "a": { "b": "" } })).await;
@@ -8234,6 +8246,10 @@ mod refresh_coalescing_tests {
                 false,
             ));
         });
+        // The rebuild waits out the debounce, and a test clock only moves when
+        // it is told to. Without this the timer never fires and the count below
+        // reads zero for a rebuild that simply had not happened yet.
+        cx.executor().advance_clock(BACKGROUND_REFRESH_DEBOUNCE * 2);
         cx.run_until_parked();
 
         let rebuilds =

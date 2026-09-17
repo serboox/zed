@@ -11423,10 +11423,15 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                // The shipped mode waits out a debounce before rebuilding the
+                // tree, and a test clock does not run on its own -- so every
+                // assertion about what the tree holds would read the tree from
+                // before the change. The mode that rebuilds at once is the one
+                // these tests are about; the debounce has tests of its own.
+                project_panel.tree_performance =
+                    Some(settings::ProjectPanelTreePerformance::Vanilla);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new());
             });
         });
@@ -11443,10 +11448,15 @@ fn init_test_with_editor(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                // The shipped mode waits out a debounce before rebuilding the
+                // tree, and a test clock does not run on its own -- so every
+                // assertion about what the tree holds would read the tree from
+                // before the change. The mode that rebuilds at once is the one
+                // these tests are about; the debounce has tests of its own.
+                project_panel.tree_performance =
+                    Some(settings::ProjectPanelTreePerformance::Vanilla);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new())
             });
         });
@@ -11464,10 +11474,15 @@ fn init_test_with_git_ui(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                // The shipped mode waits out a debounce before rebuilding the
+                // tree, and a test clock does not run on its own -- so every
+                // assertion about what the tree holds would read the tree from
+                // before the change. The mode that rebuilds at once is the one
+                // these tests are about; the debounce has tests of its own.
+                project_panel.tree_performance =
+                    Some(settings::ProjectPanelTreePerformance::Vanilla);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new())
             });
         });
