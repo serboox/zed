@@ -2,16 +2,16 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use gpui::{
-    Anchor, App, Bounds, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseDownEvent, PathBuilder, Point, Subscription, Task, WeakEntity, Window, canvas, fill,
-    point, prelude::*, size,
+    App, Bounds, Context, Hsla, PathBuilder, Point, Subscription, Task, WeakEntity, Window, canvas,
+    fill, point, prelude::*, size,
 };
 use settings::Settings;
-use ui::{ButtonLike, PopoverMenu, Tooltip, cyberpunk, prelude::*};
+use ui::{ButtonLike, Tooltip, cyberpunk, prelude::*};
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
-use crate::process_metrics::{self, Metrics, ProcessMemory, Sample, Watcher};
+use crate::process_metrics::{self, Metrics, ProcessReading, Sample, Watcher};
 use crate::run_configurations_settings::RunConfigurationsSettings;
+use crate::run_metrics_modal::RunMetricsModal;
 
 /// How many readings are kept for the charts: two minutes at
 /// [`Watcher::HOW_OFTEN`], which is long enough to see a build ramp up and come
@@ -120,17 +120,23 @@ impl RunMetricsStatusItem {
                 let Ok(pid) = item.read_with(cx, |item, cx| item.process_of_a_run(cx)) else {
                     return;
                 };
-                let samples = match pid {
+                let read = match pid {
                     Some(_) => {
-                        cx.background_spawn(async move { process_metrics::everything_running() })
-                            .await
+                        cx.background_spawn(async move {
+                            (
+                                process_metrics::everything_running(),
+                                process_metrics::machine_uptime(),
+                            )
+                        })
+                        .await
                     }
-                    None => None,
+                    None => (None, None),
                 };
+                let (samples, machine_uptime) = read;
                 let now = Instant::now();
                 if item
                     .update(cx, |item, cx| {
-                        if item.read_the_run(pid, samples.as_deref(), now) {
+                        if item.read_the_run(pid, samples.as_deref(), now, machine_uptime) {
                             cx.notify();
                         }
                     })
@@ -150,7 +156,13 @@ impl RunMetricsStatusItem {
     /// A run the machine has nothing to say about is over, and the reading
     /// says so. A machine that did not answer at all leaves the reading as it
     /// was, rather than reporting a running thing as gone.
-    fn read_the_run(&mut self, pid: Option<u32>, samples: Option<&[Sample]>, now: Instant) -> bool {
+    fn read_the_run(
+        &mut self,
+        pid: Option<u32>,
+        samples: Option<&[Sample]>,
+        now: Instant,
+        machine_uptime: Option<std::time::Duration>,
+    ) -> bool {
         let Some(pid) = pid else {
             self.watcher.forget();
             self.readings.clear();
@@ -159,7 +171,7 @@ impl RunMetricsStatusItem {
         let Some(samples) = samples else {
             return false;
         };
-        let read = self.watcher.metrics_of(pid, samples, now);
+        let read = self.watcher.metrics_of(pid, samples, now, machine_uptime);
         match &read {
             Some(metrics) => {
                 if self.readings.len() >= READINGS_KEPT {
@@ -175,6 +187,32 @@ impl RunMetricsStatusItem {
         let changed = read != self.metrics;
         self.metrics = read;
         changed
+    }
+
+    /// Opens the reading in full, over the workspace this item's status bar
+    /// belongs to.
+    fn open_the_reading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let item = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            RunMetricsModal::open(workspace, item, window, cx);
+        });
+    }
+
+    /// What the last reading said, for a window that draws it in full.
+    pub(crate) fn reading(&self) -> Option<Metrics> {
+        self.metrics.clone()
+    }
+
+    /// The readings the charts draw, oldest first: what the processor read and
+    /// how much memory was held at each of them.
+    pub(crate) fn series(&self) -> Vec<(Option<f32>, u64)> {
+        self.readings
+            .iter()
+            .map(|reading| (reading.cpu, reading.memory))
+            .collect()
     }
 
     /// The process a run of this project is going on in, if one is. The
@@ -206,7 +244,7 @@ impl RunMetricsStatusItem {
 
 /// A label and the value after it, the way both the plaque and the reading say
 /// a fact that has no chart of its own.
-fn said(label: &'static str, value: String) -> gpui::Div {
+pub(crate) fn said(label: &'static str, value: String) -> gpui::Div {
     h_flex()
         .gap_1()
         .child(
@@ -219,7 +257,7 @@ fn said(label: &'static str, value: String) -> gpui::Div {
 
 /// What a number nobody could measure says instead of a zero, which would read
 /// as "it is using none of this".
-fn what_it_says(value: Result<u64, &'static str>) -> String {
+pub(crate) fn what_it_says(value: Result<u64, &'static str>) -> String {
     match value {
         Ok(bytes) => process_metrics::as_memory(bytes),
         Err(why) => format!("-- {why}"),
@@ -258,7 +296,7 @@ fn plotted(readings: &[(usize, f32)], ceiling: f32, bounds: Bounds<Pixels>) -> V
 /// Past [`PROCESSES_LISTED`] rows a reader stops comparing them to each other,
 /// so the rest becomes one row of their total rather than a list nobody reads
 /// to the end.
-fn listed(tree: &[ProcessMemory]) -> (Vec<ProcessMemory>, Option<(usize, u64)>) {
+pub(crate) fn listed(tree: &[ProcessReading]) -> (Vec<ProcessReading>, Option<(usize, u64)>) {
     let mut sorted = tree.to_vec();
     sorted.sort_by(|left, right| {
         right
@@ -282,7 +320,7 @@ fn listed(tree: &[ProcessMemory]) -> (Vec<ProcessMemory>, Option<(usize, u64)>) 
 /// The axis labels sit in a column beside the chart rather than inside it, so
 /// that the chart alone carries the fixed height and no text is ever inside a
 /// box that cannot grow for it.
-fn a_chart(
+pub(crate) fn a_chart(
     heading: &'static str,
     reading_now: String,
     readings: Vec<(usize, f32)>,
@@ -387,7 +425,7 @@ fn a_chart(
 /// One process of the run: what it is, how much of the largest one's memory it
 /// holds, and that amount written out. The bar's place on the ramp says the
 /// same thing the number does, so nothing here is carried by colour alone.
-fn a_bar(name: String, memory: u64, largest: u64) -> gpui::Div {
+pub(crate) fn a_bar(name: String, memory: u64, largest: u64) -> gpui::Div {
     let fraction = match largest > 0 {
         true => (memory as f32 / largest as f32).clamp(0., 1.),
         false => 0.,
@@ -451,14 +489,9 @@ impl Render for RunMetricsStatusItem {
                     }),
             );
 
-        let item = cx.entity().downgrade();
-        PopoverMenu::new("run-metrics-reading-menu")
-            .anchor(Anchor::BottomLeft)
-            .menu(move |_window, cx| {
-                let item = item.clone();
-                Some(cx.new(|cx| RunMetricsReading::new(item, cx)))
-            })
-            .trigger_with_tooltip(plaque, Tooltip::text("Show what the run is using"))
+        plaque
+            .tooltip(Tooltip::text("Show what the run is using"))
+            .on_click(cx.listener(|item, _, window, cx| item.open_the_reading(window, cx)))
             .into_any_element()
     }
 }
@@ -481,140 +514,6 @@ impl StatusItemView for RunMetricsStatusItem {
                 .get_or_insert_default()
                 .show_process_metrics = Some(false);
         }))
-    }
-}
-
-/// The reading in full, opened from the plaque: the two minutes behind the
-/// numbers in the status bar, which of the run's processes hold the memory, and
-/// the facts that have no time series.
-pub struct RunMetricsReading {
-    item: WeakEntity<RunMetricsStatusItem>,
-    focus_handle: FocusHandle,
-    _observation: Option<Subscription>,
-}
-
-impl RunMetricsReading {
-    fn new(item: WeakEntity<RunMetricsStatusItem>, cx: &mut Context<Self>) -> Self {
-        let observation = item
-            .upgrade()
-            .map(|item| cx.observe(&item, |_, _, cx| cx.notify()));
-        Self {
-            item,
-            focus_handle: cx.focus_handle(),
-            _observation: observation,
-        }
-    }
-
-    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
-    }
-}
-
-impl Focusable for RunMetricsReading {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl EventEmitter<DismissEvent> for RunMetricsReading {}
-
-impl Render for RunMetricsReading {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let shell = v_flex()
-            .id("run-metrics-reading")
-            .debug_selector(|| "run-metrics-reading".to_string())
-            .key_context("RunMetricsReading")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::cancel))
-            .on_mouse_down_out(cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                cx.emit(DismissEvent);
-            }))
-            .elevation_2(cx)
-            .w(px(320.))
-            // A window can be shorter than the reading is tall, and a surface
-            // that hangs past the bottom edge takes the last row -- the facts
-            // -- with it. The reading gives way and scrolls instead.
-            .max_h(vh(0.8, window))
-            .overflow_y_scroll()
-            .p(cyberpunk::SPACE_8)
-            .gap(cyberpunk::SPACE_8);
-
-        let Some(item) = self.item.upgrade() else {
-            return shell.into_any_element();
-        };
-        let (metrics, readings) = {
-            let item = item.read(cx);
-            (
-                item.metrics.clone(),
-                item.readings.iter().copied().collect::<Vec<_>>(),
-            )
-        };
-        let Some(metrics) = metrics else {
-            return shell.into_any_element();
-        };
-
-        let processor = readings
-            .iter()
-            .enumerate()
-            .filter_map(|(at, reading)| reading.cpu.map(|cpu| (at, cpu)))
-            .collect();
-        let held = readings
-            .iter()
-            .enumerate()
-            .map(|(at, reading)| (at, reading.memory as f32))
-            .collect::<Vec<_>>();
-        let most_held = readings
-            .iter()
-            .fold(0u64, |most, reading| most.max(reading.memory));
-
-        let (rows, the_rest) = listed(&metrics.tree);
-        let largest = rows.first().map(|one| one.memory).unwrap_or(0);
-
-        shell
-            .child(a_chart(
-                "Processor",
-                match metrics.cpu {
-                    Some(cpu) => format!("{cpu:.1}%"),
-                    None => "-- reading".to_string(),
-                },
-                processor,
-                100.,
-                cyberpunk::series_processor(),
-                vec![(0., "100".to_string()), (0.5, "50".to_string())],
-            ))
-            .child(a_chart(
-                "Memory",
-                process_metrics::as_memory(metrics.memory),
-                held,
-                most_held as f32,
-                cyberpunk::series_memory(),
-                vec![(0., process_metrics::as_memory(most_held))],
-            ))
-            .child(
-                v_flex()
-                    .gap(cyberpunk::SPACE_4)
-                    .child(
-                        Label::new("By process")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .children(rows.iter().map(|one| {
-                        a_bar(format!("{} · {}", one.pid, one.name), one.memory, largest)
-                    }))
-                    .when_some(the_rest, |list, (count, total)| {
-                        list.child(a_bar(format!("+{count} more"), total, largest))
-                    }),
-            )
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap(cyberpunk::SPACE_8)
-                    .child(said("PID", metrics.pid.to_string()))
-                    .child(said("processes", metrics.processes.to_string()))
-                    .child(said("network", what_it_says(metrics.network)))
-                    .child(said("video memory", what_it_says(metrics.video_memory))),
-            )
-            .into_any_element()
     }
 }
 
@@ -650,7 +549,7 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// The popover asks to be focused two frames after it opens, and a test has
+    /// The window asks to be focused two frames after it opens, and a test has
     /// no platform frame loop to deliver those frames -- so they are delivered
     /// by hand. Without this a keystroke lands nowhere and every way out of the
     /// reading looks broken.
@@ -674,8 +573,13 @@ mod tests {
         fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
             .await;
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        // A multi-workspace root rather than a bare workspace: the modal layer
+        // the reading opens into is drawn there, and under a bare workspace the
+        // window opens without being painted at all.
+        let (multi, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
         let item = workspace.update_in(cx, |workspace, window, cx| {
             let item = cx.new(|cx| RunMetricsStatusItem::new(workspace, window, cx));
             workspace.status_bar().update(cx, |status_bar, cx| {
@@ -692,21 +596,32 @@ mod tests {
     }
 
     fn named(pid: u32, name: &str, memory: u64) -> Sample {
+        started_by(pid, 1, name, memory)
+    }
+
+    fn started_by(pid: u32, parent: u32, name: &str, memory: u64) -> Sample {
         Sample {
             pid,
-            parent: 1,
+            parent,
             name: name.into(),
             ticks: 10,
             memory,
+            threads: 2,
+            state: 'S',
             started: 5_000,
         }
     }
 
-    fn a_process(pid: u32, memory: u64) -> ProcessMemory {
-        ProcessMemory {
+    fn a_process(pid: u32, memory: u64) -> ProcessReading {
+        ProcessReading {
             pid,
+            parent: 1,
             name: "a program".into(),
             memory,
+            cpu: None,
+            threads: 1,
+            state: 'S',
+            uptime: None,
         }
     }
 
@@ -719,7 +634,21 @@ mod tests {
     ) {
         let running = [a_sample(watched)];
         item.update(cx, |item, _| {
-            item.read_the_run(Some(watched), Some(&running), Instant::now());
+            item.read_the_run(Some(watched), Some(&running), Instant::now(), None);
+        });
+        draw(cx);
+    }
+
+    /// A run of three: the shell, what it started, and what that started in
+    /// turn, so the tree drawn from it has a shape worth reading.
+    fn a_tree_on_screen(item: &Entity<RunMetricsStatusItem>, cx: &mut VisualTestContext) {
+        let running = [
+            started_by(4242, 1, "the shell", 4 * 1024 * 1024),
+            started_by(4243, 4242, "the build", 64 * 1024 * 1024),
+            started_by(4244, 4243, "a compiler", 32 * 1024 * 1024),
+        ];
+        item.update(cx, |item, _| {
+            item.read_the_run(Some(4242), Some(&running), Instant::now(), None);
         });
         draw(cx);
     }
@@ -753,7 +682,7 @@ mod tests {
         let running = [a_sample(watched)];
 
         item.update(&mut cx, |item, _| {
-            assert!(item.read_the_run(Some(watched), Some(&running), Instant::now()));
+            assert!(item.read_the_run(Some(watched), Some(&running), Instant::now(), None));
         });
         draw(&mut cx);
 
@@ -776,7 +705,7 @@ mod tests {
         let at = Instant::now();
 
         item.update(&mut cx, |item, _| {
-            item.read_the_run(Some(watched), Some(&running), at);
+            item.read_the_run(Some(watched), Some(&running), at, None);
         });
         draw(&mut cx);
         assert!(
@@ -786,7 +715,7 @@ mod tests {
 
         item.update(&mut cx, |item, _| {
             assert!(
-                !item.read_the_run(Some(watched), None, at + Watcher::HOW_OFTEN),
+                !item.read_the_run(Some(watched), None, at + Watcher::HOW_OFTEN, None),
                 "nothing to report from a reading that did not happen"
             );
         });
@@ -805,7 +734,7 @@ mod tests {
         let watched = 4242;
         let running = [a_sample(watched)];
         item.update(&mut cx, |item, _| {
-            item.read_the_run(Some(watched), Some(&running), Instant::now());
+            item.read_the_run(Some(watched), Some(&running), Instant::now(), None);
         });
         draw(&mut cx);
         assert!(cx.debug_bounds("run-metrics-status").is_some());
@@ -866,14 +795,14 @@ mod tests {
         a_run_on_screen(&item, &mut cx, 4242);
 
         assert!(
-            cx.debug_bounds("run-metrics-reading").is_none(),
+            cx.debug_bounds("RUN-METRICS-MODAL").is_none(),
             "the reading stays closed until it is asked for"
         );
 
         press_the_plaque(&mut cx);
 
         assert!(
-            cx.debug_bounds("run-metrics-reading").is_some(),
+            cx.debug_bounds("RUN-METRICS-MODAL").is_some(),
             "pressing the plaque opens the reading"
         );
     }
@@ -884,13 +813,13 @@ mod tests {
         let (item, mut cx) = an_item_of_its_own(cx).await;
         a_run_on_screen(&item, &mut cx, 4242);
         press_the_plaque(&mut cx);
-        assert!(cx.debug_bounds("run-metrics-reading").is_some());
+        assert!(cx.debug_bounds("RUN-METRICS-MODAL").is_some());
 
         cx.simulate_keystrokes("escape");
         settle(&mut cx);
 
         assert!(
-            cx.debug_bounds("run-metrics-reading").is_none(),
+            cx.debug_bounds("RUN-METRICS-MODAL").is_none(),
             "escape closes the reading"
         );
     }
@@ -902,7 +831,7 @@ mod tests {
         a_run_on_screen(&item, &mut cx, 4242);
         press_the_plaque(&mut cx);
         let reading = cx
-            .debug_bounds("run-metrics-reading")
+            .debug_bounds("RUN-METRICS-MODAL")
             .expect("the reading is open");
 
         // Well clear of the reading, and of the plaque that opened it: pressing
@@ -916,7 +845,7 @@ mod tests {
         settle(&mut cx);
 
         assert!(
-            cx.debug_bounds("run-metrics-reading").is_none(),
+            cx.debug_bounds("RUN-METRICS-MODAL").is_none(),
             "a press outside the reading closes it"
         );
     }
@@ -969,7 +898,7 @@ mod tests {
         _cx: &mut TestAppContext,
     ) {
         let megabyte = 1024 * 1024;
-        let tree: Vec<ProcessMemory> = (1..=12)
+        let tree: Vec<ProcessReading> = (1..=12)
             .map(|which| a_process(which, which as u64 * megabyte))
             .collect();
 
@@ -993,7 +922,7 @@ mod tests {
     /// Eight processes exactly are eight rows, with nothing summed up.
     #[gpui::test]
     fn eight_processes_need_no_row_for_the_rest(_cx: &mut TestAppContext) {
-        let tree: Vec<ProcessMemory> = (1..=8).map(|which| a_process(which, 1024)).collect();
+        let tree: Vec<ProcessReading> = (1..=8).map(|which| a_process(which, 1024)).collect();
 
         let (rows, the_rest) = listed(&tree);
 
@@ -1036,7 +965,7 @@ mod tests {
         press_the_plaque(&mut cx);
 
         assert!(
-            cx.debug_bounds("run-metrics-reading").is_some(),
+            cx.debug_bounds("RUN-METRICS-MODAL").is_some(),
             "the reading opens whether or not every fact could be measured"
         );
     }
@@ -1051,7 +980,7 @@ mod tests {
         press_the_plaque(&mut cx);
 
         let reading = cx
-            .debug_bounds("run-metrics-reading")
+            .debug_bounds("RUN-METRICS-MODAL")
             .expect("the reading is open");
         let viewport = cx.update(|window, _| window.viewport_size());
 
@@ -1062,6 +991,116 @@ mod tests {
         assert!(
             reading.right() <= viewport.width && reading.bottom() <= viewport.height,
             "and it does not run off the right or the bottom of a {viewport:?} window: {reading:?}"
+        );
+    }
+
+    /// The window opens on the overview, and the second tab is where the run's
+    /// processes are drawn as the tree they are. A real press on each, because
+    /// a tab that looks chosen and shows the other half is the failure here.
+    #[gpui::test]
+    async fn the_processes_tab_draws_the_run_as_a_tree(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        a_tree_on_screen(&item, &mut cx);
+        press_the_plaque(&mut cx);
+
+        assert!(
+            cx.debug_bounds("RUN-METRICS-CHART-CPU").is_some(),
+            "the window opens on the overview"
+        );
+        assert!(
+            cx.debug_bounds("FORK-ROW-4243").is_none(),
+            "and the tree is not drawn until it is asked for"
+        );
+
+        let tab = cx
+            .debug_bounds("BUTTON-Processes")
+            .expect("the second tab is there to press");
+        cx.simulate_click(tab.center(), Modifiers::none());
+        settle(&mut cx);
+
+        for row in ["FORK-ROW-4242", "FORK-ROW-4243", "FORK-ROW-4244"] {
+            assert!(
+                cx.debug_bounds(row).is_some(),
+                "every process of the run has a row of its own: {row} has none"
+            );
+        }
+        assert!(
+            cx.debug_bounds("RUN-METRICS-CHART-CPU").is_none(),
+            "and the overview gives the window over to it"
+        );
+    }
+
+    /// Depth is what the tree says, and it says it by where a row starts. A
+    /// child stands in from its parent, and a grandchild further still.
+    #[gpui::test]
+    async fn a_child_stands_in_from_the_process_that_started_it(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        a_tree_on_screen(&item, &mut cx);
+        press_the_plaque(&mut cx);
+        let tab = cx
+            .debug_bounds("BUTTON-Processes")
+            .expect("the second tab is there to press");
+        cx.simulate_click(tab.center(), Modifiers::none());
+        settle(&mut cx);
+
+        let at = |name: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+                .origin
+                .x
+        };
+        let root = at("FORK-NAME-4242", &mut cx);
+        let child = at("FORK-NAME-4243", &mut cx);
+        let grandchild = at("FORK-NAME-4244", &mut cx);
+
+        assert!(
+            child > root,
+            "what the run started stands in from the run itself: {child:?} vs {root:?}"
+        );
+        assert!(
+            grandchild > child,
+            "and what that started stands in again: {grandchild:?} vs {child:?}"
+        );
+    }
+
+    /// The window is worth widening: the two charts stand side by side while
+    /// there is room for both, and fall into a column when there is not, rather
+    /// than being squeezed to a width that draws nothing.
+    #[gpui::test]
+    async fn the_charts_stand_side_by_side_only_while_there_is_room(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.simulate_resize(size(px(1400.), px(900.)));
+        a_run_on_screen(&item, &mut cx, 4242);
+        press_the_plaque(&mut cx);
+
+        let processor = cx
+            .debug_bounds("RUN-METRICS-CHART-CPU")
+            .expect("the processor chart is drawn");
+        let memory = cx
+            .debug_bounds("RUN-METRICS-CHART-MEMORY")
+            .expect("the memory chart is drawn");
+        assert_eq!(
+            processor.origin.y, memory.origin.y,
+            "in a wide window the two charts share a row"
+        );
+        assert!(
+            memory.origin.x > processor.origin.x,
+            "and the memory chart is the one on the right"
+        );
+
+        cx.simulate_resize(size(px(640.), px(900.)));
+        settle(&mut cx);
+
+        let processor = cx
+            .debug_bounds("RUN-METRICS-CHART-CPU")
+            .expect("the processor chart is still drawn");
+        let memory = cx
+            .debug_bounds("RUN-METRICS-CHART-MEMORY")
+            .expect("the memory chart is still drawn");
+        assert!(
+            memory.origin.y >= processor.bottom(),
+            "in a narrow window the memory chart drops below the processor one \
+             rather than standing beside it: {memory:?} against {processor:?}"
         );
     }
 }
