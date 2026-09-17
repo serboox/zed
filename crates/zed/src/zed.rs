@@ -6154,12 +6154,14 @@ mod tests {
                 "assistant",
                 "assistant2",
                 "auto_update",
-                "branch_picker",
                 "bedrock",
+                "branch_picker",
                 "branches",
                 "browser_tools",
                 "buffer_search",
+                "cargo_diagnostics", // fork: cargo diagnostics provider
                 "channel_modal",
+                "clang_diagnostics", // fork: C/C++ diagnostics provider
                 "cli",
                 "client",
                 "collab",
@@ -6184,25 +6186,31 @@ mod tests {
                 "erd_view",
                 "feedback",
                 "file_finder",
+                "file_relations", // fork: file relations view
                 "git",
                 "git_graph",
                 "git_onboarding",
                 "git_panel",
                 "git_picker",
+                "go_diagnostics", // fork: Go diagnostics provider
                 "go_to_line",
+                "hierarchy_view", // fork: call and type hierarchy view
                 "highlights_tree_view",
                 "html",
                 "icon_theme_selector",
                 "image_viewer",
                 "inline_assistant",
                 "journal",
+                "js_diagnostics",   // fork: JavaScript diagnostics provider
+                "json_diagnostics", // fork: JSON diagnostics provider
                 "keymap_editor",
                 "keystroke_input",
                 "language_selector",
-                "welcome",
                 "line_ending_selector",
+                "log_lens", // fork: log lens
                 "lsp_tool",
                 "markdown",
+                "markdown_diagnostics", // fork: Markdown diagnostics provider
                 "menu",
                 "multi_workspace",
                 "new_process_modal",
@@ -6212,23 +6220,33 @@ mod tests {
                 "outline_panel",
                 "pane",
                 "panel",
-                "pdf", // fork: pdf_preview
+                "pdf",             // fork: pdf_preview
+                "php_diagnostics", // fork: PHP diagnostics provider
                 "picker",
                 "preview",
                 "project_panel",
                 "project_search",
                 "project_symbols",
                 "projects",
+                "prose_diagnostics",  // fork: prose diagnostics provider
+                "proto_diagnostics",  // fork: protobuf diagnostics provider
+                "python_diagnostics", // fork: Python diagnostics provider
                 "recent_projects",
                 "remote_debug",
+                "rename_preview", // fork: rename preview
                 "repl",
+                "ruby_diagnostics",   // fork: Ruby diagnostics provider
                 "run_configurations", // fork: run configuration actions (zed_actions + run_configurations crate)
                 "search",
+                "search_everywhere", // fork: search everywhere
                 "settings_editor",
                 "settings_profile_selector",
+                "shell_diagnostics", // fork: shell diagnostics provider
                 "skill_creator",
                 "snippets",
+                "sql_diagnostics", // fork: SQL diagnostics provider
                 "stash_picker",
+                "structural_search", // fork: structural search
                 "svg",
                 "syntax_tree_view",
                 "tab_switcher",
@@ -6239,12 +6257,17 @@ mod tests {
                 "theme",
                 "theme_selector",
                 "toast",
+                "toml_diagnostics", // fork: TOML diagnostics provider
                 "toolchain",
+                "typo_diagnostics", // fork: typo diagnostics provider
                 "variable_list",
                 "vim",
+                "welcome",
                 "window",
                 "workspace",
                 "worktree_picker",
+                "xml_diagnostics",  // fork: XML diagnostics provider
+                "yaml_diagnostics", // fork: YAML diagnostics provider
                 "zed",
                 "zed_actions",
                 "zed_predict_onboarding",
