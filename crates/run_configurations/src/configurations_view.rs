@@ -9,6 +9,7 @@ use project::Project;
 use project::TaskContexts;
 use serde_json::Value;
 use settings::Settings;
+use std::path::Path;
 use task::{DebugScenario, TaskContext, TaskTemplate};
 use ui::{ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
@@ -601,7 +602,7 @@ fn what_the_window_is_pulled_by() -> Vec<AnyElement> {
 /// and resolving that against a context without it fails outright, which used to
 /// leave the press doing nothing at all. So the worktree's own variables go in
 /// first and whatever the open item knows is laid over them.
-fn what_to_resolve_against(contexts: &TaskContexts) -> TaskContext {
+fn what_to_resolve_against(contexts: &TaskContexts, project_root: Option<&Path>) -> TaskContext {
     let mut context = contexts
         .active_worktree_context
         .as_ref()
@@ -618,6 +619,18 @@ fn what_to_resolve_against(contexts: &TaskContexts) -> TaskContext {
         if active.cwd.is_some() {
             context.cwd = active.cwd.clone();
         }
+    }
+    // A configuration belongs to the project whose file it was read from, and
+    // says so with `$ZED_WORKTREE_ROOT`. Everything above is worked out from
+    // whatever the reader is looking at, which need not be in that project at
+    // all -- a SQL console lives under the editor's own config directory, and
+    // resolved against that a task builds into a folder beside a query file.
+    if let Some(root) = project_root {
+        context.task_variables.insert(
+            task::VariableName::WorktreeRoot,
+            root.to_string_lossy().into_owned(),
+        );
+        context.cwd = Some(root.to_path_buf());
     }
     context
 }
@@ -648,7 +661,18 @@ pub async fn run_a_task_on(
         return;
     };
     let contexts = contexts.await;
-    let context = what_to_resolve_against(&contexts);
+    let project_root = workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        })
+        .ok()
+        .flatten();
+    let context = what_to_resolve_against(&contexts, project_root.as_deref());
     let comes_from = match contexts.worktree() {
         Some(id) => project::TaskSourceKind::Worktree {
             id,
@@ -758,7 +782,18 @@ pub async fn start_a_debug_session(
     };
     let contexts = contexts.await;
     let worktree = contexts.worktree();
-    let context = what_to_resolve_against(&contexts);
+    let project_root = workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        })
+        .ok()
+        .flatten();
+    let context = what_to_resolve_against(&contexts, project_root.as_deref());
     workspace
         .update_in(cx, |workspace, window, cx| {
             workspace.start_debug_session(scenario, context.into(), None, worktree, window, cx);
@@ -4059,7 +4094,7 @@ mod tests {
         );
 
         let resolved = configuration
-            .resolve_task("test", &what_to_resolve_against(&contexts))
+            .resolve_task("test", &what_to_resolve_against(&contexts, None))
             .expect("a configuration of the project resolves against the project");
         assert_eq!(
             resolved.resolved.cwd.as_deref(),
@@ -4087,12 +4122,30 @@ mod tests {
         );
         contexts.active_worktree_context = Some((project::WorktreeId::from_usize(0), the_project));
 
-        let context = what_to_resolve_against(&contexts);
+        let context = what_to_resolve_against(&contexts, None);
         assert_eq!(
             context
                 .task_variables
                 .get(&task::VariableName::WorktreeRoot),
             Some("/projects/the-one-in-front")
+        );
+
+        // But a configuration read from a project's own file belongs to that
+        // project, whatever the reader happens to be looking at. A SQL console
+        // lives under the editor's config directory, and resolved against it a
+        // task builds into a folder beside a query file.
+        let context = what_to_resolve_against(&contexts, Some(Path::new("/projects/the-real-one")));
+        assert_eq!(
+            context
+                .task_variables
+                .get(&task::VariableName::WorktreeRoot),
+            Some("/projects/the-real-one"),
+            "the root came from the tab in front rather than from the project"
+        );
+        assert_eq!(
+            context.cwd.as_deref(),
+            Some(Path::new("/projects/the-real-one")),
+            "the task would run somewhere other than the project it belongs to"
         );
     }
 
