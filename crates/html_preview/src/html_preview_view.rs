@@ -271,7 +271,10 @@ pub struct HtmlPreviewView {
     /// Where this preview's own top is, so that what sits above the page -- the
     /// address row, and anything that joins it -- can be measured as the distance
     /// from here to the page rather than counted up from paddings and borders.
-    #[cfg(feature = "servo")]
+    ///
+    /// Kept whether or not this build has an engine: the two places that read it
+    /// are not behind the engine's feature, and a field that is makes the crate
+    /// build one way and not the other.
     own_top: std::rc::Rc<std::cell::Cell<Pixels>>,
     /// The address last put into the bar, so a page that has gone somewhere of
     /// its own accord is noticed without asking the engine every frame.
@@ -601,7 +604,6 @@ impl HtmlPreviewView {
                 asked_where: None,
                 #[cfg(feature = "servo")]
                 address: address_bar(window, cx),
-                #[cfg(feature = "servo")]
                 own_top: std::rc::Rc::new(std::cell::Cell::new(Pixels::ZERO)),
                 #[cfg(feature = "servo")]
                 showing_address: None,
@@ -3081,6 +3083,9 @@ mod tests {
     /// engine is told the size of the area the page is painted in, and a click is
     /// measured against that same area, so a page drawn small instead of laid out
     /// small would lie about both.
+    ///
+    /// Only a build with an engine can show a page as a device at all.
+    #[cfg(feature = "servo")]
     #[gpui::test]
     async fn a_page_shown_as_a_device_is_laid_out_at_that_size(cx: &mut TestAppContext) {
         let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
