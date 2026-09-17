@@ -240,6 +240,18 @@ pub struct ConnectionConfig {
     /// nothing chooses it by default.
     #[serde(default = "default_transaction_idle_minutes")]
     pub transaction_idle_minutes: u64,
+    /// How long a result may go without a row before this connection gives up
+    /// on it, in seconds.
+    ///
+    /// A guard against a connection that has died without saying so, not
+    /// against a slow query: it is measured between rows, so a result that
+    /// takes an hour to arrive is never cut short as long as rows keep coming.
+    /// The right number is the server's and the network's, not the reader's --
+    /// a warehouse behind a tunnel may think for minutes before the first row.
+    ///
+    /// Zero means no limit, and is deliberately expressible.
+    #[serde(default = "default_row_stall_seconds")]
+    pub row_stall_seconds: u64,
     /// Marks a connection nobody should be reaching for any more.
     ///
     /// It still connects and still answers: a deprecated connection is one on
@@ -266,6 +278,12 @@ impl ConnectionConfig {
         (self.transaction_idle_minutes > 0)
             .then(|| std::time::Duration::from_secs(self.transaction_idle_minutes * 60))
     }
+
+    /// How long a result here may go without a row, or nothing where no limit
+    /// was asked for.
+    pub fn row_stall_limit(&self) -> Option<std::time::Duration> {
+        (self.row_stall_seconds > 0).then(|| std::time::Duration::from_secs(self.row_stall_seconds))
+    }
 }
 
 /// Half an hour, which is long enough to read a result and decide, and short
@@ -273,6 +291,13 @@ impl ConnectionConfig {
 /// when somebody else needs the rows.
 fn default_transaction_idle_minutes() -> u64 {
     30
+}
+
+/// A minute, which is long enough for a server to think before the first row of
+/// a heavy result and short enough that a connection that died without saying
+/// so is noticed rather than waited on.
+fn default_row_stall_seconds() -> u64 {
+    60
 }
 
 fn default_true() -> bool {
@@ -294,6 +319,7 @@ impl Default for ConnectionConfig {
             label: String::from("New Connection"),
             deprecated: false,
             transaction_idle_minutes: default_transaction_idle_minutes(),
+            row_stall_seconds: default_row_stall_seconds(),
             driver: DatabaseDriver::MySQL,
             host: String::from("localhost"),
             port: 3306,

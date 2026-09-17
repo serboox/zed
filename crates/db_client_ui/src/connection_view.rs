@@ -197,6 +197,7 @@ pub struct ConnectionView {
     /// connection and is set in the connections file, and losing it every time
     /// somebody opened this dialog would quietly turn the guard off.
     transaction_idle_minutes: u64,
+    row_stall_editor: Entity<Editor>,
     use_ssh: bool,
     ssh_host_editor: Entity<Editor>,
     ssh_port_editor: Entity<Editor>,
@@ -254,6 +255,14 @@ impl ConnectionView {
         let label_editor = make_editor("Connection name (optional)", "", window, cx);
         let host_editor = make_editor("Host / IP", "127.0.0.1", window, cx);
         let port_editor = make_editor("Port", "3306", window, cx);
+        let row_stall_editor = make_editor(
+            "Seconds",
+            &db_client::ConnectionConfig::default()
+                .row_stall_seconds
+                .to_string(),
+            window,
+            cx,
+        );
         let username_editor = make_editor("Username", "root", window, cx);
         let password_editor = make_editor("Password", "", window, cx);
         password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
@@ -297,6 +306,7 @@ impl ConnectionView {
             deprecated: false,
             transaction_idle_minutes: db_client::ConnectionConfig::default()
                 .transaction_idle_minutes,
+            row_stall_editor,
             use_ssh: false,
             ssh_host_editor,
             ssh_port_editor,
@@ -355,6 +365,8 @@ impl ConnectionView {
             String::new()
         };
         let port_editor = make_editor("Port", &port_str, window, cx);
+        let row_stall_editor =
+            make_editor("Seconds", &config.row_stall_seconds.to_string(), window, cx);
         let username_editor = make_editor("Username", &config.username, window, cx);
         let password_editor = make_editor("Password", &config.password, window, cx);
         password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
@@ -448,6 +460,7 @@ impl ConnectionView {
             read_only: config.read_only,
             deprecated: config.deprecated,
             transaction_idle_minutes: config.transaction_idle_minutes,
+            row_stall_editor,
             use_ssh,
             ssh_host_editor,
             ssh_port_editor,
@@ -605,6 +618,17 @@ impl ConnectionView {
         cx.notify();
     }
 
+    /// How long this connection waits between rows, as the reader typed it.
+    ///
+    /// Anything that is not a number falls back to the default rather than to
+    /// no limit at all: a typo should not quietly turn the guard off.
+    fn row_stall_seconds(&self, cx: &App) -> u64 {
+        Self::read_text(&self.row_stall_editor, cx)
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| db_client::ConnectionConfig::default().row_stall_seconds)
+    }
+
     fn read_text(editor: &Entity<Editor>, cx: &App) -> String {
         editor.read(cx).text(cx)
     }
@@ -739,6 +763,7 @@ impl ConnectionView {
                 read_only: self.read_only,
                 deprecated: self.deprecated,
                 transaction_idle_minutes: self.transaction_idle_minutes,
+                row_stall_seconds: self.row_stall_seconds(cx),
             });
         }
 
@@ -803,6 +828,7 @@ impl ConnectionView {
             read_only: self.read_only,
             deprecated: self.deprecated,
             transaction_idle_minutes: self.transaction_idle_minutes,
+            row_stall_seconds: self.row_stall_seconds(cx),
         })
     }
 

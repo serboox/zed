@@ -233,6 +233,13 @@ pub struct MySqlProvider {
     /// is guarded by the same number as one opened through the editor. Two
     /// numbers for the same thing is how a guard ends up meaning nothing.
     transaction_idle_limit: Option<Duration>,
+    /// How long a result may go without a row before this connection gives up
+    /// on it, or nothing where the reader asked for no limit.
+    ///
+    /// The reader's number, not this file's: a warehouse behind a tunnel may
+    /// think for minutes before the first row, and a minute is the right
+    /// answer only for a server that is close.
+    row_stall_limit: Option<Duration>,
 }
 
 /// Bounds how long a silently dead physical connection can stall a caller
@@ -356,6 +363,7 @@ impl MySqlProvider {
             transaction_opened_at: Mutex::new(None),
             current_database: Mutex::new(None),
             transaction_idle_limit: config.transaction_idle_limit(),
+            row_stall_limit: config.row_stall_limit(),
         })
     }
 
@@ -503,7 +511,13 @@ impl MySqlProvider {
             database: String::new(),
         };
         Self::switch_the_held_connection_to(&mut transaction, database).await?;
-        let answer = run_the_statement(&mut transaction.connection, opening_statement, 0).await?;
+        let answer = run_the_statement(
+            &mut transaction.connection,
+            opening_statement,
+            0,
+            self.row_stall_limit,
+        )
+        .await?;
         self.remember_the_transaction_opened(Some(Instant::now()));
         *held = Some(transaction);
         Ok(answer)
@@ -541,7 +555,7 @@ impl MySqlProvider {
             .acquire()
             .await
             .context("Failed to take a connection for the query")?;
-        run_the_statement(&mut connection, sql, pool_wait_ms).await
+        run_the_statement(&mut connection, sql, pool_wait_ms, self.row_stall_limit).await
     }
 
     fn current_pool(&self) -> MySqlPool {
@@ -558,6 +572,44 @@ impl MySqlProvider {
     /// a prompt error instead of a permanent hang. Not used for arbitrary
     /// user SQL or data-affecting DDL, which can legitimately run long and
     /// must not be cut off client-side while still executing server-side.
+    /// Asks the catalogue one question and hands back the answer's second
+    /// column, which is where `SHOW CREATE ...` puts the text.
+    ///
+    /// On a connection of its own when the shared one is busy. This provider
+    /// holds a single physical connection and serialises everything on it, so
+    /// a question asked while a result is still streaming waits for that result
+    /// and then gives up -- and the reader, who only clicked a table to read
+    /// its shape, is told the DDL could not be got. Reading a definition takes
+    /// nothing away from the query that is running, so it does not have to
+    /// queue behind it.
+    async fn show_create(&self, sql: String, failure_context: &'static str) -> Result<String> {
+        let row = match self.op_lock.try_lock() {
+            Some(_guard) => {
+                let pool = self.current_pool();
+                let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&pool);
+                Self::bounded_metadata(query, failure_context).await?
+            }
+            None => {
+                use sqlx::Connection as _;
+                let mut side = Self::bounded_metadata(
+                    sqlx::MySqlConnection::connect_with(&self.connect_options),
+                    failure_context,
+                )
+                .await?;
+                let asked = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&mut side);
+                let row = Self::bounded_metadata(asked, failure_context).await;
+                // Closed here rather than dropped: a connection dropped mid-flight
+                // leaves the server holding it until its own timeout.
+                let _ = side.close().await;
+                row?
+            }
+        };
+        row.try_get::<Vec<u8>, _>(1)
+            .map(bytes_to_string)
+            .or_else(|_| row.try_get::<String, _>(1))
+            .context("Failed to read the definition from the result")
+    }
+
     async fn bounded_metadata<T>(
         future: impl std::future::Future<Output = sqlx::Result<T>>,
         failure_context: &'static str,
@@ -677,6 +729,7 @@ async fn run_the_statement(
     connection: &mut sqlx::MySqlConnection,
     sql: &str,
     pool_wait_ms: u64,
+    row_stall_limit: Option<Duration>,
 ) -> Result<QueryResult> {
     let start = Instant::now();
     let prefixed = format!(
@@ -686,7 +739,7 @@ async fn run_the_statement(
     );
 
     if is_a_read_query(sql) {
-        return stream_the_rows(connection, &prefixed, start, pool_wait_ms).await;
+        return stream_the_rows(connection, &prefixed, start, pool_wait_ms, row_stall_limit).await;
     }
 
     let result = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
@@ -715,11 +768,37 @@ async fn run_the_statement(
 /// capped before the next is read, so a huge result -- many rows, or a single
 /// multi-megabyte BLOB cell -- cannot be pulled into memory all at once and
 /// freeze the client.
+/// The next row, waiting no longer than the connection was told to.
+///
+/// Measured between rows rather than over the whole result: a query that takes
+/// an hour is never cut short as long as rows keep arriving, and only a
+/// connection that has gone quiet trips it. No limit means waiting as long as
+/// it takes, which is what a reader asks for by setting the limit to zero.
+async fn next_row<'a>(
+    stream: &mut (impl futures::Stream<Item = Result<sqlx::mysql::MySqlRow, sqlx::Error>> + Unpin + 'a),
+    row_stall_limit: Option<Duration>,
+) -> Result<Option<sqlx::mysql::MySqlRow>> {
+    let waited = match row_stall_limit {
+        None => stream.try_next().await,
+        Some(limit) => match tokio::time::timeout(limit, stream.try_next()).await {
+            Ok(waited) => waited,
+            Err(_elapsed) => anyhow::bail!(
+                "Query results stopped streaming after {limit:?} — the database \
+                 connection stalled mid-result. Raise or clear \"stop waiting \
+                 for a row after\" in this connection's settings if the server \
+                 needs longer."
+            ),
+        },
+    };
+    waited.context("Query execution failed")
+}
+
 async fn stream_the_rows(
     connection: &mut sqlx::MySqlConnection,
     prefixed: &str,
     start: Instant,
     pool_wait_ms: u64,
+    row_stall_limit: Option<Duration>,
 ) -> Result<QueryResult> {
     let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed)).fetch(&mut *connection);
     let mut columns: Vec<String> = Vec::new();
@@ -734,19 +813,14 @@ async fn stream_the_rows(
         // Bound each row fetch so a connection that goes silently dead
         // mid-result cannot block forever while `op_lock` is held; the guard
         // then drops on return and the next query can reconnect.
-        let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
-            Ok(Ok(Some(row))) => row,
-            Ok(Ok(None)) => {
+        let row = match next_row(&mut stream, row_stall_limit).await? {
+            Some(row) => row,
+            None => {
                 if execute_ms.is_none() {
                     execute_ms = Some(start.elapsed().as_millis() as u64);
                 }
                 break;
             }
-            Ok(Err(error)) => return Err(error).context("Query execution failed"),
-            Err(_elapsed) => anyhow::bail!(
-                "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
-                 the database connection stalled mid-result"
-            ),
         };
         if execute_ms.is_none() {
             execute_ms = Some(start.elapsed().as_millis() as u64);
@@ -838,6 +912,7 @@ async fn stream_into_the_sink(
     connection: &mut sqlx::MySqlConnection,
     sql: &str,
     sink: &mut dyn crate::provider::RowSink,
+    row_stall_limit: Option<Duration>,
 ) -> Result<u64> {
     let prefixed = format!(
         "{}{}",
@@ -858,15 +933,8 @@ async fn stream_into_the_sink(
     let mut row_count: u64 = 0;
 
     loop {
-        // Bounded for the same reason as in `stream_the_rows`.
-        let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
-            Ok(Ok(Some(row))) => row,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => return Err(error).context("Query execution failed"),
-            Err(_elapsed) => anyhow::bail!(
-                "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
-                 the database connection stalled mid-result"
-            ),
+        let Some(row) = next_row(&mut stream, row_stall_limit).await? else {
+            break;
         };
         if columns.is_empty() {
             columns = row
@@ -1508,31 +1576,23 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
-        let _guard = self.op_lock.lock().await;
-        let pool = self.current_pool();
-        let sql = format!(
-            "SHOW CREATE TABLE `{}`.`{}`",
-            database.replace('`', "``"),
-            table.replace('`', "``")
-        );
-        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&pool);
-        let row = Self::bounded_metadata(query, "Failed to get table DDL").await?;
-        row.try_get::<Vec<u8>, _>(1)
-            .map(bytes_to_string)
-            .or_else(|_| row.try_get::<String, _>(1))
-            .context("Failed to read DDL from result")
+        self.show_create(
+            format!(
+                "SHOW CREATE TABLE `{}`.`{}`",
+                database.replace('`', "``"),
+                table.replace('`', "``")
+            ),
+            "Failed to get table DDL",
+        )
+        .await
     }
 
     async fn get_database_ddl(&self, database: &str) -> Result<String> {
-        let _guard = self.op_lock.lock().await;
-        let pool = self.current_pool();
-        let sql = format!("SHOW CREATE DATABASE `{}`", database.replace('`', "``"));
-        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&pool);
-        let row = Self::bounded_metadata(query, "Failed to get database DDL").await?;
-        row.try_get::<Vec<u8>, _>(1)
-            .map(bytes_to_string)
-            .or_else(|_| row.try_get::<String, _>(1))
-            .context("Failed to read database DDL from result")
+        self.show_create(
+            format!("SHOW CREATE DATABASE `{}`", database.replace('`', "``")),
+            "Failed to get database DDL",
+        )
+        .await
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
@@ -1566,7 +1626,8 @@ impl DbProvider for MySqlProvider {
             // the transaction with it, and sending the statement again on a
             // fresh connection would run it outside the transaction the
             // reader still believes they are in.
-            let answer = run_the_statement(&mut transaction.connection, sql, 0).await;
+            let answer =
+                run_the_statement(&mut transaction.connection, sql, 0, self.row_stall_limit).await;
             if effect == WhatItDoesToTheTransaction::Finishes && answer.is_ok() {
                 self.release_the_transaction(&mut held);
             }
@@ -1628,7 +1689,13 @@ impl DbProvider for MySqlProvider {
         // run inside the transaction rather than beside it.
         if let Some(transaction) = held.as_mut() {
             Self::switch_the_held_connection_to(transaction, database).await?;
-            return stream_into_the_sink(&mut transaction.connection, sql, sink).await;
+            return stream_into_the_sink(
+                &mut transaction.connection,
+                sql,
+                sink,
+                self.row_stall_limit,
+            )
+            .await;
         }
         drop(held);
 
@@ -1638,7 +1705,7 @@ impl DbProvider for MySqlProvider {
             .acquire()
             .await
             .context("Failed to take a connection for the export")?;
-        stream_into_the_sink(&mut connection, sql, sink).await
+        stream_into_the_sink(&mut connection, sql, sink, self.row_stall_limit).await
     }
 
     fn holds_transactions(&self) -> bool {
