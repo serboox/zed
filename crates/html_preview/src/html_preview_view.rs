@@ -3059,6 +3059,9 @@ mod tests {
     /// that row comes to has to be a real measurement -- it was reported as
     /// nothing at all once, and the floating controls landed on the back,
     /// forward and reload buttons.
+    ///
+    /// Only a build with an engine has a browser row to measure.
+    #[cfg(feature = "servo")]
     #[gpui::test]
     async fn the_browser_says_how_far_its_own_row_reaches(cx: &mut TestAppContext) {
         let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
