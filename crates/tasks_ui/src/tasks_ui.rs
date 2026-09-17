@@ -6,9 +6,13 @@ use std::{
 use anyhow::Context as _;
 use collections::HashMap;
 use editor::{Editor, MultiBufferOffset, ToPoint as _};
-use gpui::{App, AppContext as _, Context, Entity, Task, TaskExt, Window};
+use gpui::{
+    App, AppContext as _, AsyncWindowContext, Context, Entity, Task, TaskExt, WeakEntity, Window,
+};
 use project::{Location, TaskContexts, TaskSourceKind, Worktree};
-use task::{RevealTarget, TaskContext, TaskId, TaskTemplate, TaskVariables, VariableName};
+use task::{
+    ResolvedTask, RevealTarget, TaskContext, TaskId, TaskTemplate, TaskVariables, VariableName,
+};
 use tree_sitter::{Query, StreamingIterator as _};
 use workspace::Workspace;
 
@@ -158,13 +162,53 @@ pub fn init(cx: &mut App) {
                                 resolved.use_new_terminal = use_new_terminal;
                             }
 
-                            workspace.schedule_resolved_task(
-                                task_source_kind,
-                                last_scheduled_task,
-                                false,
-                                window,
-                                cx,
-                            );
+                            // A rerun keeps the context it was first run in --
+                            // that is what this flag is for -- but the task
+                            // itself is whatever the file says now. The command
+                            // was worked out when the task first ran, so a task
+                            // edited since would otherwise be replayed as it
+                            // used to be: a command the file no longer holds,
+                            // failing with an error that names nothing the
+                            // reader can find.
+                            let task_contexts = task_contexts(workspace, window, cx);
+                            cx.spawn_in(window, async move |workspace, cx| {
+                                let task_contexts = task_contexts.await;
+                                let stale = is_stale(
+                                    &workspace,
+                                    &task_source_kind,
+                                    &last_scheduled_task,
+                                    &task_contexts,
+                                    cx,
+                                )
+                                .await
+                                .unwrap_or(None);
+
+                                workspace
+                                    .update_in(cx, |workspace, window, cx| match stale {
+                                        Some(current) => {
+                                            let default_context = TaskContext::default();
+                                            workspace.schedule_task(
+                                                task_source_kind,
+                                                &current,
+                                                task_contexts
+                                                    .active_context()
+                                                    .unwrap_or(&default_context),
+                                                false,
+                                                window,
+                                                cx,
+                                            )
+                                        }
+                                        None => workspace.schedule_resolved_task(
+                                            task_source_kind,
+                                            last_scheduled_task,
+                                            false,
+                                            window,
+                                            cx,
+                                        ),
+                                    })
+                                    .ok()
+                            })
+                            .detach();
                         }
                     } else {
                         spawn_task_or_modal(
@@ -355,6 +399,58 @@ where
     })
 }
 
+/// The task's current definition, when the file no longer says what it said
+/// the last time this task ran.
+///
+/// `None` means there is nothing to update: the definition is unchanged, or it
+/// is not in any file at all -- a one-off command has no template to go back
+/// to, and replaying it is the only thing a rerun can mean.
+///
+async fn is_stale(
+    workspace: &WeakEntity<Workspace>,
+    source: &TaskSourceKind,
+    last: &ResolvedTask,
+    contexts: &TaskContexts,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<Option<TaskTemplate>> {
+    let worktree = contexts.worktree();
+    let listing = workspace.update(cx, |workspace, cx| {
+        workspace
+            .project()
+            .read(cx)
+            .task_store()
+            .read(cx)
+            .task_inventory()
+            .map(|inventory| inventory.read(cx).list_tasks(None, None, worktree, cx))
+    })?;
+    let Some(listing) = listing else {
+        return Ok(None);
+    };
+
+    Ok(newer_definition_of(
+        last.original_task(),
+        source,
+        listing.await,
+    ))
+}
+
+/// The same task as the file holds it now, when that is not what it held then.
+///
+/// Matched by label within the same source, because a template's id is a hash
+/// of the template itself: the moment it is edited it stops being findable by
+/// the id the old run recorded.
+fn newer_definition_of(
+    was: &TaskTemplate,
+    source: &TaskSourceKind,
+    listing: impl IntoIterator<Item = (TaskSourceKind, TaskTemplate)>,
+) -> Option<TaskTemplate> {
+    listing
+        .into_iter()
+        .find(|(kind, template)| kind == source && template.label == was.label)
+        .map(|(_, template)| template)
+        .filter(|template| template != was)
+}
+
 pub fn task_contexts(
     workspace: &Workspace,
     window: &mut Window,
@@ -478,6 +574,58 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
+
+    /// A rerun replays the command it worked out the first time, so a task
+    /// edited since would run as it used to -- a command the file no longer
+    /// holds, failing with an error naming nothing the reader can find.
+    #[test]
+    fn a_rerun_notices_the_file_has_changed() {
+        use task::TaskTemplate;
+
+        let was = TaskTemplate {
+            label: "Run API".to_string(),
+            command: "with-env".to_string(),
+            args: vec![],
+            ..TaskTemplate::default()
+        };
+        let now = TaskTemplate {
+            args: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p bin".to_string(),
+            ],
+            ..was.clone()
+        };
+        // Two sources that are cheap to name; which two does not matter, only
+        // that a task from one is not a task from the other.
+        let project = super::TaskSourceKind::AbsPath {
+            id_base: "local tasks.json".into(),
+            abs_path: std::path::PathBuf::from("/project/.zed/tasks.json"),
+        };
+        let elsewhere = super::TaskSourceKind::UserInput;
+
+        assert_eq!(
+            super::newer_definition_of(&was, &project, [(project.clone(), now.clone())]),
+            Some(now.clone()),
+            "the file gained the arguments and the rerun kept the old command"
+        );
+        assert_eq!(
+            super::newer_definition_of(&was, &project, [(project.clone(), was.clone())]),
+            None,
+            "nothing changed, so there is nothing to re-resolve"
+        );
+        assert_eq!(
+            super::newer_definition_of(&was, &project, [(elsewhere, now.clone())]),
+            None,
+            "a task of the same name from somewhere else is a different task"
+        );
+        assert_eq!(
+            super::newer_definition_of(&was, &project, []),
+            None,
+            "a one-off command has no file to go back to; replaying it is all a \
+             rerun can mean"
+        );
+    }
 
     use editor::{Editor, MultiBufferOffset, SelectionEffects};
     use gpui::TestAppContext;
