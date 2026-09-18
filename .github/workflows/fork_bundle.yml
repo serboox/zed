@@ -93,8 +93,26 @@ jobs:
     name: Run the whole suite
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # The suite's own build is what fills a runner's disk: every test binary
+      # of a 200-crate workspace carries debug info nobody here reads, and the
+      # run died writing its own log with "No space left on device". Nothing in
+      # this job debugs a test, so none of it is built.
+      CARGO_PROFILE_DEV_DEBUG: "false"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "false"
     steps:
       - uses: actions/checkout@v4
+      # A runner arrives with tens of gigabytes of toolchains for languages this
+      # editor is not written in. They are worth more as free space.
+      - name: Make room for the build
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Install the editor's build dependencies
         run: script/linux
       - uses: ./.github/actions/run_tests
