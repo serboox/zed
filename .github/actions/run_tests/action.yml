@@ -18,4 +18,18 @@ runs:
 
     - name: Run tests
       shell: bash -euxo pipefail {0}
-      run: cargo nextest run --workspace --no-fail-fast --failure-output immediate-final
+      # Kept as a file as well as printed: this job's log is not always
+      # retrievable afterwards, and a red run whose reason cannot be read is a
+      # red run nobody can fix.
+      run: |
+        set -o pipefail
+        cargo nextest run --workspace --no-fail-fast \
+          --failure-output immediate-final 2>&1 | tee nextest.log
+
+    - name: Keep what the run said
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nextest-log
+        path: nextest.log
+        retention-days: 7
