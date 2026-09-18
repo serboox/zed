@@ -2396,6 +2396,18 @@ impl Window {
         self.platform_window.start_file_drag(paths)
     }
 
+    /// Says that what this window will do with the files now being dragged over
+    /// it is take them, so whoever is dragging them should let go of the
+    /// originals once the drop is done -- a move rather than a copy.
+    ///
+    /// Only for a drop that really does take the file somewhere else. A drop
+    /// that merely reads a path -- typing it into a terminal, opening the file
+    /// where it lies -- leaves the file where it is, and saying otherwise here
+    /// would have it deleted out from under the reader.
+    pub fn take_external_drag_as_move(&self) {
+        self.platform_window.take_external_drag_as_move();
+    }
+
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);

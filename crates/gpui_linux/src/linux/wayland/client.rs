@@ -318,6 +318,14 @@ pub(crate) struct WaylandClientState {
     /// with yet. Kept here rather than on the data source, because the source
     /// only ever hands back the mime type it is being asked for.
     dragged_files: Vec<PathBuf>,
+    /// What the desktop settled on doing with that drag. A move is only carried
+    /// out once the drop is finished, and it is this client that carries it out:
+    /// whoever took the files has copied them, and removing the originals is
+    /// what turns that copy into a move.
+    dragged_action: DndAction,
+    /// The picture the desktop carries under the pointer, and what backs it. It
+    /// has to outlive the drag, so it is held here and let go when the drag ends.
+    drag_icon: Option<DragIcon>,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
@@ -361,6 +369,125 @@ pub(crate) struct WaylandClientState {
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
+}
+
+/// How wide and tall the drag picture is, in the buffer's own pixels. It is
+/// shown at half that, so it stays sharp on a screen that doubles everything
+/// and is merely smooth on one that does not.
+const DRAG_ICON_SIZE: i32 = 128;
+const DRAG_ICON_SCALE: i32 = 2;
+
+/// The picture the desktop carries under the pointer: a page, and a second one
+/// behind it when more than one file is being carried.
+///
+/// Drawn here rather than taken from an icon theme because this is the only
+/// place in the client that draws anything at all, and one page is what every
+/// desktop draws for a file. `wl_shm` wants premultiplied ARGB in native order,
+/// which for the colours below -- all fully opaque -- is the colour as written.
+fn drag_icon_pixels(count: usize) -> Vec<u8> {
+    const INK: u32 = 0xff30_3642;
+    const PAPER: u32 = 0xffe8_ecf2;
+    const BEHIND: u32 = 0xffb9_c1cd;
+    const FOLD: u32 = 0xffc3_cad4;
+
+    let side = DRAG_ICON_SIZE as usize;
+    let mut pixels = vec![0u32; side * side];
+    let mut page = |left: i32, top: i32, right: i32, bottom: i32, fill: u32, fold: bool| {
+        for y in top.max(0)..bottom.min(DRAG_ICON_SIZE) {
+            for x in left.max(0)..right.min(DRAG_ICON_SIZE) {
+                let edge = x < left + 2 || x >= right - 2 || y < top + 2 || y >= bottom - 2;
+                // The top right corner is folded away, and the fold itself is
+                // what tells a page from a plain rectangle.
+                let corner = right - x + (y - top);
+                let folded = fold && corner > (right - left) && corner <= (right - left) + 26;
+                let at = y as usize * side + x as usize;
+                pixels[at] = match (folded, edge) {
+                    (true, _) if corner <= (right - left) + 4 => 0,
+                    (true, _) => FOLD,
+                    (_, true) => INK,
+                    _ => fill,
+                };
+            }
+        }
+    };
+    if count > 1 {
+        page(20, 26, 96, 116, BEHIND, false);
+    }
+    page(32, 12, 108, 102, PAPER, true);
+
+    pixels
+        .into_iter()
+        .flat_map(|pixel| pixel.to_ne_bytes())
+        .collect()
+}
+
+/// An anonymous file holding `bytes`, for the compositor to read the drag
+/// picture out of. It lives as long as the descriptor does.
+fn a_file_holding(bytes: &[u8]) -> Option<std::fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::fd::FromRawFd;
+
+    let name = c"zed-drag-icon";
+    // Safety: the name is a valid C string and the descriptor returned is ours.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if fd < 0 {
+        return None;
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes).ok()?;
+    file.flush().ok()?;
+    file.rewind().ok()?;
+    Some(file)
+}
+
+/// The picture for a drag of `count` files, ready to be handed to the
+/// compositor. Nothing comes back when the memory for it cannot be had, and the
+/// drag then goes ahead without a picture rather than not at all.
+fn drag_icon_for(globals: &Globals, count: usize) -> Option<DragIcon> {
+    use std::os::fd::AsFd;
+
+    let pixels = drag_icon_pixels(count);
+    let file = a_file_holding(&pixels)?;
+    let pool = globals
+        .shm
+        .create_pool(file.as_fd(), pixels.len() as i32, &globals.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        DRAG_ICON_SIZE,
+        DRAG_ICON_SIZE,
+        DRAG_ICON_SIZE * 4,
+        wl_shm::Format::Argb8888,
+        &globals.qh,
+        (),
+    );
+    let surface = globals.compositor.create_surface(&globals.qh, ());
+    if surface.version() >= 3 {
+        surface.set_buffer_scale(DRAG_ICON_SCALE);
+    }
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage(0, 0, DRAG_ICON_SIZE, DRAG_ICON_SIZE);
+    surface.commit();
+    Some(DragIcon {
+        surface,
+        buffer,
+        pool,
+    })
+}
+
+/// The surface the compositor draws under the pointer during a drag this window
+/// started, and the memory it is drawn in.
+pub struct DragIcon {
+    surface: wl_surface::WlSurface,
+    buffer: wl_buffer::WlBuffer,
+    pool: wl_shm_pool::WlShmPool,
+}
+
+impl DragIcon {
+    fn let_go(self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+        self.surface.destroy();
+    }
 }
 
 pub struct DragState {
@@ -440,17 +567,54 @@ impl WaylandClientStatePtr {
         };
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         state.dragged_files = paths.to_vec();
+        state.dragged_action = DndAction::empty();
         let data_source = data_device_manager.create_data_source(&state.globals.qh, DraggedOut);
         data_source.offer(FILE_LIST_MIME_TYPE.to_string());
         data_source.offer(GNOME_COPIED_FILES_MIME_TYPE.to_string());
         // Saying which actions are on offer is only part of the protocol from
         // version three; an older compositor works out the action itself, and
         // asking it here would be a protocol error rather than a refusal.
+        //
+        // Both are offered, and which one happens is the desktop's to decide the
+        // way it decides between two file manager windows: a file dragged
+        // somewhere else is moved there, and holding the key that means "copy"
+        // copies it instead.
         if data_source.version() >= 3 {
-            data_source.set_actions(DndAction::Copy);
+            data_source.set_actions(DndAction::Copy | DndAction::Move);
         }
-        data_device.start_drag(Some(&data_source), surface, None, serial);
+
+        let icon = drag_icon_for(&state.globals, paths.len());
+        data_device.start_drag(
+            Some(&data_source),
+            surface,
+            icon.as_ref().map(|icon| &icon.surface),
+            serial,
+        );
+        if let Some(icon) = icon
+            && let Some(gone) = state.drag_icon.replace(icon)
+        {
+            gone.let_go();
+        }
         true
+    }
+
+    /// Says that what this window is about to do with the drag over it amounts
+    /// to taking the files, so whoever started the drag lets go of the originals
+    /// once it is done.
+    ///
+    /// Said again for every step of the drag: what is under the pointer changes
+    /// as it moves, and only some of what it passes over takes the file.
+    pub fn take_external_drag_as_move(&self) {
+        let Some(client) = self.0.upgrade() else {
+            return;
+        };
+        let state = client.borrow();
+        let Some(offer) = state.drag.data_offer.as_ref() else {
+            return;
+        };
+        if offer.version() >= 3 {
+            offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Move);
+        }
     }
 
     pub fn set_pending_activation(&self, window: ObjectId) {
@@ -822,6 +986,8 @@ impl WaylandClient {
             cursor_shape_device: None,
             data_device,
             dragged_files: Vec::new(),
+            dragged_action: DndAction::empty(),
+            drag_icon: None,
             primary_selection,
             text_input: None,
             pre_edit_text: None,
@@ -2501,8 +2667,11 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         return;
                     };
 
-                    const ACTIONS: DndAction = DndAction::Copy;
-                    data_offer.set_actions(ACTIONS, ACTIONS);
+                    // Copy until something in the window says it is taking the
+                    // files rather than reading them. Most drops only read a
+                    // path, and a window that asked for a move by default would
+                    // have the file deleted out from under whoever dropped it.
+                    data_offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
 
                     let pipe = Pipe::new().unwrap();
                     data_offer.receive(FILE_LIST_MIME_TYPE.to_string(), unsafe {
@@ -2572,6 +2741,15 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 };
                 let position = Point::new(x.into(), y.into());
                 state.drag.position = position;
+                // Back to a copy before the window is told where the pointer is.
+                // Whatever is under it now says otherwise while handling that,
+                // if what it does is take the file; what the pointer has left
+                // behind no longer gets a say.
+                if let Some(offer) = state.drag.data_offer.as_ref()
+                    && offer.version() >= 3
+                {
+                    offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
+                }
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Pending { position });
                 drop(state);
@@ -2670,11 +2848,45 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
                 let paths = state.dragged_files.clone();
                 state.clipboard.send_paths(&mime_type, &paths, fd);
             }
-            // Either the drop landed somewhere and that application has taken
-            // what it wanted, or nothing accepted it. The drag is over both ways,
-            // and what it carried is no longer anybody's.
-            wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled => {
+            // What the desktop settled on. It can change while the drag is in
+            // flight -- the key that means "copy" is held or let go -- so the
+            // last word before the drop is the one that counts.
+            wl_data_source::Event::Action { dnd_action } => {
+                state.dragged_action = dnd_action.into_result().unwrap_or(DndAction::empty());
+            }
+            // The drop landed and whoever took it has finished reading. A move
+            // is only half done at this point: the files have been copied to
+            // wherever they went, and removing the originals is what makes it a
+            // move rather than a copy. That is the source's to do, and the
+            // source is this window.
+            wl_data_source::Event::DndFinished => {
+                let moving = state.dragged_action.contains(DndAction::Move);
+                let paths = std::mem::take(&mut state.dragged_files);
+                if let Some(icon) = state.drag_icon.take() {
+                    icon.let_go();
+                }
+                if moving && !paths.is_empty() {
+                    state
+                        .common
+                        .background_executor
+                        .spawn(async move {
+                            for path in paths {
+                                std::fs::remove_file(&path)
+                                    .or_else(|_| std::fs::remove_dir_all(&path))
+                                    .log_err();
+                            }
+                        })
+                        .detach();
+                }
+                data_source.destroy();
+            }
+            // Nothing took it. Nothing is removed either.
+            wl_data_source::Event::Cancelled => {
                 state.dragged_files.clear();
+                state.dragged_action = DndAction::empty();
+                if let Some(icon) = state.drag_icon.take() {
+                    icon.let_go();
+                }
                 data_source.destroy();
             }
             _ => {}

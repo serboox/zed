@@ -40,6 +40,8 @@ pub(crate) struct TestWindowState {
     /// Stands for a platform that cannot start a drag of its own, which is what
     /// every platform gpui does not implement one for does.
     pub(crate) refuse_file_drags: bool,
+    /// Whether this window last said it takes the files dragged over it.
+    pub(crate) drag_taken_as_move: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +96,7 @@ impl TestWindow {
             is_fullscreen: false,
             dragged_out: Vec::new(),
             refuse_file_drags: false,
+            drag_taken_as_move: false,
         })))
     }
 
@@ -340,6 +343,10 @@ impl PlatformWindow for TestWindow {
 
     fn start_window_move(&self) {
         unimplemented!()
+    }
+
+    fn take_external_drag_as_move(&self) {
+        self.0.lock().drag_taken_as_move = true;
     }
 
     fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {

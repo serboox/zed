@@ -885,6 +885,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn start_file_drag(&self, _paths: &[std::path::PathBuf]) -> bool {
         false
     }
+    /// Says that whatever this window does with the drag now over it amounts to
+    /// taking the files, so whoever started the drag should let go of the
+    /// originals once it is done. A platform that cannot say this drops the
+    /// request, and the drag stays a copy.
+    fn take_external_drag_as_move(&self) {}
     fn start_window_resize(&self, _edge: ResizeEdge) {}
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]

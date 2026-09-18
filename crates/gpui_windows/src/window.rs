@@ -113,6 +113,9 @@ pub(crate) struct WindowsWindowInner {
     /// for it: the editor's own state is held open across it and every redraw
     /// in the meantime would find it so.
     pending_file_drag: RefCell<Vec<std::path::PathBuf>>,
+    /// Whether what this window will do with the drag over it amounts to taking
+    /// the files. Answered again for every step of the drag.
+    takes_the_drag: Cell<bool>,
 }
 
 impl WindowsWindowState {
@@ -285,6 +288,7 @@ impl WindowsWindowInner {
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
             pending_file_drag: RefCell::new(Vec::new()),
+            takes_the_drag: Cell::new(false),
         }))
     }
 
@@ -650,7 +654,24 @@ fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
         std::mem::forget(global);
         // No drop source of our own: without one the shell uses the standard
         // one, which is how every other application's drags already behave.
-        SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY)?;
+        //
+        // Both are offered, the way Explorer offers both: where it lands decides,
+        // and the key that means "copy" is how a reader asks for the other.
+        let taken = SHDoDragDrop(
+            Some(hwnd),
+            &data,
+            None::<&IDropSource>,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+        )?;
+        // A move is only half done here -- the files have been copied to wherever
+        // they went -- and letting go of the originals is what makes it a move.
+        if taken.0 & DROPEFFECT_MOVE.0 != 0 {
+            for path in paths {
+                std::fs::remove_file(path)
+                    .or_else(|_| std::fs::remove_dir_all(path))
+                    .log_err();
+            }
+        }
     }
     Ok(())
 }
@@ -1082,6 +1103,10 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    fn take_external_drag_as_move(&self) {
+        self.0.takes_the_drag.set(true);
+    }
+
     fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
         if paths.is_empty() {
             return false;
@@ -1215,6 +1240,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if idata_obj.QueryGetData(&config as _) == S_OK {
+                // A drag that has only just arrived has not been over anything
+                // yet; the step that follows says whether this window takes it.
                 *pdweffect = DROPEFFECT_COPY;
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());
@@ -1263,11 +1290,6 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
-            self.0
-                .drop_target_helper
-                .DragOver(&cursor_position, *pdweffect)
-                .log_err();
             ScreenToClient(self.0.hwnd, &mut cursor_position)
                 .ok()
                 .log_err();
@@ -1280,7 +1302,23 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 scale_factor,
             ),
         });
+        // Asked again for every step: what is under the pointer changes as it
+        // moves, and only some of what it passes over takes the file. Whatever
+        // is under it now says so while handling this.
+        self.0.takes_the_drag.set(false);
         self.handle_drag_drop(input);
+        let effect = match self.0.takes_the_drag.get() {
+            true => DROPEFFECT_MOVE,
+            false => DROPEFFECT_COPY,
+        };
+        unsafe {
+            *pdweffect = effect;
+            let screen_position = POINT { x: pt.x, y: pt.y };
+            self.0
+                .drop_target_helper
+                .DragOver(&screen_position, effect)
+                .log_err();
+        }
 
         Ok(())
     }
@@ -1305,7 +1343,12 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            // Whatever the last step over this window settled on is what the
+            // drop does, so the source knows whether to let go of the original.
+            *pdweffect = match self.0.takes_the_drag.get() {
+                true => DROPEFFECT_MOVE,
+                false => DROPEFFECT_COPY,
+            };
             self.0
                 .drop_target_helper
                 .Drop(idata_obj, &cursor_position, *pdweffect)

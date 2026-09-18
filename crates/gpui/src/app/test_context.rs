@@ -818,6 +818,12 @@ impl VisualTestContext {
         self.cx.test_window(self.window).0.lock().refuse_file_drags = true;
     }
 
+    /// Whether this window has said that what it does with the files dragged
+    /// over it amounts to taking them.
+    pub fn drag_taken_as_move(&self) -> bool {
+        self.cx.test_window(self.window).0.lock().drag_taken_as_move
+    }
+
     /// Simulate a mouse move event to the given point
     pub fn simulate_mouse_move(
         &mut self,

@@ -109,6 +109,8 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+#[allow(non_upper_case_globals)]
+const NSDragOperationMove: NSDragOperation = 16;
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -450,6 +452,10 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             dragging_source_operation_mask
                 as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
         );
+        decl.add_method(
+            sel!(draggingSession:endedAtPoint:operation:),
+            dragging_session_ended as extern "C" fn(&Object, Sel, id, NSPoint, NSUInteger),
+        );
 
         decl.add_method(
             sel!(addTitlebarAccessoryViewController:),
@@ -528,6 +534,12 @@ struct MacWindowState {
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
+    /// The files this window handed to the desktop, kept until the drag ends so
+    /// that a move can let go of the originals.
+    dragged_out: Vec<std::path::PathBuf>,
+    /// Whether what this window will do with the drag over it amounts to taking
+    /// the files. Answered again for every step of the drag.
+    takes_the_drag: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
     // When true, the whole content view is reported as app-owned titlebar content via
@@ -933,6 +945,8 @@ impl MacWindow {
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 external_files_dragged: false,
+                dragged_out: Vec::new(),
+                takes_the_drag: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
@@ -1864,8 +1878,9 @@ impl PlatformWindow for MacWindow {
         if paths.is_empty() {
             return false;
         }
-        let this = self.0.lock();
+        let mut this = self.0.lock();
         let window = this.native_window;
+        this.dragged_out = paths.to_vec();
         drop(this);
 
         unsafe {
@@ -1929,6 +1944,10 @@ impl PlatformWindow for MacWindow {
             ];
             session != nil
         }
+    }
+
+    fn take_external_drag_as_move(&self) {
+        self.0.lock().takes_the_drag = true;
     }
 
     fn play_system_bell(&self) {
@@ -3010,6 +3029,17 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
     point(px(window_x as f32), px(window_y as f32))
 }
 
+/// What this window will do with the drag over it: take the files, or merely
+/// read where they are.
+fn what_this_window_does_with_a_drag(this: &Object) -> NSDragOperation {
+    let window_state = unsafe { get_window_state(this) };
+    let takes = window_state.as_ref().lock().takes_the_drag;
+    match takes {
+        true => NSDragOperationMove,
+        false => NSDragOperationCopy,
+    }
+}
+
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
@@ -3017,7 +3047,7 @@ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDr
     if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
         && send_file_drop_event(window_state, event)
     {
-        return NSDragOperationCopy;
+        return what_this_window_does_with_a_drag(this);
     }
     NSDragOperationNone
 }
@@ -3026,23 +3056,51 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
     if send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
-        NSDragOperationCopy
+        what_this_window_does_with_a_drag(this)
     } else {
         NSDragOperationNone
     }
 }
 
-/// What a drag started by this window allows wherever it is being carried. It
-/// is the same answer inside the application and outside it: a file dragged out
-/// of the editor is copied, never moved, because moving it would be a change to
-/// the project nobody asked for.
+/// What a drag started by this window allows wherever it is being carried.
+/// Both, the way one file manager window allows both to another: where it lands
+/// decides, and the key that means "copy" is how a reader asks for the other.
 extern "C" fn dragging_source_operation_mask(
     _: &Object,
     _: Sel,
     _: id,
     _context: NSInteger,
 ) -> NSDragOperation {
-    NSDragOperationCopy
+    NSDragOperationCopy | NSDragOperationMove
+}
+
+/// The drag this window started is over. A move is only half done here -- the
+/// files have been copied to wherever they went -- and letting go of the
+/// originals is what makes it a move.
+extern "C" fn dragging_session_ended(
+    this: &Object,
+    _: Sel,
+    _: id,
+    _: NSPoint,
+    operation: NSUInteger,
+) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    let paths = std::mem::take(&mut lock.dragged_out);
+    let executor = lock.background_executor.clone();
+    drop(lock);
+    if operation & NSDragOperationMove == 0 || paths.is_empty() {
+        return;
+    }
+    executor
+        .spawn(async move {
+            for path in paths {
+                std::fs::remove_file(&path)
+                    .or_else(|_| std::fs::remove_dir_all(&path))
+                    .log_err();
+            }
+        })
+        .detach();
 }
 
 extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
@@ -3114,6 +3172,10 @@ fn send_file_drop_event(
     };
 
     let mut lock = window_state.lock();
+    // Asked again for every step: what is under the pointer changes as it moves,
+    // and only some of what it passes over takes the file. Whatever answers this
+    // step says so while the event is being handled, below.
+    lock.takes_the_drag = false;
     if let Some(mut callback) = lock.event_callback.take() {
         drop(lock);
         callback(PlatformInput::FileDrop(file_drop_event));

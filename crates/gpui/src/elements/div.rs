@@ -5126,6 +5126,56 @@ mod tests {
         );
     }
 
+    /// A drop target that takes the file has to be able to say so, or whoever
+    /// is dragging it keeps the original and the file is copied where it was
+    /// meant to be moved.
+    #[gpui::test]
+    async fn a_drop_target_can_say_it_takes_the_file(cx: &mut TestAppContext) {
+        struct TakesFiles;
+
+        impl Render for TakesFiles {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().on_drag_move::<crate::ExternalPaths>(
+                    |_: &DragMoveEvent<crate::ExternalPaths>, window, _| {
+                        window.take_external_drag_as_move();
+                    },
+                )
+            }
+        }
+
+        let (_view, mut cx) = cx.add_window_view(|_, _| TakesFiles);
+        cx.simulate_resize(size(px(400.), px(300.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !cx.drag_taken_as_move(),
+            "nothing has been dragged over the window yet"
+        );
+
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        cx.simulate_event(crate::FileDropEvent::Entered {
+            position: point(px(40.), px(40.)),
+            paths: crate::ExternalPaths(smallvec::smallvec![file]),
+        });
+        cx.simulate_event(crate::FileDropEvent::Pending {
+            position: point(px(60.), px(60.)),
+        });
+
+        assert!(
+            cx.drag_taken_as_move(),
+            "the window said it takes the file, so whoever is dragging it should \
+             let go of the original"
+        );
+    }
+
     /// A drag that means nothing outside this window -- a tab being reordered --
     /// must go on meaning what it meant when it is carried off the edge, rather
     /// than becoming a drag of no files at all.

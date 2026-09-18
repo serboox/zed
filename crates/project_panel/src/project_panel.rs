@@ -6149,7 +6149,10 @@ impl ProjectPanel {
 
                     this.on_drag_files(files_of_this_drag)
                         .on_drag_move::<ExternalPaths>(cx.listener(
-                            move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                            move |this, event: &DragMoveEvent<ExternalPaths>, window, cx| {
+                                // Dropping here takes the file into the project,
+                                // so wherever it came from should let go of it.
+                                window.take_external_drag_as_move();
                                 let is_current_target =
                                     this.drag_target_entry
                                         .as_ref()
@@ -7755,11 +7758,14 @@ impl Render for ProjectPanel {
                                     |div| div.bg(cx.theme().colors().drop_target_background),
                                 )
                                 .on_drag_move::<ExternalPaths>(cx.listener(
-                                    move |this, event: &DragMoveEvent<ExternalPaths>, _, _| {
+                                    move |this, event: &DragMoveEvent<ExternalPaths>, window, _| {
                                         let Some(_last_root_id) = this.state.last_worktree_root_id
                                         else {
                                             return;
                                         };
+                                        // Dropping below the last entry puts the
+                                        // file in the project too.
+                                        window.take_external_drag_as_move();
                                         if event.bounds.contains(&event.event.position) {
                                             this.drag_target_entry = Some(DragTarget::Background);
                                         } else {

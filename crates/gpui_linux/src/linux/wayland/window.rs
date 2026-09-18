@@ -1779,6 +1779,10 @@ impl PlatformWindow for WaylandWindow {
         state.client.start_file_drag(&state.surface, paths)
     }
 
+    fn take_external_drag_as_move(&self) {
+        self.borrow().client.take_external_drag_as_move();
+    }
+
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {
