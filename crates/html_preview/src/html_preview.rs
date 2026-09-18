@@ -1,3 +1,11 @@
+// A build without the HTML engine still compiles the browser this crate is
+// built around -- its menus, its navigation, what it asks a page about --
+// but nothing in that build ever calls any of it. That is the point of the
+// feature, not an oversight, and gating each of the forty items one at a
+// time would say the same thing forty times and drift the first time one
+// moved.
+#![cfg_attr(not(feature = "servo"), allow(dead_code))]
+
 use gpui::{App, actions};
 use workspace::Workspace;
 

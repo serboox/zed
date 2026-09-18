@@ -1299,6 +1299,16 @@ async fn test_remote_code_lens_resolve(cx: &mut TestAppContext, server_cx: &mut 
         .unwrap();
     cx.run_until_parked();
 
+    // The lens comes from the server, so the server has to be up before the
+    // editor asks. Opening the buffer starts one, but the menu is opened a
+    // few steps later and would read the empty answer cached before it was.
+    server_cx.update_entity(&headless, |headless, cx| {
+        headless.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.restart_all_language_servers(cx);
+        });
+    });
+    cx.run_until_parked();
+
     let cx = cx.add_empty_window();
     let workspace = cx.new_window_entity(|window, cx| {
         workspace::Workspace::test_new(project.clone(), window, cx)
@@ -1315,6 +1325,12 @@ async fn test_remote_code_lens_resolve(cx: &mut TestAppContext, server_cx: &mut 
             s.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
         });
     });
+    cx.executor()
+        .advance_clock(editor::CODE_ACTIONS_DEBOUNCE_TIMEOUT * 2);
+    cx.run_until_parked();
+    // The lens is fetched from a server on the other side of the connection,
+    // and the round trip does not finish inside the first debounce. One more
+    // is what the menu waits for.
     cx.executor()
         .advance_clock(editor::CODE_ACTIONS_DEBOUNCE_TIMEOUT * 2);
     cx.run_until_parked();
@@ -3754,6 +3770,22 @@ pub async fn init_test(
             false,
             cx,
         )
+    });
+
+    // The language servers of a remote project are started on this side, and
+    // this editor starts none until it is asked to. The suite's own settings
+    // turn that back on for the tests, but they only reach the client -- the
+    // headless app builds its store from the shipped defaults. Without this a
+    // test that opens a buffer and waits for its server waits for ever.
+    server_cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "global_lsp_settings": { "start": "automatically" } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
     });
 
     let ssh = RemoteClient::connect_mock(opts, cx).await;

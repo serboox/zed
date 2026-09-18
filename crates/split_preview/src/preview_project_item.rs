@@ -365,6 +365,12 @@ mod tests {
         cx: &'a mut TestAppContext,
     ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
         let app_state = cx.update(|cx| {
+            // A database of this test's own. Without one every test in this
+            // binary writes to the same fallback connection, and since they run
+            // beside each other, one test's workspace row is gone by the time
+            // another saves a tab against it -- which comes back as a foreign
+            // key failure in whichever test lost the race.
+            cx.set_global(db::AppDatabase::test_new());
             let app_state = AppState::test(cx);
             editor::init(cx);
             crate::init(cx);
@@ -385,8 +391,19 @@ mod tests {
             .insert_tree(path!("/project"), serde_json::Value::Object(tree))
             .await;
         let project = Project::test(app_state.fs.clone(), [path!("/project").as_ref()], cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let (multi, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        // The session's record of a tab points at the session's record of its
+        // window, so the window has to be written down before any tab in it can
+        // be. A workspace built in a test has not been written down yet.
+        let flushing = multi.update_in(cx, |multi, window, cx| {
+            multi.flush_all_serialization(window, cx)
+        });
+        for task in flushing {
+            task.await;
+        }
         (workspace, cx)
     }
 
@@ -624,6 +641,8 @@ mod tests {
         &'a mut VisualTestContext,
     ) {
         let app_state = cx.update(|cx| {
+            // A database of this test's own; see the note in `workspace_with`.
+            cx.set_global(db::AppDatabase::test_new());
             let app_state = AppState::test(cx);
             editor::init(cx);
             crate::init(cx);
@@ -675,6 +694,22 @@ mod tests {
         split: &Entity<SplitPreviewView>,
         cx: &mut VisualTestContext,
     ) -> (WorkspaceId, u64, Entity<Project>) {
+        // The session's record of a tab points at the session's record of its
+        // window, so the window has to be written down before any tab in it can
+        // be. A window built in a test has not been written down until something
+        // in it asks to be.
+        let multi = cx.windows()[0]
+            .downcast::<workspace::MultiWorkspace>()
+            .expect("the window holds a workspace");
+        let flushing = multi
+            .update(cx, |multi, window, cx| {
+                multi.flush_all_serialization(window, cx)
+            })
+            .expect("the window is open");
+        for task in flushing {
+            task.await;
+        }
+
         let (saving, workspace_id, item_id, project) =
             workspace.update_in(cx, |workspace, window, cx| {
                 let workspace_id = workspace.database_id().expect("a database id");

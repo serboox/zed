@@ -324,6 +324,23 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(
     .await;
 
     let project = Project::test(fs.clone(), [path!("/workspace1").as_ref()], cx).await;
+    // A worktree nobody has vouched for is not read for what it says to run:
+    // `.zed/debug.json` is the project telling the editor to start a program,
+    // and that answer is withheld until the worktree is trusted.
+    project.update(cx, |project, cx| {
+        let worktree_store = project.worktree_store();
+        let worktrees = worktree_store
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| project::trusted_worktrees::PathTrust::Worktree(worktree.read(cx).id()))
+            .collect::<collections::HashSet<_>>();
+        if let Some(trusted) = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx) {
+            trusted.update(cx, |trusted, cx| {
+                trusted.trust(&worktree_store, worktrees, cx)
+            });
+        }
+    });
+    cx.run_until_parked();
 
     let workspace = init_test_workspace(&project, cx).await;
     let cx = &mut VisualTestContext::from_window(*workspace, cx);

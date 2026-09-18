@@ -49,12 +49,16 @@ impl PanelLayout {
         git_panel_dock: Some(DockPosition::Right),
     };
 
+    /// Where the panels stand out of the box. The two presets differ in where
+    /// the agent, the tree and the outline sit; the panels nobody arranges a
+    /// window around -- collaboration and git -- stay on the right in both, so
+    /// choosing a layout does not move what the reader never asked about.
     const EDITOR: Self = Self {
         agent_dock: Some(DockPosition::Right),
         project_panel_dock: Some(DockSide::Left),
         outline_panel_dock: Some(DockSide::Left),
-        collaboration_panel_dock: Some(DockPosition::Left),
-        git_panel_dock: Some(DockPosition::Left),
+        collaboration_panel_dock: Some(DockPosition::Right),
+        git_panel_dock: Some(DockPosition::Right),
     };
 
     pub fn is_agent_layout(&self) -> bool {
@@ -1589,27 +1593,28 @@ mod tests {
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
 
-        // Should be Agent with an empty user layout (user hasn't customized).
+        // Should be Editor with an empty user layout (user hasn't customized):
+        // out of the box the tree is on the left and the agent on the right.
         let layout = AgentSettings::get_layout(cx);
-        let WindowLayout::Agent(Some(user_layout)) = layout else {
-            panic!("expected Agent(Some), got {:?}", layout);
+        let WindowLayout::Editor(Some(user_layout)) = layout else {
+            panic!("expected Editor(Some), got {:?}", layout);
         };
         assert_eq!(user_layout, PanelLayout::default());
 
-        // User explicitly sets agent dock to left (matching the default).
-        // The merged result is still agent, but the user layout captures
-        // only what the user wrote.
+        // User explicitly sets agent dock to right (matching the default).
+        // The merged result is still the editor layout, but the user layout
+        // captures only what the user wrote.
         SettingsStore::update_global(cx, |store, cx| {
             store
-                .set_user_settings(r#"{ "agent": { "dock": "left" } }"#, cx)
+                .set_user_settings(r#"{ "agent": { "dock": "right" } }"#, cx)
                 .unwrap();
         });
 
         let layout = AgentSettings::get_layout(cx);
-        let WindowLayout::Agent(Some(user_layout)) = layout else {
-            panic!("expected Agent(Some), got {:?}", layout);
+        let WindowLayout::Editor(Some(user_layout)) = layout else {
+            panic!("expected Editor(Some), got {:?}", layout);
         };
-        assert_eq!(user_layout.agent_dock, Some(DockPosition::Left));
+        assert_eq!(user_layout.agent_dock, Some(DockPosition::Right));
         assert_eq!(user_layout.project_panel_dock, None);
         assert_eq!(user_layout.outline_panel_dock, None);
         assert_eq!(user_layout.collaboration_panel_dock, None);
@@ -1760,8 +1765,9 @@ mod tests {
 
             assert_eq!(user_layout.agent_dock, Some(DockPosition::Left));
             assert_eq!(user_layout.project_panel_dock, Some(DockSide::Right));
-            // Other fields weren't in user settings and didn't need changing.
-            assert_eq!(user_layout.outline_panel_dock, None);
+            // The outline stands on the left out of the box, and the agent
+            // layout wants it on the right, so that one had to be written too.
+            assert_eq!(user_layout.outline_panel_dock, Some(DockSide::Right));
 
             // And the merged result should now match agent.
             let layout = AgentSettings::get_layout(cx);
@@ -1832,9 +1838,9 @@ mod tests {
             assert_eq!(user_layout.outline_panel_dock, Some(DockSide::Left));
             assert_eq!(
                 user_layout.collaboration_panel_dock,
-                Some(DockPosition::Left)
+                Some(DockPosition::Right)
             );
-            assert_eq!(user_layout.git_panel_dock, Some(DockPosition::Left));
+            assert_eq!(user_layout.git_panel_dock, Some(DockPosition::Right));
 
             // Even though defaults are now agent, the backfilled user settings
             // keep everything in the editor layout. The user's experience

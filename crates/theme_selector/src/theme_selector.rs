@@ -760,11 +760,15 @@ mod tests {
             footer.left(),
             footer.right()
         );
+        // The room the actions leave is on their left, not on their right: that
+        // is what "in the corner" means, and unlike a share of the bar it stays
+        // true however long the labels are.
         assert!(
-            docs.left() > footer.left() + footer.size.width * 0.5,
-            "both actions belong in the right half; the secondary one starts at {:?} in a bar \
-             spanning {:?}..{:?}",
-            docs.left(),
+            docs.left() - footer.left() > footer.right() - install.right(),
+            "the actions leave {:?} of room before them and {:?} after, so they are not \
+             against the right edge of a bar spanning {:?}..{:?}",
+            docs.left() - footer.left(),
+            footer.right() - install.right(),
             footer.left(),
             footer.right()
         );

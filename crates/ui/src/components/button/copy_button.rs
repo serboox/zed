@@ -38,6 +38,7 @@ pub struct CopyButton {
     tooltip_label: SharedString,
     visible_on_hover: Option<SharedString>,
     style: Option<ButtonStyle>,
+    size: Option<ButtonSize>,
     custom_on_click: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
 
@@ -51,6 +52,7 @@ impl CopyButton {
             tooltip_label: "Copy".into(),
             visible_on_hover: None,
             style: None,
+            size: None,
             custom_on_click: None,
         }
     }
@@ -68,6 +70,16 @@ impl CopyButton {
 
     pub fn icon_size(mut self, icon_size: IconSize) -> Self {
         self.icon_size = icon_size;
+        self
+    }
+
+    /// How tall the button stands.
+    ///
+    /// Worth setting where the button sits beside a line of text rather than in
+    /// chrome of its own: the default is taller than a line of the buffer, and
+    /// a button taller than the line it is on makes that line take two.
+    pub fn size(mut self, size: ButtonSize) -> Self {
+        self.size = Some(size);
         self
     }
 
@@ -116,6 +128,7 @@ impl RenderOnce for CopyButton {
             .icon_color(color)
             .icon_size(self.icon_size)
             .when_some(self.style, |button, style| button.style(style))
+            .when_some(self.size, |button, size| button.size(size))
             .disabled(self.disabled)
             .tooltip(Tooltip::text(tooltip))
             .on_click(move |_, window, cx| {

@@ -3111,6 +3111,12 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            // A database of this test's own. Without one every test in this
+            // binary writes to the same fallback connection, and since they run
+            // beside each other, one test's workspace row is gone by the time
+            // another saves a preview against it -- which comes back as a
+            // foreign key failure in whichever test lost the race.
+            cx.set_global(db::AppDatabase::test_new());
             let state = AppState::test(cx);
             editor::init(cx);
             crate::init(cx);

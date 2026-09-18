@@ -5196,14 +5196,15 @@ async fn test_focused_thread_tracks_user_intent(cx: &mut TestAppContext) {
         );
     });
 
-    workspace_a.read_with(cx, |workspace, cx| {
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        let panel = workspace
+            .panel::<AgentPanel>(cx)
+            .expect("Agent panel should exist");
+        // Whichever side the agent panel is on. Naming one here says the panel
+        // is on the left, which is a setting and not a fact.
+        let side = workspace::Panel::position(panel.read(cx), window, cx);
         assert!(
-            workspace.panel::<AgentPanel>(cx).is_some(),
-            "Agent panel should exist"
-        );
-        let dock = workspace.left_dock().read(cx);
-        assert!(
-            dock.is_open(),
+            workspace.dock_at_position(side).read(cx).is_open(),
             "Clicking a thread should open the agent panel dock"
         );
     });

@@ -261,6 +261,12 @@ impl DiagnosticBlock {
             )
             .child(
                 CopyButton::new(copy_button_id, self.copy_message.clone())
+                    // Shorter than a line of the buffer. A diagnostic sits on
+                    // the line it is about, and a button taller than that line
+                    // makes a one-line message take two -- which also stops the
+                    // short ones being drawn at the end of the line at all.
+                    .size(ButtonSize::None)
+                    .icon_size(IconSize::XSmall)
                     .tooltip_label("Copy Diagnostic"),
             )
             .into_any_element()
