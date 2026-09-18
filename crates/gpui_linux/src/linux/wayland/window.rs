@@ -1774,9 +1774,13 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
-    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+    fn start_file_drag(
+        &self,
+        paths: &[std::path::PathBuf],
+        picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+    ) -> bool {
         let state = self.borrow();
-        state.client.start_file_drag(&state.surface, paths)
+        state.client.start_file_drag(&state.surface, paths, picture)
     }
 
     fn take_external_drag_as_move(&self) {

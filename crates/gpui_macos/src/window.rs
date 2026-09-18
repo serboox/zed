@@ -1874,7 +1874,11 @@ impl PlatformWindow for MacWindow {
         }
     }
 
-    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+    fn start_file_drag(
+        &self,
+        paths: &[std::path::PathBuf],
+        _picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+    ) -> bool {
         if paths.is_empty() {
             return false;
         }

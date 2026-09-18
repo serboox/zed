@@ -2967,10 +2967,13 @@ impl Pane {
                 let project = self.project.clone();
                 let item = item.boxed_clone();
                 move |cx: &mut App| {
-                    project.upgrade().and_then(|project| {
+                    let path = project.upgrade().and_then(|project| {
                         let path = item.project_path(cx)?;
                         project.read(cx).absolute_path(&path, cx)
-                    })
+                    });
+                    let paths = path.into_iter().collect::<Vec<_>>();
+                    let picture = file_icons::drag_picture::drag_picture(&paths, cx);
+                    gpui::DraggedFiles::new(paths).drawn_as(picture)
                 }
             })
             .drag_over::<DraggedTab>(move |tab, dragged_tab: &DraggedTab, _, cx| {

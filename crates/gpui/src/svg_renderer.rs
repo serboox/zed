@@ -194,6 +194,23 @@ impl SvgRenderer {
         })
     }
 
+    /// The shape an SVG asset makes at `size`, as how much of each pixel it
+    /// covers. What colour that shape is drawn in is the caller's to decide,
+    /// which is how one icon takes the colour of whatever it sits beside.
+    pub fn render_shape(
+        &self,
+        path: &SharedString,
+        size: Size<DevicePixels>,
+    ) -> Result<Option<(Size<DevicePixels>, Vec<u8>)>> {
+        self.render_alpha_mask(
+            &RenderSvgParams {
+                path: path.clone(),
+                size,
+            },
+            None,
+        )
+    }
+
     pub(crate) fn render_alpha_mask(
         &self,
         params: &RenderSvgParams,

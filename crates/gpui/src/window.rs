@@ -2392,8 +2392,12 @@ impl Window {
     ///
     /// The window stops receiving ordinary pointer events for the rest of the
     /// drag: from here the platform owns it.
-    pub fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
-        self.platform_window.start_file_drag(paths)
+    pub fn start_file_drag(
+        &self,
+        paths: &[std::path::PathBuf],
+        picture: Option<&Arc<RenderImage>>,
+    ) -> bool {
+        self.platform_window.start_file_drag(paths, picture)
     }
 
     /// Says that what this window will do with the files now being dragged over
@@ -4816,6 +4820,7 @@ impl Window {
                             // being delivered would start a second drag inside
                             // the first.
                             files: Default::default(),
+                            picture: None,
                             cursor_offset: position,
                             cursor_style: None,
                         });
@@ -4910,7 +4915,10 @@ impl Window {
         // The drag is given up only once the platform has taken it. A platform
         // that cannot start such a drag leaves it exactly where it was, rather
         // than ending it and leaving the reader holding nothing.
-        if !self.platform_window.start_file_drag(&drag.files) {
+        if !self
+            .platform_window
+            .start_file_drag(&drag.files, drag.picture.as_ref())
+        {
             return;
         }
         cx.active_drag.take();

@@ -6144,7 +6144,11 @@ impl ProjectPanel {
                             active_selection: selection,
                             marked_selections: marked_selections.clone(),
                         };
-                        move |cx: &mut App| files_of(&project, &dragged, cx)
+                        move |cx: &mut App| {
+                            let paths = files_of(&project, &dragged, cx);
+                            let picture = file_icons::drag_picture::drag_picture(&paths, cx);
+                            gpui::DraggedFiles::new(paths).drawn_as(picture)
+                        }
                     };
 
                     this.on_drag_files(files_of_this_drag)

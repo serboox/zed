@@ -597,11 +597,8 @@ impl Interactivity {
     /// all of its meaning.
     ///
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_drag_files`].
-    pub fn on_drag_files<I>(&mut self, files: impl Fn(&mut App) -> I + 'static)
-    where
-        I: IntoIterator<Item = std::path::PathBuf>,
-    {
-        self.drag_files = Some(Box::new(move |cx| files(cx).into_iter().collect()));
+    pub fn on_drag_files(&mut self, files: impl Fn(&mut App) -> DraggedFiles + 'static) {
+        self.drag_files = Some(Box::new(files));
     }
 
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
@@ -1544,10 +1541,9 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The closure is called when a drag starts, not when the element is drawn.
     ///
     /// The fluent API equivalent to [`Interactivity::on_drag_files`].
-    fn on_drag_files<I>(mut self, files: impl Fn(&mut App) -> I + 'static) -> Self
+    fn on_drag_files(mut self, files: impl Fn(&mut App) -> DraggedFiles + 'static) -> Self
     where
         Self: Sized,
-        I: IntoIterator<Item = std::path::PathBuf>,
     {
         self.interactivity().on_drag_files(files);
         self
@@ -1623,8 +1619,37 @@ pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
 
-pub(crate) type DragFilesListener =
-    Box<dyn Fn(&mut App) -> SmallVec<[std::path::PathBuf; 2]> + 'static>;
+pub(crate) type DragFilesListener = Box<dyn Fn(&mut App) -> DraggedFiles + 'static>;
+
+/// What a drag carries out of this window: the files it stands for, and the
+/// picture the desktop carries under the pointer while it does.
+///
+/// A picture is worth giving: without one the desktop draws whatever it draws
+/// for an unknown drag, which on most of them is nothing at all.
+#[derive(Default)]
+pub struct DraggedFiles {
+    /// Where the files are. Empty means the drag means nothing outside this
+    /// window and never leaves it.
+    pub paths: SmallVec<[std::path::PathBuf; 2]>,
+    /// What to carry under the pointer.
+    pub picture: Option<Arc<crate::RenderImage>>,
+}
+
+impl DraggedFiles {
+    /// A drag of these files, with whatever picture the desktop cares to draw.
+    pub fn new(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+            picture: None,
+        }
+    }
+
+    /// The same drag, carrying a picture of its own.
+    pub fn drawn_as(mut self, picture: Option<Arc<crate::RenderImage>>) -> Self {
+        self.picture = picture;
+        self
+    }
+}
 
 type DropListener = Box<dyn Fn(&dyn Any, &mut Window, &mut App) + 'static>;
 
@@ -2817,14 +2842,15 @@ impl Interactivity {
                             let cursor_offset = event.position - hitbox.origin;
                             let drag =
                                 (drag_listener)(drag_value.as_ref(), cursor_offset, window, cx);
-                            let files = drag_files
+                            let carried = drag_files
                                 .as_ref()
                                 .map(|files| files(cx))
                                 .unwrap_or_default();
                             cx.active_drag = Some(AnyDrag {
                                 view: drag,
                                 value: drag_value,
-                                files,
+                                files: carried.paths,
+                                picture: carried.picture,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                             });
@@ -4984,7 +5010,7 @@ mod tests {
                         })
                         .on_drag_files({
                             let files = self.files.clone();
-                            move |_| files.clone()
+                            move |_| DraggedFiles::new(files.clone())
                         }),
                 )
         }

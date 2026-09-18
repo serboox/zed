@@ -2791,6 +2791,10 @@ pub struct AnyDrag {
     /// The view used to render this drag
     pub view: AnyView,
 
+    /// What the desktop carries under the pointer once this drag leaves the
+    /// window. Nothing leaves the platform to draw whatever it draws for a file.
+    pub picture: Option<Arc<crate::RenderImage>>,
+
     /// The value of the dragged item, to be dropped
     pub value: Arc<dyn Any>,
 

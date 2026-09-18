@@ -38,6 +38,7 @@ component.workspace = true
 db.workspace = true
 dirs.workspace = true
 futures-lite.workspace = true
+file_icons.workspace = true
 fs.workspace = true
 futures.workspace = true
 git.workspace = true

@@ -882,7 +882,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Says whether the platform took it. A platform that cannot start such a
     /// drag -- or one that refused this one -- says so, and the drag goes on
     /// being the window's own rather than disappearing into nothing.
-    fn start_file_drag(&self, _paths: &[std::path::PathBuf]) -> bool {
+    fn start_file_drag(
+        &self,
+        _paths: &[std::path::PathBuf],
+        _picture: Option<&std::sync::Arc<crate::RenderImage>>,
+    ) -> bool {
         false
     }
     /// Says that whatever this window does with the drag now over it amounts to

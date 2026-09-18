@@ -1,3 +1,5 @@
+pub mod drag_picture;
+
 use std::sync::Arc;
 use std::{path::Path, str};
 

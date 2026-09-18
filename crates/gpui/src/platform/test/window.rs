@@ -349,7 +349,11 @@ impl PlatformWindow for TestWindow {
         self.0.lock().drag_taken_as_move = true;
     }
 
-    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+    fn start_file_drag(
+        &self,
+        paths: &[std::path::PathBuf],
+        _picture: Option<&std::sync::Arc<crate::RenderImage>>,
+    ) -> bool {
         let mut this = self.0.lock();
         if this.refuse_file_drags {
             return false;

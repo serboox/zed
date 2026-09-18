@@ -68,6 +68,13 @@ impl RenderImage {
         }
     }
 
+    /// How many of this image's own pixels go into one the reader sees. An
+    /// image drawn for a screen that doubles everything says two.
+    pub fn drawn_at_scale(mut self, scale_factor: f32) -> Self {
+        self.scale_factor = scale_factor;
+        self
+    }
+
     /// Convert this image into a byte slice.
     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
         self.data

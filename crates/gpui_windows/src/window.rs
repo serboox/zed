@@ -1107,7 +1107,11 @@ impl PlatformWindow for WindowsWindow {
         self.0.takes_the_drag.set(true);
     }
 
-    fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> bool {
+    fn start_file_drag(
+        &self,
+        paths: &[std::path::PathBuf],
+        _picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+    ) -> bool {
         if paths.is_empty() {
             return false;
         }
