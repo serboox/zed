@@ -188,8 +188,11 @@ jobs:
           set -euo pipefail
           rpm="$(ls target/fork-packages/zed-fork-*.rpm)"
           docker run --rm -v "$PWD:/work" -w /work fedora:latest bash -euxc "
-            dnf install -y '$rpm'
-            zed-fork --version
+            dnf install -y shadow-utils util-linux '$rpm'
+            # The editor refuses to run as root, and everything in a container
+            # is root unless somebody else is made, so somebody else is made.
+            useradd --create-home someone
+            runuser -l someone -c 'zed-fork --version'
             rpm -e zed-fork
           "
 

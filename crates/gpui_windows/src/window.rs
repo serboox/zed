@@ -646,11 +646,11 @@ fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
         };
         // The data object takes the memory: `fRelease` is what says so, and
         // releasing it here as well would free it twice.
-        data.SetData(&format, &medium, BOOL::from(true))?;
+        data.SetData(&format, &medium, true)?;
         std::mem::forget(global);
         // No drop source of our own: without one the shell uses the standard
         // one, which is how every other application's drags already behave.
-        SHDoDragDrop(hwnd, &data, None::<&IDropSource>, DROPEFFECT_COPY)?;
+        SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY)?;
     }
     Ok(())
 }
