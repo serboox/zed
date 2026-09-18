@@ -115,6 +115,12 @@ jobs:
           df -h /
       - name: Install the editor's build dependencies
         run: script/linux
+      # `script/linux` installs the Vulkan loader but no driver for it to load,
+      # and a runner has no graphics card. The renderer's own tests ask for an
+      # adapter and get "vulkan drivers/libraries could not be loaded" without
+      # this; the packaging job below already installs it for the same reason.
+      - name: Install a graphics driver the renderer's tests can use
+        run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libgl1
       - uses: ./.github/actions/run_tests
 
   linux:
