@@ -540,6 +540,10 @@ pub struct DragState {
     /// files. Answered once per step of the pointer, after whatever is under it
     /// has been told where the pointer is.
     takes_the_drag: bool,
+    /// What the desktop last settled on for the drag now over this window. It is
+    /// what the drop happens as, and with it whether whoever started the drag
+    /// lets go of the original.
+    action: DndAction,
 }
 
 pub struct ClickState {
@@ -626,13 +630,11 @@ impl WaylandClientStatePtr {
         // version three; an older compositor works out the action itself, and
         // asking it here would be a protocol error rather than a refusal.
         //
-        // Only a move is offered. Where a drag lands is the receiver's to
-        // decide, and offered both, a desktop picks the copy for a drag that
-        // came from another application -- which was measured here: every drag
-        // out of this window came back "Copy" and never once "Move", whatever
-        // was asked for. Offering the one action leaves nothing to decide.
+        // Both are offered. Only the receiver knows what it is going to do with
+        // the file, and something that can only take a copy -- a chat window,
+        // an upload form -- refuses a drag that offers nothing else.
         if data_source.version() >= 3 {
-            data_source.set_actions(DndAction::Move);
+            data_source.set_actions(DndAction::Copy | DndAction::Move);
         }
 
         let icon = drag_icon_for(&state.globals, paths.len(), picture);
@@ -1052,6 +1054,7 @@ impl WaylandClient {
                 data_offer: None,
                 window: None,
                 takes_the_drag: false,
+                action: DndAction::empty(),
                 position: Point::default(),
             },
             click: ClickState {
@@ -2840,10 +2843,15 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     return;
                 };
                 let data_offer = state.drag.data_offer.clone().unwrap();
+                log::info!(
+                    "drop into this window: as {:?}; this window asked to take the files: {}",
+                    state.drag.action,
+                    state.drag.takes_the_drag
+                );
                 // Only a drag that was accepted and settled on an action may be
                 // finished; saying so about any other is a protocol error, and a
                 // protocol error takes the whole connection with it.
-                if data_offer.version() >= 3 {
+                if data_offer.version() >= 3 && !state.drag.action.is_empty() {
                     data_offer.finish();
                 }
                 data_offer.destroy();
@@ -2879,9 +2887,11 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
         let mut state = client.borrow_mut();
 
         if let wl_data_offer::Event::Action { dnd_action } = &event {
+            let settled = dnd_action.into_result().unwrap_or(DndAction::empty());
+            state.drag.action = settled;
             log::info!(
                 "drag into this window: the desktop settled on {:?}",
-                dnd_action.into_result().unwrap_or(DndAction::empty())
+                settled
             );
         }
 
@@ -2922,7 +2932,11 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
         let mut state = client.borrow_mut();
 
         match event {
+            // What the receiver asked for. It is the only thing this window
+            // ever learns about whatever is on the other end of the drag: the
+            // protocol tells a source nothing about where its drag landed.
             wl_data_source::Event::Send { mime_type, fd } => {
+                log::info!("drag out of this window: the receiver asked for {mime_type}");
                 let paths = state.dragged_files.clone();
                 state.clipboard.send_paths(&mime_type, &paths, fd);
             }

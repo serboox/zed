@@ -6154,9 +6154,15 @@ impl ProjectPanel {
                     this.on_drag_files(files_of_this_drag)
                         .on_drag_move::<ExternalPaths>(cx.listener(
                             move |this, event: &DragMoveEvent<ExternalPaths>, window, cx| {
-                                // Dropping here takes the file into the project,
-                                // so wherever it came from should let go of it.
-                                window.take_external_drag_as_move();
+                                // Only while the pointer is really over this row.
+                                // A drag-move listener hears every movement in
+                                // the window, and a row that claimed the file
+                                // from across the window would have it deleted
+                                // while it was being dropped somewhere that only
+                                // reads its path.
+                                if event.bounds.contains(&event.event.position) {
+                                    window.take_external_drag_as_move();
+                                }
                                 let is_current_target =
                                     this.drag_target_entry
                                         .as_ref()
@@ -7767,9 +7773,11 @@ impl Render for ProjectPanel {
                                         else {
                                             return;
                                         };
-                                        // Dropping below the last entry puts the
-                                        // file in the project too.
-                                        window.take_external_drag_as_move();
+                                        if event.bounds.contains(&event.event.position) {
+                                            // Below the last entry is still the
+                                            // project, so this takes the file too.
+                                            window.take_external_drag_as_move();
+                                        }
                                         if event.bounds.contains(&event.event.position) {
                                             this.drag_target_entry = Some(DragTarget::Background);
                                         } else {

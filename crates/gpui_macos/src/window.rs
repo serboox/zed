@@ -3066,19 +3066,18 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     }
 }
 
-/// What a drag started by this window allows wherever it is being carried: a
-/// move, and only a move.
+/// What a drag started by this window allows wherever it is being carried.
 ///
-/// Offered both, a desktop picks the copy for a drag that came from another
-/// application, whatever was asked for. Offering the one action leaves nothing
-/// to decide.
+/// Both: only the receiver knows what it is going to do with the file, and
+/// something that can only take a copy -- a chat window, an upload form --
+/// refuses a drag that offers nothing else.
 extern "C" fn dragging_source_operation_mask(
     _: &Object,
     _: Sel,
     _: id,
     _context: NSInteger,
 ) -> NSDragOperation {
-    NSDragOperationMove
+    NSDragOperationCopy | NSDragOperationMove
 }
 
 /// The drag this window started is over. A move is only half done here -- the

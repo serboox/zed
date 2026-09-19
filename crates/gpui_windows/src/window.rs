@@ -655,10 +655,15 @@ fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
         // No drop source of our own: without one the shell uses the standard
         // one, which is how every other application's drags already behave.
         //
-        // Only a move is offered. Offered both, a shell picks the copy for a
-        // drag that came from another application, whatever was asked for;
-        // offering the one action leaves nothing to decide.
-        let taken = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_MOVE)?;
+        // Both are offered: only the receiver knows what it is going to do with
+        // the file, and something that can only take a copy -- a chat window, an
+        // upload form -- refuses a drag that offers nothing else.
+        let taken = SHDoDragDrop(
+            Some(hwnd),
+            &data,
+            None::<&IDropSource>,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+        )?;
         // A move is only half done here -- the files have been copied to wherever
         // they went -- and letting go of the originals is what makes it a move.
         if taken.0 & DROPEFFECT_MOVE.0 != 0 {
