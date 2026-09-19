@@ -536,6 +536,10 @@ pub struct DragState {
     data_offer: Option<wl_data_offer::WlDataOffer>,
     window: Option<WaylandWindowStatePtr>,
     position: Point<Pixels>,
+    /// Whether what this window will do with the drag amounts to taking the
+    /// files. Answered once per step of the pointer, after whatever is under it
+    /// has been told where the pointer is.
+    takes_the_drag: bool,
 }
 
 pub struct ClickState {
@@ -622,12 +626,13 @@ impl WaylandClientStatePtr {
         // version three; an older compositor works out the action itself, and
         // asking it here would be a protocol error rather than a refusal.
         //
-        // Both are offered, and which one happens is the desktop's to decide the
-        // way it decides between two file manager windows: a file dragged
-        // somewhere else is moved there, and holding the key that means "copy"
-        // copies it instead.
+        // Only a move is offered. Where a drag lands is the receiver's to
+        // decide, and offered both, a desktop picks the copy for a drag that
+        // came from another application -- which was measured here: every drag
+        // out of this window came back "Copy" and never once "Move", whatever
+        // was asked for. Offering the one action leaves nothing to decide.
         if data_source.version() >= 3 {
-            data_source.set_actions(DndAction::Copy | DndAction::Move);
+            data_source.set_actions(DndAction::Move);
         }
 
         let icon = drag_icon_for(&state.globals, paths.len(), picture);
@@ -655,13 +660,7 @@ impl WaylandClientStatePtr {
         let Some(client) = self.0.upgrade() else {
             return;
         };
-        let state = client.borrow();
-        let Some(offer) = state.drag.data_offer.as_ref() else {
-            return;
-        };
-        if offer.version() >= 3 {
-            offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Move);
-        }
+        client.borrow_mut().drag.takes_the_drag = true;
     }
 
     pub fn set_pending_activation(&self, window: ObjectId) {
@@ -1052,6 +1051,7 @@ impl WaylandClient {
             drag: DragState {
                 data_offer: None,
                 window: None,
+                takes_the_drag: false,
                 position: Point::default(),
             },
             click: ClickState {
@@ -2726,6 +2726,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     // path, and a window that asked for a move by default would
                     // have the file deleted out from under whoever dropped it.
                     data_offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
+                    state.drag.takes_the_drag = false;
 
                     let pipe = Pipe::new().unwrap();
                     data_offer.receive(FILE_LIST_MIME_TYPE.to_string(), unsafe {
@@ -2795,19 +2796,30 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 };
                 let position = Point::new(x.into(), y.into());
                 state.drag.position = position;
-                // Back to a copy before the window is told where the pointer is.
-                // Whatever is under it now says otherwise while handling that,
-                // if what it does is take the file; what the pointer has left
-                // behind no longer gets a say.
-                if let Some(offer) = state.drag.data_offer.as_ref()
-                    && offer.version() >= 3
-                {
-                    offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
-                }
+                // Asked afresh for this step: what is under the pointer changes
+                // as it moves, and only some of what it passes over takes the
+                // file. Whatever is under it now answers while handling the
+                // event below, and the answer is given to the compositor once,
+                // after -- setting it before and again during would leave the
+                // last word to whichever happened to be last.
+                state.drag.takes_the_drag = false;
+                let offer = state.drag.data_offer.clone();
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Pending { position });
                 drop(state);
                 drag_window.handle_input(input);
+
+                let client = this.get_client();
+                let state = client.borrow();
+                if let Some(offer) = offer.as_ref()
+                    && offer.version() >= 3
+                {
+                    let preferred = match state.drag.takes_the_drag {
+                        true => DndAction::Move,
+                        false => DndAction::Copy,
+                    };
+                    offer.set_actions(DndAction::Copy | DndAction::Move, preferred);
+                }
             }
             wl_data_device::Event::Leave => {
                 let Some(drag_window) = state.drag.window.clone() else {
@@ -2930,15 +2942,14 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
             // move rather than a copy. That is the source's to do, and the
             // source is this window.
             wl_data_source::Event::DndFinished => {
-                let paths = files_the_drag_gave_up(
-                    state.dragged_action,
-                    std::mem::take(&mut state.dragged_files),
-                );
+                let carried = std::mem::take(&mut state.dragged_files);
+                let carried_count = carried.len();
+                let paths = files_the_drag_gave_up(state.dragged_action, carried);
                 let moving = !paths.is_empty();
                 log::info!(
-                    "drag out of this window finished as {:?}; {} file(s) {}",
+                    "drag out of this window finished as {:?}; {} file(s) carried, {}",
                     state.dragged_action,
-                    paths.len(),
+                    carried_count,
                     match moving {
                         true => "let go of here",
                         false => "left where they are",

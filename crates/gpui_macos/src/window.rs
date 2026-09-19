@@ -3066,16 +3066,19 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     }
 }
 
-/// What a drag started by this window allows wherever it is being carried.
-/// Both, the way one file manager window allows both to another: where it lands
-/// decides, and the key that means "copy" is how a reader asks for the other.
+/// What a drag started by this window allows wherever it is being carried: a
+/// move, and only a move.
+///
+/// Offered both, a desktop picks the copy for a drag that came from another
+/// application, whatever was asked for. Offering the one action leaves nothing
+/// to decide.
 extern "C" fn dragging_source_operation_mask(
     _: &Object,
     _: Sel,
     _: id,
     _context: NSInteger,
 ) -> NSDragOperation {
-    NSDragOperationCopy | NSDragOperationMove
+    NSDragOperationMove
 }
 
 /// The drag this window started is over. A move is only half done here -- the
