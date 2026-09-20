@@ -1787,6 +1787,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().client.take_external_drag_as_move();
     }
 
+    fn external_drop_is_a_move(&self) -> bool {
+        self.borrow().client.external_drop_is_a_move()
+    }
+
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {

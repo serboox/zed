@@ -349,6 +349,10 @@ impl PlatformWindow for TestWindow {
         self.0.lock().drag_taken_as_move = true;
     }
 
+    fn external_drop_is_a_move(&self) -> bool {
+        self.0.lock().drag_taken_as_move
+    }
+
     fn start_file_drag(
         &self,
         paths: &[std::path::PathBuf],

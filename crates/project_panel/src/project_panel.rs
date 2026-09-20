@@ -14,7 +14,7 @@ use editor::{
 };
 use feature_flags::{FeatureFlagAppExt, ProjectPanelUndoRedoFeatureFlag};
 use file_icons::FileIcons;
-use fs::TrashId;
+use fs::{RemoveOptions, TrashId};
 use git;
 use git::status::GitSummary;
 use git_ui;
@@ -4979,6 +4979,12 @@ impl ProjectPanel {
     ) {
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
 
+        // A move is only half done when the drop lands: the files are copied in
+        // below, and letting go of the originals is what makes it a move. That
+        // is the dragger's to do, and a file manager will not do it -- it has no
+        // way of knowing that what it dropped the file on really took it. This
+        // did take it, so it finishes the move itself.
+        let moving = window.external_drop_is_a_move();
         let open_file_after_drop = paths.len() == 1 && paths[0].is_file();
 
         let Some((target_directory, worktree, fs)) = maybe!({
@@ -5043,6 +5049,8 @@ impl ProjectPanel {
                     return Ok(());
                 }
 
+                let originals = paths.clone();
+                let fs_for_move = fs.clone();
                 let (worktree_id, task) = worktree.update(cx, |worktree, cx| {
                     (
                         worktree.id(),
@@ -5053,6 +5061,32 @@ impl ProjectPanel {
                 let opened_entries: Vec<_> = task
                     .await
                     .with_context(|| "failed to copy external paths")?;
+
+                if moving {
+                    for path in &originals {
+                        let gone = fs_for_move
+                            .remove_file(
+                                path,
+                                RemoveOptions {
+                                    recursive: false,
+                                    ignore_if_not_exists: true,
+                                },
+                            )
+                            .await;
+                        if gone.is_err() {
+                            fs_for_move
+                                .remove_dir(
+                                    path,
+                                    RemoveOptions {
+                                        recursive: true,
+                                        ignore_if_not_exists: true,
+                                    },
+                                )
+                                .await
+                                .log_err();
+                        }
+                    }
+                }
                 this.update_in(cx, |this, window, cx| {
                     let mut did_open = false;
                     if open_file_after_drop && !opened_entries.is_empty() {

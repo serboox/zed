@@ -894,6 +894,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// originals once it is done. A platform that cannot say this drops the
     /// request, and the drag stays a copy.
     fn take_external_drag_as_move(&self) {}
+    /// Whether the drag being dropped on this window was settled as a move, so
+    /// that whatever takes the files knows the originals are meant to go.
+    fn external_drop_is_a_move(&self) -> bool {
+        false
+    }
     fn start_window_resize(&self, _edge: ResizeEdge) {}
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]

@@ -2412,6 +2412,16 @@ impl Window {
         self.platform_window.take_external_drag_as_move();
     }
 
+    /// Whether the drag now being dropped was settled as a move.
+    ///
+    /// Whoever started the drag is meant to let go of the originals, and some do
+    /// not: a file manager has no way of knowing that what it dropped the file
+    /// on really took it, so it keeps its own copy. Something that did take the
+    /// file can finish the move itself, and this is how it knows to.
+    pub fn external_drop_is_a_move(&self) -> bool {
+        self.platform_window.external_drop_is_a_move()
+    }
+
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);

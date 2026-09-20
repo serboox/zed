@@ -665,6 +665,13 @@ impl WaylandClientStatePtr {
         client.borrow_mut().drag.takes_the_drag = true;
     }
 
+    /// Whether the drag being dropped on this window was settled as a move.
+    pub fn external_drop_is_a_move(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|client| client.borrow().drag.action.contains(DndAction::Move))
+    }
+
     pub fn set_pending_activation(&self, window: ObjectId) {
         self.0.upgrade().unwrap().borrow_mut().pending_activation =
             Some(PendingActivation::Window(window));
@@ -2936,8 +2943,12 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
             // ever learns about whatever is on the other end of the drag: the
             // protocol tells a source nothing about where its drag landed.
             wl_data_source::Event::Send { mime_type, fd } => {
-                log::info!("drag out of this window: the receiver asked for {mime_type}");
                 let paths = state.dragged_files.clone();
+                log::info!(
+                    "drag out of this window: the receiver asked for {mime_type}; answering with {} file(s): {:?}",
+                    paths.len(),
+                    paths
+                );
                 state.clipboard.send_paths(&mime_type, &paths, fd);
             }
             // What the desktop settled on. It can change while the drag is in
