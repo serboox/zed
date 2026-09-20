@@ -16,6 +16,62 @@ runs:
       shell: bash -euxo pipefail {0}
       run: script/clear-target-dir-if-larger-than 350 200
 
+    - name: Build what the extension test would otherwise build itself
+      # `test_extension_store_with_test_extension` installs the test extension
+      # as a dev extension, and gives that one call 60 seconds. On a cold
+      # runner the call has to fetch a 150 MB SDK, clone a grammar and compile
+      # a wasm crate from scratch, which does not fit. Each of those is done
+      # here instead, in the exact place and shape the builder looks for, so
+      # the call finds them ready and the budget measures the test rather than
+      # the runner.
+      shell: bash -euxo pipefail {0}
+      run: |
+        extension=extensions/test-extension
+
+        rustup target add wasm32-wasip2
+        RUSTC_WRAPPER= cargo build \
+          --manifest-path "$extension/Cargo.toml" \
+          --target wasm32-wasip2 \
+          --target-dir "$extension/target"
+
+        # `ExtensionBuilder` skips its own download when this points at a
+        # directory holding `bin/clang`. The version has to match the one the
+        # builder would have fetched.
+        release=wasi-sdk-25
+        asset=wasi-sdk-25.0-x86_64-linux.tar.gz
+        unpacked="$RUNNER_TEMP/wasi-sdk"
+        mkdir -p "$unpacked"
+        curl --fail --location --silent --show-error \
+          "https://github.com/WebAssembly/wasi-sdk/releases/download/$release/$asset" \
+          | tar -xz -C "$unpacked"
+        # The archive holds a single directory whose name carries the version,
+        # so it is found rather than spelled out twice. An empty result would
+        # otherwise leave `$sdk` unset and point the check at the runner's own
+        # /bin/clang, which exists and would hide the failure behind a
+        # WASI_SDK_PATH the builder cannot use.
+        mapfile -t candidates < <(find "$unpacked" -mindepth 1 -maxdepth 1 -type d)
+        test "${#candidates[@]}" -eq 1
+        sdk="${candidates[0]}"
+        test -x "$sdk/bin/clang"
+        echo "WASI_SDK_PATH=$sdk" >> "$GITHUB_ENV"
+
+        # The same shallow checkout the builder makes. It still re-runs the
+        # fetch, which is a network call it cannot be talked out of, but one
+        # that already has the revision and costs a few seconds rather than a
+        # clone.
+        entry="$(sed -n '/^\[grammars\.gleam\]/,/^\[[^g]/p' "$extension/extension.toml")"
+        url="$(printf '%s' "$entry" | sed -n 's/^repository = "\(.*\)"/\1/p')"
+        rev="$(printf '%s' "$entry" | sed -n 's/^commit = "\(.*\)"/\1/p')"
+        test -n "$url" && test -n "$rev"
+        grammar="$extension/grammars/gleam"
+        mkdir -p "$grammar"
+        git -C "$grammar" init
+        # The builder refuses a grammar directory whose origin is not the URL
+        # its manifest names, so the URL is read from that same manifest.
+        git -C "$grammar" remote add origin "$url"
+        git -C "$grammar" fetch --depth 1 origin "$rev"
+        git -C "$grammar" checkout "$rev"
+
     - name: Run tests
       shell: bash -euxo pipefail {0}
       # Kept as a file as well as printed: this job's log is not always

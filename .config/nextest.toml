@@ -27,6 +27,16 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 filter = 'package(extension_host) and test(test_extension_store_with_test_extension)'
 slow-timeout = { period = "300s", terminate-after = 1 }
 
+# Randomized stress tests: the operation count is fixed but the work per
+# operation is not, and a shared runner does not finish either within a minute.
+[[profile.default.overrides]]
+filter = 'package(worktree) and test(test_random_worktree_changes)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(multi_buffer) and test(test_random_multibuffer)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
 [[profile.default.overrides]]
 filter = 'package(language_model) and test(test_from_image_downscales_to_default_5mb_limit)'
 slow-timeout = { period = "300s", terminate-after = 1 }

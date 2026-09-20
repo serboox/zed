@@ -13191,6 +13191,19 @@ mod tests {
         assert!((start - 0.0).abs() < 1e-3);
     }
 
+    fn a_result_of(rows: usize, columns: usize) -> QueryResult {
+        QueryResult {
+            columns: (0..columns).map(|c| format!("col{c}")).collect(),
+            rows: (0..rows)
+                .map(|r| (0..columns).map(|c| Some(format!("r{r}c{c}"))).collect())
+                .collect(),
+            rows_affected: rows as u64,
+            execution_time_ms: 1,
+            timing: None,
+            raw_documents: None,
+        }
+    }
+
     // Autonomous perf guard: a large result must virtualize — only the visible
     // window of rows is built per frame, not the whole result. If this fails,
     // scrolling is O(total_rows) per frame (the cause of single-digit FPS).
@@ -13204,23 +13217,12 @@ mod tests {
         });
 
         let total = 5000usize;
-        let cols: Vec<String> = (0..15).map(|i| format!("col{i}")).collect();
-        let rows: Vec<Vec<Option<String>>> = (0..total)
-            .map(|r| (0..15).map(|c| Some(format!("r{r}c{c}"))).collect())
-            .collect();
-        let result = QueryResult {
-            columns: cols,
-            rows,
-            rows_affected: total as u64,
-            execution_time_ms: 1,
-            timing: None,
-            raw_documents: None,
-        };
-
         let window = cx.add_window(|_window, cx| ResultView::new("perf", cx));
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         window
-            .update(cx, |view, _window, cx| view.set_result(result, cx))
+            .update(cx, |view, _window, cx| {
+                view.set_result(a_result_of(total, 15), cx)
+            })
             .unwrap();
 
         RENDERED_ROW_COUNT.store(0, Ordering::Relaxed);
@@ -13229,24 +13231,47 @@ mod tests {
         cx.run_until_parked();
 
         let built = RENDERED_ROW_COUNT.load(Ordering::Relaxed);
-        eprintln!("VIRTUALIZATION CHECK: built {built} rows out of {total}");
         assert!(built > 0, "no rows were rendered — the draw did not run");
         assert!(
             built < 1000,
             "table is NOT virtualizing: built {built} of {total} rows per draw (scroll is O(n))"
         );
+    }
 
-        // Time repeated full redraws (build + layout) as an FPS proxy. GPU paint
-        // is not exercised in tests, but element construction + flexbox layout is
-        // the CPU cost that dominates the frame, so this tracks the real bottleneck.
+    // A measurement, not a guard: it prints a number and asserts nothing, and a
+    // debug build spends around a third of a second per frame, so 120 of them
+    // outlast the suite's per-test budget. Run it by hand when the grid's
+    // drawing cost is the question:
+    //
+    //   cargo test -p db_client_ui --lib frame_time_of_a_large_result \
+    //     -- --ignored --nocapture
+    #[gpui::test]
+    #[ignore]
+    fn frame_time_of_a_large_result(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_window, cx| ResultView::new("perf", cx));
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(cx, |view, _window, cx| {
+                view.set_result(a_result_of(5000, 15), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // GPU paint is not exercised in tests, but element construction and
+        // flexbox layout are the CPU cost that dominates the frame.
         let frames = 120;
         let start = std::time::Instant::now();
         for _ in 0..frames {
             window.update(cx, |_, window, _| window.refresh()).unwrap();
             cx.run_until_parked();
         }
-        let elapsed = start.elapsed();
-        let per_frame_ms = elapsed.as_secs_f64() * 1000.0 / frames as f64;
+        let per_frame_ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
         eprintln!(
             "FRAME TIME: {per_frame_ms:.2} ms/frame over {frames} frames (~{:.0} build-FPS)",
             1000.0 / per_frame_ms
