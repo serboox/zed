@@ -438,17 +438,21 @@ async fn capture_windows(
     // holds those open long after the shell itself has gone. Here the wait is
     // simply abandoned -- there is no separate pipe whose partial contents
     // would be worth keeping.
-    let output =
+    // The race hands back the future that lost along with the one that won, and
+    // the losing one still holds its mutable borrow of `cmd` until the end of
+    // the statement. So the race is reduced to a plain value first, and `cmd` is
+    // named in the failures only in the statement after, where it is free again.
+    let finished =
         match futures::future::select(std::pin::pin!(cmd.output()), std::pin::pin!(give_up_on_it))
             .await
         {
-            futures::future::Either::Left((output, _)) => {
-                output.with_context(|| format!("command {cmd:?}"))?
-            }
-            futures::future::Either::Right(_) => {
-                anyhow::bail!("command {cmd:?} did not finish in time");
-            }
+            futures::future::Either::Left((output, _)) => Some(output),
+            futures::future::Either::Right(_) => None,
         };
+    let output = match finished {
+        Some(output) => output.with_context(|| format!("command {cmd:?}"))?,
+        None => anyhow::bail!("command {cmd:?} did not finish in time"),
+    };
     let env_output = String::from_utf8_lossy(&output.stdout);
 
     parse_env_output(
