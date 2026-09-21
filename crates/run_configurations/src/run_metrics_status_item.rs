@@ -18,11 +18,6 @@ use crate::run_metrics_modal::RunMetricsModal;
 /// back down without turning the chart into a smear.
 const READINGS_KEPT: usize = 120;
 
-/// How many processes get a bar of their own before the rest becomes one row of
-/// their total. Past eight categorical rows a reader stops comparing them to
-/// each other.
-const PROCESSES_LISTED: usize = 8;
-
 /// How tall one chart stands. It holds no text, so it may be told a height;
 /// everything with words in it takes the height its words need.
 const CHART_HEIGHT: Pixels = px(56.);
@@ -290,13 +285,12 @@ fn plotted(readings: &[(usize, f32)], ceiling: f32, bounds: Bounds<Pixels>) -> V
         .collect()
 }
 
-/// The processes a reading lists, largest first, and how many it left out with
-/// what they hold between them.
+/// Every process of a reading, largest first, ties broken by pid so the order
+/// does not shuffle between two readings that hold the same amount.
 ///
-/// Past [`PROCESSES_LISTED`] rows a reader stops comparing them to each other,
-/// so the rest becomes one row of their total rather than a list nobody reads
-/// to the end.
-pub(crate) fn listed(tree: &[ProcessReading]) -> (Vec<ProcessReading>, Option<(usize, u64)>) {
+/// All of them and not a first few: the window they are drawn in is given a
+/// height by the reader, and what that height is for is seeing the whole run.
+pub(crate) fn by_memory(tree: &[ProcessReading]) -> Vec<ProcessReading> {
     let mut sorted = tree.to_vec();
     sorted.sort_by(|left, right| {
         right
@@ -304,14 +298,7 @@ pub(crate) fn listed(tree: &[ProcessReading]) -> (Vec<ProcessReading>, Option<(u
             .cmp(&left.memory)
             .then_with(|| left.pid.cmp(&right.pid))
     });
-    if sorted.len() <= PROCESSES_LISTED {
-        return (sorted, None);
-    }
-    let rest = sorted.split_off(PROCESSES_LISTED);
-    let total = rest
-        .iter()
-        .fold(0u64, |sum, one| sum.saturating_add(one.memory));
-    (sorted, Some((rest.len(), total)))
+    sorted
 }
 
 /// One chart: what it is, what it reads right now, and the two minutes behind
@@ -330,10 +317,15 @@ pub(crate) fn a_chart(
 ) -> gpui::Div {
     let gridlines: Vec<f32> = axis.iter().map(|(at, _)| *at).collect();
     let grid = cyberpunk::border_dim();
+    // The plot takes whatever height the caller gives the chart and keeps
+    // `CHART_HEIGHT` as its floor. A fixed height here is what left a window
+    // stretched to the editor drawing a 56px line under 500px of nothing.
     v_flex()
+        .h_full()
         .gap(cyberpunk::SPACE_4)
         .child(
             h_flex()
+                .flex_none()
                 .justify_between()
                 .items_end()
                 .child(
@@ -345,6 +337,8 @@ pub(crate) fn a_chart(
         )
         .child(
             h_flex()
+                .flex_1()
+                .min_h(CHART_HEIGHT)
                 .items_stretch()
                 .gap(cyberpunk::SPACE_4)
                 .child(
@@ -361,7 +355,7 @@ pub(crate) fn a_chart(
                         })),
                 )
                 .child(
-                    div().flex_1().h(CHART_HEIGHT).child(
+                    div().flex_1().h_full().child(
                         canvas(
                             |_, _, _| {},
                             move |bounds: Bounds<Pixels>, _, window: &mut Window, _| {
@@ -431,6 +425,10 @@ pub(crate) fn a_bar(name: String, memory: u64, largest: u64) -> gpui::Div {
         false => 0.,
     };
     h_flex()
+        .debug_selector({
+            let name = name.clone();
+            move || format!("MEMORY-BAR-{name}")
+        })
         .gap(cyberpunk::SPACE_4)
         .child(
             div()
@@ -521,7 +519,7 @@ impl StatusItemView for RunMetricsStatusItem {
 mod tests {
     use super::*;
 
-    use gpui::{Entity, KeyBinding, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, KeyBinding, Modifiers, MouseButton, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
@@ -635,6 +633,21 @@ mod tests {
         let running = [a_sample(watched)];
         item.update(cx, |item, _| {
             item.read_the_run(Some(watched), Some(&running), Instant::now(), None);
+        });
+        draw(cx);
+    }
+
+    /// A run wide enough to fill a window somebody pulled taller: one shell and
+    /// the many short-lived children a build spawns.
+    fn a_wide_run_on_screen(item: &Entity<RunMetricsStatusItem>, cx: &mut VisualTestContext) {
+        let megabyte = 1024 * 1024;
+        let mut running = vec![started_by(4242, 1, "the shell", 8 * megabyte)];
+        running
+            .extend((1..=24u32).map(|which| {
+                started_by(4242 + which, 4242, "a compiler", which as u64 * megabyte)
+            }));
+        item.update(cx, |item, _| {
+            item.read_the_run(Some(4242), Some(&running), Instant::now(), None);
         });
         draw(cx);
     }
@@ -891,43 +904,40 @@ mod tests {
         );
     }
 
-    /// The list is ordered by what each process holds, stops at eight rows, and
-    /// says what the rest hold between them rather than dropping them.
+    /// The list is ordered by what each process holds and leaves nothing out:
+    /// a run's twelfth-largest process is a row like any other.
     #[gpui::test]
-    fn the_processes_listed_are_the_largest_eight_and_the_rest_is_their_total(
-        _cx: &mut TestAppContext,
-    ) {
+    fn every_process_is_listed_largest_first(_cx: &mut TestAppContext) {
         let megabyte = 1024 * 1024;
         let tree: Vec<ProcessReading> = (1..=12)
             .map(|which| a_process(which, which as u64 * megabyte))
             .collect();
 
-        let (rows, the_rest) = listed(&tree);
+        let rows = by_memory(&tree);
 
-        assert_eq!(rows.len(), PROCESSES_LISTED, "eight rows and no more");
         assert_eq!(
             rows.iter().map(|one| one.pid).collect::<Vec<_>>(),
-            vec![12, 11, 10, 9, 8, 7, 6, 5],
-            "largest first"
-        );
-        let (count, total) = the_rest.expect("four processes were left out");
-        assert_eq!(count, 4);
-        assert_eq!(
-            total,
-            (1 + 2 + 3 + 4) * megabyte,
-            "the one row stands for everything the rest hold"
+            vec![12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "largest first, and all twelve of them"
         );
     }
 
-    /// Eight processes exactly are eight rows, with nothing summed up.
+    /// Two processes holding the same amount keep the same order between two
+    /// readings, or the list jitters once a second for no reason a reader can see.
     #[gpui::test]
-    fn eight_processes_need_no_row_for_the_rest(_cx: &mut TestAppContext) {
-        let tree: Vec<ProcessReading> = (1..=8).map(|which| a_process(which, 1024)).collect();
+    fn processes_holding_the_same_amount_keep_their_order(_cx: &mut TestAppContext) {
+        let tree: Vec<ProcessReading> = [4243, 4241, 4242]
+            .into_iter()
+            .map(|pid| a_process(pid, 1024))
+            .collect();
 
-        let (rows, the_rest) = listed(&tree);
+        let rows = by_memory(&tree);
 
-        assert_eq!(rows.len(), 8);
-        assert_eq!(the_rest, None, "nothing was left out, so nothing is summed");
+        assert_eq!(
+            rows.iter().map(|one| one.pid).collect::<Vec<_>>(),
+            vec![4241, 4242, 4243],
+            "the pid decides when what they hold does not"
+        );
     }
 
     /// A number nobody could measure says why, because a zero there would read
@@ -991,6 +1001,112 @@ mod tests {
         assert!(
             reading.right() <= viewport.width && reading.bottom() <= viewport.height,
             "and it does not run off the right or the bottom of a {viewport:?} window: {reading:?}"
+        );
+    }
+
+    /// A window pulled taller has to spend the height on the reading. The
+    /// charts take whatever the rows and the facts below them do not, so a
+    /// reader who makes room for a build's shape gets a bigger shape and not a
+    /// bigger blank.
+    #[gpui::test]
+    async fn a_window_pulled_taller_draws_a_taller_chart(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        a_run_on_screen(&item, &mut cx, 4242);
+        press_the_plaque(&mut cx);
+
+        let before = cx
+            .debug_bounds("RUN-METRICS-CHART-CPU")
+            .expect("the window opens on the overview");
+        let window_before = cx
+            .debug_bounds("RUN-METRICS-MODAL")
+            .expect("the window is open")
+            .size
+            .height;
+
+        let grip = cx
+            .debug_bounds("DIALOG-GRIP-Bottom")
+            .expect("a window the reader resizes has an edge to pull");
+        let from = grip.center();
+        let to = point(from.x, from.y + PULLED_BY);
+        cx.simulate_mouse_move(from, None, Modifiers::none());
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        settle(&mut cx);
+
+        let window = cx
+            .debug_bounds("RUN-METRICS-MODAL")
+            .expect("the window is still open after the pull");
+        let grew_by = window.size.height - window_before;
+        assert!(
+            grew_by > PULLED_BY / 2.,
+            "the pull reached the window at all: it was {window_before:?} tall and is {:?}",
+            window.size.height
+        );
+
+        let after = cx
+            .debug_bounds("RUN-METRICS-CHART-CPU")
+            .expect("the chart is still drawn");
+        assert!(
+            after.size.height > before.size.height * 2.,
+            "the chart took the height it can use: it was {:?} and is {:?}, \
+             while the window grew by {grew_by:?}",
+            before.size.height,
+            after.size.height
+        );
+
+        assert!(
+            after.size.height <= CHART_MOST_DRAWN,
+            "and it stops where a plot stops reading better for being taller: {:?}",
+            after.size.height
+        );
+    }
+
+    /// How far the pull in the test above drags the window's bottom edge.
+    const PULLED_BY: Pixels = px(320.);
+
+    /// The tallest a chart is drawn, with the heading above it counted in. The
+    /// cap itself lives in the window; this is what it looks like from outside.
+    const CHART_MOST_DRAWN: Pixels = px(260.);
+
+    /// The charts stop growing, so a window pulled taller than they can use has
+    /// to spend the rest on the processes -- every one of them, not the first
+    /// few with the remainder summed into a row nobody can act on.
+    #[gpui::test]
+    async fn a_pulled_window_lists_every_process(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        a_wide_run_on_screen(&item, &mut cx);
+        press_the_plaque(&mut cx);
+
+        let window = cx
+            .debug_bounds("RUN-METRICS-MODAL")
+            .expect("the reading is open");
+        // Spelled out rather than built from the pids, because a selector is
+        // matched by a `&'static str`. 4266 holds the most and 4243 the least
+        // of the twenty-four; every one of them is a row now, where the list
+        // used to stop at eight and sum the remainder into one.
+        for row in [
+            "MEMORY-BAR-4266 · a compiler",
+            "MEMORY-BAR-4258 · a compiler",
+            "MEMORY-BAR-4243 · a compiler",
+        ] {
+            assert!(
+                cx.debug_bounds(row).is_some(),
+                "every process of the run has a bar: {row} has none"
+            );
+        }
+
+        // Having a row is not being on screen: the ninth-largest is the first
+        // one the old list summed away, so a window this tall has to draw it
+        // without the reader scrolling for it.
+        let ninth = cx
+            .debug_bounds("MEMORY-BAR-4258 · a compiler")
+            .expect("the ninth-largest process has a bar");
+        assert!(
+            ninth.origin.y >= window.origin.y && ninth.bottom() <= window.bottom(),
+            "the ninth row is drawn inside the window it was given: {ninth:?} in {window:?}"
         );
     }
 

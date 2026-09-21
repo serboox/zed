@@ -10,7 +10,7 @@ use workspace::{ModalView, Workspace};
 
 use crate::process_metrics::{self, ProcessReading};
 use crate::run_metrics_status_item::{
-    RunMetricsStatusItem, a_bar, a_chart, listed, said, what_it_says,
+    RunMetricsStatusItem, a_bar, a_chart, by_memory, said, what_it_says,
 };
 
 /// How far one step of the fork tree moves a row in from its parent. Wide enough
@@ -34,6 +34,15 @@ const TREE_WIDTH: Pixels = px(720.);
 /// The least width a chart is given before the row holding the charts wraps and
 /// stands them one above the other instead.
 const CHART_LEAST_WIDTH: Pixels = px(300.);
+
+/// How short the row of charts may be squeezed before the window scrolls to it
+/// instead. A heading and a plot, and nothing spare.
+const CHART_LEAST_HEIGHT: Pixels = px(88.);
+
+/// How tall a chart grows before the height is better spent on the processes
+/// below it. Two minutes of readings drawn much taller than this turns a short
+/// burst into a needle and a steady figure into a wall.
+const CHART_MOST_HEIGHT: Pixels = px(240.);
 
 /// Which half of the window is being read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,7 +479,7 @@ impl RunMetricsModal {
             .fold(0u64, |most, (_, memory)| most.max(*memory));
         let busiest = busiest_of(readings);
 
-        let (rows, the_rest) = listed(&metrics.tree);
+        let rows = by_memory(&metrics.tree);
         let largest = rows.first().map(|one| one.memory).unwrap_or(0);
 
         div()
@@ -483,19 +492,30 @@ impl RunMetricsModal {
             .child(
                 v_flex()
                     .w_full()
+                    // The column is at least as tall as the window it scrolls
+                    // in, so a window stretched taller than its reading has the
+                    // surplus to give rather than leaving it blank.
+                    .min_h_full()
                     .gap(cyberpunk::SPACE_18)
                     // The two charts stand side by side while there is room for
                     // both and fall into a column when there is not, which is
-                    // what makes the window worth widening.
+                    // what makes the window worth widening. They grow with it
+                    // too, up to the height past which a plot reads worse rather
+                    // than better; the processes below take the rest.
                     .child(
                         h_flex()
                             .w_full()
+                            .flex_grow_1()
+                            .flex_shrink_0()
+                            .min_h(CHART_LEAST_HEIGHT)
+                            .max_h(CHART_MOST_HEIGHT)
                             .flex_wrap()
-                            .items_start()
+                            .items_stretch()
                             .gap(cyberpunk::SPACE_18)
                             .child(
                                 div()
                                     .flex_1()
+                                    .h_full()
                                     .min_w(CHART_LEAST_WIDTH)
                                     .debug_selector(|| "RUN-METRICS-CHART-CPU".to_string())
                                     .child(a_chart(
@@ -510,6 +530,7 @@ impl RunMetricsModal {
                             .child(
                                 div()
                                     .flex_1()
+                                    .h_full()
                                     .min_w(CHART_LEAST_WIDTH)
                                     .debug_selector(|| "RUN-METRICS-CHART-MEMORY".to_string())
                                     .child(a_chart(
@@ -525,6 +546,12 @@ impl RunMetricsModal {
                     .child(
                         v_flex()
                             .w_full()
+                            // What the charts stop taking, the processes get:
+                            // every one of them, in whatever room is left. It
+                            // grows into free height but never shrinks below its
+                            // rows -- this column is scrolled, not clipped.
+                            .flex_grow_1()
+                            .flex_shrink_0()
                             .gap(cyberpunk::SPACE_4)
                             .child(
                                 Label::new("Memory by process")
@@ -533,14 +560,13 @@ impl RunMetricsModal {
                             )
                             .children(rows.iter().map(|one| {
                                 a_bar(format!("{} · {}", one.pid, one.name), one.memory, largest)
-                            }))
-                            .when_some(the_rest, |list, (count, total)| {
-                                list.child(a_bar(format!("+{count} more"), total, largest))
-                            }),
+                            })),
                     )
                     .child(
                         v_flex()
                             .w_full()
+                            .flex_none()
+                            .debug_selector(|| "RUN-METRICS-FACTS".to_string())
                             .gap(cyberpunk::SPACE_4)
                             .child(
                                 Label::new("Everything else the machine says")
