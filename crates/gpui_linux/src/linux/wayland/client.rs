@@ -86,7 +86,9 @@ use crate::linux::{
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal,
     read_fd_with_timeout, reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
+        clipboard::{
+            Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES, formats_a_file_drag_offers,
+        },
         cursor::Cursor,
         serial::{SerialKind, SerialTracker},
         to_shape,
@@ -624,8 +626,9 @@ impl WaylandClientStatePtr {
         state.dragged_files = paths.to_vec();
         state.dragged_action = DndAction::empty();
         let data_source = data_device_manager.create_data_source(&state.globals.qh, DraggedOut);
-        data_source.offer(FILE_LIST_MIME_TYPE.to_string());
-        data_source.offer(GNOME_COPIED_FILES_MIME_TYPE.to_string());
+        for format in formats_a_file_drag_offers() {
+            data_source.offer(format.to_string());
+        }
         // Saying which actions are on offer is only part of the protocol from
         // version three; an older compositor works out the action itself, and
         // asking it here would be a protocol error rather than a refusal.
@@ -2945,7 +2948,8 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
             wl_data_source::Event::Send { mime_type, fd } => {
                 let paths = state.dragged_files.clone();
                 log::info!(
-                    "drag out of this window: the receiver asked for {mime_type}; answering with {} file(s): {:?}",
+                    "drag out of this window: the receiver asked for {mime_type} while the action stands at {:?}; answering with {} file(s): {:?}",
+                    state.dragged_action,
                     paths.len(),
                     paths
                 );

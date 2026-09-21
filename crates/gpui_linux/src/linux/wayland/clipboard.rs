@@ -212,17 +212,7 @@ impl Clipboard {
     /// carries paths rather than a clipboard item, so it does not go through the
     /// clipboard's own contents, but the writing is the same non-blocking write.
     pub fn send_paths(&self, mime_type: &str, paths: &[PathBuf], fd: OwnedFd) {
-        let bytes = match mime_type {
-            GNOME_COPIED_FILES_MIME_TYPE => serialize_gnome_copied_files(paths, false).into_bytes(),
-            FILE_LIST_MIME_TYPE => serialize_uri_list(paths).into_bytes(),
-            _ => paths
-                .iter()
-                .map(|path| path.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("\n")
-                .into_bytes(),
-        };
-        self.send_internal(fd, bytes);
+        self.send_internal(fd, answered_with(mime_type, paths));
     }
 
     pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
@@ -299,6 +289,26 @@ impl Clipboard {
     }
 }
 
+/// What a drag answers a request for `mime_type` with.
+///
+/// The GNOME format is a clipboard convention and carries its own `copy`/`cut`
+/// verb, which a drag has no honest value for: the action is negotiated after
+/// the data may already have been asked for. A file drag does not offer it --
+/// see [`formats_a_file_drag_offers`] -- and a receiver that asks for it anyway
+/// is told what the clipboard would say.
+fn answered_with(mime_type: &str, paths: &[PathBuf]) -> Vec<u8> {
+    match mime_type {
+        GNOME_COPIED_FILES_MIME_TYPE => serialize_gnome_copied_files(paths, false).into_bytes(),
+        FILE_LIST_MIME_TYPE => serialize_uri_list(paths).into_bytes(),
+        _ => paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes(),
+    }
+}
+
 fn contents_bytes_for_mime(contents: Option<&ClipboardItem>, mime_type: &str) -> Option<Vec<u8>> {
     let contents = contents?;
     if mime_type == GNOME_COPIED_FILES_MIME_TYPE {
@@ -310,4 +320,59 @@ fn contents_bytes_for_mime(contents: Option<&ClipboardItem>, mime_type: &str) ->
         return Some(serialize_uri_list(paths).into_bytes());
     }
     contents.text().map(String::into_bytes)
+}
+
+/// The formats a file drag puts on offer.
+///
+/// One, and deliberately: `text/uri-list` is the format a drag is read with,
+/// and it carries paths and nothing else, so what happens to the original is
+/// decided by the negotiated action alone. The GNOME clipboard format was
+/// offered here too and carried its own `copy`/`cut` verb, which a drag cannot
+/// fill in honestly -- the protocol lets a receiver ask for the data before the
+/// action is settled, and lets it ask more than once -- so a second answer to
+/// the same question could disagree with the first.
+pub(crate) fn formats_a_file_drag_offers() -> [&'static str; 1] {
+    [FILE_LIST_MIME_TYPE]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A drag says what it carries and lets the action say what becomes of it.
+    /// Offering the clipboard format here put a second, contradictable answer
+    /// in the payload itself.
+    #[test]
+    fn a_file_drag_offers_the_drag_format_and_not_the_clipboard_one() {
+        let offered = formats_a_file_drag_offers();
+
+        assert!(
+            offered.contains(&FILE_LIST_MIME_TYPE),
+            "a drag is read as a uri list: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&GNOME_COPIED_FILES_MIME_TYPE),
+            "and never as a clipboard verb: {offered:?}"
+        );
+    }
+
+    /// Whatever a receiver asks for, the answer names the files. The uri list
+    /// is the one that matters, and it is the same list however the drag ends.
+    #[test]
+    fn every_answer_names_the_files_it_carries() {
+        let paths = [PathBuf::from("/tmp/one.txt"), PathBuf::from("/tmp/two.txt")];
+
+        for mime_type in [
+            FILE_LIST_MIME_TYPE,
+            GNOME_COPIED_FILES_MIME_TYPE,
+            "text/plain",
+        ] {
+            let said =
+                String::from_utf8(answered_with(mime_type, &paths)).expect("the payload is text");
+            assert!(
+                said.contains("one.txt") && said.contains("two.txt"),
+                "{mime_type} names both files: {said:?}"
+            );
+        }
+    }
 }
