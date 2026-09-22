@@ -583,6 +583,11 @@ jobs:
           fi
           commits="$(git rev-list --count "$previous..HEAD" -- \
             crates assets Cargo.toml Cargo.lock rust-toolchain.toml script)"
+          # A run somebody started by hand is the asking itself, so it
+          # publishes whether or not the editor changed.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            commits=1
+          fi
           echo "commits=$commits" >> "$GITHUB_OUTPUT"
           echo "previous=$previous" >> "$GITHUB_OUTPUT"
           if [ "$commits" = "0" ]; then
