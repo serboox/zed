@@ -448,6 +448,22 @@ fn a_file_holding(bytes: &[u8]) -> Option<std::fs::File> {
 /// A move is only half done when the drop lands -- whoever took the files has
 /// copied them -- and letting go of these is what makes it a move. Anything
 /// else and the files stay exactly where they were.
+/// The one action a drag puts on offer for what it means.
+///
+/// One and not both, either way. The desktop settles the action by matching
+/// what the source offers against what the receiver will take, and where both
+/// are on offer the receiver decides -- and the receiver can decide either way,
+/// so offering both is offering no promise at all. A move that also offered a
+/// copy would be settled as a copy by a file manager; a copy that also offered
+/// a move would have the original deleted by a receiver that prefers to take
+/// the file, which this editor's own windows do.
+fn offered_by(means: gpui::DragMeans) -> DndAction {
+    match means {
+        gpui::DragMeans::Taking => DndAction::Move,
+        gpui::DragMeans::Copying => DndAction::Copy,
+    }
+}
+
 fn files_the_drag_gave_up(action: DndAction, paths: Vec<PathBuf>) -> Vec<PathBuf> {
     match action.contains(DndAction::Move) {
         true => paths,
@@ -611,6 +627,7 @@ impl WaylandClientStatePtr {
         surface: &wl_surface::WlSurface,
         paths: &[PathBuf],
         picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+        means: gpui::DragMeans,
     ) -> bool {
         let Some(client) = self.0.upgrade() else {
             return false;
@@ -633,11 +650,15 @@ impl WaylandClientStatePtr {
         // version three; an older compositor works out the action itself, and
         // asking it here would be a protocol error rather than a refusal.
         //
-        // Both are offered. Only the receiver knows what it is going to do with
-        // the file, and something that can only take a copy -- a chat window,
-        // an upload form -- refuses a drag that offers nothing else.
+        // What is offered is settled here and cannot be changed afterwards --
+        // the request may be made once only, and only before the drag starts.
+        // So a drag that means to move offers move alone: offering copy as well
+        // leaves the choice to the receiver, and a file manager receiving a drag
+        // out of another application settles on copy every time. The cost is
+        // that a receiver which can only copy refuses the drag outright, which
+        // is why the reader can ask for a copy instead.
         if data_source.version() >= 3 {
-            data_source.set_actions(DndAction::Copy | DndAction::Move);
+            data_source.set_actions(offered_by(means));
         }
 
         let icon = drag_icon_for(&state.globals, paths.len(), picture);
@@ -2996,8 +3017,17 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
                 }
                 data_source.destroy();
             }
-            // Nothing took it. Nothing is removed either.
+            // Nothing took it. Either it was dropped where nothing was
+            // listening, or what it was dropped on could not do what the drag
+            // asked for -- a window that only copies refuses a drag that only
+            // moves, and there is no second chance to offer it a copy instead.
             wl_data_source::Event::Cancelled => {
+                log::info!(
+                    "drag out of this window was refused; {} file(s) stay where they are, \
+                     and the action stood at {:?}",
+                    state.dragged_files.len(),
+                    state.dragged_action
+                );
                 state.dragged_files.clear();
                 state.dragged_action = DndAction::empty();
                 if let Some(icon) = state.drag_icon.take() {
@@ -3149,6 +3179,35 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    /// What a drag offers decides what it can become, and it is decided once,
+    /// before the drag starts. A move that also offers a copy is settled as a
+    /// copy by any receiver that would rather copy -- which a file manager
+    /// receiving a drag from another application does.
+    #[test]
+    fn a_drag_that_means_to_move_offers_nothing_else() {
+        let moving = offered_by(gpui::DragMeans::Taking);
+
+        assert!(moving.contains(DndAction::Move), "the move is on offer");
+        assert!(
+            !moving.contains(DndAction::Copy),
+            "and the copy is not, or the receiver settles on it: {moving:?}"
+        );
+    }
+
+    /// And a copy offers nothing else either, for the same reason read the other
+    /// way round: a receiver free to settle on a move would have the original
+    /// deleted after a drag the reader asked to be a copy.
+    #[test]
+    fn a_drag_that_means_to_copy_offers_nothing_else() {
+        let copying = offered_by(gpui::DragMeans::Copying);
+
+        assert!(copying.contains(DndAction::Copy), "the copy is on offer");
+        assert!(
+            !copying.contains(DndAction::Move),
+            "and the move is not, or the original is taken from under the reader: {copying:?}"
+        );
+    }
 
     #[derive(Default)]
     struct FakeImeCursorRectangleSink {

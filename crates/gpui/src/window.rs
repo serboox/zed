@@ -4,14 +4,14 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragMeans, Edges, Effect,
+    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -2396,8 +2396,9 @@ impl Window {
         &self,
         paths: &[std::path::PathBuf],
         picture: Option<&Arc<RenderImage>>,
+        means: DragMeans,
     ) -> bool {
-        self.platform_window.start_file_drag(paths, picture)
+        self.platform_window.start_file_drag(paths, picture, means)
     }
 
     /// Says that what this window will do with the files now being dragged over
@@ -4925,14 +4926,37 @@ impl Window {
         // The drag is given up only once the platform has taken it. A platform
         // that cannot start such a drag leaves it exactly where it was, rather
         // than ending it and leaving the reader holding nothing.
-        if !self
-            .platform_window
-            .start_file_drag(&drag.files, drag.picture.as_ref())
-        {
+        if !self.platform_window.start_file_drag(
+            &drag.files,
+            drag.picture.as_ref(),
+            self.what_a_drag_means(),
+        ) {
             return;
         }
         cx.active_drag.take();
         self.refresh();
+    }
+
+    /// What a drag carried out of the window is asking for, read from the
+    /// modifier held as it leaves.
+    ///
+    /// Moving is what a file dragged out of a file tree means, so it is what is
+    /// asked for unless the reader says otherwise. The modifier is the one each
+    /// desktop already uses to turn a move into a copy, so nothing new has to
+    /// be learned: Option on macOS, Control everywhere else.
+    ///
+    /// It is read once, as the drag leaves. A desktop settles the action from
+    /// what the source offered, and that offer cannot be changed afterwards.
+    fn what_a_drag_means(&self) -> DragMeans {
+        #[cfg(target_os = "macos")]
+        let asked_for_a_copy = self.modifiers().alt;
+        #[cfg(not(target_os = "macos"))]
+        let asked_for_a_copy = self.modifiers().control;
+
+        match asked_for_a_copy {
+            true => DragMeans::Copying,
+            false => DragMeans::Taking,
+        }
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {

@@ -464,6 +464,27 @@ impl Debug for DisplayId {
     }
 }
 
+/// What a drag leaving the window asks the desktop to do with the files.
+///
+/// The desktop settles this once, from what the source offers against what the
+/// receiver will take, and on Wayland the offer cannot be changed once the drag
+/// has started. So a drag that means to move says so from the first moment and
+/// offers nothing else: a receiver that would rather copy -- which a file
+/// manager does for a drag out of another application -- is otherwise taken at
+/// its word, and the original is left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragMeans {
+    /// The files go. The original is let go of once the receiver has taken it,
+    /// and a receiver that can only copy refuses the drag rather than quietly
+    /// making a second copy.
+    Taking,
+    /// The files are copied and the originals stay where they are. Nothing else
+    /// is offered: a receiver free to take the file instead -- which this
+    /// editor's own windows ask to do -- would have the original deleted after
+    /// a drag the reader asked to be a copy.
+    Copying,
+}
+
 /// Which part of the window to resize
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
@@ -886,6 +907,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         &self,
         _paths: &[std::path::PathBuf],
         _picture: Option<&std::sync::Arc<crate::RenderImage>>,
+        _means: DragMeans,
     ) -> bool {
         false
     }

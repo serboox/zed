@@ -537,6 +537,8 @@ struct MacWindowState {
     /// The files this window handed to the desktop, kept until the drag ends so
     /// that a move can let go of the originals.
     dragged_out: Vec<std::path::PathBuf>,
+    /// What the drag those files were handed to the desktop for asks it to do.
+    dragged_out_means: gpui::DragMeans,
     /// Whether what this window will do with the drag over it amounts to taking
     /// the files. Answered again for every step of the drag.
     takes_the_drag: bool,
@@ -946,6 +948,7 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 dragged_out: Vec::new(),
+                dragged_out_means: gpui::DragMeans::Copying,
                 takes_the_drag: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -1878,6 +1881,7 @@ impl PlatformWindow for MacWindow {
         &self,
         paths: &[std::path::PathBuf],
         _picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+        means: gpui::DragMeans,
     ) -> bool {
         if paths.is_empty() {
             return false;
@@ -1885,6 +1889,7 @@ impl PlatformWindow for MacWindow {
         let mut this = self.0.lock();
         let window = this.native_window;
         this.dragged_out = paths.to_vec();
+        this.dragged_out_means = means;
         drop(this);
 
         unsafe {
@@ -3071,13 +3076,23 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
 /// Both: only the receiver knows what it is going to do with the file, and
 /// something that can only take a copy -- a chat window, an upload form --
 /// refuses a drag that offers nothing else.
+/// What this window will let the drag it started become: one operation and not
+/// both, either way. A drag that also allowed the other is settled by the
+/// destination, and it can settle either way -- a file manager would copy a
+/// drag that meant to move, and a destination that takes files would have the
+/// original deleted after a drag that meant to copy.
 extern "C" fn dragging_source_operation_mask(
-    _: &Object,
+    this: &Object,
     _: Sel,
     _: id,
     _context: NSInteger,
 ) -> NSDragOperation {
-    NSDragOperationCopy | NSDragOperationMove
+    let window_state = unsafe { get_window_state(this) };
+    let means = window_state.as_ref().lock().dragged_out_means;
+    match means {
+        gpui::DragMeans::Taking => NSDragOperationMove,
+        gpui::DragMeans::Copying => NSDragOperationCopy,
+    }
 }
 
 /// The drag this window started is over. A move is only half done here -- the

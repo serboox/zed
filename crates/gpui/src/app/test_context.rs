@@ -812,6 +812,12 @@ impl VisualTestContext {
             .clone()
     }
 
+    /// What the last drag handed to the platform asked the desktop to do, or
+    /// nothing when no drag has left the window.
+    pub fn what_the_last_drag_meant(&self) -> Option<crate::DragMeans> {
+        self.cx.test_window(self.window).0.lock().last_drag_meant
+    }
+
     /// Makes this window's platform one that cannot start a drag of its own, the
     /// way a platform gpui has no implementation for behaves.
     pub fn refuse_file_drags(&self) {

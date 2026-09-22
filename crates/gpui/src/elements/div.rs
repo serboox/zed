@@ -5087,6 +5087,103 @@ mod tests {
         );
     }
 
+    /// A file carried out of a file tree means to be moved. The desktop settles
+    /// the action from what the source offers, and where both are on offer the
+    /// receiver decides -- and a file manager receiving a drag from another
+    /// application decides to copy. So a plain drag asks for the move outright.
+    #[gpui::test]
+    async fn a_drag_that_leaves_the_window_means_to_move_the_file(cx: &mut TestAppContext) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file], cx);
+
+        carry_it_out_of_the_window(&mut cx, Modifiers::none());
+
+        assert_eq!(
+            cx.what_the_last_drag_meant(),
+            Some(crate::DragMeans::Taking),
+            "nothing was held, so the file goes rather than being copied"
+        );
+    }
+
+    /// The modifier every desktop already uses to turn a move into a copy does
+    /// that here too, which is the way out for a receiver that cannot take a
+    /// file at all and would otherwise refuse the drag.
+    ///
+    /// It is pressed only for the step that carries the drag out of the window,
+    /// because that is the step that decides: the drag is handed over there, and
+    /// what it offers cannot be changed afterwards.
+    #[gpui::test]
+    async fn the_copy_modifier_makes_a_leaving_drag_a_copy(cx: &mut TestAppContext) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file], cx);
+
+        carry_it_out_of_the_window(&mut cx, asking_for_a_copy());
+
+        assert_eq!(
+            cx.what_the_last_drag_meant(),
+            Some(crate::DragMeans::Copying),
+            "the modifier was held as the drag left, so the original stays"
+        );
+    }
+
+    /// And the modifier is read there and nowhere earlier: held while the drag
+    /// is picked up but let go of before it leaves, it was not what the reader
+    /// asked for by the time the question was put.
+    #[gpui::test]
+    async fn a_modifier_let_go_of_before_the_drag_leaves_is_not_what_was_asked(
+        cx: &mut TestAppContext,
+    ) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file], cx);
+
+        let held = asking_for_a_copy();
+        cx.simulate_mouse_down(point(px(20.), px(20.)), MouseButton::Left, held);
+        cx.simulate_mouse_move(point(px(40.), px(40.)), MouseButton::Left, held);
+        cx.simulate_mouse_move(
+            point(px(-30.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+
+        assert_eq!(
+            cx.what_the_last_drag_meant(),
+            Some(crate::DragMeans::Taking),
+            "the modifier was gone by the step that hands the drag over"
+        );
+    }
+
+    /// Presses inside the window and drags, holding nothing, then carries the
+    /// drag past the left edge holding `at_the_edge`. The last step is the one
+    /// that hands the drag to the platform, so it is the only one whose
+    /// modifiers can decide what the drag asks for.
+    fn carry_it_out_of_the_window(cx: &mut crate::VisualTestContext, at_the_edge: Modifiers) {
+        cx.simulate_mouse_down(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(40.), px(40.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(point(px(-30.), px(40.)), MouseButton::Left, at_the_edge);
+    }
+
+    /// The modifier each desktop uses to turn a move into a copy.
+    fn asking_for_a_copy() -> Modifiers {
+        let mut held = Modifiers::none();
+        #[cfg(target_os = "macos")]
+        {
+            held.alt = true;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            held.control = true;
+        }
+        held
+    }
+
     /// A platform that cannot start a drag of its own must leave the drag where
     /// it is. Ending it there would take the drag away from a reader who is
     /// still holding the button, with nothing anywhere to show for it.

@@ -113,6 +113,8 @@ pub(crate) struct WindowsWindowInner {
     /// for it: the editor's own state is held open across it and every redraw
     /// in the meantime would find it so.
     pending_file_drag: RefCell<Vec<std::path::PathBuf>>,
+    /// What that pending drag asks the shell to do with the files.
+    pending_file_drag_means: Cell<gpui::DragMeans>,
     /// Whether what this window will do with the drag over it amounts to taking
     /// the files. Answered again for every step of the drag.
     takes_the_drag: Cell<bool>,
@@ -288,6 +290,7 @@ impl WindowsWindowInner {
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
             pending_file_drag: RefCell::new(Vec::new()),
+            pending_file_drag_means: Cell::new(gpui::DragMeans::Copying),
             takes_the_drag: Cell::new(false),
         }))
     }
@@ -617,7 +620,7 @@ impl Drop for WindowsWindow {
 pub(crate) fn run_pending_file_drag(inner: &WindowsWindowInner) -> Option<isize> {
     let paths = std::mem::take(&mut *inner.pending_file_drag.borrow_mut());
     if !paths.is_empty() {
-        start_file_drag(inner.hwnd, &paths).log_err();
+        start_file_drag(inner.hwnd, &paths, inner.pending_file_drag_means.get()).log_err();
     }
     Some(0)
 }
@@ -629,7 +632,7 @@ pub(crate) fn run_pending_file_drag(inner: &WindowsWindowInner) -> Option<isize>
 /// a data object that only has to be told what it holds, and `SHDoDragDrop` with
 /// no drop source of its own uses the standard one, which is the one every other
 /// application's drags already behave like.
-fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
+fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf], means: gpui::DragMeans) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -655,15 +658,15 @@ fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf]) -> Result<()> {
         // No drop source of our own: without one the shell uses the standard
         // one, which is how every other application's drags already behave.
         //
-        // Both are offered: only the receiver knows what it is going to do with
-        // the file, and something that can only take a copy -- a chat window, an
-        // upload form -- refuses a drag that offers nothing else.
-        let taken = SHDoDragDrop(
-            Some(hwnd),
-            &data,
-            None::<&IDropSource>,
-            DROPEFFECT_COPY | DROPEFFECT_MOVE,
-        )?;
+        // One effect and not both, either way. Offering both leaves the choice
+        // to the receiver, and it can go either way: a file manager settles a
+        // drag from another application as a copy, and a receiver that takes
+        // files would have the original deleted after a drag meant as one.
+        let offered = match means {
+            gpui::DragMeans::Taking => DROPEFFECT_MOVE,
+            gpui::DragMeans::Copying => DROPEFFECT_COPY,
+        };
+        let taken = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, offered)?;
         // A move is only half done here -- the files have been copied to wherever
         // they went -- and letting go of the originals is what makes it a move.
         if taken.0 & DROPEFFECT_MOVE.0 != 0 {
@@ -1112,11 +1115,13 @@ impl PlatformWindow for WindowsWindow {
         &self,
         paths: &[std::path::PathBuf],
         _picture: Option<&std::sync::Arc<gpui::RenderImage>>,
+        means: gpui::DragMeans,
     ) -> bool {
         if paths.is_empty() {
             return false;
         }
         *self.0.pending_file_drag.borrow_mut() = paths.to_vec();
+        self.0.pending_file_drag_means.set(means);
         unsafe {
             PostMessageW(
                 Some(self.0.hwnd),

@@ -42,6 +42,8 @@ pub(crate) struct TestWindowState {
     pub(crate) refuse_file_drags: bool,
     /// Whether this window last said it takes the files dragged over it.
     pub(crate) drag_taken_as_move: bool,
+    /// What the last drag handed to the platform asked the desktop to do.
+    pub(crate) last_drag_meant: Option<crate::DragMeans>,
 }
 
 #[derive(Clone)]
@@ -96,6 +98,7 @@ impl TestWindow {
             is_fullscreen: false,
             dragged_out: Vec::new(),
             refuse_file_drags: false,
+            last_drag_meant: None,
             drag_taken_as_move: false,
         })))
     }
@@ -357,12 +360,14 @@ impl PlatformWindow for TestWindow {
         &self,
         paths: &[std::path::PathBuf],
         _picture: Option<&std::sync::Arc<crate::RenderImage>>,
+        means: crate::DragMeans,
     ) -> bool {
         let mut this = self.0.lock();
         if this.refuse_file_drags {
             return false;
         }
         this.dragged_out.push(paths.to_vec());
+        this.last_drag_meant = Some(means);
         true
     }
 
