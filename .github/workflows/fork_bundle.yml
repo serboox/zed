@@ -11,6 +11,12 @@ name: Bundle this fork
 # graphics stack the engine cannot use, `HTML_ENGINE: unavailable`, and the job
 # summary repeats whichever it was.
 on:
+  # A release a week, when the editor changed in that week -- the release job
+  # says no when it did not. GitHub reads a scheduled workflow from the
+  # repository's default branch, so this only fires while that is the fork's
+  # own branch.
+  schedule:
+    - cron: "0 3 * * 1"
   push:
     branches: [personal_zed_fork, bundle/**]
   workflow_dispatch:
@@ -534,16 +540,16 @@ jobs:
   # behind a login and come down as zips of zips. A release is a plain link per
   # file, which is what somebody installing this actually needs.
   #
-  # Every build of the branch publishes one. A cron would be the other way to
-  # get a release a week, but a scheduled workflow is read from the repository's
-  # default branch, and this file does not live there -- it would never fire.
+  # Every build of the branch publishes one, and the weekly schedule above
+  # makes sure a week with changes ends in a release even without a push. A
+  # week without changes to the editor ends in nothing: the step below says so.
   release:
     name: Publish the bundles where they can be downloaded
-    needs: [plan, linux, windows, macos]
+    needs: [plan, tests, linux, windows, macos]
     if: >-
       always() && !cancelled()
       && !contains(needs.*.result, 'failure')
-      && github.ref == 'refs/heads/personal_zed_fork'
+      && endsWith(github.ref, '/personal_zed_fork')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -560,17 +566,45 @@ jobs:
           path: bundles
           merge-multiple: true
 
+      # A release is for changes to the editor. A week in which only the
+      # workflow or a document moved has nothing to hand anybody, and a release
+      # that carries the same editor as the last one is only noise to scroll
+      # past when looking for the one that changed something.
+      - name: Say whether the editor itself changed since the last release
+        id: changed
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)"
+          if [ -z "$previous" ] || ! git rev-parse -q --verify "$previous^{commit}" > /dev/null; then
+            echo "there is no release to compare against, so this is the first"
+            echo "commits=1" >> "$GITHUB_OUTPUT"
+            echo "previous=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          commits="$(git rev-list --count "$previous..HEAD" -- \
+            crates assets Cargo.toml Cargo.lock rust-toolchain.toml script)"
+          echo "commits=$commits" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          if [ "$commits" = "0" ]; then
+            echo "The editor has not changed since \`$previous\`, so no release." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Name the release after the day and the commit
+        if: steps.changed.outputs.commits != '0'
         id: name
         run: |
           set -euo pipefail
           echo "tag=fork-$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Say what is in it
+        if: steps.changed.outputs.commits != '0'
         id: notes
         run: |
           set -euo pipefail
-          previous="$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)"
+          previous="${{ steps.changed.outputs.previous }}"
           {
             echo "Built from \`personal_zed_fork\` at ${GITHUB_SHA::7}."
             echo
@@ -598,11 +632,16 @@ jobs:
               git log --no-merges --pretty='- %s' -n 50 "$previous..HEAD" || true
             fi
           } > notes.md
+          # What this fork is and what it costs, which is the same every time
+          # and so is kept as a document rather than written out here.
+          echo >> notes.md
+          cat .github/fork-release-notes.md >> notes.md
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Publish it
+        if: steps.changed.outputs.commits != '0'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -615,7 +654,6 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Zed fork ${{ steps.name.outputs.tag }}" \
             --notes-file notes.md \
-            --prerelease \
             "${files[@]}"
         env:
           GH_TOKEN: ${{ github.token }}
