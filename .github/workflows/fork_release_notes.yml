@@ -1,0 +1,48 @@
+name: Refresh the fork release description
+
+# The description of what this build is lives in fork-release-notes.md and is
+# written into each release when it is published. Editing that document should
+# not need a three-hour rebuild to reach the release people download from, so
+# this rewrites the latest release's description in place and keeps its files.
+on:
+  push:
+    branches: [personal_zed_fork]
+    paths:
+      - .github/fork-release-notes.md
+      - .github/workflows/fork_release_notes.yml
+  workflow_dispatch:
+
+concurrency:
+  group: fork-release-notes
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    name: Write the description into the latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The part above the document -- the build line, the file table and the
+      # commit list -- belongs to that release and is kept as it was.
+      - name: Rewrite the description and publish as a full release
+        run: |
+          set -euo pipefail
+          tag="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
+          if [ -z "$tag" ]; then
+            echo "there is no release to refresh"
+            exit 0
+          fi
+          gh release view "$tag" --json body -q .body \
+            | awk '/^## What this build is$/ { exit } { print }' > head.md
+          {
+            cat head.md
+            echo
+            cat .github/fork-release-notes.md
+          } > notes.md
+          gh release edit "$tag" --notes-file notes.md --prerelease=false --latest
+          echo "Refreshed the description of \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
