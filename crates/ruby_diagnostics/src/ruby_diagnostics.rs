@@ -45,7 +45,7 @@ pub fn what_ruby_reported(output: &str, named: &str, text: &str) -> Vec<lsp::Dia
                 range: the_whole_line(text, quoted),
                 severity: Some(lsp::DiagnosticSeverity::ERROR),
                 source: Some("ruby -c".to_string()),
-                message,
+                message: message.into(),
                 ..Default::default()
             });
         }

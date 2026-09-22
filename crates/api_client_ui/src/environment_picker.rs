@@ -427,7 +427,7 @@ fn the_mark(marked: bool) -> AnyElement {
             .size(IconSize::Small)
             .color(Color::Accent)
             .into_any_element(),
-        false => div().size(ui::rems_from_px(14.)).into_any_element(),
+        false => div().size(ui::rems_from_px(14_f32)).into_any_element(),
     }
 }
 

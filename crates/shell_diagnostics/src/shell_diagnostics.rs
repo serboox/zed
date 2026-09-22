@@ -97,7 +97,7 @@ pub fn what_shellcheck_reported(output: &str, named: &str, text: &str) -> Vec<ls
             severity: Some(severity_of(&comment.level)),
             code: Some(lsp::NumberOrString::String(format!("SC{}", comment.code))),
             source: Some("shellcheck".to_string()),
-            message: comment.message.clone(),
+            message: comment.message.clone().into(),
             ..Default::default()
         })
         .collect()
@@ -237,7 +237,7 @@ mod tests {
         );
         assert_eq!(found[0].source.as_deref(), Some("shellcheck"));
         assert_eq!(
-            found[0].message,
+            found[0].message.as_str(),
             "Double quote to prevent globbing and word splitting."
         );
     }

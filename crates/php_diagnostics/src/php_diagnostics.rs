@@ -37,7 +37,7 @@ pub fn what_php_reported(output: &str, named: &str, text: &str) -> Vec<lsp::Diag
         range: the_whole_line(text, reported.line),
         severity: Some(lsp::DiagnosticSeverity::ERROR),
         source: Some("php -l".to_string()),
-        message: reported.message,
+        message: reported.message.into(),
         ..Default::default()
     }]
 }
@@ -107,7 +107,8 @@ mod tests {
         let found = what_php_reported(A_MISSING_SEMICOLON, NAMED, text);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
-            found[0].message, "syntax error, unexpected token \"}\", expecting \",\" or \";\"",
+            found[0].message.as_str(),
+            "syntax error, unexpected token \"}\", expecting \",\" or \";\"",
             "the message keeps everything php said and nothing it did not"
         );
         assert_eq!(
@@ -130,7 +131,10 @@ mod tests {
             "PHP Parse error:  syntax error, unexpected token \"in\" in bad.php on line 2\n";
         let found = what_php_reported(output, NAMED, "<?php\n$x in;\n");
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].message, "syntax error, unexpected token \"in\"");
+        assert_eq!(
+            found[0].message.as_str(),
+            "syntax error, unexpected token \"in\""
+        );
         assert_eq!(found[0].range.start.line, 1);
     }
 

@@ -29,7 +29,8 @@ use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
-use crate::{branch_picker, git_panel::show_error_toast};
+use crate::branch_picker;
+use git_ui_core::notifications::show_error_toast;
 
 actions!(
     branch_picker,
@@ -884,7 +885,7 @@ impl Render for DeleteBranchTooltip {
             Tooltip::with_meta_in(
                 "Delete Branch",
                 Some(&branch_picker::DeleteBranch),
-                "Hold alt to force delete",
+                concat!("Hold ", ui::alt_key_name!(), " to force delete"),
                 &self.focus_handle,
                 cx,
             )
@@ -1227,7 +1228,7 @@ fn remote_provider_icons(
             let (provider, _) = parse_git_remote_url(provider_registry.clone(), remote_url)?;
             Some((
                 remote_name.clone(),
-                crate::get_provider_icon(&provider.name()),
+                ui::git_hosting_provider_icon(provider.name().as_str()),
             ))
         })
         .collect()
@@ -2019,7 +2020,7 @@ impl PickerDelegate for BranchListDelegate {
                                     &focus_handle,
                                     cx,
                                 )
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.delegate.confirm(true, window, cx);
@@ -2043,7 +2044,7 @@ impl PickerDelegate for BranchListDelegate {
                                             &focus_handle,
                                             cx,
                                         )
-                                        .map(|kb| kb.size(rems_from_px(12.))),
+                                        .map(|kb| kb.size(rems_from_px(12_f32))),
                                     )
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(
@@ -2060,7 +2061,7 @@ impl PickerDelegate for BranchListDelegate {
                             .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.delegate.confirm(false, window, cx);
@@ -2080,7 +2081,7 @@ impl PickerDelegate for BranchListDelegate {
                                             &focus_handle,
                                             cx,
                                         )
-                                        .map(|kb| kb.size(rems_from_px(12.))),
+                                        .map(|kb| kb.size(rems_from_px(12_f32))),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.delegate.confirm(false, window, cx);
@@ -2105,7 +2106,7 @@ impl PickerDelegate for BranchListDelegate {
                                     &focus_handle,
                                     cx,
                                 )
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.delegate.confirm(true, window, cx);
@@ -2123,7 +2124,7 @@ impl PickerDelegate for BranchListDelegate {
                                 .style(cyberpunk::Rank::Accent.style())
                                 .key_binding(
                                     KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                        .map(|kb| kb.size(rems_from_px(12.))),
+                                        .map(|kb| kb.size(rems_from_px(12_f32))),
                                 )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.delegate.confirm(false, window, cx);
@@ -2140,7 +2141,7 @@ impl PickerDelegate for BranchListDelegate {
                             .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.delegate.confirm(false, window, cx);
@@ -2208,7 +2209,7 @@ async fn offer_the_worktree(
                 .file_name()
                 .map_or_else(|| shown.clone(), |name| name.to_string_lossy().into_owned());
             workspace.update_in(cx, |workspace, window, cx| {
-                crate::worktree_service::handle_switch_worktree(
+                git_ui_core::worktree_service::handle_switch_worktree(
                     workspace,
                     &zed_actions::SwitchWorktree {
                         path: held_at,

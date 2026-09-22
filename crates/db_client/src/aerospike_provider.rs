@@ -54,6 +54,7 @@ impl AerospikeProvider {
             .ok_or_else(|| anyhow!("Aerospike cluster has no available nodes"))?;
         node.info(&AdminPolicy::default(), commands)
             .await
+            .map(|replies| replies.into_iter().collect())
             .map_err(|error| anyhow!("Aerospike info command failed: {error}"))
     }
 }

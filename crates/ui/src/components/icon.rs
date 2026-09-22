@@ -75,12 +75,12 @@ impl IconSize {
             // "normal" icon and 16 the largest before a jump to 48, which is the
             // metric of an early-2010s desktop. Raising the steps rather than the
             // call sites moves every icon in the editor at once.
-            IconSize::Indicator => rems_from_px(12.),
-            IconSize::XSmall => rems_from_px(14.),
-            IconSize::Small => rems_from_px(17.),
-            IconSize::Medium => rems_from_px(20.),
-            IconSize::Large => rems_from_px(24.),
-            IconSize::XLarge => rems_from_px(48.),
+            IconSize::Indicator => rems_from_px(12_f32),
+            IconSize::XSmall => rems_from_px(14_f32),
+            IconSize::Small => rems_from_px(17_f32),
+            IconSize::Medium => rems_from_px(20_f32),
+            IconSize::Large => rems_from_px(24_f32),
+            IconSize::XLarge => rems_from_px(48_f32),
             IconSize::Custom(size) => size,
         }
     }
@@ -117,6 +117,20 @@ impl IconSize {
 impl From<IconName> for Icon {
     fn from(icon: IconName) -> Self {
         Icon::new(icon)
+    }
+}
+
+pub fn git_hosting_provider_icon(provider_name: &str) -> IconName {
+    match provider_name {
+        "Bitbucket" => IconName::Bitbucket,
+        "Chromium" => IconName::Gerrit,
+        "Codeberg" => IconName::Codeberg,
+        "Forgejo Self-Hosted" => IconName::Forgejo,
+        "GitHub" => IconName::Github,
+        "GitLab" => IconName::Gitlab,
+        "Gitea" => IconName::Gitea,
+        "SourceHut" => IconName::Sourcehut,
+        _ => IconName::Link,
     }
 }
 
@@ -361,12 +375,12 @@ mod tests {
     #[test]
     fn the_scale_is_not_stuck_in_the_early_twenty_tens() {
         assert!(
-            IconSize::Medium.rems().0 >= rems_from_px(20.).0,
+            IconSize::Medium.rems().0 >= rems_from_px(20_f32).0,
             "the default icon is what most call sites get: {:?}",
             IconSize::Medium.rems()
         );
         assert!(
-            IconSize::Small.rems().0 >= rems_from_px(16.).0,
+            IconSize::Small.rems().0 >= rems_from_px(16_f32).0,
             "even the small icon has to stay legible: {:?}",
             IconSize::Small.rems()
         );

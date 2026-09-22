@@ -1,8 +1,7 @@
 use crate::{
-    Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinition,
-    GoToDefinitionSplit, GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind,
-    HighlightKey, Navigated, PointForPosition, SelectPhase,
-    editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
+    Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinitionSplit,
+    GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind, HighlightKey, Navigated,
+    PointForPosition, SelectPhase, editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
 };
 use gpui::{
     App, AsyncWindowContext, Context, Entity, HighlightStyle, Modifiers, Pixels, Task,
@@ -51,8 +50,16 @@ impl RangeInEditor {
     ) -> bool {
         match (self, trigger_point) {
             (Self::Text(range), TriggerPoint::Text(point)) => {
-                let point_after_start = range.start.cmp(point, &snapshot.buffer_snapshot()).is_le();
-                point_after_start && range.end.cmp(point, &snapshot.buffer_snapshot()).is_ge()
+                let buffer_snapshot = snapshot.buffer_snapshot();
+                if !range.start.is_valid(&buffer_snapshot)
+                    || !range.end.is_valid(&buffer_snapshot)
+                    || !point.is_valid(&buffer_snapshot)
+                {
+                    return false;
+                }
+                let point_after_start = range.start.cmp(point, &buffer_snapshot).is_le();
+                let point_after_end = range.end.cmp(point, &buffer_snapshot).is_ge();
+                point_after_start && point_after_end
             }
             (Self::Inlay(highlight), TriggerPoint::InlayHint(point, _, _)) => {
                 highlight.inlay == point.inlay
@@ -327,9 +334,13 @@ impl Editor {
                 (true, true) => {
                     self.go_to_type_definition_split(&GoToTypeDefinitionSplit, window, cx)
                 }
-                (true, false) => self.go_to_type_definition(&GoToTypeDefinition, window, cx),
+                (true, false) => {
+                    self.go_to_type_definition(&GoToTypeDefinition::default(), window, cx)
+                }
                 (false, true) => self.go_to_definition_split(&GoToDefinitionSplit, window, cx),
-                (false, false) => self.go_to_definition(&GoToDefinition::default(), window, cx),
+                (false, false) => {
+                    self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, window, cx)
+                }
             }
         } else {
             Task::ready(Ok(Navigated::No))
@@ -1136,8 +1147,9 @@ mod tests {
     use futures::StreamExt;
     use gpui::{Modifiers, MousePressureEvent, PressureStage};
     use indoc::indoc;
+    use language::Point;
     use lsp::request::{GotoDefinition, GotoTypeDefinition};
-    use multi_buffer::MultiBufferOffset;
+    use multi_buffer::{MultiBufferOffset, PathKey};
     use settings::InlayHintSettingsContent;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -1330,7 +1342,6 @@ mod tests {
         fn semantic_tokens(
             &self,
             _buffer: Entity<language::Buffer>,
-            _refresh: Option<project::lsp_store::RefreshForServer>,
             _cx: &mut App,
         ) -> Option<
             futures::future::Shared<
@@ -1411,7 +1422,7 @@ mod tests {
             _buffer: &Entity<language::Buffer>,
             _position: text::Anchor,
             _cx: &mut App,
-        ) -> Task<anyhow::Result<Option<std::ops::Range<text::Anchor>>>> {
+        ) -> Task<anyhow::Result<Option<crate::RenameTarget>>> {
             Task::ready(Ok(None))
         }
 
@@ -1420,6 +1431,7 @@ mod tests {
             _buffer: &Entity<language::Buffer>,
             _position: text::Anchor,
             _new_name: String,
+            _language_server_id: Option<lsp::LanguageServerId>,
             _cx: &mut App,
         ) -> Option<Task<anyhow::Result<project::ProjectTransaction>>> {
             None
@@ -1606,6 +1618,71 @@ mod tests {
                 https://example.com
             "},
         );
+    }
+
+    #[gpui::test]
+    async fn test_hover_link_after_multibuffer_path_changes(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+        cx.set_state("https://zed.dev/ˇreleases");
+        let old_snapshot = cx.update_editor(|editor, window, cx| editor.snapshot(window, cx));
+        let link_start = MultiBufferOffset(17).to_display_point(&old_snapshot.display_snapshot);
+        let link_end = MultiBufferOffset(22).to_display_point(&old_snapshot.display_snapshot);
+        let point_for_position = |point| PointForPosition {
+            previous_valid: point,
+            next_valid: point,
+            nearest_valid: point,
+            exact_unclipped: point,
+            column_overshoot_after_line_end: 0,
+        };
+
+        let buffer = cx.editor(|editor, _, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("test editor should contain a singleton buffer")
+        });
+        cx.update_multibuffer(|multibuffer, cx| {
+            let max_point = buffer.read(cx).max_point();
+            multibuffer.set_excerpts_for_path(
+                PathKey::sorted(1),
+                buffer,
+                [Point::zero()..max_point],
+                0,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let modifiers = if cfg!(target_os = "macos") {
+            Modifiers::command_shift()
+        } else {
+            Modifiers::control_shift()
+        };
+        cx.update_editor(|editor, window, cx| {
+            editor.update_hovered_link(
+                point_for_position(link_start),
+                None,
+                &old_snapshot,
+                modifiers,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, window, cx| {
+            editor.update_hovered_link(
+                point_for_position(link_end),
+                None,
+                &old_snapshot,
+                modifiers,
+                window,
+                cx,
+            );
+        });
     }
 
     #[gpui::test]
@@ -2522,6 +2599,7 @@ mod tests {
                 "This is file2.rs".as_bytes().to_vec(),
             )
             .await;
+        cx.run_until_parked();
 
         // Base document with {ABS} placeholder for absolute path prefix.
         // Each test case replaces a specific line to add cursor (ˇ) or highlight («»ˇ) markers.
@@ -2691,6 +2769,7 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        cx.run_until_parked();
 
         // file2.rs:5:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2767,6 +2846,7 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        cx.run_until_parked();
 
         // file2.rs:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2824,6 +2904,7 @@ Sentence ending file2.rs.
                 "line 1\nline 2\nline 3\n".as_bytes().to_vec(),
             )
             .await;
+        cx.run_until_parked();
 
         // file2.rs:2:in should resolve to file2.rs line 2 (like Ruby backtraces)
         cx.set_state(indoc! {"
@@ -2882,6 +2963,7 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        cx.run_until_parked();
 
         // Markdown link [text](file2.rs:3:2) should highlight only the inner link,
         // not the surrounding markdown syntax.

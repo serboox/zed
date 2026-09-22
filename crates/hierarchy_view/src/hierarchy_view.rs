@@ -497,7 +497,14 @@ impl HierarchyPanel {
                 .update_in(cx, |workspace, window, cx| {
                     let pane = workspace.active_pane().clone();
                     let editor = workspace.open_project_item::<Editor>(
-                        pane, buffer, true, true, true, true, window, cx,
+                        Some(pane),
+                        buffer,
+                        true,
+                        true,
+                        true,
+                        true,
+                        window,
+                        cx,
                     );
                     editor.update(cx, |editor, cx| {
                         let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -1386,8 +1393,16 @@ mod tests {
 
         workspace.update_in(cx, |workspace, window, cx| {
             let pane = workspace.active_pane().clone();
-            let editor = workspace
-                .open_project_item::<Editor>(pane, buffer, true, true, true, true, window, cx);
+            let editor = workspace.open_project_item::<Editor>(
+                Some(pane),
+                buffer,
+                true,
+                true,
+                true,
+                true,
+                window,
+                cx,
+            );
             editor.update(cx, |editor, cx| {
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     // Column 3 lands inside "callee" on the first line.
@@ -1906,8 +1921,16 @@ mod tests {
             .unwrap();
         workspace.update_in(cx, |workspace, window, cx| {
             let pane = workspace.active_pane().clone();
-            let editor = workspace
-                .open_project_item::<Editor>(pane, buffer, true, true, true, true, window, cx);
+            let editor = workspace.open_project_item::<Editor>(
+                Some(pane),
+                buffer,
+                true,
+                true,
+                true,
+                true,
+                window,
+                cx,
+            );
             editor.update(cx, |editor, cx| {
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     // Column 9 lands inside "take_stock" on the first line.

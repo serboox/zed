@@ -19,6 +19,23 @@ include!(concat!(env!("OUT_DIR"), "/zed.messages.rs"));
 pub const REMOTE_SERVER_PEER_ID: PeerId = PeerId { owner_id: 0, id: 0 };
 pub const REMOTE_SERVER_PROJECT_ID: u64 = 0;
 
+impl Envelope {
+    #[inline(never)]
+    pub fn decode_from_slice(buffer: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode(buffer)
+    }
+
+    #[inline(never)]
+    pub fn encode_to_buffer(&self, buffer: &mut Vec<u8>) -> Result<(), prost::EncodeError> {
+        self.encode(buffer)
+    }
+
+    #[inline(never)]
+    pub fn encoded_size(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
 messages!(
     (Ack, Foreground),
     (AckBufferOperation, Background),
@@ -112,6 +129,8 @@ messages!(
     (GetNotificationsResponse, Foreground),
     (GetCrashFiles, Background),
     (GetCrashFilesResponse, Background),
+    (GetFilePermalink, Foreground),
+    (GetFilePermalinkResponse, Foreground),
     (GetPathMetadata, Background),
     (GetPathMetadataResponse, Background),
     (GetPermalinkToLine, Foreground),
@@ -128,6 +147,10 @@ messages!(
     (GetTypeDefinitionResponse, Background),
     (GetImplementation, Background),
     (GetImplementationResponse, Background),
+    (GetIncomingCalls, Background),
+    (GetIncomingCallsResponse, Background),
+    (GetOutgoingCalls, Background),
+    (GetOutgoingCallsResponse, Background),
     (OpenUnstagedDiff, Foreground),
     (OpenUnstagedDiffResponse, Foreground),
     (OpenUncommittedDiff, Foreground),
@@ -170,6 +193,8 @@ messages!(
     (LoadCommitDiffResponse, Foreground),
     (LspExtExpandMacro, Background),
     (LspExtExpandMacroResponse, Background),
+    (LspExtExpandAbbreviation, Background),
+    (LspExtExpandAbbreviationResponse, Background),
     (LspExtOpenDocs, Background),
     (LspExtOpenDocsResponse, Background),
     (LspExtRunnables, Background),
@@ -201,11 +226,17 @@ messages!(
     (PerformRename, Background),
     (PerformRenameResponse, Background),
     (Ping, Foreground),
+    (PrepareCallHierarchy, Background),
+    (PrepareCallHierarchyResponse, Background),
     (PrepareRename, Background),
     (PrepareRenameResponse, Background),
     (ProjectEntryResponse, Foreground),
     (RefreshInlayHints, Background),
     (RefreshSemanticTokens, Background),
+    (RefreshDocumentColors, Background),
+    (RefreshDocumentLinks, Background),
+    (RefreshFoldingRanges, Background),
+    (RefreshDocumentSymbols, Background),
     (RegisterBufferWithLanguageServers, Background),
     (RejoinChannelBuffers, Foreground),
     (RejoinChannelBuffersResponse, Foreground),
@@ -236,8 +267,8 @@ messages!(
     (GetDocumentLinksResponse, Background),
     (ResolveDocumentLink, Background),
     (ResolveDocumentLinkResponse, Background),
-    (PrepareCallHierarchy, Background),
-    (PrepareCallHierarchyResponse, Background),
+    (PrepareCallHierarchyItems, Background),
+    (PrepareCallHierarchyItemsResponse, Background),
     (CallHierarchyCalls, Background),
     (CallHierarchyCallsResponse, Background),
     (PrepareTypeHierarchy, Background),
@@ -362,6 +393,10 @@ messages!(
     (GetTreeDiffResponse, Background),
     (GetBlobContent, Background),
     (GetBlobContentResponse, Background),
+    (BlameBufferAtRevision, Background),
+    (BlameBufferAtRevisionResponse, Background),
+    (LoadCommitTemplate, Background),
+    (LoadCommitTemplateResponse, Background),
     (GitClone, Background),
     (GitCloneResponse, Background),
     (ToggleLspLogs, Background),
@@ -482,10 +517,17 @@ request_messages!(
     (OpenNewBuffer, OpenBufferResponse),
     (PerformRename, PerformRenameResponse),
     (Ping, Ack),
+    (PrepareCallHierarchy, PrepareCallHierarchyResponse),
+    (GetIncomingCalls, GetIncomingCallsResponse),
+    (GetOutgoingCalls, GetOutgoingCallsResponse),
     (PrepareRename, PrepareRenameResponse),
     (RefreshInlayHints, Ack),
     (RefreshSemanticTokens, Ack),
     (RefreshCodeLens, Ack),
+    (RefreshDocumentColors, Ack),
+    (RefreshDocumentLinks, Ack),
+    (RefreshFoldingRanges, Ack),
+    (RefreshDocumentSymbols, Ack),
     (RejoinChannelBuffers, RejoinChannelBuffersResponse),
     (RejoinRoom, RejoinRoomResponse),
     (ReloadBuffers, ReloadBuffersResponse),
@@ -506,7 +548,7 @@ request_messages!(
     (GetDocumentColor, GetDocumentColorResponse),
     (GetDocumentLinks, GetDocumentLinksResponse),
     (ResolveDocumentLink, ResolveDocumentLinkResponse),
-    (PrepareCallHierarchy, PrepareCallHierarchyResponse),
+    (PrepareCallHierarchyItems, PrepareCallHierarchyItemsResponse),
     (CallHierarchyCalls, CallHierarchyCallsResponse),
     (PrepareTypeHierarchy, PrepareTypeHierarchyResponse),
     (TypeHierarchyRelatives, TypeHierarchyRelativesResponse),
@@ -536,6 +578,7 @@ request_messages!(
     (UpdateRepository, Ack),
     (RemoveRepository, Ack),
     (LspExtExpandMacro, LspExtExpandMacroResponse),
+    (LspExtExpandAbbreviation, LspExtExpandAbbreviationResponse),
     (LspExtOpenDocs, LspExtOpenDocsResponse),
     (LspExtRunnables, LspExtRunnablesResponse),
     (SetRoomParticipantRole, Ack),
@@ -554,6 +597,7 @@ request_messages!(
     (ShutdownRemoteServer, Ack),
     (RemoveWorktree, Ack),
     (OpenServerSettings, OpenBufferResponse),
+    (GetFilePermalink, GetFilePermalinkResponse),
     (GetPermalinkToLine, GetPermalinkToLineResponse),
     (FlushBufferedMessages, Ack),
     (LanguageServerPromptRequest, LanguageServerPromptResponse),
@@ -605,6 +649,8 @@ request_messages!(
     (PullWorkspaceDiagnostics, Ack),
     (GetDefaultBranch, GetDefaultBranchResponse),
     (GetBlobContent, GetBlobContentResponse),
+    (BlameBufferAtRevision, BlameBufferAtRevisionResponse),
+    (LoadCommitTemplate, LoadCommitTemplateResponse),
     (GetTreeDiff, GetTreeDiffResponse),
     (GitClone, GitCloneResponse),
     (ToggleLspLogs, Ack),
@@ -658,7 +704,10 @@ lsp_messages!(
     (GetTypeDefinition, GetTypeDefinitionResponse, true),
     (GetImplementation, GetImplementationResponse, true),
     (InlayHints, InlayHintsResponse, false),
-    (SemanticTokens, SemanticTokensResponse, true)
+    (SemanticTokens, SemanticTokensResponse, true),
+    (PrepareCallHierarchy, PrepareCallHierarchyResponse, true),
+    (GetIncomingCalls, GetIncomingCallsResponse, true),
+    (GetOutgoingCalls, GetOutgoingCallsResponse, true),
 );
 
 entity_messages!(
@@ -683,7 +732,7 @@ entity_messages!(
     GetDocumentColor,
     GetDocumentLinks,
     ResolveDocumentLink,
-    PrepareCallHierarchy,
+    PrepareCallHierarchyItems,
     CallHierarchyCalls,
     PrepareTypeHierarchy,
     TypeHierarchyRelatives,
@@ -737,6 +786,10 @@ entity_messages!(
     RefreshInlayHints,
     RefreshSemanticTokens,
     RefreshCodeLens,
+    RefreshDocumentColors,
+    RefreshDocumentLinks,
+    RefreshFoldingRanges,
+    RefreshDocumentSymbols,
     ReloadBuffers,
     RemoveProjectCollaborator,
     RenameProjectEntry,
@@ -767,6 +820,7 @@ entity_messages!(
     UpdateWorktreeSettings,
     UpdateUserSettings,
     LspExtExpandMacro,
+    LspExtExpandAbbreviation,
     LspExtOpenDocs,
     LspExtRunnables,
     LspExtSwitchSourceHeader,
@@ -779,6 +833,7 @@ entity_messages!(
     Toast,
     HideToast,
     OpenServerSettings,
+    GetFilePermalink,
     GetPermalinkToLine,
     LanguageServerPromptRequest,
     GitGetBranches,
@@ -828,6 +883,8 @@ entity_messages!(
     GetDefaultBranch,
     GetTreeDiff,
     GetBlobContent,
+    BlameBufferAtRevision,
+    LoadCommitTemplate,
     GitClone,
     GetAgentServerCommand,
     GetContextServerCommand,
@@ -1057,6 +1114,9 @@ impl LspQuery {
             Some(lsp_query::Request::GetDocumentLinks(_)) => ("GetDocumentLinks", false),
             Some(lsp_query::Request::InlayHints(_)) => ("InlayHints", false),
             Some(lsp_query::Request::SemanticTokens(_)) => ("SemanticTokens", false),
+            Some(lsp_query::Request::PrepareCallHierarchy(_)) => ("PrepareCallHierarchy", false),
+            Some(lsp_query::Request::GetIncomingCalls(_)) => ("GetIncomingCalls", false),
+            Some(lsp_query::Request::GetOutgoingCalls(_)) => ("GetOutgoingCalls", false),
             None => ("<unknown>", true),
         }
     }

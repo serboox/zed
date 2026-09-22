@@ -135,7 +135,7 @@ pub fn as_diagnostics_by_file(
             }),
             code: finding.code.clone().map(lsp::NumberOrString::String),
             source: Some(SOURCE.to_string()),
-            message: finding.message.clone(),
+            message: finding.message.clone().into(),
             related_information: (!related.is_empty()).then_some(related),
             ..Default::default()
         };
@@ -290,7 +290,7 @@ mod tests {
         }));
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].source.as_deref(), Some("clang"));
-        assert_eq!(shown[0].message, "expected ';'");
+        assert_eq!(shown[0].message.as_str(), "expected ';'");
         assert_eq!(shown[0].range.start, lsp::Position::new(0, 3));
         assert_eq!(shown[0].code, None, "a hard error has no flag to name");
     }

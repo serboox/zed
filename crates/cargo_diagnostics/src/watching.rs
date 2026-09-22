@@ -322,7 +322,7 @@ mod tests {
         Reported {
             path: PathBuf::from(path),
             diagnostic: lsp::Diagnostic {
-                message: "mismatched types".to_string(),
+                message: "mismatched types".to_string().into(),
                 ..Default::default()
             },
             fixes: Vec::new(),

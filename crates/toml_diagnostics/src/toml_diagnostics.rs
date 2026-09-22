@@ -258,7 +258,11 @@ mod tests {
             },
             "the second `name` and nothing else"
         );
-        assert!(said[0].message.contains("name"), "{}", said[0].message);
+        assert!(
+            said[0].message.as_str().contains("name"),
+            "{}",
+            said[0].message
+        );
     }
 
     /// A table header written twice is the same mistake spelled differently.
@@ -367,7 +371,11 @@ mod tests {
             },
             "the `2` alone"
         );
-        assert!(said[0].message.contains("string"), "{}", said[0].message);
+        assert!(
+            said[0].message.as_str().contains("string"),
+            "{}",
+            said[0].message
+        );
     }
 
     /// The validator points this at the table and names the key separately,
@@ -385,7 +393,7 @@ mod tests {
             }
         );
         assert_eq!(
-            said[0].message,
+            said[0].message.as_str(),
             "`rust_version` is not a property this schema allows"
         );
     }
@@ -435,10 +443,10 @@ mod what_a_language_server_silences {
         Arc::new(Language::new(
             LanguageConfig {
                 name: "TOML".into(),
-                matcher: LanguageMatcher {
+                matcher: Arc::new(LanguageMatcher {
                     path_suffixes: vec!["toml".to_string()],
                     ..Default::default()
-                },
+                }),
                 ..LanguageConfig::default()
             },
             None,

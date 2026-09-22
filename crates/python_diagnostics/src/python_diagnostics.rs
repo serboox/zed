@@ -176,7 +176,7 @@ pub fn what_ruff_reported(
                 code: finding.code.clone().map(lsp::NumberOrString::String),
                 code_description: documented_at(finding.url.as_deref()),
                 source: Some("ruff".to_string()),
-                message: what_it_said(&finding),
+                message: what_it_said(&finding).into(),
                 ..Default::default()
             },
             path,
@@ -388,6 +388,7 @@ mod tests {
             unused_import
                 .diagnostic
                 .message
+                .as_str()
                 .starts_with("`os` imported"),
             "{}",
             unused_import.diagnostic.message
@@ -434,11 +435,11 @@ mod tests {
         let reported = over_the_real_file(REAL_OUTPUT);
 
         assert_eq!(
-            reported[0].diagnostic.message,
+            reported[0].diagnostic.message.as_str(),
             "`os` imported but unused\nfix: Remove unused import: `os`"
         );
         assert_eq!(
-            reported[1].diagnostic.message,
+            reported[1].diagnostic.message.as_str(),
             "Local variable `café` is assigned to but never used\nfix (unsafe): Remove assignment to unused variable `café`"
         );
     }

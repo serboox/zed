@@ -122,7 +122,7 @@ pub fn what_oxlint_reported(
                 code: finding.code.clone().map(lsp::NumberOrString::String),
                 code_description: documented_at(finding.url.as_deref()),
                 source: Some("oxlint".to_string()),
-                message: what_it_said(&finding),
+                message: what_it_said(&finding).into(),
                 related_information,
                 ..Default::default()
             },
@@ -304,6 +304,7 @@ mod tests {
             unused_import
                 .diagnostic
                 .message
+                .as_str()
                 .starts_with("Identifier 'readFile' is imported but never used."),
             "{}",
             unused_import.diagnostic.message
@@ -360,11 +361,11 @@ mod tests {
         let reported = over_the_real_files(REAL_OUTPUT);
 
         assert_eq!(
-            reported[0].diagnostic.message,
+            reported[0].diagnostic.message.as_str(),
             "Identifier 'readFile' is imported but never used.\nhelp: Consider removing this import."
         );
         assert_eq!(
-            reported[1].diagnostic.message,
+            reported[1].diagnostic.message.as_str(),
             "Variable 'café' is declared but never used. Unused variables should start with a '_'.\nhelp: Consider removing this declaration."
         );
     }
@@ -383,7 +384,7 @@ mod tests {
             Some(lsp::DiagnosticSeverity::ERROR)
         );
         assert_eq!(reported[0].diagnostic.code, None);
-        assert_eq!(reported[0].diagnostic.message, "Unexpected token");
+        assert_eq!(reported[0].diagnostic.message.as_str(), "Unexpected token");
     }
 
     /// A file `read` cannot supply is skipped. The offsets are only

@@ -247,10 +247,10 @@ mod tests {
         Arc::new(Language::new(
             LanguageConfig {
                 name: "Python".into(),
-                matcher: LanguageMatcher {
+                matcher: Arc::new(LanguageMatcher {
                     path_suffixes: vec!["py".to_string()],
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             },
             None,

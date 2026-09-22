@@ -178,7 +178,7 @@ pub fn what_the_compiler_reported(
                     .as_ref()
                     .map(|code| lsp::NumberOrString::String(code.code.clone())),
                 source: Some("cargo".to_string()),
-                message: said,
+                message: said.into(),
                 related_information,
                 ..Default::default()
             },
@@ -438,12 +438,16 @@ mod tests {
         assert_eq!(error.diagnostic.range.start.character, 4);
         assert_eq!(error.diagnostic.range.end.character, 14);
         assert!(
-            error.diagnostic.message.starts_with("mismatched types"),
+            error
+                .diagnostic
+                .message
+                .as_str()
+                .starts_with("mismatched types"),
             "{}",
             error.diagnostic.message
         );
         assert!(
-            error.diagnostic.message.contains("expected `u32`"),
+            error.diagnostic.message.as_str().contains("expected `u32`"),
             "the label under the primary span is part of what it said: {}",
             error.diagnostic.message
         );
@@ -455,7 +459,7 @@ mod tests {
         );
         assert_eq!(warning.diagnostic.range.start.line, 5);
         assert!(
-            warning.diagnostic.message.contains("never_read"),
+            warning.diagnostic.message.as_str().contains("never_read"),
             "{}",
             warning.diagnostic.message
         );
@@ -481,7 +485,11 @@ mod tests {
         assert_eq!(
             reported
                 .iter()
-                .filter(|one| one.diagnostic.message.starts_with("mismatched types"))
+                .filter(|one| one
+                    .diagnostic
+                    .message
+                    .as_str()
+                    .starts_with("mismatched types"))
                 .count(),
             1
         );
@@ -500,9 +508,11 @@ mod tests {
         let reported =
             what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
         assert!(
-            !reported
-                .iter()
-                .any(|one| one.diagnostic.message.contains("For more information")),
+            !reported.iter().any(|one| one
+                .diagnostic
+                .message
+                .as_str()
+                .contains("For more information")),
             "{reported:?}"
         );
     }
@@ -636,7 +646,7 @@ mod tests {
         let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
         let borrow = reported
             .iter()
-            .find(|one| one.diagnostic.message.starts_with("cannot borrow"))
+            .find(|one| one.diagnostic.message.as_str().starts_with("cannot borrow"))
             .expect("the borrow error");
 
         assert_eq!(
@@ -739,7 +749,7 @@ mod tests {
         );
         for one in &reported {
             assert!(
-                one.diagnostic.message.contains("help:"),
+                one.diagnostic.message.as_str().contains("help:"),
                 "the advice is still in what the error says: {}",
                 one.diagnostic.message
             );
@@ -826,7 +836,11 @@ mod tests {
             what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
         let unused = &reported[1];
         assert!(
-            unused.diagnostic.message.starts_with("unused variable"),
+            unused
+                .diagnostic
+                .message
+                .as_str()
+                .starts_with("unused variable"),
             "{}",
             unused.diagnostic.message
         );

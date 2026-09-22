@@ -253,7 +253,6 @@ impl workspace::item::SerializableItem for SplitPreviewView {
         workspace: &mut Workspace,
         item_id: ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
@@ -443,7 +442,7 @@ mod tests {
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             window.refresh();
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         });
     }
 
@@ -711,14 +710,14 @@ mod tests {
         }
 
         let (saving, workspace_id, item_id, project) =
-            workspace.update_in(cx, |workspace, window, cx| {
+            workspace.update_in(cx, |workspace, _window, cx| {
                 let workspace_id = workspace.database_id().expect("a database id");
                 let item_id = split.entity_id().as_u64();
                 let project = workspace.project().clone();
                 let saving = split
                     .update(cx, |split, cx| {
                         workspace::item::SerializableItem::serialize(
-                            split, workspace, item_id, false, window, cx,
+                            split, workspace, item_id, false, cx,
                         )
                     })
                     .expect("a tab over a real file has something to write down");

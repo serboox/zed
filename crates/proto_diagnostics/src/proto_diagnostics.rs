@@ -116,7 +116,7 @@ fn what_it_said(trouble: &protox::Error, file: &Path, text: &str) -> Checked {
         },
         severity: Some(lsp::DiagnosticSeverity::ERROR),
         source: Some("protox".to_string()),
-        message: what_it_says(trouble),
+        message: what_it_says(trouble).into(),
         related_information: the_other_places(trouble, file, text),
         ..Default::default()
     })
@@ -303,7 +303,8 @@ mod tests {
         let diagnostic = faulted(project.checked(&file));
 
         assert_eq!(
-            diagnostic.message, "name 'Order' is defined twice",
+            diagnostic.message.as_str(),
+            "name 'Order' is defined twice",
             "{diagnostic:?}"
         );
         assert_eq!(
@@ -341,7 +342,8 @@ mod tests {
         let diagnostic = faulted(project.checked(&file));
 
         assert_eq!(
-            diagnostic.message, "field number '1' is already used",
+            diagnostic.message.as_str(),
+            "field number '1' is already used",
             "{diagnostic:?}"
         );
         assert_eq!(
@@ -443,7 +445,7 @@ mod tests {
             "the fourth line, counted from zero: {diagnostic:?}"
         );
         assert!(
-            diagnostic.message.contains("but found ';'"),
+            diagnostic.message.as_str().contains("but found ';'"),
             "{}",
             diagnostic.message
         );
@@ -462,7 +464,7 @@ mod tests {
         let diagnostic = faulted(project.checked(&file));
         assert_eq!(diagnostic.severity, Some(lsp::DiagnosticSeverity::ERROR));
         assert!(
-            diagnostic.message.contains("Missing"),
+            diagnostic.message.as_str().contains("Missing"),
             "the fault has to name what is missing: {diagnostic:?}"
         );
         assert_eq!(
@@ -542,7 +544,10 @@ mod tests {
         );
         let diagnostic = faulted(project.checked(&file));
         assert_eq!(diagnostic.severity, Some(lsp::DiagnosticSeverity::ERROR));
-        assert!(diagnostic.message.contains("end of file"), "{diagnostic:?}");
+        assert!(
+            diagnostic.message.as_str().contains("end of file"),
+            "{diagnostic:?}"
+        );
         assert!(
             diagnostic.range.start.line <= 3,
             "somewhere in the file the reader wrote: {diagnostic:?}"

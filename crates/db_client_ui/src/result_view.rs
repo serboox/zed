@@ -12021,7 +12021,7 @@ impl Render for ResultView {
                 .justify_center()
                 .child(loading_spinner(
                     "loading-spinner",
-                    IconSize::Custom(ui::rems_from_px(28.)),
+                    IconSize::Custom(ui::rems_from_px(28_f32)),
                 ))
                 .into_any_element()
         } else if let Some(error) = self.error.clone() {

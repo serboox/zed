@@ -209,7 +209,7 @@ pub fn diagnostics_from_source(
                 lsp::DiagnosticSeverity::WARNING
             }),
             source: Some(source.to_string()),
-            message: complaint.message,
+            message: complaint.message.into(),
             ..Default::default()
         })
         .collect()

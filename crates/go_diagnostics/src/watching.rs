@@ -353,7 +353,7 @@ mod tests {
             path: PathBuf::from(path),
             fixes: Vec::new(),
             diagnostic: lsp::Diagnostic {
-                message: "undefined: missingHelper".to_string(),
+                message: "undefined: missingHelper".to_string().into(),
                 ..Default::default()
             },
         }

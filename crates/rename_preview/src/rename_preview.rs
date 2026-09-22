@@ -1319,8 +1319,16 @@ mod tests {
 
         let editor = workspace.update_in(&mut cx, |workspace, window, cx| {
             let pane = workspace.active_pane().clone();
-            let editor = workspace
-                .open_project_item::<Editor>(pane, buffer, true, true, true, true, window, cx);
+            let editor = workspace.open_project_item::<Editor>(
+                Some(pane),
+                buffer,
+                true,
+                true,
+                true,
+                true,
+                window,
+                cx,
+            );
             editor.update(cx, |editor, cx| {
                 editor.change_selections(
                     editor::SelectionEffects::no_scroll(),

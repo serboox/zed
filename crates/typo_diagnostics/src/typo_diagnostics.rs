@@ -83,7 +83,7 @@ pub fn typos_in(text: &str, accepted: &Accepted) -> Vec<lsp::Diagnostic> {
             // the reader is the one who decides whether it was meant.
             severity: Some(lsp::DiagnosticSeverity::HINT),
             source: Some(SOURCE.to_string()),
-            message: what_it_said(&typo),
+            message: what_it_said(&typo).into(),
             ..Default::default()
         })
         .collect()
@@ -236,7 +236,7 @@ fn myOtherFunction(reader: &Reader) -> usize {
     fn a_misspelling_in_a_snake_case_name_is_reported_with_its_correction() {
         let reported = over(CHECKED);
         let found = &reported[1];
-        assert_eq!(found.message, "`functoin` should be `function`");
+        assert_eq!(found.message.as_str(), "`functoin` should be `function`");
         assert_eq!(
             placed(found),
             (1, 6, 14),
@@ -252,7 +252,7 @@ fn myOtherFunction(reader: &Reader) -> usize {
     fn a_misspelling_in_a_camel_case_name_is_reported_with_its_correction() {
         let reported = over(CHECKED);
         let found = &reported[3];
-        assert_eq!(found.message, "`Functoin` should be `Function`");
+        assert_eq!(found.message.as_str(), "`Functoin` should be `Function`");
         assert_eq!(
             placed(found),
             (8, 10, 18),
@@ -266,9 +266,12 @@ fn myOtherFunction(reader: &Reader) -> usize {
     fn a_misspelling_in_a_comment_is_reported_with_its_correction() {
         let reported = over(CHECKED);
         assert_eq!(reported.len(), 4, "{reported:?}");
-        assert_eq!(reported[0].message, "`lenght` should be `length`");
+        assert_eq!(reported[0].message.as_str(), "`lenght` should be `length`");
         assert_eq!(placed(&reported[0]), (0, 7, 13));
-        assert_eq!(reported[2].message, "`recieved` should be `received`");
+        assert_eq!(
+            reported[2].message.as_str(),
+            "`recieved` should be `received`"
+        );
         assert_eq!(placed(&reported[2]), (4, 34, 42));
     }
 
@@ -300,7 +303,7 @@ fn myOtherFunction(reader: &Reader) -> usize {
         assert_eq!(
             over("let flags = WRONLY;\n")
                 .iter()
-                .map(|found| found.message.clone())
+                .map(|found| found.message.to_string())
                 .collect::<Vec<_>>(),
             vec!["`WRONLY` should be `WRONGLY`".to_string()],
             "the same word on its own is still a misspelling"
@@ -322,7 +325,7 @@ fn myOtherFunction(reader: &Reader) -> usize {
         assert_eq!(
             reported
                 .iter()
-                .map(|found| found.message.clone())
+                .map(|found| found.message.to_string())
                 .collect::<Vec<_>>(),
             vec![
                 "`lenght` should be `length`".to_string(),

@@ -215,7 +215,7 @@ spec:
         let mut said = checked(text);
         assert_eq!(said.len(), 1, "{said:?}");
         let diagnostic = said.remove(0);
-        (diagnostic.range, diagnostic.message)
+        (diagnostic.range, diagnostic.message.to_string())
     }
 
     fn range(from: (u32, u32), to: (u32, u32)) -> lsp::Range {
@@ -456,7 +456,11 @@ spec:
             range((3, 6), (3, 8)),
             "what the merge brought in is wrong, and `*d` is where to fix it"
         );
-        assert!(said[0].message.contains("integer"), "{:?}", said[0].message);
+        assert!(
+            said[0].message.as_str().contains("integer"),
+            "{:?}",
+            said[0].message
+        );
     }
 
     /// An anchored value that fits and an alias to it that fits are both

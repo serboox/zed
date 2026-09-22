@@ -192,7 +192,7 @@ fn as_diagnostic(violation: &SQLBaseError, sql: &str) -> Option<lsp::Diagnostic>
         severity: Some(lsp::DiagnosticSeverity::WARNING),
         code: Some(lsp::NumberOrString::String(rule.code.to_owned())),
         source: Some("sqruff".to_owned()),
-        message: what_it_said(violation),
+        message: what_it_said(violation).into(),
         ..Default::default()
     })
 }
@@ -323,7 +323,7 @@ mod tests {
                     finding.range.start.character,
                     finding.range.end.line,
                     finding.range.end.character,
-                    finding.message.replace('\n', " / "),
+                    finding.message.as_str().replace('\n', " / "),
                 )
             })
             .collect()

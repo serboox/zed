@@ -204,7 +204,7 @@ impl Clipboard {
 
     pub fn send(&self, mime_type: String, fd: OwnedFd) {
         if let Some(bytes) = contents_bytes_for_mime(self.contents.as_ref(), &mime_type) {
-            self.send_internal(fd, bytes);
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -212,12 +212,12 @@ impl Clipboard {
     /// carries paths rather than a clipboard item, so it does not go through the
     /// clipboard's own contents, but the writing is the same non-blocking write.
     pub fn send_paths(&self, mime_type: &str, paths: &[PathBuf], fd: OwnedFd) {
-        self.send_internal(fd, answered_with(mime_type, paths));
+        self.send_bytes(fd, answered_with(mime_type, paths));
     }
 
     pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
         if let Some(bytes) = contents_bytes_for_mime(self.primary_contents.as_ref(), &mime_type) {
-            self.send_internal(fd, bytes);
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -259,7 +259,7 @@ impl Clipboard {
         Some(item)
     }
 
-    fn send_internal(&self, fd: OwnedFd, bytes: Vec<u8>) {
+    pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
         let mut written = 0;
         self.loop_handle
             .insert_source(

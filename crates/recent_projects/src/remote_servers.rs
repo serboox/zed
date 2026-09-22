@@ -330,7 +330,7 @@ impl PickerDelegate for DevContainerPickerDelegate {
                         .style(Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
@@ -342,7 +342,7 @@ impl PickerDelegate for DevContainerPickerDelegate {
                         .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::Confirm.boxed_clone(), cx)
@@ -508,7 +508,8 @@ impl ProjectPicker {
                         connection, project, paths, app_state, window, None, None, cx,
                     )
                     .await
-                    .log_err();
+                    .log_err()
+                    .map(|(_workspace, items)| items);
 
                     if let Some(items) = items {
                         for (item, path) in items.into_iter().zip(paths_with_positions) {
@@ -1199,6 +1200,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                 let Some(server_entry) = self.state.servers.get(*server) else {
                     return;
                 };
+                cx.emit(DismissEvent);
                 match server_entry {
                     RemoteEntry::Project {
                         connection, index, ..

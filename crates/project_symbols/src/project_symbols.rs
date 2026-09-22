@@ -145,7 +145,14 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                     };
 
                     let editor = workspace.open_project_item::<Editor>(
-                        pane, buffer, true, true, true, true, window, cx,
+                        secondary.then_some(pane),
+                        buffer,
+                        true,
+                        true,
+                        true,
+                        true,
+                        window,
+                        cx,
                     );
 
                     editor.update(cx, |editor, cx| {
@@ -391,10 +398,11 @@ mod tests {
         language_registry.add(Arc::new(Language::new(
             LanguageConfig {
                 name: "Rust".into(),
-                matcher: LanguageMatcher {
+                matcher: (LanguageMatcher {
                     path_suffixes: vec!["rs".to_string()],
                     ..Default::default()
-                },
+                })
+                .into(),
                 ..Default::default()
             },
             None,
@@ -544,10 +552,11 @@ mod tests {
         language_registry.add(Arc::new(Language::new(
             LanguageConfig {
                 name: "Rust".into(),
-                matcher: LanguageMatcher {
+                matcher: (LanguageMatcher {
                     path_suffixes: vec!["rs".to_string()],
                     ..Default::default()
-                },
+                })
+                .into(),
                 ..Default::default()
             },
             None,
@@ -777,10 +786,10 @@ mod tests {
         language_registry.add(Arc::new(Language::new(
             LanguageConfig {
                 name: "Rust".into(),
-                matcher: LanguageMatcher {
+                matcher: Arc::new(LanguageMatcher {
                     path_suffixes: vec!["rs".to_string()],
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             },
             None,

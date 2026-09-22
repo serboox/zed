@@ -464,17 +464,17 @@ pub enum ButtonSize {
 impl ButtonSize {
     pub fn rems(self) -> Rems {
         match self {
-            ButtonSize::Large => rems_from_px(36.),
-            ButtonSize::Medium => rems_from_px(32.),
+            ButtonSize::Large => rems_from_px(36_f32),
+            ButtonSize::Medium => rems_from_px(32_f32),
             // 24 is the floor WCAG 2.5.8 sets for a pointer target, and this is
             // the size ~93% of the buttons in the tree get, because they do not
             // ask for one. It is deliberately not 28: the taller default would
             // also thicken every dense strip -- the status bar has no fixed
             // height and simply grows -- so that step needs a visual pass over
             // the chrome first.
-            ButtonSize::Default => rems_from_px(28.),
-            ButtonSize::Compact => rems_from_px(24.),
-            ButtonSize::None => rems_from_px(20.),
+            ButtonSize::Default => rems_from_px(28_f32),
+            ButtonSize::Compact => rems_from_px(24_f32),
+            ButtonSize::None => rems_from_px(20_f32),
         }
     }
 }
@@ -1028,12 +1028,12 @@ mod tests {
     #[test]
     fn the_default_button_clears_the_pointer_target_floor() {
         assert!(
-            ButtonSize::Default.rems().0 >= rems_from_px(28.).0,
+            ButtonSize::Default.rems().0 >= rems_from_px(28_f32).0,
             "the default button height is what most buttons get: {:?}",
             ButtonSize::Default.rems()
         );
         assert!(
-            ButtonSize::Compact.rems().0 >= rems_from_px(24.).0,
+            ButtonSize::Compact.rems().0 >= rems_from_px(24_f32).0,
             "a compact button is still a pointer target: {:?}",
             ButtonSize::Compact.rems()
         );

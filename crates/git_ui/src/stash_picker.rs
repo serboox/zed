@@ -645,7 +645,7 @@ impl PickerDelegate for StashListDelegate {
                                 &focus_handle,
                                 cx,
                             )
-                            .map(|kb| kb.size(rems_from_px(12.))),
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(stash_picker::DropStashItem.boxed_clone(), cx)
@@ -661,7 +661,7 @@ impl PickerDelegate for StashListDelegate {
                                 &focus_handle,
                                 cx,
                             )
-                            .map(|kb| kb.size(rems_from_px(12.))),
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(cx.listener(move |picker, _, window, cx| {
                             cx.stop_propagation();
@@ -675,7 +675,7 @@ impl PickerDelegate for StashListDelegate {
                         .style(cyberpunk::Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::SecondaryConfirm, &focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
@@ -687,7 +687,7 @@ impl PickerDelegate for StashListDelegate {
                         .style(cyberpunk::Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::Confirm.boxed_clone(), cx)

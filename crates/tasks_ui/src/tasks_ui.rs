@@ -615,7 +615,7 @@ mod tests {
             "nothing changed, so there is nothing to re-resolve"
         );
         assert_eq!(
-            super::newer_definition_of(&was, &project, [(elsewhere, now.clone())]),
+            super::newer_definition_of(&was, &project, [(elsewhere, now)]),
             None,
             "a task of the same name from somewhere else is a different task"
         );

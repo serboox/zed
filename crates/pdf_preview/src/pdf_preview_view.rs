@@ -3244,7 +3244,7 @@ mod tests {
         });
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1000.), px(600.)));
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         // The window measures itself, not the document: a reader that thought the
         // window was as tall as the whole document would call every page visible
@@ -3270,7 +3270,7 @@ mod tests {
             view.scroll
                 .set_offset(point(already.x, already.y - to_the_bottom));
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let at_the_bottom = view.read_with(&mut visual, |view, _| view.pages_worth_rendering());
         assert!(
@@ -3305,8 +3305,8 @@ mod tests {
         // Settled first: the reader is still finding out that there is no engine
         // in a test, and what it has to say about that moves the pages down.
         visual.run_until_parked();
-        visual.update(|window, cx| window.draw(cx).clear());
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         // Over the first page as it was actually painted, so the drag is the one
         // a reader would make rather than one in coordinates of our own.
@@ -3329,7 +3329,7 @@ mod tests {
             click_count: 1,
             first_mouse: false,
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         visual.simulate_event(MouseMoveEvent {
             position: on_the_page(0.75, 0.6),
             pressed_button: Some(MouseButton::Left),
@@ -3341,7 +3341,7 @@ mod tests {
             modifiers: Modifiers::none(),
             click_count: 1,
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let selection = view
             .read_with(&mut visual, |view, _| view.selection.clone())
@@ -3374,7 +3374,7 @@ mod tests {
             click_count: 1,
             first_mouse: false,
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         let after = view.read_with(&mut visual, |view, _| view.selection.clone());
         assert!(
             after.is_none(),
@@ -3399,8 +3399,8 @@ mod tests {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1000.), px(700.)));
         visual.run_until_parked();
-        visual.update(|window, cx| window.draw(cx).clear());
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let painted_pages = |visual: &mut VisualTestContext, view: &gpui::Entity<PdfView>| {
             view.read_with(visual, |view, _| {
@@ -3419,7 +3419,7 @@ mod tests {
         view.update(&mut visual, |view, cx| {
             view.show_one_page_at_a_time(true, cx)
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         // Only one page is laid out now, so the rest keep the place they last
         // had; what matters is which page is asked for and which is on screen.
         assert_eq!(
@@ -3429,7 +3429,7 @@ mod tests {
         );
 
         view.update(&mut visual, |view, cx| view.step_page(1, cx));
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(
             view.read_with(&mut visual, |view, _| (
                 view.page_in_view(),
@@ -3440,7 +3440,7 @@ mod tests {
         );
 
         view.update(&mut visual, |view, cx| view.show_page(5, cx));
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(
             view.read_with(&mut visual, |view, _| view.page_in_view()),
             5,
@@ -3455,7 +3455,7 @@ mod tests {
         // One frame lays the column out, the next scrolls to the page that was
         // being read, and a third shows the result.
         for _ in 0..3 {
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
         }
         assert_eq!(
             painted_pages(&mut visual, &view),
@@ -3492,7 +3492,7 @@ mod tests {
         visual.simulate_resize(size(px(900.), px(600.)));
         for _ in 0..6 {
             visual.run_until_parked();
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
         }
 
         let (still_asked_for, tried_twice) = view.read_with(&mut visual, |view, _| {
@@ -3532,8 +3532,8 @@ mod tests {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         for width in [px(1600.), px(1200.), px(900.)] {
             visual.simulate_resize(size(width, px(700.)));
-            visual.update(|window, cx| window.draw(cx).clear());
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
 
             let first = visual
                 .debug_bounds("pdf-thumbnails")
@@ -3662,7 +3662,7 @@ mod tests {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| window.focus(&view.focus, cx));
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let reachable: Vec<String> = visual.update(|window, cx| {
             window
@@ -3701,8 +3701,8 @@ mod tests {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1000.), px(700.)));
         visual.run_until_parked();
-        visual.update(|window, cx| window.draw(cx).clear());
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let page = view.read_with(&mut visual, |view, _| view.page_bounds[0].get());
         // Near the top of the page: a page is taller than the window, so its
@@ -3718,7 +3718,7 @@ mod tests {
             click_count: 1,
             first_mouse: false,
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let (opened, at) = view.read_with(&mut visual, |view, _| {
             (
@@ -3772,8 +3772,8 @@ mod tests {
             visual.simulate_resize(size(width, px(600.)));
             // Twice: the strip is laid out from the room it had last time, so the
             // first frame at a new width is what tells it how much that is.
-            visual.update(|window, cx| window.draw(cx).clear());
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
 
             let viewport = visual.update(|window, _| window.viewport_size());
             let window_area = Bounds {
@@ -3856,8 +3856,8 @@ mod tests {
         visual.simulate_resize(size(px(1200.), px(600.)));
         // Twice, as the narrow-window test above does: the strip lays itself
         // out from the room it had last frame.
-        visual.update(|window, cx| window.draw(cx).clear());
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
         let before = view.update_in(&mut visual, |view, _, _| view.zoom());
         let zoom_in = visual
@@ -3941,7 +3941,7 @@ mod tests {
         visual.simulate_resize(size(px(1000.), px(900.)));
         visual.run_until_parked();
         for _ in 0..2 {
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
         }
 
         let page = view.read_with(&mut visual, |view, _| view.page_bounds[0].get());

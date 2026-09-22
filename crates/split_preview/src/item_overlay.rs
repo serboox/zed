@@ -155,10 +155,10 @@ mod tests {
         Arc::new(Language::new(
             LanguageConfig {
                 name: "YAML".into(),
-                matcher: LanguageMatcher {
+                matcher: Arc::new(LanguageMatcher {
                     path_suffixes: vec!["yaml".into()],
                     ..LanguageMatcher::default()
-                },
+                }),
                 ..LanguageConfig::default()
             },
             None,
@@ -169,10 +169,10 @@ mod tests {
         Arc::new(Language::new(
             LanguageConfig {
                 name: "Markdown".into(),
-                matcher: LanguageMatcher {
+                matcher: Arc::new(LanguageMatcher {
                     path_suffixes: vec!["md".into()],
                     ..LanguageMatcher::default()
-                },
+                }),
                 ..LanguageConfig::default()
             },
             None,
@@ -226,7 +226,7 @@ mod tests {
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             window.refresh();
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         });
     }
 

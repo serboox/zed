@@ -245,7 +245,10 @@ mod tests {
         let asked_about = declaring.read_with(cx, |buffer, _| {
             let snapshot = buffer.snapshot();
             snapshot
-                .text_for_range(range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
+                .text_for_range(
+                    range.range().start.to_offset(&snapshot)
+                        ..range.range().end.to_offset(&snapshot),
+                )
                 .collect::<String>()
         });
         assert_eq!(
@@ -253,7 +256,7 @@ mod tests {
             "the range offered is the class's name"
         );
 
-        cx.update(|cx| over.perform_rename(&declaring, position, "Widget".to_string(), cx))
+        cx.update(|cx| over.perform_rename(&declaring, position, "Widget".to_string(), None, cx))
             .expect("something takes the rename")
             .await
             .expect("and performs it");

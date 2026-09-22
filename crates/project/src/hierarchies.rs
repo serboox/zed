@@ -99,7 +99,7 @@ pub async fn prepare_call_hierarchy(
     if let Some((client, project_id)) = upstream_of(lsp_store, cx) {
         let (buffer_id, position, version) = position_request(buffer, position, cx);
         let response = client
-            .request(proto::PrepareCallHierarchy {
+            .request(proto::PrepareCallHierarchyItems {
                 project_id,
                 buffer_id,
                 position,
@@ -803,9 +803,9 @@ async fn buffer_and_position(
 
 pub async fn handle_prepare_call_hierarchy(
     lsp_store: Entity<LspStore>,
-    envelope: TypedEnvelope<proto::PrepareCallHierarchy>,
+    envelope: TypedEnvelope<proto::PrepareCallHierarchyItems>,
     mut cx: AsyncApp,
-) -> Result<proto::PrepareCallHierarchyResponse> {
+) -> Result<proto::PrepareCallHierarchyItemsResponse> {
     let peer_id = envelope.original_sender_id.unwrap_or(envelope.sender_id);
     let payload = envelope.payload;
     let (buffer, position) = buffer_and_position(
@@ -827,7 +827,7 @@ pub async fn handle_prepare_call_hierarchy(
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    Ok(proto::PrepareCallHierarchyResponse { supported, items })
+    Ok(proto::PrepareCallHierarchyItemsResponse { supported, items })
 }
 
 pub async fn handle_call_hierarchy_calls(

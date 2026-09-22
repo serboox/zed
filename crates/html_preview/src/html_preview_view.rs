@@ -2051,7 +2051,7 @@ impl HtmlPreviewView {
             .scroll_handle(self.scroll_handle.clone())
             .image_resolver({
                 let base_directory = self.base_directory.clone();
-                move |dest_url| {
+                move |dest_url, _cx| {
                     resolve_preview_image(
                         dest_url,
                         base_directory.as_deref(),
@@ -3225,7 +3225,7 @@ mod tests {
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             window.refresh();
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
     }

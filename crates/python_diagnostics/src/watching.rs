@@ -375,7 +375,7 @@ mod tests {
             path: PathBuf::from(path),
             fixes: Vec::new(),
             diagnostic: lsp::Diagnostic {
-                message: "`os` imported but unused".to_string(),
+                message: "`os` imported but unused".to_string().into(),
                 ..Default::default()
             },
         }

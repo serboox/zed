@@ -137,7 +137,7 @@ fn read_one(found: &Diagnostic, checked: File, text: &str) -> Option<lsp::Diagno
             found.secondary_code_or_id().to_string(),
         )),
         source: Some(SOURCE.to_string()),
-        message: found.concise_message().to_string(),
+        message: found.concise_message().to_string().into(),
         ..Default::default()
     })
 }
@@ -235,7 +235,7 @@ mod tests {
         );
         assert_eq!(error.source.as_deref(), Some("ty"));
         assert!(
-            error.message.contains("int"),
+            error.message.as_str().contains("int"),
             "the message should say what was expected: {}",
             error.message
         );

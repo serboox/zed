@@ -11,10 +11,11 @@ use ui::cyberpunk::{self, Severity};
 use ui::{ScrollAxes, Scrollbars, WithScrollbar as _, prelude::*};
 use workspace::{Item, Workspace};
 
+use workspace::path_link::PathMatching;
 #[cfg(not(test))]
-use workspace::path_link::possible_open_target;
+use workspace::path_link::resolve_open_target;
 #[cfg(test)]
-use workspace::path_link::{BackgroundPathChecks, possible_open_target_with_fs_checks};
+use workspace::path_link::{BackgroundPathChecks, resolve_open_target_with_fs_checks};
 
 /// Reads a run terminal's own output and lays it out.
 ///
@@ -138,12 +139,19 @@ impl LogLensView {
             let Ok(found) = cx.update(|_, cx| {
                 #[cfg(not(test))]
                 {
-                    possible_open_target(&workspace, &caller, working_directory.as_deref(), cx)
+                    resolve_open_target(
+                        &workspace,
+                        PathMatching::Heuristic,
+                        &caller,
+                        working_directory.as_deref(),
+                        cx,
+                    )
                 }
                 #[cfg(test)]
                 {
-                    possible_open_target_with_fs_checks(
+                    resolve_open_target_with_fs_checks(
                         &workspace,
+                        PathMatching::Heuristic,
                         &caller,
                         working_directory.as_deref(),
                         cx,

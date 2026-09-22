@@ -199,7 +199,7 @@ mod tests {
         let on = what_to_report(true, MISSPELLED, &accepted);
         assert_eq!(
             on.iter()
-                .map(|found| found.message.clone())
+                .map(|found| found.message.to_string())
                 .collect::<Vec<_>>(),
             vec!["`functoin` should be `function`".to_string()]
         );

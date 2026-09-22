@@ -122,8 +122,11 @@ pub fn what_the_compiler_reported(
                     .get_or_insert_with(Vec::new)
                     .push(place),
                 None => {
-                    last.diagnostic.message.push('\n');
-                    last.diagnostic.message.push_str(line.trim_start());
+                    last.diagnostic.message.as_mut_string().push('\n');
+                    last.diagnostic
+                        .message
+                        .as_mut_string()
+                        .push_str(line.trim_start());
                 }
             }
             continue;
@@ -150,7 +153,7 @@ pub fn what_the_compiler_reported(
                 range,
                 severity: Some(lsp::DiagnosticSeverity::ERROR),
                 source: Some("go build".to_string()),
-                message: message.to_string(),
+                message: message.to_string().into(),
                 ..Default::default()
             },
         });
@@ -283,7 +286,7 @@ pub fn what_vet_reported(
                             severity: Some(lsp::DiagnosticSeverity::WARNING),
                             code: Some(lsp::NumberOrString::String(analyzer.clone())),
                             source: Some("go vet".to_string()),
-                            message: finding.message,
+                            message: finding.message.into(),
                             ..Default::default()
                         },
                     });
@@ -707,7 +710,7 @@ mod tests {
         // `\treturn "a string"` -- the string starts at byte 8, column 9.
         assert_eq!(broken.diagnostic.range.start.character, 8);
         assert!(
-            broken.diagnostic.message.starts_with("cannot use"),
+            broken.diagnostic.message.as_str().starts_with("cannot use"),
             "{}",
             broken.diagnostic.message
         );
@@ -716,7 +719,7 @@ mod tests {
         assert_eq!(unused.path, Path::new("/project/main.go"));
         assert_eq!(unused.diagnostic.range.start.line, 6);
         assert_eq!(
-            unused.diagnostic.message,
+            unused.diagnostic.message.as_str(),
             "declared and not used: unusedValue"
         );
         assert_eq!(
@@ -745,7 +748,7 @@ mod tests {
             what_the_compiler_reported(REAL_BUILD, Path::new("/project"), read_the_captured_module);
         let undefined = reported
             .iter()
-            .find(|one| one.diagnostic.message.contains("missingHelper"))
+            .find(|one| one.diagnostic.message.as_str().contains("missingHelper"))
             .expect("the undefined name is reported");
         assert_eq!(undefined.diagnostic.range.start.line, 8);
         assert_eq!(
@@ -785,7 +788,11 @@ mod tests {
             "the analyzer that said it"
         );
         assert!(
-            found.diagnostic.message.contains("wrong type string"),
+            found
+                .diagnostic
+                .message
+                .as_str()
+                .contains("wrong type string"),
             "{}",
             found.diagnostic.message
         );
@@ -889,7 +896,7 @@ mod tests {
         let duplicate = &reported[0];
 
         assert_eq!(
-            duplicate.diagnostic.message,
+            duplicate.diagnostic.message.as_str(),
             "duplicate case \"dup\" (constant of type string) in expression switch",
             "the earlier case is a place now, not a line of text"
         );
@@ -984,7 +991,7 @@ mod tests {
             what_the_compiler_reported(&stream, Path::new("/project"), |_| Some(built_file()));
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert_eq!(
-            reported[0].diagnostic.message,
+            reported[0].diagnostic.message.as_str(),
             "cannot use x as string value\nhave (int)\nwant (string)"
         );
     }

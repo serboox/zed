@@ -153,7 +153,7 @@ fn advice_about(warning: &LintWarning, lines: &[&str], byte_order_mark: u32) -> 
         severity: Some(how_much_it_matters(warning.severity)),
         code: warning.rule_name.clone().map(lsp::NumberOrString::String),
         source: Some("rumdl".to_string()),
-        message: warning.message.clone(),
+        message: warning.message.clone().into(),
         ..Default::default()
     }
 }
@@ -275,7 +275,7 @@ mod tests {
             "the heading on the third line and the list item on the sixth"
         );
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message.as_str(),
             "Expected heading level 2, but found heading level 3"
         );
         assert_eq!(diagnostics[0].source.as_deref(), Some("rumdl"));

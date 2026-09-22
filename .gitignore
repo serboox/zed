@@ -67,3 +67,4 @@ crates/docs_preprocessor/actions.json
 .claude/napkin.md
 
 .local*
+.cache

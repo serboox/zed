@@ -128,7 +128,7 @@ pub fn faults_in(text: &str) -> Vec<lsp::Diagnostic> {
             severity: Some(fault.grade),
             code: Some(lsp::NumberOrString::String(fault.code.to_string())),
             source: Some(SOURCE.to_string()),
-            message: fault.message,
+            message: fault.message.into(),
             ..Default::default()
         })
         .collect()
@@ -137,7 +137,7 @@ pub fn faults_in(text: &str) -> Vec<lsp::Diagnostic> {
 /// The prefix a tag's name carries where the document declares no namespace
 /// for it, and nothing where it declares one or the tag carries none.
 fn undeclared_prefix_of(reader: &NsReader<&[u8]>, tag: &BytesStart<'_>) -> Option<String> {
-    match reader.resolve_element(tag.name()).0 {
+    match reader.resolver().resolve_element(tag.name()).0 {
         ResolveResult::Unknown(prefix) => Some(String::from_utf8_lossy(&prefix).into_owned()),
         ResolveResult::Bound(_) | ResolveResult::Unbound => None,
     }
@@ -151,12 +151,19 @@ fn undeclared_prefix_of(reader: &NsReader<&[u8]>, tag: &BytesStart<'_>) -> Optio
 fn what_the_error_says(error: &Error) -> &'static str {
     match error {
         Error::Syntax(SyntaxError::InvalidBangMarkup) => "invalid-markup",
-        Error::Syntax(SyntaxError::UnclosedPIOrXmlDecl) => "unclosed-declaration",
+        Error::Syntax(SyntaxError::UnclosedPI | SyntaxError::UnclosedXmlDecl) => {
+            "unclosed-declaration"
+        }
         Error::Syntax(SyntaxError::UnclosedComment) => "unclosed-comment",
         Error::Syntax(SyntaxError::UnclosedDoctype) => "unclosed-doctype",
         Error::Syntax(SyntaxError::UnclosedCData) => "unclosed-cdata",
         Error::Syntax(SyntaxError::UnclosedTag) => "unclosed-tag",
+        Error::Syntax(
+            SyntaxError::UnclosedSingleQuotedAttributeValue
+            | SyntaxError::UnclosedDoubleQuotedAttributeValue,
+        ) => "unclosed-attribute-value",
         Error::IllFormed(IllFormedError::MissingDeclVersion(_)) => "missing-declaration-version",
+        Error::IllFormed(IllFormedError::UnknownVersion) => "unknown-declaration-version",
         Error::IllFormed(IllFormedError::MissingDoctypeName) => "missing-doctype-name",
         Error::IllFormed(IllFormedError::MissingEndTag(_)) => "missing-end-tag",
         Error::IllFormed(IllFormedError::UnmatchedEndTag(_)) => "unmatched-end-tag",
@@ -309,7 +316,7 @@ mod tests {
             "the protocol's own unit -- not the 29 bytes the parser counted"
         );
         assert_eq!(
-            found[0].message,
+            found[0].message.as_str(),
             "ill-formed document: expected `</café>`, but `</cafe>` was found"
         );
         assert_eq!(found[0].source.as_deref(), Some("xml"));
@@ -351,7 +358,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(both[0].message, "start tag `root` is never closed");
+        assert_eq!(both[0].message.as_str(), "start tag `root` is never closed");
         assert_eq!(both[0].range.start, lsp::Position::new(0, 0));
         assert_eq!(both[1].range.start, lsp::Position::new(1, 2));
     }
@@ -400,7 +407,7 @@ mod tests {
             "both tags, so a warning does not stop the read the way an error does"
         );
         assert_eq!(
-            found[0].message,
+            found[0].message.as_str(),
             "namespace prefix `xsl` is not declared in this document"
         );
     }

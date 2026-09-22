@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     fn draw(cx: &mut VisualTestContext) {
-        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
     }
 
     fn launchpad_windows(cx: &mut TestAppContext) -> Vec<WindowHandle<Launchpad>> {

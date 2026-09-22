@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use collections::{HashMap, HashSet};
-use editor::{Editor, SemanticsProvider};
+use editor::{Editor, RenameTarget, SemanticsProvider};
 use futures::future::Shared;
 use gpui::{App, AppContext as _, Entity, Task, WeakEntity, Window};
 use language::{Buffer, BufferId, BufferRow};
 use project::{
     DocumentHighlight, InProcessSemantics, InProcessSemanticsContext, InProcessSpan, InlayHint,
     InvalidationStrategy, LocationLink, Project, ProjectTransaction,
-    lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
+    lsp_store::{BufferSemanticTokens, CacheInlayHints},
 };
 use semantic_index::definitions::Definition;
 use semantic_index::resolution::WhatItMeans;
@@ -1036,10 +1036,9 @@ impl SemanticsProvider for IndexFirst {
     fn semantic_tokens(
         &self,
         buffer: Entity<Buffer>,
-        refresh: Option<RefreshForServer>,
         cx: &mut App,
     ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
-        self.project.semantic_tokens(buffer, refresh, cx)
+        self.project.semantic_tokens(buffer, cx)
     }
 
     fn supports_inlay_hints(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
@@ -1157,7 +1156,7 @@ impl SemanticsProvider for IndexFirst {
         buffer: &Entity<Buffer>,
         position: text::Anchor,
         cx: &mut App,
-    ) -> Task<Result<Option<Range<text::Anchor>>>> {
+    ) -> Task<Result<Option<RenameTarget>>> {
         let from_the_server = self.project.range_for_rename(buffer, position, cx);
         let point = self.position_of(buffer, position, cx);
         let Some(from_a_source) = self.from_a_source(cx, |source, context, cx| {
@@ -1168,8 +1167,8 @@ impl SemanticsProvider for IndexFirst {
         let buffer = buffer.clone();
         cx.spawn(async move |cx| {
             let answered = from_the_server.await;
-            if let Ok(Some(range)) = &answered {
-                return Ok(Some(range.clone()));
+            if let Ok(Some(_)) = &answered {
+                return answered;
             }
             let Some(range) = from_a_source.await else {
                 // Whatever the server said, including its error: a source with
@@ -1181,7 +1180,10 @@ impl SemanticsProvider for IndexFirst {
                 if range.start > range.end || range.end > snapshot.len() {
                     return None;
                 }
-                Some(snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+                Some(RenameTarget::new(
+                    snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                    None,
+                ))
             }))
         })
     }
@@ -1191,11 +1193,12 @@ impl SemanticsProvider for IndexFirst {
         buffer: &Entity<Buffer>,
         position: text::Anchor,
         new_name: String,
+        language_server_id: Option<lsp::LanguageServerId>,
         cx: &mut App,
     ) -> Option<Task<Result<ProjectTransaction>>> {
-        let from_the_server = self
-            .project
-            .perform_rename(buffer, position, new_name.clone(), cx);
+        let from_the_server =
+            self.project
+                .perform_rename(buffer, position, new_name.clone(), language_server_id, cx);
         let point = self.position_of(buffer, position, cx);
         let renaming = new_name.clone();
         let Some(from_a_source) = self.from_a_source(cx, move |source, context, cx| {

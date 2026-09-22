@@ -21,7 +21,12 @@ pub struct Readable {
 pub fn by_suffix() -> HashMap<String, String> {
     let mut claimed = HashMap::new();
     for name in grammars::embedded_languages() {
-        for suffix in grammars::load_config(&name).matcher.path_suffixes {
+        for suffix in grammars::load_config(&name)
+            .matcher
+            .path_suffixes
+            .iter()
+            .cloned()
+        {
             // First claim wins, and the languages come back in a stable order,
             // so which one that is does not change between runs.
             claimed.entry(suffix).or_insert_with(|| name.clone());
@@ -176,8 +181,8 @@ pub fn readable() -> (Vec<Readable>, Vec<String>) {
                 name,
                 grammar: grammar.clone(),
                 outline,
-                suffixes: config.matcher.path_suffixes,
-                first_line: config.matcher.first_line_pattern,
+                suffixes: config.matcher.path_suffixes.clone(),
+                first_line: config.matcher.first_line_pattern.clone(),
             }),
             Err(trouble) => refused.push(format!("{name}: {trouble}")),
         }

@@ -90,7 +90,7 @@ pub fn what_harper_said(text: &str, prose: &Prose) -> Vec<lsp::Diagnostic> {
                     severity: Some(lsp::DiagnosticSeverity::HINT),
                     code: Some(lsp::NumberOrString::String(rule.clone())),
                     source: Some("harper".to_string()),
-                    message: lint.message,
+                    message: lint.message.into(),
                     ..Default::default()
                 });
             }

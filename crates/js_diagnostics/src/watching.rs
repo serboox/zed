@@ -336,7 +336,7 @@ mod tests {
         Reported {
             path: PathBuf::from(path),
             diagnostic: lsp::Diagnostic {
-                message: "`debugger` statement is not allowed".to_string(),
+                message: "`debugger` statement is not allowed".to_string().into(),
                 ..Default::default()
             },
         }

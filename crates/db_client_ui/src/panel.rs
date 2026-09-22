@@ -48,7 +48,7 @@ use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
 use project::{
     DocumentHighlight, InlayHint, InvalidationStrategy, Location, LocationLink, ProjectTransaction,
-    lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
+    lsp_store::{BufferSemanticTokens, CacheInlayHints},
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -1919,7 +1919,6 @@ impl SemanticsProvider for DbSemanticsProvider {
     fn semantic_tokens(
         &self,
         _buffer: Entity<Buffer>,
-        _refresh: Option<RefreshForServer>,
         _cx: &mut App,
     ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
         None
@@ -2271,7 +2270,7 @@ impl SemanticsProvider for DbSemanticsProvider {
         _buffer: &Entity<Buffer>,
         _position: Anchor,
         _cx: &mut App,
-    ) -> Task<anyhow::Result<Option<std::ops::Range<Anchor>>>> {
+    ) -> Task<anyhow::Result<Option<editor::RenameTarget>>> {
         Task::ready(Ok(None))
     }
 
@@ -2280,6 +2279,7 @@ impl SemanticsProvider for DbSemanticsProvider {
         _buffer: &Entity<Buffer>,
         _position: Anchor,
         _new_name: String,
+        _language_server_id: Option<language::LanguageServerId>,
         _cx: &mut App,
     ) -> Option<Task<anyhow::Result<ProjectTransaction>>> {
         None
@@ -3324,10 +3324,11 @@ async fn apply_sql_diagnostics(
                     diagnostic: language::Diagnostic {
                         source: Some("sql".to_string()),
                         severity,
-                        message: diagnostic.message,
+                        message: diagnostic.message.into(),
                         source_kind: language::DiagnosticSourceKind::Other,
                         ..Default::default()
                     },
+                    related_information: None,
                 }
             })
             .collect();

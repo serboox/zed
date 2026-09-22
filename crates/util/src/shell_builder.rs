@@ -99,8 +99,17 @@ impl ShellBuilder {
             });
             if self.redirect_stdin {
                 match self.kind {
-                    ShellKind::Fish | ShellKind::Posix => {
-                        combined_command.insert_str(0, "exec </dev/null; ");
+                    ShellKind::Posix => {
+                        // Perform the STDIN redirection prior to the actual
+                        // command on a separate line, so that it is already
+                        // active if the command contains a syntax error.
+                        // Otherwise, with -i, dash will fall back to an
+                        // interactive shell in this case.
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
+                    ShellKind::Fish => {
+                        combined_command.insert_str(0, "begin; ");
+                        combined_command.push_str("; end </dev/null");
                     }
                     ShellKind::Nushell
                     | ShellKind::Csh
@@ -150,8 +159,12 @@ impl ShellBuilder {
             });
             if self.redirect_stdin {
                 match self.kind {
-                    ShellKind::Fish | ShellKind::Posix => {
-                        combined_command.insert_str(0, "exec </dev/null; ");
+                    ShellKind::Posix => {
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
+                    ShellKind::Fish => {
+                        combined_command.insert_str(0, "begin; ");
+                        combined_command.push_str("; end </dev/null");
                     }
                     ShellKind::Nushell
                     | ShellKind::Csh
@@ -289,7 +302,7 @@ mod test {
             .build(Some("echo".into()), &["test".to_string()]);
 
         assert_eq!(program, "fish");
-        assert_eq!(args, vec!["-i", "-c", "exec </dev/null; echo test"]);
+        assert_eq!(args, vec!["-i", "-c", "begin; echo test; end </dev/null"]);
     }
 
     #[test]
@@ -305,7 +318,7 @@ mod test {
         assert_eq!(program, "sh");
         assert_eq!(
             args,
-            vec!["-i", "-c", "exec </dev/null; cat <<EOF\nhello\nEOF"]
+            vec!["-i", "-c", "exec </dev/null\ncat <<EOF\nhello\nEOF"]
         );
     }
 
@@ -326,7 +339,6 @@ mod test {
         );
     }
 
-    #[test]
     /// An argument is one argument. Pasted into the shell line bare, one that
     /// holds spaces is split into several, and a task whose argument is a whole
     /// script ran only its first word -- `sh -c mkdir`, with the operand gone.
@@ -357,6 +369,7 @@ mod test {
         );
     }
 
+    #[test]
     fn does_not_quote_sole_command_only() {
         let shell = Shell::Program("fish".to_owned());
         let shell_builder = ShellBuilder::new(&shell, false);

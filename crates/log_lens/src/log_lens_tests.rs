@@ -394,7 +394,7 @@ async fn init_lens<'a>(
 /// A gpui test window never draws on its own, and painted bounds only exist
 /// for the frame that was drawn.
 fn draw(cx: &mut VisualTestContext) {
-    cx.update(|window, cx| window.draw(cx).clear());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
 }
 
