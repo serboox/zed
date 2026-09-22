@@ -529,3 +529,93 @@ jobs:
       - name: Say whether the engine ran here
         if: always() && steps.engine.outcome == 'success'
         run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+  # The bundles are built either way, but as artifacts of the run they are
+  # behind a login and come down as zips of zips. A release is a plain link per
+  # file, which is what somebody installing this actually needs.
+  #
+  # Every build of the branch publishes one. A cron would be the other way to
+  # get a release a week, but a scheduled workflow is read from the repository's
+  # default branch, and this file does not live there -- it would never fire.
+  release:
+    name: Publish the bundles where they can be downloaded
+    needs: [plan, linux, windows, macos]
+    if: >-
+      always() && !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && github.ref == 'refs/heads/personal_zed_fork'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Everything the platform jobs built, unpacked into one directory: the
+      # files themselves, not the artifact containers they travelled in.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zed-*
+          path: bundles
+          merge-multiple: true
+
+      - name: Name the release after the day and the commit
+        id: name
+        run: |
+          set -euo pipefail
+          echo "tag=fork-$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Say what is in it
+        id: notes
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)"
+          {
+            echo "Built from \`personal_zed_fork\` at ${GITHUB_SHA::7}."
+            echo
+            echo "| Platform | File |"
+            echo "| --- | --- |"
+            for file in bundles/*; do
+              [ -f "$file" ] || continue
+              case "$file" in
+                *.deb)     echo "| Linux (Debian, Ubuntu) | \`$(basename "$file")\` |" ;;
+                *.rpm)     echo "| Linux (Fedora, RHEL) | \`$(basename "$file")\` |" ;;
+                *.tar.gz)  echo "| Linux (any) | \`$(basename "$file")\` |" ;;
+                *.dmg)     echo "| macOS | \`$(basename "$file")\` |" ;;
+                *.app.zip) echo "| macOS (unpacked app) | \`$(basename "$file")\` |" ;;
+                *.exe)     echo "| Windows | \`$(basename "$file")\` |" ;;
+                *)         echo "| | \`$(basename "$file")\` |" ;;
+              esac
+            done
+            # Only when the tag is one this checkout actually has: a release
+            # list can name a tag that was never fetched, and asking git for a
+            # range it cannot resolve would take the whole step down with it.
+            if [ -n "$previous" ] && git rev-parse -q --verify "$previous^{commit}" > /dev/null; then
+              echo
+              echo "## What changed since \`$previous\`"
+              echo
+              git log --no-merges --pretty='- %s' -n 50 "$previous..HEAD" || true
+            fi
+          } > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish it
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(bundles/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "nothing was built, so there is nothing to publish" >&2
+            exit 1
+          fi
+          gh release create "${{ steps.name.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "Zed fork ${{ steps.name.outputs.tag }}" \
+            --notes-file notes.md \
+            --prerelease \
+            "${files[@]}"
+        env:
+          GH_TOKEN: ${{ github.token }}
