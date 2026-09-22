@@ -818,6 +818,21 @@ impl VisualTestContext {
         self.cx.test_window(self.window).0.lock().last_drag_meant
     }
 
+    /// Ends the drag this window last handed to the platform, the way the
+    /// desktop does once whatever it was dropped on is finished with it.
+    pub fn end_the_last_drag(&mut self, end: crate::FileDragEnd) {
+        let window = self.cx.test_window(self.window);
+        let (paths, mut ended) = {
+            let mut lock = window.0.lock();
+            let paths = lock.dragged_out.last().cloned().unwrap_or_default();
+            (paths, lock.file_drag_ended.take())
+        };
+        if let Some(ended) = ended.as_mut() {
+            ended(paths, end);
+        }
+        window.0.lock().file_drag_ended = ended;
+    }
+
     /// Makes this window's platform one that cannot start a drag of its own, the
     /// way a platform gpui has no implementation for behaves.
     pub fn refuse_file_drags(&self) {

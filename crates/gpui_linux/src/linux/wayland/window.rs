@@ -52,6 +52,7 @@ pub(crate) struct Callbacks {
     resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved: Option<Box<dyn FnMut()>>,
     should_close: Option<Box<dyn FnMut() -> bool>>,
+    file_drag_ended: Option<Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>>,
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
@@ -793,6 +794,14 @@ impl WaylandWindow {
 impl WaylandWindowStatePtr {
     pub fn handle(&self) -> AnyWindowHandle {
         self.state.borrow().handle
+    }
+
+    /// Tells whoever is listening that a drag this window started is over.
+    pub fn file_drag_ended(&self, paths: Vec<std::path::PathBuf>, end: gpui::FileDragEnd) {
+        let mut callbacks = self.callbacks.borrow_mut();
+        if let Some(ended) = callbacks.file_drag_ended.as_mut() {
+            ended(paths, end);
+        }
     }
 
     pub fn surface(&self) -> wl_surface::WlSurface {
@@ -1687,6 +1696,13 @@ impl PlatformWindow for WaylandWindow {
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.callbacks.borrow_mut().should_close = Some(callback);
+    }
+
+    fn on_file_drag_ended(
+        &self,
+        callback: Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>,
+    ) {
+        self.0.callbacks.borrow_mut().file_drag_ended = Some(callback);
     }
 
     fn on_close(&self, callback: Box<dyn FnOnce()>) {

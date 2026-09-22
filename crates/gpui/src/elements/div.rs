@@ -5152,6 +5152,35 @@ mod tests {
         );
     }
 
+    /// The window is told when a drag it started is over, and with what. It is
+    /// the only way it can learn: the desktop says nothing about where a drag
+    /// landed, so everything the window does afterwards hangs off this.
+    #[gpui::test]
+    async fn the_window_hears_how_a_drag_it_started_ended(cx: &mut TestAppContext) {
+        let file = std::path::PathBuf::from("/tmp/a file.txt");
+        let (_moved_to, mut cx) = a_draggable_window(vec![file.clone()], cx);
+        let heard = Rc::new(Cell::new(None));
+        cx.update(|window, cx| {
+            let heard = heard.clone();
+            window.on_file_drag_ended(cx, move |paths, end, _, _| heard.set(Some((paths, end))));
+        });
+
+        carry_it_out_of_the_window(&mut cx, Modifiers::none());
+        assert!(
+            heard.take().is_none(),
+            "a drag that has only just left is not over"
+        );
+
+        cx.end_the_last_drag(crate::FileDragEnd::Taken);
+        cx.run_until_parked();
+
+        assert_eq!(
+            heard.take(),
+            Some((vec![file], crate::FileDragEnd::Taken)),
+            "the window hears which files it was, and what became of the drag"
+        );
+    }
+
     /// Presses inside the window and drags, holding nothing, then carries the
     /// drag past the left edge holding `at_the_edge`. The last step is the one
     /// that hands the drag to the platform, so it is the only one whose

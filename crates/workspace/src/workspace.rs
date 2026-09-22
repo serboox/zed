@@ -624,6 +624,18 @@ pub enum CloseIntent {
     ReplaceWindow,
 }
 
+/// How long a receiver is given to finish moving a file before the window it
+/// came from looks to see whether it is still there. Long enough for a file
+/// manager to rename a file, short enough that a tab left pointing at nothing
+/// is noticed second.
+const WAIT_FOR_A_RECEIVER_TO_MOVE_IT: Duration = Duration::from_millis(400);
+
+/// Whether `open` is `carried` itself or something inside it, so that a folder
+/// carried out of the window takes the tabs of the files in it.
+fn is_at_or_under(open: &ProjectPath, carried: &ProjectPath) -> bool {
+    open.worktree_id == carried.worktree_id && open.path.starts_with(&carried.path)
+}
+
 #[derive(Clone)]
 pub struct Toast {
     id: NotificationId,
@@ -6255,6 +6267,116 @@ impl Workspace {
             self.active_item_path_changed(true, window, cx);
         }
         cx.emit(Event::PaneRemoved);
+    }
+
+    /// A drag of files out of this window is over.
+    ///
+    /// What became of each file was the receiver's to decide -- one handed a
+    /// move does the moving itself, one that only reads the file leaves it
+    /// where it is -- so the only way to know is to look at the disk. A file
+    /// that is gone was moved, and the tab still holding it points at nothing.
+    ///
+    /// A tab with unsaved work is left alone either way: closing it would throw
+    /// the work away, and the file it would have been saved to is not there any
+    /// more.
+    pub fn a_drag_out_of_this_window_ended(
+        &mut self,
+        paths: Vec<PathBuf>,
+        end: gpui::FileDragEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let gpui::FileDragEnd::Refused = end {
+            self.show_toast(
+                Toast::new(
+                    NotificationId::named("a-drag-was-refused".into()),
+                    match cfg!(target_os = "macos") {
+                        true => {
+                            "That window will not take a file. Hold Option while dragging to \
+                                 copy it there instead."
+                        }
+                        false => {
+                            "That window will not take a file. Hold Ctrl while dragging to \
+                                  copy it there instead."
+                        }
+                    },
+                )
+                .autohide(),
+                cx,
+            );
+            return;
+        }
+
+        let fs = self.project.read(cx).fs().clone();
+        cx.spawn_in(window, async move |workspace, cx| {
+            // The receiver does the moving, and it does not have to have
+            // finished by the time it says it is done with the drag.
+            cx.background_executor()
+                .timer(WAIT_FOR_A_RECEIVER_TO_MOVE_IT)
+                .await;
+
+            // A path the machine will not answer for is not a path that is
+            // gone: only an answer of "nothing is there" closes a tab.
+            let mut gone = Vec::new();
+            for path in paths {
+                if matches!(fs.metadata(&path).await, Ok(None)) {
+                    gone.push(path);
+                }
+            }
+            if gone.is_empty() {
+                return anyhow::Ok(());
+            }
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.close_the_tabs_of(gone, window, cx)
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Closes whatever tab holds each of `paths`, and whatever tab holds a file
+    /// that was under one of them: a folder carried out takes everything in it.
+    ///
+    /// Work that has not been saved is left alone. The check is made twice over
+    /// -- once here, and once by the close itself, which is told to ask rather
+    /// than discard -- because between the two the reader may have typed.
+    fn close_the_tabs_of(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.project.clone();
+        let carried: Vec<ProjectPath> = paths
+            .iter()
+            .filter_map(|path| project.read(cx).project_path_for_absolute_path(path, cx))
+            .collect();
+        if carried.is_empty() {
+            return;
+        }
+
+        for pane in self.panes.clone() {
+            let closing: Vec<_> = pane
+                .read(cx)
+                .items()
+                .filter(|item| !item.is_dirty(cx))
+                .filter(|item| {
+                    item.project_path(cx)
+                        .is_some_and(|open| carried.iter().any(|gone| is_at_or_under(&open, gone)))
+                })
+                .map(|item| item.item_id())
+                .collect();
+            if closing.is_empty() {
+                continue;
+            }
+            pane.update(cx, |pane, cx| {
+                pane.close_items(window, cx, SaveIntent::Close, &move |item_id| {
+                    closing.contains(&item_id)
+                })
+            })
+            .detach_and_log_err(cx);
+        }
     }
 
     pub fn panes_mut(&mut self) -> &mut [Entity<Pane>] {
@@ -18908,6 +19030,213 @@ mod tests {
                 "Both panels should still be in the right dock"
             );
         });
+    }
+
+    /// A file dragged out of the window and moved away leaves a tab pointing at
+    /// nothing, so the tab goes with it.
+    #[gpui::test]
+    async fn a_tab_closes_when_its_file_was_moved_out_of_the_window(cx: &mut TestAppContext) {
+        let (workspace, fs, cx) = a_window_with_a_file_open(cx).await;
+
+        fs.remove_file(Path::new(path!("/project/a.txt")), Default::default())
+            .await
+            .expect("whatever took the file moved it away");
+        the_drag_of_the_file_ends(&workspace, gpui::FileDragEnd::Taken, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_none(),
+                "the tab that held it is gone too"
+            );
+        });
+    }
+
+    /// A window that only read the file -- a chat, an upload form -- leaves it
+    /// where it is, and the tab stays open on a file that is still there.
+    #[gpui::test]
+    async fn a_tab_stays_when_its_file_is_still_there(cx: &mut TestAppContext) {
+        let (workspace, _fs, cx) = a_window_with_a_file_open(cx).await;
+
+        the_drag_of_the_file_ends(&workspace, gpui::FileDragEnd::Taken, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_some(),
+                "nothing moved the file, so nothing closes the tab"
+            );
+        });
+    }
+
+    /// A drag nothing took changes nothing, whatever else has happened to the
+    /// file in the meantime.
+    #[gpui::test]
+    async fn a_refused_drag_closes_nothing(cx: &mut TestAppContext) {
+        let (workspace, fs, cx) = a_window_with_a_file_open(cx).await;
+
+        fs.remove_file(Path::new(path!("/project/a.txt")), Default::default())
+            .await
+            .expect("something else removed it");
+        the_drag_of_the_file_ends(&workspace, gpui::FileDragEnd::Refused, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_some(),
+                "a drag nobody took is not a reason to close anything"
+            );
+        });
+    }
+
+    /// A folder carried out takes what was in it: the tabs of its files point
+    /// at paths that moved with it.
+    #[gpui::test]
+    async fn a_folder_moved_out_closes_the_tabs_of_what_was_in_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "inside": { "a.txt": "hello" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let worktree_id = the_one_worktree_of(&workspace, cx);
+        let item = cx.new(|cx| {
+            TestItem::new(cx).with_project_items(&[TestProjectItem::new_in_worktree(
+                1,
+                "inside/a.txt",
+                worktree_id,
+                cx,
+            )])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+
+        fs.remove_dir(
+            Path::new(path!("/project/inside")),
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .expect("the folder was moved away whole");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.a_drag_out_of_this_window_ended(
+                vec![PathBuf::from(path!("/project/inside"))],
+                gpui::FileDragEnd::Taken,
+                window,
+                cx,
+            );
+        });
+        cx.executor()
+            .advance_clock(WAIT_FOR_A_RECEIVER_TO_MOVE_IT * 2);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_none(),
+                "the tab of a file inside the folder goes with the folder"
+            );
+        });
+    }
+
+    /// Work that has not been saved outlives the file it was going to be saved
+    /// to: closing the tab would throw it away, and there is nowhere left to
+    /// put it back.
+    #[gpui::test]
+    async fn a_tab_with_unsaved_work_stays_even_when_its_file_is_gone(cx: &mut TestAppContext) {
+        let (workspace, fs, cx) = a_window_with_a_file_open(cx).await;
+        let item = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .next()
+                .expect("the tab is open")
+                .downcast::<TestItem>()
+                .expect("it is the test item")
+        });
+        item.update(cx, |item, _| item.is_dirty = true);
+
+        fs.remove_file(Path::new(path!("/project/a.txt")), Default::default())
+            .await
+            .expect("whatever took the file moved it away");
+        the_drag_of_the_file_ends(&workspace, gpui::FileDragEnd::Taken, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_some(),
+                "the tab stays, because what is in it is not anywhere else"
+            );
+        });
+    }
+
+    /// A window with `/project/a.txt` open in a tab.
+    async fn a_window_with_a_file_open(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Arc<FakeFs>, &mut VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "a.txt": "hello" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let worktree_id = the_one_worktree_of(&workspace, cx);
+        let item = cx.new(|cx| {
+            TestItem::new(cx).with_project_items(&[TestProjectItem::new_in_worktree(
+                1,
+                "a.txt",
+                worktree_id,
+                cx,
+            )])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.active_item(cx).is_some(),
+                "the tab is open to begin with"
+            );
+        });
+
+        (workspace, fs, cx)
+    }
+
+    fn the_one_worktree_of(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> WorktreeId {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("the project has the one worktree")
+                .read(cx)
+                .id()
+        })
+    }
+
+    /// Says the drag of `/project/a.txt` ended, and lets the window act on it.
+    fn the_drag_of_the_file_ends(
+        workspace: &Entity<Workspace>,
+        end: gpui::FileDragEnd,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.a_drag_out_of_this_window_ended(
+                vec![PathBuf::from(path!("/project/a.txt"))],
+                end,
+                window,
+                cx,
+            );
+        });
+        cx.executor()
+            .advance_clock(WAIT_FOR_A_RECEIVER_TO_MOVE_IT * 2);
+        cx.run_until_parked();
     }
 
     #[gpui::test]

@@ -485,6 +485,18 @@ pub enum DragMeans {
     Copying,
 }
 
+/// What became of a drag of files this window handed to the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileDragEnd {
+    /// Whatever it was dropped on took the files and has finished with them.
+    /// Whether a file moved or was copied is that receiver's doing, not this
+    /// window's, so the only way to know is to look at what is on disk.
+    Taken,
+    /// Nothing took it: it was let go of over something that would not have it,
+    /// or over nothing at all. Every file is exactly where it was.
+    Refused,
+}
+
 /// Which part of the window to resize
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
@@ -911,6 +923,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> bool {
         false
     }
+    /// Called when a drag this window started is over, with the files it
+    /// carried and what became of it.
+    ///
+    /// A platform that cannot start such a drag never calls it.
+    fn on_file_drag_ended(&self, _callback: Box<dyn FnMut(Vec<std::path::PathBuf>, FileDragEnd)>) {}
     /// Says that whatever this window does with the drag now over it amounts to
     /// taking the files, so whoever started the drag should let go of the
     /// originals once it is done. A platform that cannot say this drops the

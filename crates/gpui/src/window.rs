@@ -5,8 +5,8 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragMeans, Edges, Effect,
-    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
-    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Entity, EntityId, EventEmitter, FileDragEnd, FileDropEvent, FontId, Global, GlobalElementId,
+    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
@@ -2399,6 +2399,24 @@ impl Window {
         means: DragMeans,
     ) -> bool {
         self.platform_window.start_file_drag(paths, picture, means)
+    }
+
+    /// Registers what to do when a drag this window started is over.
+    ///
+    /// It says which files were carried and whether anything took them. It does
+    /// not say what became of each file: a receiver that takes a move does the
+    /// moving itself, so whether a file is still where it was is a question for
+    /// the disk and not for this callback.
+    pub fn on_file_drag_ended(
+        &self,
+        cx: &App,
+        f: impl Fn(Vec<std::path::PathBuf>, FileDragEnd, &mut Window, &mut App) + 'static,
+    ) {
+        let mut cx = self.to_async(cx);
+        self.platform_window
+            .on_file_drag_ended(Box::new(move |paths, end| {
+                cx.update(|window, cx| f(paths, end, window, cx)).log_err();
+            }))
     }
 
     /// Says that what this window will do with the files now being dragged over

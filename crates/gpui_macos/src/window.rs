@@ -539,6 +539,8 @@ struct MacWindowState {
     dragged_out: Vec<std::path::PathBuf>,
     /// What the drag those files were handed to the desktop for asks it to do.
     dragged_out_means: gpui::DragMeans,
+    /// Who to tell when that drag is over.
+    file_drag_ended: Option<Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>>,
     /// Whether what this window will do with the drag over it amounts to taking
     /// the files. Answered again for every step of the drag.
     takes_the_drag: bool,
@@ -949,6 +951,7 @@ impl MacWindow {
                 external_files_dragged: false,
                 dragged_out: Vec::new(),
                 dragged_out_means: gpui::DragMeans::Copying,
+                file_drag_ended: None,
                 takes_the_drag: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -1875,6 +1878,13 @@ impl PlatformWindow for MacWindow {
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
+    }
+
+    fn on_file_drag_ended(
+        &self,
+        callback: Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>,
+    ) {
+        self.0.lock().file_drag_ended = Some(callback);
     }
 
     fn start_file_drag(
@@ -3095,9 +3105,11 @@ extern "C" fn dragging_source_operation_mask(
     }
 }
 
-/// The drag this window started is over. A move is only half done here -- the
-/// files have been copied to wherever they went -- and letting go of the
-/// originals is what makes it a move.
+/// The drag this window started is over. What became of each file is the
+/// receiver's doing and not this window's: a destination handed file URLs and a
+/// move does the moving itself, and one that only reads the file leaves it
+/// where it is. Removing it here as well is how a file dropped into a chat
+/// window ends up nowhere at all.
 extern "C" fn dragging_session_ended(
     this: &Object,
     _: Sel,
@@ -3108,20 +3120,22 @@ extern "C" fn dragging_session_ended(
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     let paths = std::mem::take(&mut lock.dragged_out);
-    let executor = lock.background_executor.clone();
+    let ended = lock.file_drag_ended.take();
     drop(lock);
-    if operation & NSDragOperationMove == 0 || paths.is_empty() {
+    let Some(mut ended) = ended else {
         return;
+    };
+    let end = match operation == 0 {
+        true => gpui::FileDragEnd::Refused,
+        false => gpui::FileDragEnd::Taken,
+    };
+    ended(paths, end);
+    // Back where it was, unless the callback registered another in the
+    // meantime -- that one is the newer word and this one is stale.
+    let mut lock = window_state.as_ref().lock();
+    if lock.file_drag_ended.is_none() {
+        lock.file_drag_ended = Some(ended);
     }
-    executor
-        .spawn(async move {
-            for path in paths {
-                std::fs::remove_file(&path)
-                    .or_else(|_| std::fs::remove_dir_all(&path))
-                    .log_err();
-            }
-        })
-        .detach();
 }
 
 extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {

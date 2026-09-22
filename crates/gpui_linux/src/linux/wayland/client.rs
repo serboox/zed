@@ -320,6 +320,9 @@ pub(crate) struct WaylandClientState {
     /// with yet. Kept here rather than on the data source, because the source
     /// only ever hands back the mime type it is being asked for.
     dragged_files: Vec<PathBuf>,
+    /// The window whose drag those files belong to, so it can be told how the
+    /// drag ended.
+    dragged_from: Option<WaylandWindowStatePtr>,
     /// What the desktop settled on doing with that drag. A move is only carried
     /// out once the drop is finished, and it is this client that carries it out:
     /// whoever took the files has copied them, and removing the originals is
@@ -442,12 +445,6 @@ fn a_file_holding(bytes: &[u8]) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// What a drag that has just ended leaves behind: everything it carried when
-/// the desktop settled on moving it, and nothing at all otherwise.
-///
-/// A move is only half done when the drop lands -- whoever took the files has
-/// copied them -- and letting go of these is what makes it a move. Anything
-/// else and the files stay exactly where they were.
 /// The one action a drag puts on offer for what it means.
 ///
 /// One and not both, either way. The desktop settles the action by matching
@@ -455,32 +452,12 @@ fn a_file_holding(bytes: &[u8]) -> Option<std::fs::File> {
 /// are on offer the receiver decides -- and the receiver can decide either way,
 /// so offering both is offering no promise at all. A move that also offered a
 /// copy would be settled as a copy by a file manager; a copy that also offered
-/// a move would have the original deleted by a receiver that prefers to take
-/// the file, which this editor's own windows do.
+/// a move would be settled as a move by a window that takes files, which this
+/// editor's own windows do.
 fn offered_by(means: gpui::DragMeans) -> DndAction {
     match means {
         gpui::DragMeans::Taking => DndAction::Move,
         gpui::DragMeans::Copying => DndAction::Copy,
-    }
-}
-
-fn files_the_drag_gave_up(action: DndAction, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    match action.contains(DndAction::Move) {
-        true => paths,
-        false => Vec::new(),
-    }
-}
-
-/// Removes what a move left behind. A file that has already gone is no error:
-/// whoever took it may have moved it themselves.
-fn let_go_of(paths: &[PathBuf]) {
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        std::fs::remove_file(path)
-            .or_else(|_| std::fs::remove_dir_all(path))
-            .log_err();
     }
 }
 
@@ -641,6 +618,7 @@ impl WaylandClientStatePtr {
         };
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         state.dragged_files = paths.to_vec();
+        state.dragged_from = state.windows.get(&surface.id()).cloned();
         state.dragged_action = DndAction::empty();
         let data_source = data_device_manager.create_data_source(&state.globals.qh, DraggedOut);
         for format in formats_a_file_drag_offers() {
@@ -1065,6 +1043,7 @@ impl WaylandClient {
             cursor_shape_device: None,
             data_device,
             dragged_files: Vec::new(),
+            dragged_from: None,
             dragged_action: DndAction::empty(),
             drag_icon: None,
             primary_selection,
@@ -2986,35 +2965,30 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
                     state.dragged_action
                 );
             }
-            // The drop landed and whoever took it has finished reading. A move
-            // is only half done at this point: the files have been copied to
-            // wherever they went, and removing the originals is what makes it a
-            // move rather than a copy. That is the source's to do, and the
-            // source is this window.
+            // The drop landed and whoever took it has finished. What became of
+            // each file is that receiver's doing and not this window's: for a
+            // list of `file://` paths the receiver of a move does the moving,
+            // which is what a file manager does, and what a file manager
+            // dragging into this editor leaves for this editor to do.
+            //
+            // So nothing is removed here. A window that reads the file without
+            // moving it -- a chat, an upload form -- leaves the original where
+            // it is, which is the copy it meant to make, and removing it from
+            // under the reader is how a file ends up nowhere.
             wl_data_source::Event::DndFinished => {
                 let carried = std::mem::take(&mut state.dragged_files);
-                let carried_count = carried.len();
-                let paths = files_the_drag_gave_up(state.dragged_action, carried);
-                let moving = !paths.is_empty();
                 log::info!(
-                    "drag out of this window finished as {:?}; {} file(s) carried, {}",
+                    "drag out of this window finished as {:?}; {} file(s) are the receiver's now",
                     state.dragged_action,
-                    carried_count,
-                    match moving {
-                        true => "let go of here",
-                        false => "left where they are",
-                    }
+                    carried.len()
                 );
                 if let Some(icon) = state.drag_icon.take() {
                     icon.let_go();
                 }
-                if moving {
-                    state
-                        .common
-                        .background_executor
-                        .spawn(async move { let_go_of(&paths) })
-                        .detach();
+                if let Some(window) = state.dragged_from.take() {
+                    window.file_drag_ended(carried, gpui::FileDragEnd::Taken);
                 }
+                state.dragged_action = DndAction::empty();
                 data_source.destroy();
             }
             // Nothing took it. Either it was dropped where nothing was
@@ -3022,16 +2996,19 @@ impl Dispatch<wl_data_source::WlDataSource, DraggedOut> for WaylandClientStatePt
             // asked for -- a window that only copies refuses a drag that only
             // moves, and there is no second chance to offer it a copy instead.
             wl_data_source::Event::Cancelled => {
+                let carried = std::mem::take(&mut state.dragged_files);
                 log::info!(
                     "drag out of this window was refused; {} file(s) stay where they are, \
                      and the action stood at {:?}",
-                    state.dragged_files.len(),
+                    carried.len(),
                     state.dragged_action
                 );
-                state.dragged_files.clear();
                 state.dragged_action = DndAction::empty();
                 if let Some(icon) = state.drag_icon.take() {
                     icon.let_go();
+                }
+                if let Some(window) = state.dragged_from.take() {
+                    window.file_drag_ended(carried, gpui::FileDragEnd::Refused);
                 }
                 data_source.destroy();
             }
@@ -3290,65 +3267,6 @@ mod tests {
             text_input.cursor_rectangles.borrow().as_slice(),
             &[(10, 20, 1, 18)]
         );
-    }
-
-    fn a_file(dir: &std::path::Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, b"something").expect("the file is written");
-        path
-    }
-
-    /// A drag the desktop settled on moving is only half done when the drop
-    /// lands: the files have been copied to wherever they went, and letting go
-    /// of the originals is what makes it a move rather than a copy.
-    #[test]
-    fn a_drag_taken_as_a_move_leaves_nothing_behind() {
-        let dir = tempfile::tempdir().expect("a directory of our own");
-        let one = a_file(dir.path(), "one.txt");
-        let two = a_file(dir.path(), "two.txt");
-
-        let given_up = files_the_drag_gave_up(DndAction::Move, vec![one.clone(), two.clone()]);
-        assert_eq!(given_up, vec![one.clone(), two.clone()]);
-        let_go_of(&given_up);
-
-        assert!(!one.exists(), "a file that was moved is not still here");
-        assert!(!two.exists(), "nor is the second one");
-    }
-
-    /// A copy leaves both: the one that was taken and the one it was taken from.
-    #[test]
-    fn a_drag_taken_as_a_copy_leaves_everything_where_it_was() {
-        let dir = tempfile::tempdir().expect("a directory of our own");
-        let one = a_file(dir.path(), "one.txt");
-
-        let given_up = files_the_drag_gave_up(DndAction::Copy, vec![one.clone()]);
-        assert!(given_up.is_empty(), "a copy gives nothing up");
-        let_go_of(&given_up);
-
-        assert!(one.exists(), "the file that was copied is still here");
-    }
-
-    /// Nothing at all was agreed -- the drag was let go over something that
-    /// would not take it -- and nothing is removed.
-    #[test]
-    fn a_drag_nobody_took_leaves_everything_where_it_was() {
-        let dir = tempfile::tempdir().expect("a directory of our own");
-        let one = a_file(dir.path(), "one.txt");
-
-        assert!(files_the_drag_gave_up(DndAction::empty(), vec![one.clone()]).is_empty());
-        assert!(one.exists());
-    }
-
-    /// A file already gone by the time the drop finishes -- whoever took it
-    /// moved it themselves -- is not an error to report.
-    #[test]
-    fn a_file_already_gone_is_not_a_complaint() {
-        let dir = tempfile::tempdir().expect("a directory of our own");
-        let gone = dir.path().join("never-was.txt");
-
-        let_go_of(std::slice::from_ref(&gone));
-
-        assert!(!gone.exists());
     }
 
     /// The picture says how many files are being carried: one page for one, and

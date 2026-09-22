@@ -525,6 +525,20 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
+        // A drag of files out of this window is the window's to hear about: the
+        // tabs that held them are here, and so is the place to say that nothing
+        // took them.
+        let multi_workspace_handle = cx.entity().downgrade();
+        window.on_file_drag_ended(cx, move |paths, end, window, cx| {
+            multi_workspace_handle
+                .update(cx, |multi_workspace, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.a_drag_out_of_this_window_ended(paths, end, window, cx);
+                    });
+                })
+                .log_err();
+        });
+
         let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
         cx.subscribe_in(

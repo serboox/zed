@@ -115,6 +115,8 @@ pub(crate) struct WindowsWindowInner {
     pending_file_drag: RefCell<Vec<std::path::PathBuf>>,
     /// What that pending drag asks the shell to do with the files.
     pending_file_drag_means: Cell<gpui::DragMeans>,
+    /// Who to tell when that drag is over.
+    file_drag_ended: RefCell<Option<Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>>>,
     /// Whether what this window will do with the drag over it amounts to taking
     /// the files. Answered again for every step of the drag.
     takes_the_drag: Cell<bool>,
@@ -291,6 +293,7 @@ impl WindowsWindowInner {
             parent_hwnd: context.parent_hwnd,
             pending_file_drag: RefCell::new(Vec::new()),
             pending_file_drag_means: Cell::new(gpui::DragMeans::Copying),
+            file_drag_ended: RefCell::new(None),
             takes_the_drag: Cell::new(false),
         }))
     }
@@ -619,8 +622,21 @@ impl Drop for WindowsWindow {
 /// pointer event that asked for it is over.
 pub(crate) fn run_pending_file_drag(inner: &WindowsWindowInner) -> Option<isize> {
     let paths = std::mem::take(&mut *inner.pending_file_drag.borrow_mut());
-    if !paths.is_empty() {
-        start_file_drag(inner.hwnd, &paths, inner.pending_file_drag_means.get()).log_err();
+    if paths.is_empty() {
+        return Some(0);
+    }
+    let end = start_file_drag(inner.hwnd, &paths, inner.pending_file_drag_means.get()).log_err();
+    // Taken out of its cell for the call and put back after, so that a callback
+    // free to register another one does not borrow the cell twice.
+    let Some(mut ended) = inner.file_drag_ended.borrow_mut().take() else {
+        return Some(0);
+    };
+    if let Some(end) = end {
+        ended(paths, end);
+    }
+    let mut cell = inner.file_drag_ended.borrow_mut();
+    if cell.is_none() {
+        *cell = Some(ended);
     }
     Some(0)
 }
@@ -632,9 +648,13 @@ pub(crate) fn run_pending_file_drag(inner: &WindowsWindowInner) -> Option<isize>
 /// a data object that only has to be told what it holds, and `SHDoDragDrop` with
 /// no drop source of its own uses the standard one, which is the one every other
 /// application's drags already behave like.
-fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf], means: gpui::DragMeans) -> Result<()> {
+fn start_file_drag(
+    hwnd: HWND,
+    paths: &[std::path::PathBuf],
+    means: gpui::DragMeans,
+) -> Result<gpui::FileDragEnd> {
     if paths.is_empty() {
-        return Ok(());
+        return Ok(gpui::FileDragEnd::Refused);
     }
     unsafe {
         let data: IDataObject = SHCreateDataObject(None, None, None::<&IDataObject>)?;
@@ -667,17 +687,15 @@ fn start_file_drag(hwnd: HWND, paths: &[std::path::PathBuf], means: gpui::DragMe
             gpui::DragMeans::Copying => DROPEFFECT_COPY,
         };
         let taken = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, offered)?;
-        // A move is only half done here -- the files have been copied to wherever
-        // they went -- and letting go of the originals is what makes it a move.
-        if taken.0 & DROPEFFECT_MOVE.0 != 0 {
-            for path in paths {
-                std::fs::remove_file(path)
-                    .or_else(|_| std::fs::remove_dir_all(path))
-                    .log_err();
-            }
-        }
+        // What became of each file is the receiver's doing and not this
+        // window's: a shell target handed a move does the moving itself, and
+        // one that only reads the file leaves it where it is. Removing it here
+        // as well is how a file dropped into a chat window ends up nowhere.
+        Ok(match taken.0 == 0 {
+            true => gpui::FileDragEnd::Refused,
+            false => gpui::FileDragEnd::Taken,
+        })
     }
-    Ok(())
 }
 
 /// `paths` as a `DROPFILES` block: the header, then every path as wide
@@ -1109,6 +1127,13 @@ impl PlatformWindow for WindowsWindow {
 
     fn take_external_drag_as_move(&self) {
         self.0.takes_the_drag.set(true);
+    }
+
+    fn on_file_drag_ended(
+        &self,
+        callback: Box<dyn FnMut(Vec<std::path::PathBuf>, gpui::FileDragEnd)>,
+    ) {
+        *self.0.file_drag_ended.borrow_mut() = Some(callback);
     }
 
     fn start_file_drag(

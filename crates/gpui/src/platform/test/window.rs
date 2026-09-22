@@ -44,6 +44,8 @@ pub(crate) struct TestWindowState {
     pub(crate) drag_taken_as_move: bool,
     /// What the last drag handed to the platform asked the desktop to do.
     pub(crate) last_drag_meant: Option<crate::DragMeans>,
+    /// Who to tell when a drag this window started is over.
+    pub(crate) file_drag_ended: Option<Box<dyn FnMut(Vec<std::path::PathBuf>, crate::FileDragEnd)>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +101,7 @@ impl TestWindow {
             dragged_out: Vec::new(),
             refuse_file_drags: false,
             last_drag_meant: None,
+            file_drag_ended: None,
             drag_taken_as_move: false,
         })))
     }
@@ -354,6 +357,13 @@ impl PlatformWindow for TestWindow {
 
     fn external_drop_is_a_move(&self) -> bool {
         self.0.lock().drag_taken_as_move
+    }
+
+    fn on_file_drag_ended(
+        &self,
+        callback: Box<dyn FnMut(Vec<std::path::PathBuf>, crate::FileDragEnd)>,
+    ) {
+        self.0.lock().file_drag_ended = Some(callback);
     }
 
     fn start_file_drag(
