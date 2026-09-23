@@ -837,8 +837,6 @@ impl DirectXRenderer {
             return Ok(());
         }
         let devices = self.devices.as_ref().context("devices missing")?.clone();
-        let resources = self.resources.as_ref().context("resources missing")?;
-        let viewport = resources.viewport;
 
         let mut sprites = Vec::with_capacity(surfaces.len());
         let mut views = Vec::with_capacity(surfaces.len());
@@ -884,11 +882,12 @@ impl DirectXRenderer {
         // texture is what a draw call is set up with.
         for (at, view) in views.iter().enumerate() {
             self.pipelines.shared_frames.draw_range_with_texture(
-                &devices.device,
                 &devices.device_context,
                 slice::from_ref(view),
-                slice::from_ref(&viewport),
-                slice::from_ref(&self.globals.global_params_buffer),
+                self.globals
+                    .batch_params_buffer
+                    .as_ref()
+                    .context("batch params buffer missing")?,
                 slice::from_ref(&self.globals.sampler),
                 at as u32,
                 1,
