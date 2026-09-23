@@ -822,9 +822,9 @@ pub enum SettingsObserverMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsObserverEvent {
-    LocalSettingsUpdated(Result<PathBuf, InvalidSettingsError>),
-    LocalTasksUpdated(Result<PathBuf, InvalidSettingsError>),
-    LocalDebugScenariosUpdated(Result<PathBuf, InvalidSettingsError>),
+    LocalSettingsUpdated(WorktreeId, Result<PathBuf, InvalidSettingsError>),
+    LocalTasksUpdated(WorktreeId, Result<PathBuf, InvalidSettingsError>),
+    LocalDebugScenariosUpdated(WorktreeId, Result<PathBuf, InvalidSettingsError>),
     GlobalTasksUpdated(Result<PathBuf, InvalidSettingsError>),
     GlobalDebugScenariosUpdated(Result<PathBuf, InvalidSettingsError>),
 }
@@ -1408,17 +1408,19 @@ impl SettingsObserver {
                     match result {
                         Err(InvalidSettingsError::Tasks { path, message }) => {
                             log::error!("Failed to set local tasks in {path:?}: {message:?}");
-                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(Err(
-                                InvalidSettingsError::Tasks { path, message },
-                            )));
+                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(
+                                worktree_id,
+                                Err(InvalidSettingsError::Tasks { path, message }),
+                            ));
                         }
                         Err(e) => {
                             log::error!("Failed to set local tasks: {e}");
                         }
                         Ok(()) => {
-                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(Ok(directory
-                                .as_std_path()
-                                .join(task_file_name()))));
+                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(
+                                worktree_id,
+                                Ok(directory.as_std_path().join(task_file_name())),
+                            ));
                         }
                     }
                 }
@@ -1439,17 +1441,19 @@ impl SettingsObserver {
                             log::error!(
                                 "Failed to set local debug scenarios in {path:?}: {message:?}"
                             );
-                            cx.emit(SettingsObserverEvent::LocalDebugScenariosUpdated(Err(
-                                InvalidSettingsError::Debug { path, message },
-                            )));
+                            cx.emit(SettingsObserverEvent::LocalDebugScenariosUpdated(
+                                worktree_id,
+                                Err(InvalidSettingsError::Debug { path, message }),
+                            ));
                         }
                         Err(e) => {
                             log::error!("Failed to set local debug scenarios: {e}");
                         }
                         Ok(()) => {
-                            cx.emit(SettingsObserverEvent::LocalDebugScenariosUpdated(Ok(
-                                directory.as_std_path().join(debug_task_file_name()),
-                            )));
+                            cx.emit(SettingsObserverEvent::LocalDebugScenariosUpdated(
+                                worktree_id,
+                                Ok(directory.as_std_path().join(debug_task_file_name())),
+                            ));
                         }
                     }
                 }
@@ -1580,9 +1584,10 @@ fn apply_local_settings(
         match result {
             Err(InvalidSettingsError::LocalSettings { path, message }) => {
                 log::error!("Failed to set local settings in {path:?}: {message}");
-                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Err(
-                    InvalidSettingsError::LocalSettings { path, message },
-                )));
+                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(
+                    worktree_id,
+                    Err(InvalidSettingsError::LocalSettings { path, message }),
+                ));
             }
             Err(e) => log::error!("Failed to set local settings: {e}"),
             Ok(()) => {
@@ -1592,9 +1597,10 @@ fn apply_local_settings(
                         .join(local_settings_file_relative_path().as_std_path()),
                     LocalSettingsPath::OutsideWorktree(abs_path) => abs_path.to_path_buf(),
                 };
-                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Ok(
-                    settings_path,
-                )))
+                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(
+                    worktree_id,
+                    Ok(settings_path),
+                ))
             }
         }
     })

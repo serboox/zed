@@ -2039,20 +2039,47 @@ impl Workspace {
                     notification_id,
                     message,
                     link,
-                } => this.show_notification(
-                    NotificationId::named(notification_id.clone()),
-                    cx,
-                    |cx| {
-                        let mut notification = MessageNotification::new(message.clone(), cx);
-                        if let Some(link) = link {
-                            notification = notification
-                                .more_info_message(link.label)
-                                .more_info_url(link.url);
-                        }
+                    open_path,
+                } => {
+                    let workspace = cx.entity().downgrade();
+                    this.show_notification(
+                        NotificationId::named(notification_id.clone()),
+                        cx,
+                        |cx| {
+                            // An error the reader cannot copy has to be retyped
+                            // to be searched for or reported.
+                            let mut notification = MessageNotification::new(message.clone(), cx)
+                                .copy_text(message.clone());
+                            if let Some(link) = link {
+                                notification = notification
+                                    .more_info_message(link.label)
+                                    .more_info_url(link.url);
+                            }
+                            if let Some(open_path) = open_path.clone() {
+                                notification = notification
+                                    .primary_message("Open File")
+                                    .primary_icon(IconName::ArrowUpRight)
+                                    .primary_on_click(move |window, cx| {
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                workspace
+                                                    .open_path(
+                                                        open_path.clone(),
+                                                        None,
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                    .detach_and_log_err(cx);
+                                            })
+                                            .log_err();
+                                    });
+                            }
 
-                        cx.new(|_| notification)
-                    },
-                ),
+                            cx.new(|_| notification)
+                        },
+                    )
+                }
 
                 project::Event::HideToast { notification_id } => {
                     this.dismiss_notification(&NotificationId::named(notification_id.clone()), cx)
@@ -19590,6 +19617,48 @@ mod tests {
                     .map(|item| item.tab_content_text(0, cx).to_string())
                     .collect()
             })
+        }
+
+        #[gpui::test]
+        async fn a_notice_about_a_broken_file_opens_it_when_clicked(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+            let broken_file = ProjectPath {
+                worktree_id,
+                path: rel_path("small.fast").into(),
+            };
+
+            project.update(cx, |_, cx| {
+                cx.emit(project::Event::Toast {
+                    notification_id: "broken-project-file".into(),
+                    message: "Failed to set local debug scenarios".to_string(),
+                    link: None,
+                    open_path: Some(broken_file.clone()),
+                })
+            });
+            cx.run_until_parked();
+            draw(cx);
+
+            let open_button = cx
+                .debug_bounds("NOTIFICATION-PRIMARY")
+                .expect("a notice about a broken file has to offer to open it");
+            cx.simulate_click(open_button.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+
+            let opened = workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx))
+            });
+            assert_eq!(
+                opened,
+                Some(broken_file),
+                "the click opens the file it names"
+            );
+            assert!(
+                workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+                "and the notice goes away once it has been acted on"
+            );
         }
 
         #[gpui::test]

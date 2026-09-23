@@ -363,6 +363,8 @@ pub enum Event {
         message: String,
         /// Optional link to display as a button in the toast.
         link: Option<ToastLink>,
+        /// The file the message is about, offered as a button that opens it.
+        open_path: Option<ProjectPath>,
     },
     HideToast {
         notification_id: SharedString,
@@ -4057,6 +4059,7 @@ impl Project {
                 notification_id: "dap".into(),
                 message: message.clone(),
                 link: None,
+                open_path: None,
             });
         }
     }
@@ -4214,6 +4217,7 @@ impl Project {
                 notification_id: "lsp".into(),
                 message: message.clone(),
                 link: None,
+                open_path: None,
             }),
             LspStoreEvent::SnippetEdit {
                 buffer_id,
@@ -4260,55 +4264,106 @@ impl Project {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SettingsObserverEvent::LocalSettingsUpdated(result) => match result {
+            SettingsObserverEvent::LocalSettingsUpdated(worktree_id, result) => match result {
                 Err(InvalidSettingsError::LocalSettings { message, path }) => {
-                    let message = format!("Failed to set local settings in {path:?}:\n{message}");
-                    cx.emit(Event::Toast {
-                        notification_id: format!("local-settings-{path:?}").into(),
-                        link: None,
+                    self.show_local_file_error(
+                        "local-settings",
+                        "Failed to set local settings in",
+                        *worktree_id,
+                        path.as_std_path(),
                         message,
-                    });
+                        None,
+                        cx,
+                    );
                 }
-                Ok(path) => cx.emit(Event::HideToast {
-                    notification_id: format!("local-settings-{path:?}").into(),
-                }),
+                Ok(path) => self.hide_local_file_error("local-settings", *worktree_id, path, cx),
                 Err(_) => {}
             },
-            SettingsObserverEvent::LocalTasksUpdated(result) => match result {
+            SettingsObserverEvent::LocalTasksUpdated(worktree_id, result) => match result {
                 Err(InvalidSettingsError::Tasks { message, path }) => {
-                    let message = format!("Failed to set local tasks in {path:?}:\n{message}");
-                    cx.emit(Event::Toast {
-                        notification_id: format!("local-tasks-{path:?}").into(),
-                        link: Some(ToastLink {
+                    self.show_local_file_error(
+                        "local-tasks",
+                        "Failed to set local tasks in",
+                        *worktree_id,
+                        path,
+                        message,
+                        Some(ToastLink {
                             label: "Open Tasks Documentation",
                             url: "https://zed.dev/docs/tasks",
                         }),
-                        message,
-                    });
+                        cx,
+                    );
                 }
-                Ok(path) => cx.emit(Event::HideToast {
-                    notification_id: format!("local-tasks-{path:?}").into(),
-                }),
+                Ok(path) => self.hide_local_file_error("local-tasks", *worktree_id, path, cx),
                 Err(_) => {}
             },
-            SettingsObserverEvent::LocalDebugScenariosUpdated(result) => match result {
-                Err(InvalidSettingsError::Debug { message, path }) => {
-                    let message =
-                        format!("Failed to set local debug scenarios in {path:?}:\n{message}");
-                    cx.emit(Event::Toast {
-                        notification_id: format!("local-debug-scenarios-{path:?}").into(),
-                        link: None,
-                        message,
-                    });
+            SettingsObserverEvent::LocalDebugScenariosUpdated(worktree_id, result) => {
+                match result {
+                    Err(InvalidSettingsError::Debug { message, path }) => {
+                        self.show_local_file_error(
+                            "local-debug-scenarios",
+                            "Failed to set local debug scenarios in",
+                            *worktree_id,
+                            path,
+                            message,
+                            None,
+                            cx,
+                        );
+                    }
+                    Ok(path) => {
+                        self.hide_local_file_error("local-debug-scenarios", *worktree_id, path, cx)
+                    }
+                    Err(_) => {}
                 }
-                Ok(path) => cx.emit(Event::HideToast {
-                    notification_id: format!("local-debug-scenarios-{path:?}").into(),
-                }),
-                Err(_) => {}
-            },
+            }
             SettingsObserverEvent::GlobalTasksUpdated(_)
             | SettingsObserverEvent::GlobalDebugScenariosUpdated(_) => {}
         }
+    }
+
+    /// Reports a broken project file by the project it is in, since the same
+    /// `.zed/debug.json` can exist in every open project, and offers to open it.
+    fn show_local_file_error(
+        &self,
+        kind: &str,
+        what_failed: &str,
+        worktree_id: WorktreeId,
+        path: &Path,
+        message: &str,
+        link: Option<ToastLink>,
+        cx: &mut Context<Self>,
+    ) {
+        let worktree_name = self
+            .worktree_for_id(worktree_id, cx)
+            .map(|worktree| worktree.read(cx).root_name_str().to_string());
+        let shown_path = match &worktree_name {
+            Some(name) => Path::new(name).join(path),
+            None => path.to_path_buf(),
+        };
+        let open_path = RelPath::new(path, PathStyle::local())
+            .ok()
+            .map(|relative| ProjectPath {
+                worktree_id,
+                path: relative.into_arc(),
+            });
+        cx.emit(Event::Toast {
+            notification_id: local_file_error_id(kind, worktree_id, path),
+            message: format!("{what_failed} {shown_path:?}:\n{message}"),
+            link,
+            open_path,
+        });
+    }
+
+    fn hide_local_file_error(
+        &self,
+        kind: &str,
+        worktree_id: WorktreeId,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(Event::HideToast {
+            notification_id: local_file_error_id(kind, worktree_id, path),
+        });
     }
 
     fn on_worktree_store_event(
@@ -6271,6 +6326,7 @@ impl Project {
                 notification_id: envelope.payload.notification_id.into(),
                 message: envelope.payload.message,
                 link: None,
+                open_path: None,
             });
             Ok(())
         })
@@ -7747,4 +7803,8 @@ fn provide_inline_values(
     }
 
     variables
+}
+
+fn local_file_error_id(kind: &str, worktree_id: WorktreeId, path: &Path) -> SharedString {
+    format!("{kind}-{}-{path:?}", worktree_id.to_proto()).into()
 }

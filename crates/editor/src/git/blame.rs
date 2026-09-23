@@ -756,6 +756,7 @@ impl GitBlame {
                                 notification_id: "git-blame".into(),
                                 message: all_errors,
                                 link: None,
+                                open_path: None,
                             });
                         } else {
                             // If we weren't triggered by a user, we just log errors in the background, instead of sending
@@ -960,7 +961,8 @@ mod tests {
                 notification_id: "git-blame".into(),
                 message: "Failed to blame \"file.txt\": failed to get blame for \"file.txt\""
                     .to_string(),
-                link: None
+                link: None,
+                open_path: None,
             }
         );
 

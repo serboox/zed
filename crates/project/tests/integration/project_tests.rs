@@ -1206,6 +1206,79 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
 }
 
 #[gpui::test]
+async fn a_broken_debug_file_is_reported_by_its_project_and_can_be_opened(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    TaskStore::init(None);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            ".zed": {
+                "debug.json": r#"[{ "label": "valid", "adapter": "Delve", "request": "launch" }]"#,
+            },
+            "file.rs": ""
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let seen = Rc::new(RefCell::new(None));
+    project.update(cx, |_, cx| {
+        let seen = seen.clone();
+        cx.subscribe(&project, move |_, _, event: &Event, _| {
+            if let Event::Toast {
+                notification_id,
+                message,
+                open_path,
+                ..
+            } = event
+                && notification_id.starts_with("local-debug-scenarios-")
+            {
+                *seen.borrow_mut() = Some((message.clone(), open_path.clone()));
+            }
+        })
+        .detach();
+    });
+
+    // The comma after "output" is missing, as in a hand-edited file.
+    fs.save(
+        path!("/dir/.zed/debug.json").as_ref(),
+        &"[\n  {\n    \"label\": \"broken\",\n    \"output\": \"bin\"\n    \"envFile\": \".env\"\n  }\n]"
+            .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+
+    let (message, open_path) = seen
+        .borrow()
+        .clone()
+        .expect("a broken debug.json has to be reported");
+    assert!(
+        message.contains(&format!(
+            "{:?}",
+            Path::new("dir").join(".zed").join("debug.json")
+        )),
+        "the message names the project the file is in, not only `.zed/debug.json`: {message}"
+    );
+    assert_eq!(
+        open_path,
+        Some(ProjectPath {
+            worktree_id,
+            path: rel_path(".zed/debug.json").into(),
+        }),
+        "the notice knows which file to open"
+    );
+}
+
+#[gpui::test]
 async fn test_invalid_local_tasks_shows_toast_with_doc_link(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     TaskStore::init(None);
@@ -1245,6 +1318,7 @@ async fn test_invalid_local_tasks_shows_toast_with_doc_link(cx: &mut gpui::TestA
                 notification_id,
                 message,
                 link: Some(ToastLink { url, .. }),
+                ..
             } => {
                 assert!(notification_id.starts_with("local-tasks-"));
                 assert!(message.contains("ZED_FOO"));

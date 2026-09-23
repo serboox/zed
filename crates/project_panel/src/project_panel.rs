@@ -2243,6 +2243,7 @@ impl ProjectPanel {
                                             abs_path
                                         ),
                                         link: None,
+                                        open_path: None,
                                     })
                                 });
                                 None

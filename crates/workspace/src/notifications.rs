@@ -1028,24 +1028,28 @@ pub mod simple_message_notification {
             let suffix = h_flex()
                 .gap_1()
                 .children(self.primary_message.iter().map(|message| {
-                    Button::new(("notification-primary", cx.entity_id()), message.clone())
-                        .when_some(self.button_style, |button, style| button.style(style))
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(on_click) = this.primary_on_click.as_ref() {
-                                (on_click)(window, cx)
-                            };
-                            this.dismiss(cx)
-                        }))
-                        .when_some(self.primary_icon, |button, icon| {
-                            let element = Icon::new(icon.name)
-                                .size(IconSize::Small)
-                                .color(self.primary_icon_color.unwrap_or(Color::Muted));
-                            match icon.position {
-                                IconPosition::Start => button.start_icon(element),
-                                IconPosition::End => button.end_icon(element),
-                            }
-                        })
+                    div()
+                        .debug_selector(|| "NOTIFICATION-PRIMARY".into())
+                        .child(
+                            Button::new(("notification-primary", cx.entity_id()), message.clone())
+                                .when_some(self.button_style, |button, style| button.style(style))
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(on_click) = this.primary_on_click.as_ref() {
+                                        (on_click)(window, cx)
+                                    };
+                                    this.dismiss(cx)
+                                }))
+                                .when_some(self.primary_icon, |button, icon| {
+                                    let element = Icon::new(icon.name)
+                                        .size(IconSize::Small)
+                                        .color(self.primary_icon_color.unwrap_or(Color::Muted));
+                                    match icon.position {
+                                        IconPosition::Start => button.start_icon(element),
+                                        IconPosition::End => button.end_icon(element),
+                                    }
+                                }),
+                        )
                 }))
                 .children(self.secondary_message.iter().map(|message| {
                     Button::new(("notification-secondary", cx.entity_id()), message.clone())
