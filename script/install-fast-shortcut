@@ -14,6 +14,16 @@ if [[ ! -x "$binary" ]]; then
   exit 1
 fi
 
+# The channel decides which app this build claims to be. On anything but dev it
+# takes a stable app id, so the desktop shows it as the stock Zed, refuses to
+# start beside it and shares its workspace database. Merging an upstream release
+# tag brings `stable` into this file.
+channel="$(tr -d '[:space:]' < "$repo_root/crates/zed/RELEASE_CHANNEL")"
+if [[ "$channel" != "dev" ]]; then
+  echo "error: crates/zed/RELEASE_CHANNEL is '$channel', not 'dev'; this build would pass for the stock Zed." >&2
+  exit 1
+fi
+
 bin_dir="$HOME/.local/bin"
 apps_dir="$HOME/.local/share/applications"
 link="$bin_dir/zed-fast"
