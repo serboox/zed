@@ -92,7 +92,7 @@ use std::{
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use theme::{ActiveTheme, SystemAppearance, ThemeRegistry, deserialize_icon_theme};
 use theme_settings::{ThemeSettings, load_user_theme};
-use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, prelude::*};
+use ui::{Navigable, NavigableEntry, PopoverMenuHandle, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
@@ -1869,6 +1869,7 @@ fn open_about_window(cx: &mut App) {
         ok_entry: NavigableEntry,
         copy_entry: NavigableEntry,
         app_icon: Arc<Image>,
+        name: SharedString,
         message: SharedString,
         commit: Option<SharedString>,
         full_version: SharedString,
@@ -1897,6 +1898,10 @@ fn open_about_window(cx: &mut App) {
                 ok_entry: NavigableEntry::focusable(cx),
                 copy_entry: NavigableEntry::focusable(cx),
                 app_icon: about_window_icon(release_channel),
+                name: format!("{release_channel_name} {debug}")
+                    .trim_end()
+                    .to_string()
+                    .into(),
                 message,
                 commit,
                 full_version,
@@ -1922,6 +1927,10 @@ fn open_about_window(cx: &mut App) {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let ok_is_focused = self.ok_entry.focus_handle.contains_focused(window, cx);
             let copy_is_focused = self.copy_entry.focus_handle.contains_focused(window, cx);
+            let short_commit = self
+                .commit
+                .as_ref()
+                .map(|commit| SharedString::from(commit.chars().take(10).collect::<String>()));
 
             Navigable::new(
                 v_flex()
@@ -1934,59 +1943,53 @@ fn open_about_window(cx: &mut App) {
                     .size_full()
                     .bg(cx.theme().colors().editor_background)
                     .text_color(cx.theme().colors().text)
-                    .p_4()
-                    .when(cfg!(target_os = "macos"), |this| this.pt_10())
-                    .gap_4()
-                    .text_center()
-                    .justify_between()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_2()
-                            .items_center()
-                            .child(img(self.app_icon.clone()).size_16().flex_none())
-                            .child(Headline::new(self.message.clone()))
-                            .when_some(self.commit.clone(), |this, commit| {
-                                this.child(
-                                    Label::new("Commit")
-                                        .color(Color::Muted)
-                                        .size(LabelSize::XSmall),
-                                )
-                                .child(Label::new(commit).size(LabelSize::Small))
-                            })
-                            .child(
-                                Label::new("Version")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::XSmall),
-                            )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
-                    )
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_h_0()
                             .w_full()
-                            .gap_1()
+                            .px_4()
+                            .py_3()
+                            .when(cfg!(target_os = "macos"), |this| this.pt_10())
+                            .gap_4()
+                            .items_center()
+                            .child(img(self.app_icon.clone()).size_12().flex_none())
                             .child(
-                                div()
-                                    .flex_1()
-                                    .track_focus(&self.ok_entry.focus_handle)
-                                    .on_action(cx.listener(|_, _: &menu::Confirm, window, _cx| {
-                                        window.remove_window();
-                                    }))
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_0p5()
                                     .child(
-                                        Button::new("ok", "OK")
-                                            .full_width()
-                                            .style(ButtonStyle::OutlinedGhost)
-                                            .toggle_state(ok_is_focused)
-                                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                            .on_click(cx.listener(|_, _, window, _cx| {
-                                                window.remove_window();
-                                            })),
-                                    ),
-                            )
+                                        Headline::new(self.name.clone()).size(HeadlineSize::Small),
+                                    )
+                                    .child(
+                                        Label::new(self.full_version.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .when_some(short_commit, |this, commit| {
+                                        this.child(
+                                            h_flex()
+                                                .gap_1p5()
+                                                .child(
+                                                    Label::new("Commit")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(commit)
+                                                        .size(LabelSize::Small)
+                                                        .buffer_font(cx),
+                                                ),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        ui::cyberpunk::dialog_footer()
                             .child(
                                 div()
-                                    .flex_1()
                                     .track_focus(&self.copy_entry.focus_handle)
+                                    .debug_selector(|| "ABOUT-COPY".into())
                                     .on_action(cx.listener(
                                         |this, _: &menu::Confirm, window, cx| {
                                             this.copy_details(window, cx);
@@ -1994,20 +1997,36 @@ fn open_about_window(cx: &mut App) {
                                     ))
                                     .child(
                                         Button::new("copy", "Copy")
-                                            .full_width()
-                                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                                            .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
+                                            .style(ui::cyberpunk::Rank::Neutral.style())
                                             .toggle_state(copy_is_focused)
-                                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                                             .on_click(cx.listener(|this, _event, window, cx| {
                                                 this.copy_details(window, cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .track_focus(&self.ok_entry.focus_handle)
+                                    .debug_selector(|| "ABOUT-OK".into())
+                                    .on_action(cx.listener(|_, _: &menu::Confirm, window, _cx| {
+                                        window.remove_window();
+                                    }))
+                                    .child(
+                                        Button::new("ok", "OK")
+                                            .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
+                                            .style(ui::cyberpunk::Rank::Accent.style())
+                                            .toggle_state(ok_is_focused)
+                                            .on_click(cx.listener(|_, _, window, _cx| {
+                                                window.remove_window();
                                             })),
                                     ),
                             ),
                     )
                     .into_any_element(),
             )
-            .entry(self.ok_entry.clone())
             .entry(self.copy_entry.clone())
+            .entry(self.ok_entry.clone())
         }
     }
 
@@ -2033,8 +2052,8 @@ fn open_about_window(cx: &mut App) {
     }
 
     let window_size = Size {
-        width: px(440.),
-        height: px(300.),
+        width: px(420.),
+        height: px(170.),
     };
 
     cx.open_window(
@@ -6791,6 +6810,58 @@ mod tests {
                 .unwrap();
         }
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn the_about_window_keeps_its_actions_in_the_bottom_right_corner(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let windows_before = cx.update(|cx| cx.windows().len());
+        cx.update(open_about_window);
+        cx.run_until_parked();
+        let window = cx.update(|cx| {
+            let windows = cx.windows();
+            assert_eq!(
+                windows.len(),
+                windows_before + 1,
+                "About opens a window of its own"
+            );
+            *windows.last().expect("the About window")
+        });
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let window_size = cx.update(|window, _| window.viewport_size());
+        let copy = cx
+            .debug_bounds("ABOUT-COPY")
+            .expect("the Copy button is painted");
+        let ok = cx
+            .debug_bounds("ABOUT-OK")
+            .expect("the OK button is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the actions sit in a footer");
+
+        assert!(
+            copy.right() <= ok.left(),
+            "the confirming action comes last: copy {copy:?}, ok {ok:?}"
+        );
+        assert!(
+            window_size.width - ok.right() < px(24.),
+            "the actions end at the right edge rather than filling the row: {ok:?} in {window_size:?}"
+        );
+        assert!(
+            copy.left() > window_size.width / 2.,
+            "and they are not stretched across it: {copy:?}"
+        );
+        assert!(
+            footer.bottom() <= window_size.height,
+            "nothing hangs past the bottom of the window: {footer:?} in {window_size:?}"
+        );
     }
 
     pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
