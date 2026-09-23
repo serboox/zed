@@ -117,10 +117,7 @@ fn decode_relative(data: &[u64]) -> Vec<(u64, u64, u64, u64)> {
     let mut tokens = Vec::new();
     let mut line = 0u64;
     let mut start_char = 0u64;
-    for chunk in data.chunks_exact(5) {
-        let [delta_line, delta_start, length, token_type, _modifiers] = chunk else {
-            unreachable!("chunks_exact(5) always yields slices of length 5")
-        };
+    for [delta_line, delta_start, length, token_type, _modifiers] in data.as_chunks::<5>().0 {
         if *delta_line == 0 {
             start_char += delta_start;
         } else {

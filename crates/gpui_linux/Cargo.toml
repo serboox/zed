@@ -132,5 +132,8 @@ x11-clipboard = { version = "0.9.3", optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [package.metadata.cargo-shear]
 ignored = ["bitflags", "scap", "x11-clipboard"]

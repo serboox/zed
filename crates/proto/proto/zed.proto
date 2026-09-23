@@ -519,15 +519,19 @@ message Envelope {
     GetOutgoingCallsResponse get_outgoing_calls_response = 487;
     LspExtExpandAbbreviation lsp_ext_expand_abbreviation = 488;
     LspExtExpandAbbreviationResponse lsp_ext_expand_abbreviation_response = 489;
+    LanguageServerShowDocumentRequest language_server_show_document_request = 490;
+    ExecuteLspCommand execute_lsp_command = 491;
+    ExecuteLspCommandResponse execute_lsp_command_response = 492;
+    RefreshDocumentHighlights refresh_document_highlights = 493;
 
-    PrepareTypeHierarchy prepare_type_hierarchy = 490;
-    PrepareTypeHierarchyResponse prepare_type_hierarchy_response = 491;
-    TypeHierarchyRelatives type_hierarchy_relatives = 492;
-    TypeHierarchyRelativesResponse type_hierarchy_relatives_response = 493;
-    PrepareCallHierarchyItems prepare_call_hierarchy_items = 494;
-    PrepareCallHierarchyItemsResponse prepare_call_hierarchy_items_response = 495;
-    CallHierarchyCalls call_hierarchy_calls = 496;
-    CallHierarchyCallsResponse call_hierarchy_calls_response = 497; // current max
+    PrepareTypeHierarchy prepare_type_hierarchy = 494;
+    PrepareTypeHierarchyResponse prepare_type_hierarchy_response = 495;
+    TypeHierarchyRelatives type_hierarchy_relatives = 496;
+    TypeHierarchyRelativesResponse type_hierarchy_relatives_response = 497;
+    PrepareCallHierarchyItems prepare_call_hierarchy_items = 498;
+    PrepareCallHierarchyItemsResponse prepare_call_hierarchy_items_response = 499;
+    CallHierarchyCalls call_hierarchy_calls = 500;
+    CallHierarchyCallsResponse call_hierarchy_calls_response = 501; // current max
   }
 
   reserved 87 to 88;

@@ -6578,6 +6578,7 @@ mod tests {
                 "language_selector",
                 "line_ending_selector",
                 "log_lens", // fork: log lens
+                "lsp_command_selector",
                 "lsp_tool",
                 "markdown",
                 "markdown_diagnostics", // fork: Markdown diagnostics provider

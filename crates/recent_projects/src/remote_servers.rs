@@ -2715,7 +2715,6 @@ impl RemoteServerProjects {
                     let distro_name = distro_name.clone();
                     move |_, _: &menu::Confirm, window, cx| {
                         remove_wsl_distro(cx.entity(), index, distro_name.clone(), window, cx);
-                        cx.focus_self(window);
                     }
                 }))
                 .child(
@@ -2727,7 +2726,6 @@ impl RemoteServerProjects {
                         .child(Label::new("Remove Distro").color(Color::Error))
                         .on_click(cx.listener(move |_, _, window, cx| {
                             remove_wsl_distro(cx.entity(), index, distro_name.clone(), window, cx);
-                            cx.focus_self(window);
                         })),
                 )
         })
@@ -2872,7 +2870,6 @@ impl RemoteServerProjects {
                                 window,
                                 cx,
                             );
-                            cx.focus_self(window);
                         }
                     }))
                     .child(
@@ -2890,7 +2887,6 @@ impl RemoteServerProjects {
                                     window,
                                     cx,
                                 );
-                                cx.focus_self(window);
                             })),
                     )
             })
