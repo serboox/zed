@@ -42739,9 +42739,16 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
                 cx
             )
             .language_servers,
-            [language::language_settings::ConfiguredLanguageServer::new(
-                "..."
-            )],
+            [
+                language::language_settings::ConfiguredLanguageServer::new_disabled("eslint"),
+                language::language_settings::ConfiguredLanguageServer::new_disabled(
+                    "tailwindcss-language-server"
+                ),
+                language::language_settings::ConfiguredLanguageServer::new_disabled(
+                    "tailwindcss-intellisense-css"
+                ),
+                language::language_settings::ConfiguredLanguageServer::new("..."),
+            ],
             "local .zed/settings.json must not apply before trust approval"
         )
     });

@@ -209,31 +209,36 @@ impl Editor {
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
         cx.spawn_in(window, async move |editor, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
-            let find_references = editor
-                .update_in(cx, |editor, window, cx| {
-                    if definition_revealed == Navigated::Yes {
-                        return None;
-                    }
-                    match EditorSettings::get_global(cx).go_to_definition_fallback {
-                        GoToDefinitionFallback::None => None,
-                        GoToDefinitionFallback::FindAllReferences => editor.find_all_references(
-                            &FindAllReferences {
-                                // A click asks "where is this", not "list
-                                // everywhere it appears": one answer is
-                                // navigated to rather than listed, and the
-                                // line clicked is not one of the answers.
-                                always_open_multibuffer: false,
-                                ..Default::default()
-                            },
-                            window,
-                            cx,
-                        ),
-                    }
+            // Dispatched rather than called, so a references picker registered
+            // for the action gets the click too, and only once the editor is no
+            // longer being updated, since the action's handler updates it.
+            let focus_handle = editor
+                .update(cx, |editor, cx| {
+                    let wants_references = definition_revealed != Navigated::Yes
+                        && matches!(
+                            EditorSettings::get_global(cx).go_to_definition_fallback,
+                            GoToDefinitionFallback::FindAllReferences
+                        );
+                    wants_references.then(|| editor.focus_handle.clone())
                 })
                 .ok()
                 .flatten();
-            if let Some(find_references) = find_references {
-                find_references.await.log_err();
+            if let Some(focus_handle) = focus_handle {
+                cx.update(|window, cx| {
+                    focus_handle.dispatch_action(
+                        &FindAllReferences {
+                            // A click asks "where is this", not "list everywhere
+                            // it appears": one answer is navigated to rather than
+                            // listed, and the line clicked is not one of the
+                            // answers.
+                            always_open_multibuffer: false,
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
             }
         })
         .detach();

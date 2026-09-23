@@ -3838,6 +3838,10 @@ mod tests {
             view.save(cx);
         });
         cx.run_until_parked();
+        // `.zed/tasks.json` did not exist when the store started watching it,
+        // so the watcher only notices the new file on its next poll.
+        cx.executor().advance_clock(fs::fs_watcher::poll_interval());
+        cx.run_until_parked();
 
         let written = fs
             .load(path!("/project/.zed/tasks.json").as_ref())

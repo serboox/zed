@@ -6541,7 +6541,6 @@ mod tests {
                 "context_server",
                 "copilot",
                 "copilot_edit_predictions",
-                "csv",
                 "database_panel",
                 "db_compare_data",
                 "db_ddl_source",
@@ -6590,7 +6589,6 @@ mod tests {
                 "outline",
                 "outline_panel",
                 "pane",
-                "panel",
                 "pdf",             // fork: pdf_preview
                 "php_diagnostics", // fork: PHP diagnostics provider
                 "picker",

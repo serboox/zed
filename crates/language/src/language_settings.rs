@@ -1257,7 +1257,17 @@ mod tests {
     #[gpui::test]
     fn test_language_servers_across_settings_files(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let mut store = SettingsStore::new(cx, &settings::default_settings());
+            // The shipped defaults turn eslint and tailwind off everywhere; this
+            // test is about how settings files merge, so it starts from the
+            // plain `["..."]` list rather than from that choice.
+            let fork_default = "\"language_servers\": [\n    \"!eslint\",\n    \"!tailwindcss-language-server\",\n    \"!tailwindcss-intellisense-css\",\n    \"...\"\n  ],";
+            let defaults = settings::default_settings();
+            assert!(
+                defaults.contains(fork_default),
+                "the default language server list changed; update this test"
+            );
+            let defaults = defaults.replace(fork_default, "\"language_servers\": [\"...\"],");
+            let mut store = SettingsStore::new(cx, &defaults);
             store.register_setting::<AllLanguageSettings>();
 
             let worktree_id = WorktreeId::from_usize(1);

@@ -353,6 +353,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 mod tests {
     use super::app_menus;
     use gpui::{Menu, MenuItem, TestAppContext};
+    use project::DisableAiSettings;
+    use settings::Settings as _;
 
     fn item_names(menus: &[Menu]) -> Vec<String> {
         fn walk(items: &[MenuItem], into: &mut Vec<String>) {
@@ -376,7 +378,12 @@ mod tests {
     // to reach them was to already know their name in the command palette.
     #[gpui::test]
     async fn the_menu_bar_lists_the_forks_panels(cx: &mut TestAppContext) {
-        let names = cx.update(|cx| item_names(&app_menus(cx)));
+        let names = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            DisableAiSettings::register(cx);
+            item_names(&app_menus(cx))
+        });
 
         for expected in [
             "Project Panel",
