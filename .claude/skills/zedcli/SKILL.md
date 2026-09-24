@@ -1,6 +1,6 @@
 ---
 name: zedcli
-description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, start/stop/restart run configurations, and run SQL through the Database Explorer's saved connections. Use when you need to know what the editor has open or running, restart a project's server or tests the way the editor's Run button does, or query a database the user has configured in the editor without asking for credentials.
+description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, start/stop/restart run configurations, run SQL through the Database Explorer's saved connections, and send the API Client's saved HTTP requests. Use when you need to know what the editor has open or running, restart a project's server or tests the way the editor's Run button does, query a database the user configured in the editor, or call an API endpoint the user saved there — all without asking for credentials.
 ---
 
 # zedcli
@@ -21,6 +21,9 @@ installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
 | Start / restart / stop a configuration | `zedcli run NAME` · `zedcli restart NAME` · `zedcli stop NAME` |
 | List the database connections the user saved | `zedcli db connections` |
 | Run SQL on one of them | `zedcli db query -c LABEL "SQL"` |
+| List the HTTP requests saved in the API Client | `zedcli api list` |
+| See its environments (variable names only) | `zedcli api envs` |
+| Send a saved request and get the body | `zedcli api send "Collection/Folder/Name" --env ENV` |
 
 Add `--json` to any command when you are going to read the result
 programmatically: the shape is stable and fields are named, the table is for
@@ -88,6 +91,36 @@ $ echo "SELECT COUNT(*) AS n FROM orders" | zedcli db query -c local-mysql --jso
   as an action to confirm with the user first, exactly as you would a
   destructive shell command.
 
+## HTTP requests (API Client)
+
+```
+$ zedcli api list
+REQUEST                   METHOD  URL
+Shop/Orders/Create order  POST    {{host}}/orders
+$ zedcli api send "Shop/Orders/Create order" --env staging --var id=42 | jq .
+HTTP 201 Created  184 ms  POST https://staging.example.com/orders/42   <- on stderr
+  pass  is created                                                        <- test script, stderr
+{ "id": 42 }                                                              <- body, stdout
+```
+
+- A request is named by its `Collection/Folder/Name` path, its id, or its bare
+  name when no other request shares it (an ambiguous name answers exit 4 and
+  lists the paths).
+- `--env NAME` picks the environment; without it the request's own choice or
+  the active one is used. `--var key=value` (repeatable) wins over every
+  variable for this send only and is never saved.
+- The send is the editor's own Send: pre-request script, `{{variable}}`
+  resolution, auth, the request's test script, and an entry in the History.
+- The body goes to stdout as is; the status line and test results to stderr.
+  `-i` puts the status line and headers on stdout before the body, `-o FILE`
+  writes the body to a file, `--json` gives `{status, headers, body |
+  body_base64, elapsed_ms, tests, ...}`.
+- Any HTTP status is an answer (exit 0). Add `--fail` to get exit 1 on a status
+  of 400 or more or on a failed test.
+- Variable values (tokens, passwords) are never printed; `api envs` shows names
+  only. Sending a request that changes data (POST/PUT/DELETE against a real
+  service) is an action to confirm with the user first.
+
 ## Exit statuses
 
 | Status | Meaning | What to do |
@@ -96,7 +129,7 @@ $ echo "SELECT COUNT(*) AS n FROM orders" | zedcli db query -c local-mysql --jso
 | 1 | The request failed on its own terms (SQL error, lost connection) | Read stderr; fix the SQL or the connection |
 | 2 | Bad arguments | Check `zedcli <command> --help` |
 | 3 | The editor is not running or did not answer | Ask the user to start "Zed (Fast/DB dev)"; do not start it yourself |
-| 4 | No such window, configuration or connection | List them first (`windows`, `configs`, `db connections`) |
+| 4 | No such window, configuration, connection, request or environment | List them first (`windows`, `configs`, `db connections`, `api list`, `api envs`) |
 
 `--timeout SECONDS` (default 30) bounds how long zedcli waits for an answer.
 

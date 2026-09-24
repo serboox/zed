@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cli::{
-    CliResponse, CliResponseSink, ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunAction,
-    RunInfo, RunState, WindowInfo, WindowSelector, WorkspaceInfo, exit_status,
+    ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, ApiTestInfo, CliResponse, CliResponseSink,
+    ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunAction, RunInfo, RunState, WindowInfo,
+    WindowSelector, WorkspaceInfo, exit_status,
 };
 use gpui::{AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 use run_configurations::configurations_file::Kind;
@@ -531,6 +532,209 @@ pub async fn control_run(
     responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
+/// The API client's store once its saved collections have been read, counted
+/// like [`STORE_LOOKS`] so the wait ends under a test clock too.
+async fn loaded_api_store(cx: &mut AsyncApp) -> Option<Entity<api_client_ui::ApiClientStore>> {
+    for _ in 0..STORE_LOOKS {
+        let store = cx.update(|cx| api_client_ui::ApiClientStore::global(cx));
+        if let Some(store) = store
+            && store.read_with(cx, |store, _| store.is_loaded())
+        {
+            return Some(store);
+        }
+        cx.background_executor().timer(STORE_LOOKED_AT_EVERY).await;
+    }
+    None
+}
+
+const API_NOT_READY: &str = "The API client is not ready: no editor window is open, or the \
+     saved collections are still being read.";
+
+pub async fn list_api_requests(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
+    let Some(store) = loaded_api_store(cx).await else {
+        return say_and_exit(responses, API_NOT_READY.to_string(), exit_status::FAILED);
+    };
+    let mut items = store.read_with(cx, |store, _| {
+        store
+            .requests
+            .iter()
+            .map(|request| ApiRequestInfo {
+                id: request.id.to_string(),
+                path: store.path_of(request),
+                method: request.method.as_str().to_string(),
+                url: request.url.clone(),
+            })
+            .collect::<Vec<_>>()
+    });
+    items.sort_by(|left, right| left.path.cmp(&right.path));
+    responses.send(CliResponse::ApiRequests { items }).log_err();
+    responses.send(CliResponse::Exit { status: 0 }).log_err();
+}
+
+pub async fn list_api_environments(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
+    let Some(store) = loaded_api_store(cx).await else {
+        return say_and_exit(responses, API_NOT_READY.to_string(), exit_status::FAILED);
+    };
+    let items = store.read_with(cx, |store, _| {
+        store
+            .environments
+            .iter()
+            .map(|environment| ApiEnvironmentInfo {
+                id: environment.id.to_string(),
+                name: environment.name.clone(),
+                active: store.active_environment_id == Some(environment.id),
+                variables: environment
+                    .variables
+                    .iter()
+                    .map(|variable| variable.key.clone())
+                    .collect(),
+            })
+            .collect::<Vec<_>>()
+    });
+    responses
+        .send(CliResponse::ApiEnvironments { items })
+        .log_err();
+    responses.send(CliResponse::Exit { status: 0 }).log_err();
+}
+
+/// The saved request `named` means: its id, its whole path, or a name no other
+/// request shares.
+fn api_request_named(
+    store: &api_client_ui::ApiClientStore,
+    named: &str,
+) -> Result<api_client::RequestId, String> {
+    if let Some(request) = store
+        .requests
+        .iter()
+        .find(|request| request.id.to_string() == named)
+    {
+        return Ok(request.id);
+    }
+    let by_path: Vec<_> = store
+        .requests
+        .iter()
+        .filter(|request| store.path_of(request) == named)
+        .collect();
+    match by_path.as_slice() {
+        [only] => return Ok(only.id),
+        [] => {}
+        several => {
+            return Err(format!(
+                "{} requests share the path '{named}'; give one of their ids: {}",
+                several.len(),
+                several
+                    .iter()
+                    .map(|request| request.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    let by_name: Vec<_> = store
+        .requests
+        .iter()
+        .filter(|request| request.name == named)
+        .collect();
+    match by_name.as_slice() {
+        [only] => Ok(only.id),
+        [] => Err(format!(
+            "No saved request '{named}'. See `zedcli api list`."
+        )),
+        several => Err(format!(
+            "{} requests are named '{named}'; give the whole path: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|request| store.path_of(request))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// How long a send waits for the server when the CLI did not say: the CLI's
+/// own default wait, so the editor never outlasts the command that asked.
+const API_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub async fn send_api_request(
+    request: String,
+    environment: Option<String>,
+    variables: Vec<(String, String)>,
+    timeout_seconds: u64,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let Some(store) = loaded_api_store(cx).await else {
+        return say_and_exit(responses, API_NOT_READY.to_string(), exit_status::FAILED);
+    };
+    let chosen = store.read_with(cx, |store, _| {
+        let request = api_request_named(store, &request)?;
+        let environment = match &environment {
+            None => None,
+            Some(named) => Some(
+                store
+                    .environments
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id.to_string() == *named || candidate.name == *named
+                    })
+                    .map(|candidate| candidate.id)
+                    .ok_or_else(|| format!("No environment '{named}'. See `zedcli api envs`."))?,
+            ),
+        };
+        Ok::<_, String>((request, environment))
+    });
+    let (request, environment) = match chosen {
+        Ok(chosen) => chosen,
+        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
+    };
+    let sent = api_client_ui::headless_send::send(
+        &store,
+        api_client_ui::headless_send::HeadlessSend {
+            request,
+            environment,
+            variables,
+            // A little under the CLI's own wait, so the editor's answer, not
+            // the CLI's give-up, is what the reader sees.
+            timeout: match timeout_seconds {
+                0 => API_SEND_TIMEOUT,
+                seconds => Duration::from_secs(seconds).mul_f32(0.9),
+            },
+        },
+        cx,
+    )
+    .await;
+    match sent {
+        Ok(outcome) => {
+            responses
+                .send(CliResponse::ApiResponse {
+                    response: ApiResponseInfo {
+                        method: outcome.method,
+                        url: outcome.url,
+                        environment: outcome.environment_name,
+                        status: outcome.response.status,
+                        status_text: outcome.response.status_text,
+                        headers: outcome.response.headers,
+                        body: outcome.response.body,
+                        elapsed_ms: outcome.response.elapsed_ms,
+                        tests: outcome
+                            .tests
+                            .into_iter()
+                            .map(|test| ApiTestInfo {
+                                name: test.name,
+                                passed: test.passed,
+                                error: test.error,
+                            })
+                            .collect(),
+                    },
+                })
+                .log_err();
+            responses.send(CliResponse::Exit { status: 0 }).log_err();
+        }
+        Err(error) => say_and_exit(responses, format!("{error:#}"), exit_status::FAILED),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1016,5 +1220,250 @@ mod tests {
         let app_state = init_test(cx);
         let responses = ask(cx, &app_state, CliRequest::ListConnections);
         assert_eq!(exit_of(&responses), Some(exit_status::FAILED));
+    }
+
+    /// A server that answers one request with `201 Created` and hands back the
+    /// request line it was sent.
+    fn a_server_answering_once() -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let served = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return String::new();
+            };
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"id":42}"#;
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .ok();
+            request.lines().next().unwrap_or_default().to_string()
+        });
+        (port, served)
+    }
+
+    /// An API client store holding one collection with two requests, the one
+    /// the tests send pointed at `port`.
+    fn an_api_store(cx: &mut TestAppContext, port: u16) -> Entity<api_client_ui::ApiClientStore> {
+        let store = cx.new(api_client_ui::ApiClientStore::new);
+        cx.update(|cx| cx.set_global(api_client_ui::GlobalApiClientStore(store.clone())));
+        // Outside its own crate the store reads the (empty) config directory
+        // first; what the test adds must come after, or that read replaces it.
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.is_loaded()));
+        store.update(cx, |store, cx| {
+            let collection = store.create_collection("Shop".into(), cx);
+            let folder = store.create_folder(collection, "Orders".into(), None, cx);
+            let create = store.create_request(collection, "Create order".into(), folder, cx);
+            store.create_request(collection, "List".into(), folder, cx);
+            store.create_request(collection, "List".into(), None, cx);
+            store.create_request(collection, "Health".into(), None, cx);
+            store.create_request(collection, "Health".into(), None, cx);
+            if let Some(request) = store
+                .requests
+                .iter_mut()
+                .find(|request| request.id == create)
+            {
+                request.method = api_client::HttpMethod::Post;
+                request.url = format!("http://127.0.0.1:{port}/orders/{{{{id}}}}");
+            }
+            store.create_environment("staging".into(), cx);
+        });
+        store
+    }
+
+    #[gpui::test]
+    async fn a_saved_request_is_sent_with_one_off_variables_and_kept_in_history(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let (port, served) = a_server_answering_once();
+        let store = an_api_store(cx, port);
+
+        let listed = ask(cx, &app_state, CliRequest::ListApiRequests);
+        let paths: Vec<String> = listed
+            .iter()
+            .find_map(|response| match response {
+                CliResponse::ApiRequests { items } => {
+                    Some(items.iter().map(|item| item.path.clone()).collect())
+                }
+                _ => None,
+            })
+            .expect("the requests are listed");
+        assert!(
+            paths.contains(&"Shop/Orders/Create order".to_string()),
+            "a request is named by where it sits: {paths:?}"
+        );
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Create order".into(),
+                environment: Some("staging".into()),
+                variables: vec![("id".into(), "42".into())],
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
+        let response = responses
+            .iter()
+            .find_map(|response| match response {
+                CliResponse::ApiResponse { response } => Some(response.clone()),
+                _ => None,
+            })
+            .expect("the response is answered");
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body, br#"{"id":42}"#.to_vec());
+        assert_eq!(response.environment.as_deref(), Some("staging"));
+        let request_line = served.join().expect("the server does not panic");
+        assert!(
+            request_line.starts_with("POST /orders/42 "),
+            "the one-off value went into the URL: {request_line}"
+        );
+        assert_eq!(
+            store.read_with(cx, |store, _| store.history.len()),
+            1,
+            "the send is in the history, as the Send button's is"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_request_that_is_not_there_or_not_unique_is_not_found(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        an_api_store(cx, 9);
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Nowhere".into(),
+                environment: None,
+                variables: Vec::new(),
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "List".into(),
+                environment: None,
+                variables: Vec::new(),
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
+        assert!(
+            responses.iter().any(|response| matches!(
+                response,
+                CliResponse::Stderr { message } if message.contains("Shop/Orders/List")
+            )),
+            "an ambiguous name lists the paths to choose from: {responses:?}"
+        );
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Shop/Orders/Create order".into(),
+                environment: Some("production".into()),
+                variables: Vec::new(),
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
+    }
+
+    #[gpui::test]
+    async fn environments_are_listed_by_name_without_their_values(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let store = an_api_store(cx, 9);
+        store.update(cx, |store, _| {
+            if let Some(environment) = store.environments.first_mut() {
+                environment.variables.push(api_client::Variable {
+                    key: "token".into(),
+                    initial_value: "s3cret".into(),
+                    current_value: "s3cret".into(),
+                    secret: true,
+                    enabled: true,
+                });
+            }
+        });
+        let responses = ask(cx, &app_state, CliRequest::ListApiEnvironments);
+        let text = format!("{responses:?}");
+        assert!(text.contains("staging") && text.contains("token"), "{text}");
+        assert!(
+            !text.contains("s3cret"),
+            "a value never leaves the editor: {text}"
+        );
+    }
+
+    #[gpui::test]
+    async fn two_requests_at_one_path_are_not_guessed_between(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        an_api_store(cx, 9);
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Shop/Health".into(),
+                environment: None,
+                variables: Vec::new(),
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
+        assert!(
+            responses.iter().any(|response| matches!(
+                response,
+                CliResponse::Stderr { message } if message.contains("share the path")
+            )),
+            "{responses:?}"
+        );
+    }
+
+    /// A server that takes the connection and never answers holds the editor
+    /// no longer than the command's own wait.
+    #[gpui::test]
+    async fn a_server_that_never_answers_is_given_up_on(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let silent = std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(held);
+        });
+        an_api_store(cx, port);
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Shop/Orders/Create order".into(),
+                environment: None,
+                variables: vec![("id".into(), "1".into())],
+                timeout_seconds: 1,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::FAILED),
+            "{responses:?}"
+        );
+        assert!(
+            responses.iter().any(|response| matches!(
+                response,
+                CliResponse::Stderr { message } if message.contains("no answer within")
+            )),
+            "{responses:?}"
+        );
+        silent.join().ok();
     }
 }

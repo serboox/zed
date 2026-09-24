@@ -5,6 +5,7 @@ mod environment_picker;
 mod export;
 mod full_export;
 mod grpc_view;
+pub mod headless_send;
 mod history_view;
 mod import;
 mod laying_a_body_out;

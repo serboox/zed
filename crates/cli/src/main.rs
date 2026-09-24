@@ -811,7 +811,10 @@ fn run() -> Result<()> {
                         | CliResponse::Connections { .. }
                         | CliResponse::Windows { .. }
                         | CliResponse::Runs { .. }
-                        | CliResponse::Configurations { .. } => {}
+                        | CliResponse::Configurations { .. }
+                        | CliResponse::ApiRequests { .. }
+                        | CliResponse::ApiEnvironments { .. }
+                        | CliResponse::ApiResponse { .. } => {}
                     }
                 }
 
@@ -958,7 +961,10 @@ fn run_db_command(args: &[String]) -> Result<()> {
                         CliResponse::Connections { items } => print_connections(&items),
                         CliResponse::Windows { .. }
                         | CliResponse::Runs { .. }
-                        | CliResponse::Configurations { .. } => {}
+                        | CliResponse::Configurations { .. }
+                        | CliResponse::ApiRequests { .. }
+                        | CliResponse::ApiEnvironments { .. }
+                        | CliResponse::ApiResponse { .. } => {}
                     }
                 }
 

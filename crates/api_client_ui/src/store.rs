@@ -323,6 +323,9 @@ pub struct ApiClientStore {
     /// bound.
     pub history_details: std::collections::HashMap<Uuid, HistoryExchangeDetail>,
     pub http_client: reqwest::Client,
+    /// Whether the saved collections have been read from disk. Until then an
+    /// empty tree means "not read yet", not "there are none".
+    loaded: bool,
 }
 
 pub struct GlobalApiClientStore(pub Entity<ApiClientStore>);
@@ -365,6 +368,7 @@ impl ApiClientStore {
                     store.environments = environments.environments;
                     store.global_environment = environments.global;
                     store.history = history;
+                    store.loaded = true;
                     cx.notify();
                 })
                 .ok();
@@ -383,7 +387,40 @@ impl ApiClientStore {
             history: Vec::new(),
             history_details: std::collections::HashMap::new(),
             http_client: reqwest::Client::new(),
+            loaded: cfg!(test),
         }
+    }
+
+    /// Whether the saved collections have been read from disk yet.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Where a request sits in the tree, as `Collection/Folder/.../Request`.
+    pub fn path_of(&self, request: &Request) -> String {
+        let mut parts = vec![request.name.clone()];
+        let mut folder_id = request.folder_id;
+        // Bounded by the number of folders, so a parent loop in a hand-edited
+        // file cannot spin forever.
+        for _ in 0..=self.folders.len() {
+            let Some(id) = folder_id else {
+                break;
+            };
+            let Some(folder) = self.folders.iter().find(|folder| folder.id == id) else {
+                break;
+            };
+            parts.push(folder.name.clone());
+            folder_id = folder.parent_id;
+        }
+        if let Some(collection) = self
+            .collections
+            .iter()
+            .find(|collection| collection.id == request.collection_id)
+        {
+            parts.push(collection.name.clone());
+        }
+        parts.reverse();
+        parts.join("/")
     }
 
     pub fn global(cx: &App) -> Option<Entity<Self>> {

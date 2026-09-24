@@ -32,7 +32,7 @@ use workspace::{Item, Toast, Workspace, item::ItemEvent, notifications::Notifica
 /// `pm.environment`/`pm.collectionVariables` when it starts running --
 /// taken before the script runs so its changes can be diffed against this
 /// afterwards, and only actually-changed keys get written back to the store.
-fn variable_maps_for(
+pub(crate) fn variable_maps_for(
     store: &ApiClientStore,
     request: &Request,
 ) -> (
@@ -70,7 +70,7 @@ fn variable_maps_for(
 /// `current_value` on existing variables (never `initial_value`, matching
 /// `Variable`'s own documented split) and appends brand-new ones the script
 /// introduced via `pm.environment.set`/`pm.collectionVariables.set`.
-fn apply_script_variable_changes(
+pub(crate) fn apply_script_variable_changes(
     store: &mut ApiClientStore,
     request: &Request,
     before_environment: &std::collections::BTreeMap<String, String>,
@@ -125,7 +125,7 @@ fn apply_script_variable_changes(
 /// exists (the test-script phase), otherwise falls back to the raw,
 /// unresolved fields -- the pre-request script runs before resolution, so
 /// there is no resolved form yet for it to see.
-fn script_request_data(
+pub(crate) fn script_request_data(
     request: &Request,
     resolved: Option<&api_client::ResolvedRequest>,
 ) -> api_client::ScriptRequestData {

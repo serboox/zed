@@ -198,7 +198,10 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
                         | CliResponse::Connections { .. }
                         | CliResponse::Windows { .. }
                         | CliResponse::Runs { .. }
-                        | CliResponse::Configurations { .. } => {}
+                        | CliResponse::Configurations { .. }
+                        | CliResponse::ApiRequests { .. }
+                        | CliResponse::ApiEnvironments { .. }
+                        | CliResponse::ApiResponse { .. } => {}
                     }
                 }
                 Ok(())

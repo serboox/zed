@@ -5,6 +5,7 @@ ZED=${1:-$HOME/.local/lib/zed-fast/zed}
 ZEDCLI=${2:-$HOME/.local/lib/zed-fast/zedcli}
 DISPLAY_NUMBER=${ZEDCLI_E2E_DISPLAY:-97}
 MYSQL_PORT=${ZEDCLI_E2E_MYSQL_PORT:-33961}
+HTTP_PORT=${ZEDCLI_E2E_HTTP_PORT:-33962}
 MYSQL_IMAGE=${ZEDCLI_E2E_MYSQL_IMAGE:-docker.io/library/mysql:8.4}
 
 for tool in podman Xvfb xdotool; do
@@ -12,10 +13,12 @@ for tool in podman Xvfb xdotool; do
 done
 [ -x "$ZED" ] || { echo "zedcli-e2e: no editor at $ZED" >&2; exit 2; }
 [ -x "$ZEDCLI" ] || { echo "zedcli-e2e: no zedcli at $ZEDCLI" >&2; exit 2; }
-if ss -ltn | grep -q ":$MYSQL_PORT "; then
-    echo "zedcli-e2e: port $MYSQL_PORT is taken; set ZEDCLI_E2E_MYSQL_PORT" >&2
-    exit 2
-fi
+for port in "$MYSQL_PORT" "$HTTP_PORT"; do
+    if ss -ltn | grep -q ":$port "; then
+        echo "zedcli-e2e: port $port is taken; set ZEDCLI_E2E_MYSQL_PORT or ZEDCLI_E2E_HTTP_PORT" >&2
+        exit 2
+    fi
+done
 if [ -e "/tmp/.X11-unix/X$DISPLAY_NUMBER" ]; then
     echo "zedcli-e2e: display :$DISPLAY_NUMBER is taken; set ZEDCLI_E2E_DISPLAY" >&2
     exit 2
@@ -25,10 +28,12 @@ ROOT=$(mktemp -d /tmp/zedcli-e2e.XXXXXX)
 CONTAINER="zedcli-e2e-mysql-$$"
 XVFB_PID=""
 ZED_PID=""
+HTTP_PID=""
 
 cleanup() {
     [ -n "$ZED_PID" ] && kill "$ZED_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+    [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null || true
     podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
     # A run the editor started may have outlived it; they carry the scratch root.
     pgrep -f "$ROOT" | xargs -r kill -9 2>/dev/null || true
@@ -59,13 +64,23 @@ expect_status() {
 echo "== MySQL on 127.0.0.1:$MYSQL_PORT"
 podman run -d --rm --name "$CONTAINER" -e MYSQL_ROOT_PASSWORD=e2e-root -e MYSQL_DATABASE=shop \
     -p "127.0.0.1:$MYSQL_PORT:3306" "$MYSQL_IMAGE" >/dev/null
-for _ in $(seq 1 90); do
-    podman exec "$CONTAINER" mysql -uroot -pe2e-root -e 'SELECT 1' shop >/dev/null 2>&1 && break
+# The image first runs a server of its own to initialise the data directory and
+# then restarts; only the line naming port 3306 is the one that stays up.
+for _ in $(seq 1 120); do
+    podman logs "$CONTAINER" 2>&1 | grep -q 'port: 3306  MySQL Community' && break
     sleep 1
 done
-podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -e "
-    CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(40) NULL);
-    INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace, \"the admiral\"'), (3, NULL);" 2>/dev/null
+SEEDED=""
+for _ in $(seq 1 20); do
+    if podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -e "
+        CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name VARCHAR(40) NULL);
+        REPLACE INTO users VALUES (1, 'Ada'), (2, 'Grace, \"the admiral\"'), (3, NULL);" 2>/dev/null; then
+        SEEDED=1
+        break
+    fi
+    sleep 1
+done
+[ -n "$SEEDED" ] || { echo "zedcli-e2e: MySQL never took the seed data"; podman logs "$CONTAINER" 2>&1 | tail -5; exit 1; }
 
 echo "== Editor on :$DISPLAY_NUMBER"
 # An editor started with --user-data-dir keeps its configuration inside it.
@@ -110,6 +125,62 @@ cat >"$ROOT/project/.zed/tasks.json" <<JSON
 ]
 JSON
 echo 'fn main() {}' >"$ROOT/project/main.rs"
+
+# The API client's saved requests, one with a test script, and a server that
+# echoes the path it was asked for.
+cat >"$ROOT/data/config/api_collections.json" <<JSON
+{
+  "collections": [{ "id": "a0000000-0000-4000-8000-000000000001", "name": "Shop", "variables": [] }],
+  "folders": [{ "id": "a0000000-0000-4000-8000-000000000002", "collection_id": "a0000000-0000-4000-8000-000000000001", "name": "Orders" }],
+  "requests": [
+    {
+      "id": "a0000000-0000-4000-8000-000000000003",
+      "collection_id": "a0000000-0000-4000-8000-000000000001",
+      "folder_id": "a0000000-0000-4000-8000-000000000002",
+      "name": "Get order",
+      "method": "Get",
+      "url": "{{host}}/orders/{{id}}",
+      "test_script": "pm.test(\"is found\", () => { pm.expect(pm.response.code).to.equal(200); });"
+    },
+    {
+      "id": "a0000000-0000-4000-8000-000000000004",
+      "collection_id": "a0000000-0000-4000-8000-000000000001",
+      "name": "Broken",
+      "method": "Get",
+      "url": "{{host}}/boom"
+    }
+  ],
+  "tree_order": "name"
+}
+JSON
+cat >"$ROOT/data/config/api_environments.json" <<JSON
+{
+  "environments": [
+    { "id": "b0000000-0000-4000-8000-000000000001", "name": "local",
+      "variables": [
+        { "key": "host", "initial_value": "http://127.0.0.1:$HTTP_PORT", "current_value": "http://127.0.0.1:$HTTP_PORT", "secret": false, "enabled": true },
+        { "key": "token", "initial_value": "e2e-secret-token", "current_value": "e2e-secret-token", "secret": true, "enabled": true }
+      ] }
+  ],
+  "global": { "id": "00000000-0000-0000-0000-000000000000", "name": "Globals", "variables": [] }
+}
+JSON
+/usr/bin/python3 - "$HTTP_PORT" >/dev/null 2>&1 <<'SERVER' &
+import http.server, json, sys
+class Echo(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        code = 500 if self.path == "/boom" else 200
+        body = json.dumps({"path": self.path}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Echo).serve_forever()
+SERVER
+HTTP_PID=$!
 
 Xvfb ":$DISPLAY_NUMBER" -screen 0 1600x1000x24 -nolisten tcp >/dev/null 2>&1 &
 XVFB_PID=$!
@@ -213,6 +284,23 @@ expect_status 0 "a read-only connection still reads" -- db query -c e2e-mysql-re
 expect_status 1 "a read-only connection refuses a write" -- db query -c e2e-mysql-read-only "UPDATE users SET name = 'x' WHERE id = 1"
 out=$(zc db query -c e2e-mysql --csv "SELECT name FROM users WHERE id = 1") || true
 [ "$out" = $'name\nAda' ] && pass "the refused write changed nothing" || fail "the refused write changed nothing" "$out"
+
+echo "== api"
+out=$(zc api list) || true
+echo "$out" | grep -q "Shop/Orders/Get order" && pass "saved requests are listed by path" || fail "saved requests are listed by path" "$out"
+out=$(zc api envs) || true
+echo "$out" | grep -q "local" && pass "environments are listed" || fail "environments are listed" "$out"
+echo "$out" | grep -q "e2e-secret-token" && fail "a variable's value is never printed" "$out" || pass "a variable's value is never printed"
+out=$(zc api send "Shop/Orders/Get order" --env local --var id=42 2>/dev/null) || true
+[ "$out" = '{"path": "/orders/42"}' ] && pass "a request is sent with the environment and a one-off value" \
+    || fail "a request is sent with the environment and a one-off value" "$out"
+err=$(zc api send "Get order" --env local --var id=7 2>&1 >/dev/null) || true
+echo "$err" | grep -q "pass  is found" && pass "the request's test script runs" || fail "the request's test script runs" "$err"
+expect_status 0 "an error status is still an answer" -- api send Broken --env local
+expect_status 1 "--fail makes an error status a failure" -- api send Broken --env local --fail
+expect_status 4 "an unknown request is not found" -- api send "Nowhere" --env local
+zc api send "Get order" --env local --var id=9 -o "$ROOT/body.json" >/dev/null 2>&1 || true
+grep -q '/orders/9' "$ROOT/body.json" 2>/dev/null && pass "-o writes the body to a file" || fail "-o writes the body to a file"
 
 echo "== after the editor is gone"
 kill "$ZED_PID"

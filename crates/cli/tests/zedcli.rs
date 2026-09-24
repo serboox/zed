@@ -460,3 +460,247 @@ fn an_editor_that_never_answers_times_out() {
         "the wait is bounded"
     );
 }
+
+fn an_api_response(status: u16, body: &[u8]) -> cli::ApiResponseInfo {
+    cli::ApiResponseInfo {
+        method: "POST".into(),
+        url: "http://127.0.0.1:9/orders/42".into(),
+        environment: Some("staging".into()),
+        status,
+        status_text: "Created".into(),
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: body.to_vec(),
+        elapsed_ms: 12,
+        tests: vec![cli::ApiTestInfo {
+            name: "is created".into(),
+            passed: true,
+            error: None,
+        }],
+    }
+}
+
+#[test]
+fn api_send_prints_the_body_on_stdout_and_the_status_on_stderr() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiResponse {
+                response: an_api_response(201, br#"{"id":42}"#),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "api",
+            "send",
+            "Shop/Orders/Create order",
+            "--env",
+            "staging",
+            "--var",
+            "id=42",
+            "--var",
+            "note=a=b",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        r#"{"id":42}"#,
+        "only the body, ready for jq"
+    );
+    assert!(
+        stderr(&output).contains("HTTP 201 Created")
+            && stderr(&output).contains("pass  is created"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        editor.request(),
+        CliRequest::SendApiRequest {
+            request: "Shop/Orders/Create order".into(),
+            environment: Some("staging".into()),
+            variables: vec![("id".into(), "42".into()), ("note".into(), "a=b".into())],
+            timeout_seconds: 30,
+        },
+        "a value may itself hold an equals sign"
+    );
+}
+
+#[test]
+fn include_puts_the_head_before_the_body() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiResponse {
+                response: an_api_response(201, b"ok"),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "send", "x", "-i"],
+        None,
+        None,
+    );
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("HTTP 201 Created")
+            && text.contains("content-type: application/json\n\nok"),
+        "{text}"
+    );
+    editor.request();
+}
+
+#[test]
+fn fail_turns_an_error_status_into_a_failed_exit() {
+    for (fail, want) in [(false, 0), (true, exit_status::FAILED)] {
+        let editor = FakeEditor::answering(|_| {
+            vec![
+                CliResponse::ApiResponse {
+                    response: an_api_response(500, b"boom"),
+                },
+                CliResponse::Exit { status: 0 },
+            ]
+        });
+        let mut args = vec!["api", "send", "x"];
+        if fail {
+            args.push("--fail");
+        }
+        let output = zedcli(editor.data_dir.path(), &args, None, None);
+        assert_eq!(output.status.code(), Some(want), "--fail {fail}");
+        editor.request();
+    }
+}
+
+#[test]
+fn a_binary_body_comes_out_as_base64_in_json_and_raw_into_a_file() {
+    let body: Vec<u8> = vec![0, 159, 146, 150, 255];
+    let editor = FakeEditor::answering({
+        let body = body.clone();
+        move |_| {
+            vec![
+                CliResponse::ApiResponse {
+                    response: an_api_response(200, &body),
+                },
+                CliResponse::Exit { status: 0 },
+            ]
+        }
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "send", "x", "--json"],
+        None,
+        None,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(value["body_base64"], "AJ+Slv8=");
+    assert_eq!(value["status"], 200);
+    editor.request();
+
+    let editor = FakeEditor::answering({
+        let body = body.clone();
+        move |_| {
+            vec![
+                CliResponse::ApiResponse {
+                    response: an_api_response(200, &body),
+                },
+                CliResponse::Exit { status: 0 },
+            ]
+        }
+    });
+    let file = editor.data_dir.path().join("body.bin");
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "send", "x", "-o", file.to_str().expect("a path")],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(std::fs::read(&file).expect("the body is written"), body);
+    editor.request();
+}
+
+#[test]
+fn a_variable_without_an_equals_sign_is_a_bad_argument() {
+    let data_dir = TempDir::new().expect("a data directory");
+    let output = zedcli(
+        data_dir.path(),
+        &["api", "send", "x", "--var", "nothing"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(exit_status::BAD_ARGUMENTS));
+}
+
+#[test]
+fn saved_requests_and_environments_are_listed() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiRequests {
+                items: vec![cli::ApiRequestInfo {
+                    id: "7c0e".into(),
+                    path: "Shop/Orders/Create order".into(),
+                    method: "POST".into(),
+                    url: "{{host}}/orders".into(),
+                }],
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(editor.data_dir.path(), &["api", "list"], None, None);
+    assert!(
+        stdout(&output).contains("Shop/Orders/Create order  POST"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(editor.request(), CliRequest::ListApiRequests);
+
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiEnvironments {
+                items: vec![cli::ApiEnvironmentInfo {
+                    id: "e1".into(),
+                    name: "staging".into(),
+                    active: true,
+                    variables: vec!["host".into(), "token".into()],
+                }],
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(editor.data_dir.path(), &["api", "envs"], None, None);
+    assert!(
+        stdout(&output).contains("staging      *       host, token"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(editor.request(), CliRequest::ListApiEnvironments);
+}
+
+#[test]
+fn a_body_that_cannot_be_written_is_a_failure() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiResponse {
+                response: an_api_response(200, b"ok"),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "send", "x", "-o", "/no/such/directory/body.json"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(exit_status::FAILED));
+    assert!(
+        stderr(&output).contains("cannot write"),
+        "{}",
+        stderr(&output)
+    );
+    editor.request();
+}

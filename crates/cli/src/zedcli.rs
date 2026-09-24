@@ -4,10 +4,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use cli::{
-    CliRequest, CliResponse, ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunAction, RunInfo,
-    RunState, WindowInfo, WindowSelector, exit_status, ipc::IpcOneShotServer,
+    ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse,
+    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo,
+    WindowSelector, exit_status, ipc::IpcOneShotServer,
 };
 use serde_json::json;
 
@@ -56,6 +58,54 @@ enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+    /// API Client: saved requests and environments.
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiCommand {
+    /// List the saved requests with their paths.
+    List,
+    /// List the environments and the names of their variables.
+    Envs,
+    /// Send a saved request, the way its Send button does, and print the body.
+    Send {
+        /// The request's id, its `Collection/Folder/Name` path, or a unique name.
+        request: String,
+        /// Resolve against this environment (id or name) instead of the request's own.
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Set a variable for this send only: `--var key=value`, repeatable.
+        #[arg(long = "var", value_parser = key_value)]
+        variables: Vec<(String, String)>,
+        /// Print the status line and the response headers before the body.
+        #[arg(short, long)]
+        include: bool,
+        /// Write the body to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Exit 1 on an HTTP status of 400 or more, or a failed test.
+        #[arg(long)]
+        fail: bool,
+    },
+}
+
+fn key_value(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(format!("expected key=value, got '{text}'")),
+    }
+}
+
+/// How `api send` prints what came back.
+#[derive(Debug, Default)]
+struct SendOptions {
+    include: bool,
+    output: Option<PathBuf>,
+    fail: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +177,7 @@ fn run(cli: ZedCli) -> Result<i32> {
         true => RowFormat::Json,
         false => RowFormat::Table,
     };
+    let mut send_options = SendOptions::default();
     let request = match cli.command {
         Command::Windows => CliRequest::ListWindows,
         Command::Ps => CliRequest::ListRuns { selector },
@@ -193,12 +244,37 @@ fn run(cli: ZedCli) -> Result<i32> {
                 }
             }
         },
+        Command::Api { command } => match command {
+            ApiCommand::List => CliRequest::ListApiRequests,
+            ApiCommand::Envs => CliRequest::ListApiEnvironments,
+            ApiCommand::Send {
+                request,
+                env,
+                variables,
+                include,
+                output,
+                fail,
+            } => {
+                send_options = SendOptions {
+                    include,
+                    output,
+                    fail,
+                };
+                CliRequest::SendApiRequest {
+                    request,
+                    environment: env,
+                    variables,
+                    timeout_seconds: cli.timeout,
+                }
+            }
+        },
     };
     exchange(
         request,
         cli.user_data_dir,
         Duration::from_secs(cli.timeout),
         format,
+        &send_options,
     )
 }
 
@@ -208,6 +284,7 @@ fn exchange(
     user_data_dir: Option<PathBuf>,
     timeout: Duration,
     format: RowFormat,
+    send_options: &SendOptions,
 ) -> Result<i32> {
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("opening a channel for the editor")?;
@@ -291,6 +368,21 @@ fn exchange(
             } => print!("{}", runs_as(format, &runs, &debug_sessions)),
             CliResponse::Configurations { items } => {
                 print!("{}", configurations_as(format, &items))
+            }
+            CliResponse::ApiRequests { items } => print!("{}", api_requests_as(format, &items)),
+            CliResponse::ApiEnvironments { items } => {
+                print!("{}", api_environments_as(format, &items))
+            }
+            CliResponse::ApiResponse { response } => {
+                let failed = print_api_response(format, &response, send_options)?;
+                // The editor's own Exit follows; its status is replaced here
+                // when --fail asked for a failed exchange to count as one.
+                if failed {
+                    // Already decided: the editor's Exit is only waited for so
+                    // it is not left writing to a closed channel.
+                    drain_to_exit(&response_rx, timeout).ok();
+                    return Ok(exit_status::FAILED);
+                }
             }
         }
     }
@@ -602,6 +694,139 @@ fn depth_of(pid: u32, processes: &[cli::ProcessInfo]) -> usize {
         depth += 1;
     }
     depth
+}
+
+/// Waits for the editor's `Exit` after an answer whose status is decided here.
+fn drain_to_exit(responses: &mpsc::Receiver<CliResponse>, timeout: Duration) -> Result<i32> {
+    loop {
+        match responses.recv_timeout(timeout) {
+            Ok(CliResponse::Exit { status }) => return Ok(status),
+            Ok(_) => {}
+            Err(_) => {
+                return Err(anyhow!(
+                    "the editor closed the connection without an answer"
+                ));
+            }
+        }
+    }
+}
+
+fn api_requests_as(format: RowFormat, items: &[ApiRequestInfo]) -> String {
+    if format != RowFormat::Table {
+        return json_line(&items);
+    }
+    if items.is_empty() {
+        return "No saved requests.\n".to_string();
+    }
+    table(
+        &["REQUEST", "METHOD", "URL"],
+        items
+            .iter()
+            .map(|item| vec![item.path.clone(), item.method.clone(), item.url.clone()])
+            .collect(),
+    )
+}
+
+fn api_environments_as(format: RowFormat, items: &[ApiEnvironmentInfo]) -> String {
+    if format != RowFormat::Table {
+        return json_line(&items);
+    }
+    if items.is_empty() {
+        return "No environments.\n".to_string();
+    }
+    table(
+        &["ENVIRONMENT", "ACTIVE", "VARIABLES"],
+        items
+            .iter()
+            .map(|item| {
+                vec![
+                    item.name.clone(),
+                    match item.active {
+                        true => "*".to_string(),
+                        false => String::new(),
+                    },
+                    item.variables.join(", "),
+                ]
+            })
+            .collect(),
+    )
+}
+
+/// Prints an exchange: the body on stdout (or into `--output`), the status line
+/// and test results on stderr unless `--include` puts the head on stdout too.
+/// Says whether `--fail` should count it as a failure.
+fn print_api_response(
+    format: RowFormat,
+    response: &ApiResponseInfo,
+    options: &SendOptions,
+) -> Result<bool> {
+    let failed_tests = response.tests.iter().filter(|test| !test.passed).count();
+    let failed = options.fail && (response.status >= 400 || failed_tests > 0);
+    if format == RowFormat::Json {
+        let body = match std::str::from_utf8(&response.body) {
+            Ok(text) => json!({ "body": text }),
+            Err(_) => {
+                json!({ "body_base64": base64::engine::general_purpose::STANDARD.encode(&response.body) })
+            }
+        };
+        let mut value = json!({
+            "method": response.method,
+            "url": response.url,
+            "environment": response.environment,
+            "status": response.status,
+            "status_text": response.status_text,
+            "headers": response.headers,
+            "elapsed_ms": response.elapsed_ms,
+            "tests": response.tests,
+        });
+        if let (Some(value), Some(body)) = (value.as_object_mut(), body.as_object()) {
+            value.extend(body.clone());
+        }
+        print!("{}", json_line(&value));
+        return Ok(failed);
+    }
+
+    let status_line = format!(
+        "HTTP {} {}  {} ms  {} {}",
+        response.status, response.status_text, response.elapsed_ms, response.method, response.url
+    );
+    let mut head = String::new();
+    if options.include {
+        head.push_str(&status_line);
+        head.push('\n');
+        for (name, value) in &response.headers {
+            head.push_str(&format!("{name}: {value}\n"));
+        }
+        head.push('\n');
+    } else {
+        eprintln!("{status_line}");
+    }
+    for test in &response.tests {
+        match (&test.error, test.passed) {
+            (_, true) => eprintln!("  pass  {}", test.name),
+            (Some(error), false) => eprintln!("  FAIL  {}: {error}", test.name),
+            (None, false) => eprintln!("  FAIL  {}", test.name),
+        }
+    }
+    match &options.output {
+        Some(path) => {
+            if let Err(error) = std::fs::write(path, &response.body) {
+                eprintln!("zedcli: cannot write {}: {error}", path.display());
+                return Ok(true);
+            }
+            print!("{head}");
+        }
+        None => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(head.as_bytes())?;
+            stdout.write_all(&response.body)?;
+            if !response.body.ends_with(b"\n") && std::io::stdout().is_terminal() {
+                stdout.write_all(b"\n")?;
+            }
+        }
+    }
+    Ok(failed)
 }
 
 fn configurations_as(format: RowFormat, items: &[ConfigurationInfo]) -> String {

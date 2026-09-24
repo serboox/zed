@@ -97,6 +97,58 @@ pub enum CliRequest {
         configuration: String,
         action: RunAction,
     },
+    /// Lists the API client's saved requests.
+    ListApiRequests,
+    /// Lists the API client's environments.
+    ListApiEnvironments,
+    /// Sends a saved request. `request` is its id or its `Collection/.../Name`
+    /// path; `environment` an environment's id or name.
+    SendApiRequest {
+        request: String,
+        environment: Option<String>,
+        variables: Vec<(String, String)>,
+        /// How long the server has to answer; the editor gives up after it.
+        #[serde(default)]
+        timeout_seconds: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiRequestInfo {
+    pub id: String,
+    /// `Collection/Folder/.../Request`.
+    pub path: String,
+    pub method: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiEnvironmentInfo {
+    pub id: String,
+    pub name: String,
+    pub active: bool,
+    /// Variable names only; values can be secrets.
+    pub variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiTestInfo {
+    pub name: String,
+    pub passed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiResponseInfo {
+    pub method: String,
+    pub url: String,
+    pub environment: Option<String>,
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub elapsed_ms: u64,
+    pub tests: Vec<ApiTestInfo>,
 }
 
 /// Which windows a request is about. With nothing set, the window whose project
@@ -222,6 +274,15 @@ pub enum CliResponse {
     },
     Configurations {
         items: Vec<ConfigurationInfo>,
+    },
+    ApiRequests {
+        items: Vec<ApiRequestInfo>,
+    },
+    ApiEnvironments {
+        items: Vec<ApiEnvironmentInfo>,
+    },
+    ApiResponse {
+        response: ApiResponseInfo,
     },
 }
 

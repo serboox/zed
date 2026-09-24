@@ -4032,6 +4032,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "askpass",
+ "base64 0.22.1",
  "clap",
  "clap_complete",
  "clap_complete_nushell",
@@ -31724,6 +31725,7 @@ dependencies = [
  "agent_skills",
  "agent_ui",
  "anyhow",
+ "api_client",
  "api_client_ui",
  "ashpd",
  "askpass",

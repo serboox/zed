@@ -714,6 +714,28 @@ pub async fn handle_cli_connection(
                 )
                 .await;
             }
+            CliRequest::ListApiRequests => {
+                super::cli_requests::list_api_requests(responses.as_ref(), cx).await;
+            }
+            CliRequest::ListApiEnvironments => {
+                super::cli_requests::list_api_environments(responses.as_ref(), cx).await;
+            }
+            CliRequest::SendApiRequest {
+                request,
+                environment,
+                variables,
+                timeout_seconds,
+            } => {
+                super::cli_requests::send_api_request(
+                    request,
+                    environment,
+                    variables,
+                    timeout_seconds,
+                    responses.as_ref(),
+                    cx,
+                )
+                .await;
+            }
         }
     }
 }
@@ -2661,7 +2683,10 @@ mod tests {
                     | CliResponse::Connections { .. }
                     | CliResponse::Windows { .. }
                     | CliResponse::Runs { .. }
-                    | CliResponse::Configurations { .. } => {}
+                    | CliResponse::Configurations { .. }
+                    | CliResponse::ApiRequests { .. }
+                    | CliResponse::ApiEnvironments { .. }
+                    | CliResponse::ApiResponse { .. } => {}
                 }
             }
 
