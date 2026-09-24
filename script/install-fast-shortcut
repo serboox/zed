@@ -56,6 +56,19 @@ chmod +x "$staging"
 mv -f "$staging" "$installed"
 
 ln -sf "$installed" "$link"
+
+# The command line that talks to this editor, when it was built alongside it:
+# the `cli` binary answers as `zedcli` under that name.
+zedcli_binary="$repo_root/target/release-fast/cli"
+zedcli_link="$bin_dir/zedcli"
+if [[ -x "$zedcli_binary" ]]; then
+  zedcli_installed="$installed_dir/zedcli"
+  rm -f "$zedcli_installed.installing"
+  cp "$zedcli_binary" "$zedcli_installed.installing"
+  chmod +x "$zedcli_installed.installing"
+  mv -f "$zedcli_installed.installing" "$zedcli_installed"
+  ln -sf "$zedcli_installed" "$zedcli_link"
+fi
 rm -f "$old_desktop_file" "$apps_dir/dev.zed.Zed-Dev-Legacy.desktop" "$bin_dir/zed-fast-legacy"
 
 cat > "$desktop_file" <<EOF
@@ -81,4 +94,7 @@ fi
 echo "Installed:"
 echo "  binary symlink : $link -> $installed"
 echo "  app launcher   : $desktop_file"
+if [[ -L "$zedcli_link" ]]; then
+  echo "  zedcli         : $zedcli_link -> $(readlink "$zedcli_link")"
+fi
 echo "Look for \"Zed (Fast/DB dev)\" in your app grid (distinct grey icon)."

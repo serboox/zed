@@ -417,6 +417,9 @@ pub struct DatabaseStore {
     run_configurations: Vec<RunConfiguration>,
     pub exec_jobs: Vec<crate::sql_exec::ExecJob>,
     pub(crate) next_exec_job_id: usize,
+    /// Whether the saved connections have been read from disk. Until then an
+    /// empty list means "not read yet", not "there are none".
+    connections_loaded: bool,
 }
 
 /// One of the reader's queries, counted as running for as long as this is held.
@@ -665,6 +668,8 @@ impl DatabaseStore {
                     })
                     .ok();
                 }
+                this.update(cx, |store, _| store.connections_loaded = true)
+                    .ok();
             })
             .detach();
         }
@@ -763,6 +768,7 @@ impl DatabaseStore {
         }
 
         Self {
+            connections_loaded: cfg!(test),
             connections: Vec::new(),
             folders: Vec::new(),
             query_history: Vec::new(),
@@ -1248,6 +1254,11 @@ impl DatabaseStore {
     /// store through here rather than the workspace-scoped panel.
     pub fn global(cx: &App) -> Option<Entity<DatabaseStore>> {
         cx.try_global::<GlobalDatabaseStore>().map(|g| g.0.clone())
+    }
+
+    /// Whether the saved connections have been read from disk yet.
+    pub fn connections_loaded(&self) -> bool {
+        self.connections_loaded
     }
 
     /// Saved connections as `(id, label, driver)` tuples, without credentials.

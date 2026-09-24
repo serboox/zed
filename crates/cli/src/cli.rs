@@ -52,7 +52,7 @@ pub enum CliBehaviorSetting {
     NewWindow,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum CliRequest {
     Open {
         paths: Vec<String>,
@@ -81,6 +81,106 @@ pub enum CliRequest {
     },
     /// Lists the saved database connections (no credentials).
     ListConnections,
+    /// Lists every editor window, the projects open in it and its active file.
+    ListWindows,
+    /// Lists the task runs and debug sessions of the selected windows.
+    ListRuns {
+        selector: WindowSelector,
+    },
+    /// Lists the run configurations the selected windows' projects keep.
+    ListConfigurations {
+        selector: WindowSelector,
+    },
+    /// Runs, stops or restarts a run configuration of the selected window.
+    ControlRun {
+        selector: WindowSelector,
+        configuration: String,
+        action: RunAction,
+    },
+}
+
+/// Which windows a request is about. With nothing set, the window whose project
+/// holds `cwd` is chosen, and the focused window when none does.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowSelector {
+    pub window: Option<u64>,
+    pub project: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunAction {
+    Run,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: u64,
+    pub focused: bool,
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+/// One project group of a window: a window can hold several in its sidebar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub active: bool,
+    pub projects: Vec<PathBuf>,
+    pub active_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub window: u64,
+    pub label: String,
+    pub command: String,
+    pub state: RunState,
+    /// The shell the run was started in; its tree is in `processes`.
+    pub pid: Option<u32>,
+    /// The run's processes, the shell first and every parent before its children.
+    pub processes: Vec<ProcessInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+    /// Percentage of one core; `None` when the platform cannot say.
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: u64,
+    pub threads: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DebugSessionInfo {
+    pub window: u64,
+    pub label: String,
+    pub adapter: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigurationInfo {
+    pub window: u64,
+    pub label: String,
+    /// `task` or `debug`.
+    pub kind: String,
+    pub command: String,
+    pub running: bool,
 }
 
 /// A saved database connection, without any credentials.
@@ -113,6 +213,25 @@ pub enum CliResponse {
     Connections {
         items: Vec<DbConnectionSummary>,
     },
+    Windows {
+        items: Vec<WindowInfo>,
+    },
+    Runs {
+        runs: Vec<RunInfo>,
+        debug_sessions: Vec<DebugSessionInfo>,
+    },
+    Configurations {
+        items: Vec<ConfigurationInfo>,
+    },
+}
+
+/// Exit statuses the editor answers with, beyond 0 for success and 1 for a
+/// request that failed on its own terms.
+pub mod exit_status {
+    pub const FAILED: i32 = 1;
+    pub const BAD_ARGUMENTS: i32 = 2;
+    pub const EDITOR_UNREACHABLE: i32 = 3;
+    pub const NOT_FOUND: i32 = 4;
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),

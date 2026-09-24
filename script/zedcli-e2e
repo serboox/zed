@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ZED=${1:-$HOME/.local/lib/zed-fast/zed}
+ZEDCLI=${2:-$HOME/.local/lib/zed-fast/zedcli}
+DISPLAY_NUMBER=${ZEDCLI_E2E_DISPLAY:-97}
+MYSQL_PORT=${ZEDCLI_E2E_MYSQL_PORT:-33961}
+MYSQL_IMAGE=${ZEDCLI_E2E_MYSQL_IMAGE:-docker.io/library/mysql:8.4}
+
+for tool in podman Xvfb xdotool; do
+    command -v "$tool" >/dev/null || { echo "zedcli-e2e: $tool is required" >&2; exit 2; }
+done
+[ -x "$ZED" ] || { echo "zedcli-e2e: no editor at $ZED" >&2; exit 2; }
+[ -x "$ZEDCLI" ] || { echo "zedcli-e2e: no zedcli at $ZEDCLI" >&2; exit 2; }
+if ss -ltn | grep -q ":$MYSQL_PORT "; then
+    echo "zedcli-e2e: port $MYSQL_PORT is taken; set ZEDCLI_E2E_MYSQL_PORT" >&2
+    exit 2
+fi
+if [ -e "/tmp/.X11-unix/X$DISPLAY_NUMBER" ]; then
+    echo "zedcli-e2e: display :$DISPLAY_NUMBER is taken; set ZEDCLI_E2E_DISPLAY" >&2
+    exit 2
+fi
+
+ROOT=$(mktemp -d /tmp/zedcli-e2e.XXXXXX)
+CONTAINER="zedcli-e2e-mysql-$$"
+XVFB_PID=""
+ZED_PID=""
+
+cleanup() {
+    [ -n "$ZED_PID" ] && kill "$ZED_PID" 2>/dev/null || true
+    [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    # A run the editor started may have outlived it; they carry the scratch root.
+    pgrep -f "$ROOT" | xargs -r kill -9 2>/dev/null || true
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT
+
+PASSED=0
+FAILED=0
+pass() { PASSED=$((PASSED + 1)); echo "  ok    $1"; }
+fail() {
+    FAILED=$((FAILED + 1))
+    echo "  FAIL  $1"
+    if [ -n "${2:-}" ]; then echo "$2" | sed 's/^/        /'; fi
+}
+
+zc() { "$ZEDCLI" --user-data-dir "$ROOT/data" --timeout 30 "$@"; }
+
+# Runs zedcli and checks its exit status: expect <status> <name> -- <args...>
+expect_status() {
+    local want=$1 name=$2
+    shift 3
+    local out status
+    out=$(zc "$@" 2>&1) && status=0 || status=$?
+    if [ "$status" = "$want" ]; then pass "$name"; else fail "$name (exit $status, wanted $want)" "$out"; fi
+}
+
+echo "== MySQL on 127.0.0.1:$MYSQL_PORT"
+podman run -d --rm --name "$CONTAINER" -e MYSQL_ROOT_PASSWORD=e2e-root -e MYSQL_DATABASE=shop \
+    -p "127.0.0.1:$MYSQL_PORT:3306" "$MYSQL_IMAGE" >/dev/null
+for _ in $(seq 1 90); do
+    podman exec "$CONTAINER" mysql -uroot -pe2e-root -e 'SELECT 1' shop >/dev/null 2>&1 && break
+    sleep 1
+done
+podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -e "
+    CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(40) NULL);
+    INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace, \"the admiral\"'), (3, NULL);" 2>/dev/null
+
+echo "== Editor on :$DISPLAY_NUMBER"
+# An editor started with --user-data-dir keeps its configuration inside it.
+# MySQL 8 lets caching_sha2_password in only over TLS, hence ssl_mode Require.
+mkdir -p "$ROOT/home" "$ROOT/data/config" "$ROOT/project/.zed"
+cat >"$ROOT/data/config/db_connections.json" <<JSON
+{
+  "folders": [],
+  "connections": [
+    {
+      "id": "6b1d0f0e-4c47-4d6a-9d7c-0e2e2e5e0001",
+      "label": "e2e-mysql",
+      "driver": "MySQL",
+      "host": "127.0.0.1",
+      "port": $MYSQL_PORT,
+      "username": "root",
+      "password": "e2e-root",
+      "database": "shop",
+      "ssl_mode": "Require"
+    },
+    {
+      "id": "6b1d0f0e-4c47-4d6a-9d7c-0e2e2e5e0002",
+      "label": "e2e-mysql-read-only",
+      "driver": "MySQL",
+      "host": "127.0.0.1",
+      "port": $MYSQL_PORT,
+      "username": "root",
+      "password": "e2e-root",
+      "database": "shop",
+      "ssl_mode": "Require",
+      "read_only": true
+    }
+  ]
+}
+JSON
+# The run leaves a program in a session of its own behind, the way a server
+# started by a script does; Stop has to end it as well.
+cat >"$ROOT/project/.zed/tasks.json" <<JSON
+[
+  { "label": "sleeper", "command": "sh", "args": ["-c", "setsid sleep 300 & sleep 300"] },
+  { "label": "unit tests", "command": "true" }
+]
+JSON
+echo 'fn main() {}' >"$ROOT/project/main.rs"
+
+Xvfb ":$DISPLAY_NUMBER" -screen 0 1600x1000x24 -nolisten tcp >/dev/null 2>&1 &
+XVFB_PID=$!
+sleep 1
+env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE DISPLAY=":$DISPLAY_NUMBER" GDK_BACKEND=x11 \
+    HOME="$ROOT/home" XDG_CONFIG_HOME="$ROOT/home/.config" XDG_DATA_HOME="$ROOT/home/.local/share" \
+    "$ZED" --user-data-dir "$ROOT/data" "$ROOT/project" >"$ROOT/zed.log" 2>&1 &
+ZED_PID=$!
+
+SOCKET=""
+for _ in $(seq 1 60); do
+    SOCKET=$(ls "$ROOT/data"/zed-*.sock 2>/dev/null | head -1 || true)
+    [ -n "$SOCKET" ] && break
+    sleep 1
+done
+[ -n "$SOCKET" ] || { echo "zedcli-e2e: the editor never listened"; tail -20 "$ROOT/zed.log"; exit 1; }
+# A scratch HOME opens the project in Restricted Mode, whose dialog holds back
+# the project's tasks until it is trusted.
+for _ in $(seq 1 30); do
+    zc windows --json 2>/dev/null | grep -q "$ROOT/project" && break
+    sleep 1
+done
+DISPLAY=":$DISPLAY_NUMBER" xdotool mousemove 800 500
+sleep 1
+DISPLAY=":$DISPLAY_NUMBER" xdotool key --clearmodifiers Return
+sleep 2
+
+echo "== the socket"
+[ "$(stat -c %a "$SOCKET")" = 600 ] && pass "only its own user can reach the socket" \
+    || fail "only its own user can reach the socket" "$(stat -c '%a %U' "$SOCKET")"
+
+echo "== windows"
+out=$(zc windows --json) || true
+echo "$out" | grep -q "\"$ROOT/project\"" && pass "the project's window is listed" || fail "the project's window is listed" "$out"
+WINDOW=$(echo "$out" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])' 2>/dev/null) || {
+    echo "zedcli-e2e: no window to test against"; tail -20 "$ROOT/zed.log"; exit 1; }
+zc windows | head -1 | grep -q '^WINDOW' && pass "the table has a header" || fail "the table has a header"
+expect_status 4 "an unknown window is not found" -- ps --window 999999999
+
+echo "== configs"
+out=$(cd "$ROOT/project" && zc configs) || true
+echo "$out" | grep -q sleeper && pass "configurations are found from the project directory" \
+    || fail "configurations are found from the project directory" "$out"
+expect_status 4 "an unknown configuration is not found" -- run "no such configuration" --window "$WINDOW"
+
+pids_of_sleeper() {
+    zc ps --window "$WINDOW" --json | /usr/bin/python3 -c '
+import json, sys
+runs = json.load(sys.stdin)["runs"]
+print(" ".join(str(p["pid"]) for r in runs if r["label"] == "sleeper" and r["state"] == "running" for p in r["processes"]))' 2>/dev/null || true
+}
+wait_for_pids() {
+    local pids=""
+    for _ in $(seq 1 30); do
+        pids=$(pids_of_sleeper)
+        [ "$(echo "$pids" | wc -w)" -ge 3 ] && break
+        sleep 1
+    done
+    echo "$pids"
+}
+alive() { local left=""; for pid in $1; do kill -0 "$pid" 2>/dev/null && left="$left $pid"; done; echo "$left"; }
+# Every `sleep 300` this script's editor started, found by the scratch HOME in
+# its environment, so a stray one outside the run's tree is caught as well.
+sleeps_left() { pgrep -x sleep -a | awk '$3 == "300" {print $1}' | while read -r pid; do
+        grep -qs "$ROOT" "/proc/$pid/environ" && echo "$pid"; done | tr '\n' ' '; }
+
+echo "== run, restart, stop"
+expect_status 0 "run starts the configuration" -- run sleeper --window "$WINDOW"
+FIRST=$(wait_for_pids)
+[ "$(echo "$FIRST" | wc -w)" -ge 3 ] && pass "ps shows the run with the programs it started" \
+    || fail "ps shows the run with the programs it started" "$(zc ps --window "$WINDOW")"
+expect_status 0 "run of a running configuration replaces it" -- run sleeper --window "$WINDOW"
+SECOND=$(wait_for_pids)
+[ -z "$(alive "$FIRST")" ] && pass "the previous run is gone, all of it" \
+    || fail "the previous run is gone, all of it" "left: $(alive "$FIRST")"
+expect_status 0 "restart restarts it" -- restart sleeper --window "$WINDOW"
+THIRD=$(wait_for_pids)
+[ -z "$(alive "$SECOND")" ] && [ -n "$THIRD" ] && pass "restart ended the old run and started a new one" \
+    || fail "restart ended the old run and started a new one" "old left: $(alive "$SECOND"), new: $THIRD"
+expect_status 0 "stop stops it" -- stop sleeper --window "$WINDOW"
+sleep 1
+[ -z "$(alive "$THIRD")" ] && [ -z "$(sleeps_left)" ] && pass "nothing of the run is left, not even what left its session" \
+    || fail "nothing of the run is left, not even what left its session" "left: $(alive "$THIRD") $(sleeps_left)"
+
+echo "== db"
+out=$(zc db connections) || true
+echo "$out" | grep -q e2e-mysql && pass "the saved connection is listed" || fail "the saved connection is listed" "$out"
+echo "$out" | grep -q e2e-root && fail "the password is never printed" "$out" || pass "the password is never printed"
+out=$(zc db query -c e2e-mysql --csv "SELECT id, name FROM users ORDER BY id") || true
+want=$'id,name\n1,Ada\n2,"Grace, ""the admiral"""\n3,'
+[ "$out" = "$want" ] && pass "a query prints as CSV, quoting and NULL included" || fail "a query prints as CSV, quoting and NULL included" "$out"
+out=$(echo "SELECT COUNT(*) AS n FROM users" | zc db query -c e2e-mysql --json) || true
+echo "$out" | grep -q '"n": "3"' && pass "SQL is read from stdin and printed as JSON" || fail "SQL is read from stdin and printed as JSON" "$out"
+expect_status 1 "an SQL error is a failed request" -- db query -c e2e-mysql "SELECT nope FROM users"
+expect_status 4 "an unknown connection is not found" -- db query -c no-such-connection "SELECT 1"
+out=$(zc db query -c e2e-mysql --json "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n WHERE x < 600) SELECT x FROM n") || true
+ROWS=$(echo "$out" | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)["rows"]))' 2>/dev/null || echo "?")
+echo "  info  a 600-row query came back with $ROWS rows"
+[ "$ROWS" -gt 0 ] 2>/dev/null && pass "a large result comes back" || fail "a large result comes back" "$out"
+expect_status 0 "a read-only connection still reads" -- db query -c e2e-mysql-read-only "SELECT COUNT(*) FROM users"
+expect_status 1 "a read-only connection refuses a write" -- db query -c e2e-mysql-read-only "UPDATE users SET name = 'x' WHERE id = 1"
+out=$(zc db query -c e2e-mysql --csv "SELECT name FROM users WHERE id = 1") || true
+[ "$out" = $'name\nAda' ] && pass "the refused write changed nothing" || fail "the refused write changed nothing" "$out"
+
+echo "== after the editor is gone"
+kill "$ZED_PID"
+wait "$ZED_PID" 2>/dev/null || true
+ZED_PID=""
+expect_status 3 "no running editor is said as such" -- windows
+
+echo
+if [ "$FAILED" != 0 ]; then
+    echo "-- last lines of the editor's log"
+    tail -25 "$ROOT/zed.log"
+fi
+echo "zedcli-e2e: $PASSED passed, $FAILED failed"
+[ "$FAILED" = 0 ]

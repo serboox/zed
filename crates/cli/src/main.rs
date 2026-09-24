@@ -8,6 +8,7 @@
 )]
 
 mod completions;
+mod zedcli;
 
 use crate::completions::Shell;
 
@@ -520,6 +521,17 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // The same binary answers as `zedcli` when it is installed under that name.
+    // Ahead of the root check: it only asks the running editor questions.
+    let invoked_as_zedcli = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|program| program.file_stem().map(|stem| stem == "zedcli"))
+        .unwrap_or(false);
+    if invoked_as_zedcli {
+        zedcli::main(std::env::args_os().skip(1));
+    }
+
     #[cfg(unix)]
     util::prevent_root_execution();
 
@@ -795,7 +807,11 @@ fn run() -> Result<()> {
                                 .unwrap_or(cli::CliBehaviorSetting::ExistingWindow);
                             tx.send(CliRequest::SetOpenBehavior { behavior })?;
                         }
-                        CliResponse::QueryResult { .. } | CliResponse::Connections { .. } => {}
+                        CliResponse::QueryResult { .. }
+                        | CliResponse::Connections { .. }
+                        | CliResponse::Windows { .. }
+                        | CliResponse::Runs { .. }
+                        | CliResponse::Configurations { .. } => {}
                     }
                 }
 
@@ -940,6 +956,9 @@ fn run_db_command(args: &[String]) -> Result<()> {
                             }
                         }
                         CliResponse::Connections { items } => print_connections(&items),
+                        CliResponse::Windows { .. }
+                        | CliResponse::Runs { .. }
+                        | CliResponse::Configurations { .. } => {}
                     }
                 }
 

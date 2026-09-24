@@ -55,6 +55,10 @@ pub fn store_for(project: &Entity<Project>, cx: &mut App) -> Entity<Configuratio
 /// them, so a configuration clicked together in the editor and one typed into the
 /// file are the same thing.
 pub struct ConfigurationsStore {
+    /// Whether each file has been read once. Until both have, an empty list
+    /// means "not read yet", not "the project keeps none".
+    tasks_read: bool,
+    scenarios_read: bool,
     project_root: Option<PathBuf>,
     fs: Arc<dyn fs::Fs>,
     tasks: FileContents,
@@ -99,7 +103,10 @@ impl ConfigurationsStore {
         let settings_subscription = cx.observe_global::<SettingsStore>(|store, cx| {
             store.forget_past_the_limit(cx);
         });
+        let nothing_to_read = project_root.is_none();
         Self {
+            tasks_read: nothing_to_read,
+            scenarios_read: nothing_to_read,
             project_root,
             fs,
             tasks: FileContents::default(),
@@ -131,8 +138,14 @@ impl ConfigurationsStore {
                     if store
                         .update(cx, |store, cx| {
                             match kind {
-                                Kind::Task => store.tasks = read,
-                                Kind::Debug => store.scenarios = read,
+                                Kind::Task => {
+                                    store.tasks = read;
+                                    store.tasks_read = true;
+                                }
+                                Kind::Debug => {
+                                    store.scenarios = read;
+                                    store.scenarios_read = true;
+                                }
                             }
                             cx.emit(ConfigurationsChanged);
                             cx.notify();
@@ -144,6 +157,11 @@ impl ConfigurationsStore {
                 }
             }));
         }
+    }
+
+    /// Whether both files have been read at least once.
+    pub fn has_read_its_files(&self) -> bool {
+        self.tasks_read && self.scenarios_read
     }
 
     /// The ways run on the spot, newest first.

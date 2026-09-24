@@ -194,7 +194,11 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
                         // The database commands print their own answers in the
                         // cli process; this path only relays what an editor
                         // instance says about opening files.
-                        CliResponse::QueryResult { .. } | CliResponse::Connections { .. } => {}
+                        CliResponse::QueryResult { .. }
+                        | CliResponse::Connections { .. }
+                        | CliResponse::Windows { .. }
+                        | CliResponse::Runs { .. }
+                        | CliResponse::Configurations { .. } => {}
                     }
                 }
                 Ok(())

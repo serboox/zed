@@ -418,6 +418,12 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
         std::fs::remove_file(&sock_path)?;
     }
     let listener = UnixDatagram::bind(&sock_path)?;
+    // Whoever can write to this socket can have the editor run SQL with the
+    // saved connections, so only its own user may.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         while let Ok(len) = listener.recv(&mut buf) {
@@ -685,12 +691,61 @@ pub async fn handle_cli_connection(
             CliRequest::ListConnections => {
                 handle_list_connections(responses.as_ref(), cx).await;
             }
+            CliRequest::ListWindows => {
+                super::cli_requests::list_windows(responses.as_ref(), cx);
+            }
+            CliRequest::ListRuns { selector } => {
+                super::cli_requests::list_runs(selector, responses.as_ref(), cx).await;
+            }
+            CliRequest::ListConfigurations { selector } => {
+                super::cli_requests::list_configurations(selector, responses.as_ref(), cx).await;
+            }
+            CliRequest::ControlRun {
+                selector,
+                configuration,
+                action,
+            } => {
+                super::cli_requests::control_run(
+                    selector,
+                    configuration,
+                    action,
+                    responses.as_ref(),
+                    cx,
+                )
+                .await;
+            }
         }
     }
 }
 
-const DB_NOT_READY: &str =
-    "Database Explorer is not initialized. Open the Database Explorer panel in Zed first.";
+/// How long a request waits for the saved connections to be read from disk,
+/// which happens once, shortly after the editor starts: this many looks,
+/// [`DB_LOAD_LOOKED_AT_EVERY`] apart. Counted rather than timed, so the wait
+/// ends under a test clock too.
+const DB_LOAD_LOOKS: usize = 200;
+const DB_LOAD_LOOKED_AT_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The database store once its saved connections have been read, so a request
+/// that arrives right after the editor started does not see an empty list.
+async fn loaded_database_store(
+    cx: &mut AsyncApp,
+) -> Option<gpui::Entity<db_client_ui::DatabaseStore>> {
+    for _ in 0..DB_LOAD_LOOKS {
+        let store = cx.update(|cx| db_client_ui::DatabaseStore::global(cx));
+        if let Some(store) = store
+            && store.read_with(cx, |store, _| store.connections_loaded())
+        {
+            return Some(store);
+        }
+        cx.background_executor()
+            .timer(DB_LOAD_LOOKED_AT_EVERY)
+            .await;
+    }
+    None
+}
+
+const DB_NOT_READY: &str = "Database Explorer is not ready: no editor window is open, or the \
+     saved connections are still being read.";
 
 async fn handle_execute_query(
     connection: String,
@@ -699,7 +754,7 @@ async fn handle_execute_query(
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
 ) {
-    let Some(store) = cx.update(|cx| db_client_ui::DatabaseStore::global(cx)) else {
+    let Some(store) = loaded_database_store(cx).await else {
         responses
             .send(CliResponse::Stderr {
                 message: DB_NOT_READY.to_string(),
@@ -727,20 +782,20 @@ async fn handle_execute_query(
             responses.send(CliResponse::Exit { status: 0 }).log_err();
         }
         Err(error) => {
-            responses
-                .send(CliResponse::Stderr {
-                    message: format!("{error}"),
-                })
-                .log_err();
-            responses.send(CliResponse::Exit { status: 1 }).log_err();
+            let message = format!("{error:#}");
+            let status = match message.starts_with("No database connection matching") {
+                true => cli::exit_status::NOT_FOUND,
+                false => cli::exit_status::FAILED,
+            };
+            responses.send(CliResponse::Stderr { message }).log_err();
+            responses.send(CliResponse::Exit { status }).log_err();
         }
     }
 }
 
 async fn handle_list_connections(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
-    let summaries = cx.update(|cx| {
-        db_client_ui::DatabaseStore::global(cx).map(|store| store.read(cx).connection_summaries())
-    });
+    let store = loaded_database_store(cx).await;
+    let summaries = store.map(|store| store.read_with(cx, |store, _| store.connection_summaries()));
     let Some(summaries) = summaries else {
         responses
             .send(CliResponse::Stderr {
@@ -2602,7 +2657,11 @@ mod tests {
                             .unbounded_send(CliRequest::SetOpenBehavior { behavior })
                             .map_err(|error| anyhow::anyhow!("{error}"))?;
                     }
-                    CliResponse::QueryResult { .. } | CliResponse::Connections { .. } => {}
+                    CliResponse::QueryResult { .. }
+                    | CliResponse::Connections { .. }
+                    | CliResponse::Windows { .. }
+                    | CliResponse::Runs { .. }
+                    | CliResponse::Configurations { .. } => {}
                 }
             }
 

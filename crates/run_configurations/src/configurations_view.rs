@@ -639,7 +639,7 @@ pub async fn run_a_task(
     workspace: &WeakEntity<Workspace>,
     task: TaskTemplate,
     cx: &mut gpui::AsyncWindowContext,
-) {
+) -> bool {
     run_a_task_on(workspace, task, None, cx).await
 }
 
@@ -651,14 +651,14 @@ pub async fn run_a_task_on(
     task: TaskTemplate,
     machine: Option<crate::over_ssh::Machine>,
     cx: &mut gpui::AsyncWindowContext,
-) {
+) -> bool {
     let Some(contexts) = workspace
         .update_in(cx, |workspace, window, cx| {
             tasks_ui::task_contexts(workspace, window, cx)
         })
         .ok()
     else {
-        return;
+        return false;
     };
     let contexts = contexts.await;
     let project_root = workspace
@@ -707,7 +707,7 @@ pub async fn run_a_task_on(
                                 ),
                                 cx,
                             );
-                            return;
+                            return false;
                         }
                     },
                     None => Default::default(),
@@ -728,7 +728,7 @@ pub async fn run_a_task_on(
                 .update_in(cx, |workspace, window, cx| {
                     workspace.schedule_resolved_task(comes_from, resolved, false, window, cx);
                 })
-                .ok();
+                .is_ok()
         }
         None => {
             let label = task.label;
@@ -747,6 +747,7 @@ pub async fn run_a_task_on(
                     );
                 })
                 .ok();
+            false
         }
     }
 }
@@ -781,14 +782,14 @@ pub async fn start_a_debug_session(
     workspace: &WeakEntity<Workspace>,
     scenario: DebugScenario,
     cx: &mut gpui::AsyncWindowContext,
-) {
+) -> bool {
     let Some(contexts) = workspace
         .update_in(cx, |workspace, window, cx| {
             tasks_ui::task_contexts(workspace, window, cx)
         })
         .ok()
     else {
-        return;
+        return false;
     };
     let contexts = contexts.await;
     let worktree = contexts.worktree();
@@ -808,7 +809,7 @@ pub async fn start_a_debug_session(
         .update_in(cx, |workspace, window, cx| {
             workspace.start_debug_session(scenario, context.into(), None, worktree, window, cx);
         })
-        .ok();
+        .is_ok()
 }
 
 /// The project's run configurations: what the two files hold, in a form that can

@@ -363,9 +363,15 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
-    {
+    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS {
+        false
+    } else if *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev {
+        // The dev channel still allows a second instance, but the first one
+        // answers `zedcli`: without a listener nothing on this channel can.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        crate::zed::listen_for_cli_connections(open_listener.clone())
+            .context("listening for zedcli")
+            .log_err();
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]

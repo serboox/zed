@@ -21,21 +21,7 @@ const LOOKED_AT_EVERY: Duration = Duration::from_millis(50);
 /// since the edited one hashes differently -- and a run that is forgotten is not
 /// stopped when the configuration is started again.
 pub fn runs_of(workspace: &Workspace, task: &TaskTemplate, cx: &App) -> Vec<Entity<Terminal>> {
-    let mut terminals: Vec<Entity<Terminal>> = workspace
-        .items(cx)
-        .filter_map(|item| item.downcast::<TerminalView>())
-        .map(|view| view.read(cx).terminal().clone())
-        .collect();
-    if let Some(panel) = workspace.panel::<TerminalPanel>(cx) {
-        for pane in panel.read(cx).panes() {
-            terminals.extend(
-                pane.read(cx)
-                    .items()
-                    .filter_map(|item| item.downcast::<TerminalView>())
-                    .map(|view| view.read(cx).terminal().clone()),
-            );
-        }
-    }
+    let terminals = task_terminals(workspace, cx);
     let mut runs: Vec<Entity<Terminal>> = Vec::new();
     for terminal in terminals {
         let Some(state) = terminal.read(cx).task() else {
@@ -53,6 +39,37 @@ pub fn runs_of(workspace: &Workspace, task: &TaskTemplate, cx: &App) -> Vec<Enti
         }
     }
     runs
+}
+
+/// Every terminal of this workspace that a task was started in, running or
+/// not, wherever it was put: the terminal panel or the centre of the window.
+pub fn task_terminals(workspace: &Workspace, cx: &App) -> Vec<Entity<Terminal>> {
+    let mut terminals: Vec<Entity<Terminal>> = workspace
+        .items(cx)
+        .filter_map(|item| item.downcast::<TerminalView>())
+        .map(|view| view.read(cx).terminal().clone())
+        .collect();
+    if let Some(panel) = workspace.panel::<TerminalPanel>(cx) {
+        for pane in panel.read(cx).panes() {
+            terminals.extend(
+                pane.read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>())
+                    .map(|view| view.read(cx).terminal().clone()),
+            );
+        }
+    }
+    let mut unique: Vec<Entity<Terminal>> = Vec::new();
+    for terminal in terminals {
+        if terminal.read(cx).task().is_some()
+            && unique
+                .iter()
+                .all(|known| known.entity_id() != terminal.entity_id())
+        {
+            unique.push(terminal);
+        }
+    }
+    unique
 }
 
 /// Stops a run and resolves only once nothing it started is left running.
