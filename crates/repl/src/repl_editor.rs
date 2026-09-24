@@ -904,6 +904,10 @@ mod tests {
                 cx,
             );
             buffer.set_language_registry(language_registry.clone());
+            // Parse in full before the snapshot below, however loaded the machine
+            // is: a parse that runs over the default budget finishes in the
+            // background and the snapshot sees no code blocks at all.
+            buffer.set_sync_parse_timeout(Some(std::time::Duration::from_secs(30)));
             buffer.set_language(Some(markdown.clone()), cx);
             buffer
         });
@@ -949,6 +953,7 @@ mod tests {
                 cx,
             );
             buffer.set_language_registry(language_registry.clone());
+            buffer.set_sync_parse_timeout(Some(std::time::Duration::from_secs(30)));
             buffer.set_language(Some(markdown.clone()), cx);
             buffer
         });
@@ -988,6 +993,7 @@ mod tests {
                 cx,
             );
             buffer.set_language_registry(language_registry.clone());
+            buffer.set_sync_parse_timeout(Some(std::time::Duration::from_secs(30)));
             buffer.set_language(Some(markdown.clone()), cx);
             buffer
         });
