@@ -13,7 +13,7 @@ use settings::{
     LspSettings, SemanticTokens, Settings as _, SettingsStore, update_settings_file_with_completion,
 };
 use task::{TaskId, TaskTemplate};
-use terminal::{TaskStatus, Terminal};
+use terminal::Terminal;
 use ui::cyberpunk::CyberpunkSurface as _;
 use ui::{ButtonLike, KeyBinding, PopoverMenu, Tooltip, WithScrollbar, cyberpunk, prelude::*};
 use util::ResultExt as _;
@@ -571,26 +571,11 @@ impl ConfigurationsToolbar {
     fn the_run_it_points_at(&self, cx: &App) -> Option<(Entity<Terminal>, TaskId)> {
         let template = self.task_it_points_at(cx)?;
         let workspace = self.workspace.upgrade()?;
-        let panel = workspace
-            .read(cx)
-            .panel::<terminal_view::terminal_panel::TerminalPanel>(cx)?;
-        for pane in panel.read(cx).panes() {
-            for item in pane.read(cx).items() {
-                let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
-                    continue;
-                };
-                let terminal = view.read(cx).terminal();
-                let Some(task) = terminal.read(cx).task() else {
-                    continue;
-                };
-                if task.status == TaskStatus::Running
-                    && template.was_resolved_into(&task.spawned_task.id)
-                {
-                    return Some((terminal.clone(), task.spawned_task.id.clone()));
-                }
-            }
-        }
-        None
+        let terminal = crate::run_instances::runs_of(workspace.read(cx), &template, cx)
+            .into_iter()
+            .next()?;
+        let task_id = terminal.read(cx).task()?.spawned_task.id.clone();
+        Some((terminal, task_id))
     }
 
     /// The debug session this configuration started, while it is still alive.
@@ -624,8 +609,8 @@ impl ConfigurationsToolbar {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some((terminal, _)) = self.the_run_it_points_at(cx) {
-            terminal.update(cx, |terminal, _| terminal.kill_active_task());
+        if let Some(stopping) = self.stop_every_run(cx) {
+            stopping.detach();
             return;
         }
         if let Some(session) = self.the_session_it_points_at(cx) {
@@ -644,13 +629,12 @@ impl ConfigurationsToolbar {
     /// second process from starting while the first still holds a port, which
     /// fails to bind rather than replacing it.
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((terminal, task_id)) = self.the_run_it_points_at(cx) else {
+        let Some((_, task_id)) = self.the_run_it_points_at(cx) else {
             return;
         };
-        let gone = terminal.update(cx, |terminal, cx| {
-            terminal.kill_active_task();
-            terminal.wait_for_completed_task(cx)
-        });
+        let Some(gone) = self.stop_every_run(cx) else {
+            return;
+        };
         cx.spawn_in(window, async move |_, cx| {
             gone.await;
             cx.update(|window, cx| {
@@ -667,6 +651,16 @@ impl ConfigurationsToolbar {
             .log_err();
         })
         .detach();
+    }
+
+    /// Stops every run of what the plaque points at, with everything each
+    /// run started, and resolves once none of it is left.
+    fn stop_every_run(&self, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let template = self.task_it_points_at(cx)?;
+        let workspace = self.workspace.upgrade()?;
+        Some(workspace.update(cx, |workspace, cx| {
+            crate::run_instances::stop_every_run_of(workspace, &template, cx)
+        }))
     }
 
     fn start_debugging(
@@ -1600,6 +1594,7 @@ mod tests {
     use serde_json::json;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use terminal::TaskStatus;
     use terminal_view::terminal_panel::TerminalPanel;
     use util::path;
 
@@ -1870,6 +1865,16 @@ mod tests {
         over: &APlaqueOverRuns,
         cx: &mut VisualTestContext,
     ) -> Entity<Terminal> {
+        a_run_of_command(template, "sleep", &["60"], over, cx).await
+    }
+
+    async fn a_run_of_command(
+        template: &TaskTemplate,
+        program: &str,
+        args: &[&str],
+        over: &APlaqueOverRuns,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Terminal> {
         // The run is a real process on a real PTY, and its exit arrives on that
         // PTY's own thread rather than on the executor.
         cx.background_executor.allow_parking();
@@ -1877,8 +1882,8 @@ mod tests {
             .resolve_task("run configurations", &task::TaskContext::default())
             .expect("the template resolves against an empty context");
         let mut spawned = resolved.resolved;
-        spawned.command = Some("sleep".to_string());
-        spawned.args = vec!["60".to_string()];
+        spawned.command = Some(program.to_string());
+        spawned.args = args.iter().map(|arg| arg.to_string()).collect();
         // The project is on a fake file system, so the run is given a directory
         // that really exists to start in.
         spawned.cwd = Some(std::env::temp_dir());
@@ -3210,5 +3215,138 @@ mod tests {
             "the rerun must not be asked for while the process it is replacing \
              is still going"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    /// The processes a run started besides its shell, once they are running.
+    async fn what_the_run_started(
+        run: &Entity<Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<crate::process_metrics::Caught> {
+        let shell = run
+            .read_with(cx, |terminal, _| {
+                terminal
+                    .pid_getter()
+                    .map(|getter| getter.fallback_pid().as_u32())
+            })
+            .expect("a run on a PTY knows its shell");
+        for _ in 0..300 {
+            let started: Vec<_> = crate::process_metrics::processes_under(shell)
+                .into_iter()
+                .filter(|process| process.pid != shell)
+                .collect();
+            if !started.is_empty() {
+                return started;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Vec::new()
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Waits in real time for the caught processes to end, then ends whatever
+    /// did not, so a failing test leaves nothing running; returns those.
+    fn what_outlived(
+        caught: &[crate::process_metrics::Caught],
+    ) -> Vec<crate::process_metrics::Caught> {
+        let mut left = crate::process_metrics::still_running(caught);
+        for _ in 0..300 {
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            left = crate::process_metrics::still_running(&left);
+        }
+        crate::process_metrics::signal(&left, libc::SIGKILL);
+        left
+    }
+
+    /// A program the run put in a session of its own is out of reach of the
+    /// terminal, which ends only its foreground group and its shell. Restart
+    /// must end it anyway, or the new run starts beside it.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn restart_ends_what_the_run_started_in_a_session_of_its_own(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let template = what_it_would_run(&over.toolbar, &cx);
+        let run = a_run_of_command(
+            &template,
+            "sh",
+            &["-c", "setsid sleep 300 & wait"],
+            &over,
+            &mut cx,
+        )
+        .await;
+        let started = what_the_run_started(&run, &mut cx).await;
+        assert!(!started.is_empty(), "the run's program is running");
+
+        let (asked_to_rerun, focus_handle) = over
+            .bar
+            .update(&mut cx, |bar, _window, _cx| {
+                bar.watching = Some(run.clone());
+                (bar.asked_to_rerun.clone(), bar.focus_handle.clone())
+            })
+            .expect("the bar is still open");
+        draw_the_bar(over.bar, &mut cx);
+        cx.update(|window, cx| window.focus(&focus_handle, cx));
+        draw_the_bar(over.bar, &mut cx);
+        let restart = cx
+            .debug_bounds("run-configurations-restart-button")
+            .expect("Restart is painted while the run is going on");
+        cx.simulate_click(restart.center(), gpui::Modifiers::none());
+
+        assert!(
+            wait_until_it_is_over(&run, &mut cx).await,
+            "Restart has to end the run it points at"
+        );
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if !asked_to_rerun.borrow().is_empty() {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let outlived = what_outlived(&started);
+        assert_eq!(asked_to_rerun.borrow().len(), 1, "the run is started again");
+        assert!(
+            outlived.is_empty(),
+            "nothing of the old run may be left running when the new one \
+             starts: {outlived:?}"
+        );
+    }
+
+    /// A configuration edited while it runs hashes differently from the one
+    /// that was started. The run is still that configuration's, or pressing Run
+    /// again would start a second instance beside it.
+    #[gpui::test]
+    async fn a_run_stays_its_configurations_after_the_configuration_is_edited(
+        cx: &mut TestAppContext,
+    ) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let template = what_it_would_run(&over.toolbar, &cx);
+        let run = a_run_of(&template, &over, &mut cx).await;
+
+        let mut edited = template.clone();
+        edited.command = format!("{} -race", template.command);
+        let mut another = template.clone();
+        another.label = "a configuration of its own".to_string();
+        another.command = "go run ./cmd/worker".to_string();
+        over.workspace.read_with(&cx, |workspace, cx| {
+            let found = crate::run_instances::runs_of(workspace, &edited, cx);
+            assert_eq!(
+                found.iter().map(|run| run.entity_id()).collect::<Vec<_>>(),
+                vec![run.entity_id()],
+                "the edited configuration still owns the run"
+            );
+            assert!(
+                crate::run_instances::runs_of(workspace, &another, cx).is_empty(),
+                "and a different configuration does not"
+            );
+        });
+
+        run.update(&mut cx, |terminal, _| terminal.kill_active_task());
+        assert!(wait_until_it_is_over(&run, &mut cx).await);
     }
 }

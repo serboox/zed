@@ -533,6 +533,68 @@ fn threads_of(pid: u32) -> Vec<ThreadSample> {
     threads
 }
 
+/// One process of a run, caught the moment the run is asked to stop.
+///
+/// The terminal ends the process group in its foreground and the shell, and
+/// nothing else: a program that moved into a group or session of its own, or
+/// takes its time over a polite signal, is still running when the next run
+/// starts beside it. Catching the whole tree first is what lets the rest be
+/// ended too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caught {
+    pub pid: u32,
+    started: u64,
+}
+
+/// Every process of the tree under `root`, `root` itself included.
+pub fn processes_under(root: u32) -> Vec<Caught> {
+    let Some(everything) = everything_running() else {
+        return Vec::new();
+    };
+    caught_in(root, &everything)
+}
+
+fn caught_in(root: u32, everything: &[Sample]) -> Vec<Caught> {
+    tree_of(root, everything)
+        .into_iter()
+        .map(|sample| Caught {
+            pid: sample.pid,
+            started: sample.started,
+        })
+        .collect()
+}
+
+/// Whether `stat` is still the process that was caught. A zombie has ended,
+/// and a process started under the same pid since is somebody else's.
+fn is_still(caught: &Caught, stat: &str) -> bool {
+    stat_fields(stat).is_some_and(|fields| {
+        fields.id == caught.pid && fields.started == caught.started && fields.state != 'Z'
+    })
+}
+
+/// The caught processes that are still running.
+pub fn still_running(caught: &[Caught]) -> Vec<Caught> {
+    caught
+        .iter()
+        .filter(|caught| {
+            fs::read_to_string(format!("/proc/{}/stat", caught.pid))
+                .is_ok_and(|stat| is_still(caught, &stat))
+        })
+        .copied()
+        .collect()
+}
+
+/// Sends `signal` to each caught process. One that has ended in the meantime
+/// answers `ESRCH`, which is the outcome being asked for, so it is not reported.
+#[cfg(unix)]
+pub fn signal(caught: &[Caught], signal: libc::c_int) {
+    for caught in caught {
+        unsafe {
+            libc::kill(caught.pid as libc::pid_t, signal);
+        }
+    }
+}
+
 /// `bytes` as a reader reads it.
 pub fn as_memory(bytes: u64) -> String {
     const KIB: f32 = 1024.;
@@ -568,6 +630,91 @@ mod tests {
         );
         assert_eq!(sample.state, 'S');
         assert_eq!(sample.started, 12345, "the moment the machine started it");
+    }
+
+    /// A pid is only the caught process while it started at the same moment
+    /// and has not ended: signalling a new process under a reused pid would
+    /// end somebody else's program.
+    #[test]
+    fn a_caught_process_is_told_apart_from_a_new_one_under_its_pid() {
+        let caught = Caught {
+            pid: 4242,
+            started: 12345,
+        };
+        let running = "4242 (server) S 99 4242 4242 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 12345 0 0";
+        let reused = "4242 (server) S 99 4242 4242 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 99999 0 0";
+        let ended = "4242 (server) Z 99 4242 4242 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 12345 0 0";
+        assert!(is_still(&caught, running));
+        assert!(
+            !is_still(&caught, reused),
+            "a new process under the same pid"
+        );
+        assert!(!is_still(&caught, ended), "a zombie has already ended");
+    }
+
+    #[test]
+    fn the_whole_tree_is_caught_and_nothing_beside_it() {
+        let everything = vec![
+            started_at(10, 1, 0, 0, 7),
+            started_at(11, 10, 0, 0, 8),
+            started_at(12, 11, 0, 0, 9),
+            started_at(20, 1, 0, 0, 5),
+        ];
+        let caught = caught_in(10, &everything);
+        assert_eq!(
+            caught.iter().map(|caught| caught.pid).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(caught[2].started, 9);
+    }
+
+    /// The case the terminal alone gets wrong: a program started in a session
+    /// of its own outlives the end of the process that started it, and is only
+    /// ended because it was caught beforehand.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_in_a_session_of_its_own_is_caught_and_ended() {
+        let mut starter = smol::process::Command::new("sh")
+            .args(["-c", "setsid sleep 120 & wait"])
+            .spawn()
+            .expect("sh starts");
+        let root = starter.id();
+        let mut caught = Vec::new();
+        for _ in 0..200 {
+            caught = processes_under(root);
+            if caught.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let own_session: Vec<Caught> = caught
+            .iter()
+            .filter(|caught| caught.pid != root)
+            .copied()
+            .collect();
+        assert!(
+            !own_session.is_empty(),
+            "the program started by the shell is caught with it: {caught:?}"
+        );
+
+        starter.kill().expect("the shell is ended");
+        smol::block_on(starter.status()).expect("the shell is reaped");
+        assert_eq!(
+            still_running(&own_session),
+            own_session,
+            "ending the shell alone leaves its program running"
+        );
+
+        signal(&own_session, libc::SIGKILL);
+        let mut left = own_session;
+        for _ in 0..200 {
+            left = still_running(&left);
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(left.is_empty(), "the caught program is ended: {left:?}");
     }
 
     fn a_sample(pid: u32, parent: u32, ticks: u64, memory: u64) -> Sample {

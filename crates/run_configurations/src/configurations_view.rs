@@ -714,6 +714,16 @@ pub async fn run_a_task_on(
                 };
                 crate::over_ssh::send_to(&machine, &mut resolved.resolved, from_the_file);
             }
+            // One run of a configuration at a time, however it is started: a
+            // second one beside the first fights it for its port and its files.
+            let stopping = workspace
+                .update(cx, |workspace, cx| {
+                    crate::run_instances::stop_every_run_of(workspace, &task, cx)
+                })
+                .ok();
+            if let Some(stopping) = stopping {
+                stopping.await;
+            }
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.schedule_resolved_task(comes_from, resolved, false, window, cx);

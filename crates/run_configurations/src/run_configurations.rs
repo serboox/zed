@@ -8,6 +8,7 @@ pub mod goroutines;
 pub mod over_ssh;
 pub mod process_metrics;
 pub mod run_configurations_settings;
+pub mod run_instances;
 pub mod run_metrics_modal;
 pub mod run_metrics_status_item;
 pub mod templates;
