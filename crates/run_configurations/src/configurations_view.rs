@@ -835,6 +835,10 @@ pub struct RunConfigurationsView {
     env_file: Entity<Editor>,
     /// The machine to run on, blank for this one.
     machine: Entity<Editor>,
+    /// Where the program's own `net/http/pprof` endpoint listens, blank when
+    /// it does not have one. The status bar's goroutine reading uses this
+    /// when the run is not under the debugger.
+    pprof: Entity<Editor>,
     /// The environment, a row to a variable, as the model holds it. Each row is
     /// two little editors; an empty name is a row the reader has not filled in
     /// yet and is left out of what is written.
@@ -943,6 +947,11 @@ impl RunConfigurationsView {
             window,
             cx,
         );
+        let pprof = field(
+            "Blank unless it exposes net/http/pprof, such as localhost:6060",
+            window,
+            cx,
+        );
         let adapter = field(
             "Which debugger: Delve, CodeLLDB, Debugpy, JavaScript, GDB",
             window,
@@ -958,6 +967,7 @@ impl RunConfigurationsView {
             &cwd,
             &env_file,
             &machine,
+            &pprof,
             &adapter,
             &adapter_config,
             &builds,
@@ -991,6 +1001,7 @@ impl RunConfigurationsView {
             cwd,
             env_file,
             machine,
+            pprof,
             env_rows: Vec::new(),
             adapter,
             adapter_config,
@@ -1221,6 +1232,10 @@ impl RunConfigurationsView {
                 &self.machine,
                 configurations_file::machine_of(&configuration.as_written).unwrap_or_default(),
             ),
+            (
+                &self.pprof,
+                configurations_file::pprof_of(&configuration.as_written).unwrap_or_default(),
+            ),
             (&self.adapter, adapter),
             (&self.adapter_config, adapter_config),
             (&self.builds, builds),
@@ -1348,6 +1363,12 @@ impl RunConfigurationsView {
         (!said.is_empty()).then_some(said)
     }
 
+    /// The pprof address the form names, if it names one.
+    fn pprof_in_the_form(&self, cx: &App) -> Option<String> {
+        let said = self.pprof.read(cx).text(cx).trim().to_string();
+        (!said.is_empty()).then_some(said)
+    }
+
     /// What the form says, as a debug configuration.
     fn scenario_in_the_form(&self, cx: &App) -> DebugScenario {
         let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
@@ -1383,10 +1404,11 @@ impl RunConfigurationsView {
                     return;
                 }
                 configurations_file::task_as_written(&task).map(|written| {
-                    configurations_file::with_the_machine(
+                    let written = configurations_file::with_the_machine(
                         written,
                         self.machine_in_the_form(cx).as_deref(),
-                    )
+                    );
+                    configurations_file::with_pprof(written, self.pprof_in_the_form(cx).as_deref())
                 })
             }
             Kind::Debug => {
@@ -2142,10 +2164,11 @@ impl RunConfigurationsView {
         let written = match kind {
             Kind::Task => {
                 configurations_file::task_as_written(&self.task_in_the_form(cx)).map(|written| {
-                    configurations_file::with_the_machine(
+                    let written = configurations_file::with_the_machine(
                         written,
                         self.machine_in_the_form(cx).as_deref(),
-                    )
+                    );
+                    configurations_file::with_pprof(written, self.pprof_in_the_form(cx).as_deref())
                 })
             }
             Kind::Debug => configurations_file::scenario_as_written(&self.scenario_in_the_form(cx)),
@@ -2271,6 +2294,7 @@ impl RunConfigurationsView {
                     // machine changes what the line above means, from a path of
                     // this machine to a path of that one.
                     .child(field("MACHINE", &self.machine, false))
+                    .child(field("PPROF ADDRESS", &self.pprof, false))
                     .child(
                         // The plus rides the rule that names the section rather
                         // than sitting alone on a line of its own beneath it.

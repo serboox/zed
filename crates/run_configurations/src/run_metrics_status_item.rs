@@ -9,7 +9,10 @@ use settings::Settings;
 use ui::{ButtonLike, Tooltip, cyberpunk, prelude::*};
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
-use crate::process_metrics::{self, Metrics, ProcessReading, Sample, Watcher};
+use crate::configurations_file::{self, Kind};
+use crate::configurations_store;
+use crate::goroutines::{self, GoroutineReading, GoroutineSource, Goroutines};
+use crate::process_metrics::{self, Metrics, Sample, Watcher};
 use crate::run_configurations_settings::RunConfigurationsSettings;
 use crate::run_metrics_modal::RunMetricsModal;
 
@@ -25,13 +28,6 @@ const CHART_HEIGHT: Pixels = px(56.);
 /// How wide the column of axis labels beside a chart is.
 const AXIS_WIDTH: Pixels = px(34.);
 
-/// How wide the column naming a process is, and how wide the column of values
-/// after its bar is.
-const PROCESS_NAME_WIDTH: Pixels = px(118.);
-const PROCESS_VALUE_WIDTH: Pixels = px(58.);
-
-/// How thick a bar and a chart's line are.
-const BAR_HEIGHT: Pixels = px(6.);
 const LINE_WIDTH: Pixels = px(1.5);
 
 /// The status-bar plaque saying what the project's running configuration is
@@ -46,12 +42,30 @@ pub struct RunMetricsStatusItem {
     /// these, so a run a few seconds old draws a few seconds.
     readings: VecDeque<Reading>,
     watcher: Watcher,
+    goroutines: Option<crate::goroutines::GoroutineReading>,
+    /// When the goroutines reading was last refreshed. A debugger round trip
+    /// or an HTTP request costs far more than the process-metrics poll that
+    /// drives this loop, so it is not worth paying every tick of it.
+    last_goroutines_poll: Option<Instant>,
     /// Whether this window is the one in front. A poll nobody can see is a poll
     /// for nothing, so it stops the moment focus leaves this window and starts
     /// again the moment focus comes back.
     window_active: bool,
     _watching_task: Option<Task<()>>,
+    /// A pprof fetch in flight. Dropping it -- because the run ended, or
+    /// another reading started first -- cancels it, so a slow answer from a
+    /// run that is already gone never lands on top of what came after it.
+    _goroutines_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What is needed about a run to decide where its goroutines, if any, come
+/// from: the process to measure, and the label and command of the task that
+/// started it.
+struct RunContext {
+    pid: u32,
+    label: String,
+    command: Option<String>,
 }
 
 /// One reading, kept only for what the charts draw.
@@ -79,8 +93,11 @@ impl RunMetricsStatusItem {
             metrics: None,
             readings: VecDeque::new(),
             watcher: Watcher::default(),
+            goroutines: None,
+            last_goroutines_poll: None,
             window_active: window.is_window_active(),
             _watching_task: None,
+            _goroutines_task: None,
             _subscriptions: subscriptions,
         };
         item.watch_the_run(cx);
@@ -108,13 +125,17 @@ impl RunMetricsStatusItem {
             self.metrics = None;
             self.readings.clear();
             self.watcher.forget();
+            self.goroutines = None;
+            self.last_goroutines_poll = None;
+            self._goroutines_task = None;
             return;
         }
         self._watching_task = Some(cx.spawn(async move |item, cx| {
             loop {
-                let Ok(pid) = item.read_with(cx, |item, cx| item.process_of_a_run(cx)) else {
+                let Ok(context) = item.read_with(cx, |item, cx| item.run_context(cx)) else {
                     return;
                 };
+                let pid = context.as_ref().map(|context| context.pid);
                 let read = match pid {
                     Some(_) => {
                         cx.background_spawn(async move {
@@ -131,7 +152,12 @@ impl RunMetricsStatusItem {
                 let now = Instant::now();
                 if item
                     .update(cx, |item, cx| {
-                        if item.read_the_run(pid, samples.as_deref(), now, machine_uptime) {
+                        let mut changed =
+                            item.read_the_run(pid, samples.as_deref(), now, machine_uptime);
+                        if item.poll_goroutines(context.as_ref(), cx) {
+                            changed = true;
+                        }
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -201,6 +227,24 @@ impl RunMetricsStatusItem {
         self.metrics.clone()
     }
 
+    /// The goroutines of the run, when it is a Go program. None when the run is
+    /// not one, or nothing has been read yet.
+    pub(crate) fn goroutines(&self) -> Option<crate::goroutines::GoroutineReading> {
+        self.goroutines.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reading_for_test(
+        &mut self,
+        metrics: Option<Metrics>,
+        goroutines: Option<crate::goroutines::GoroutineReading>,
+        cx: &mut Context<Self>,
+    ) {
+        self.metrics = metrics;
+        self.goroutines = goroutines;
+        cx.notify();
+    }
+
     /// The readings the charts draw, oldest first: what the processor read and
     /// how much memory was held at each of them.
     pub(crate) fn series(&self) -> Vec<(Option<f32>, u64)> {
@@ -210,10 +254,10 @@ impl RunMetricsStatusItem {
             .collect()
     }
 
-    /// The process a run of this project is going on in, if one is. The
-    /// terminal panel holds the runs; a task terminal is one that was started
-    /// from a task, which is what a configuration is.
-    fn process_of_a_run(&self, cx: &App) -> Option<u32> {
+    /// The process a run of this project is going on in, if one is, and what
+    /// started it. The terminal panel holds the runs; a task terminal is one
+    /// that was started from a task, which is what a configuration is.
+    fn run_context(&self, cx: &App) -> Option<RunContext> {
         let workspace = self.workspace.upgrade()?;
         let panel = workspace
             .read(cx)
@@ -226,14 +270,144 @@ impl RunMetricsStatusItem {
                     continue;
                 };
                 let terminal = view.read(cx).terminal().read(cx);
-                if terminal.task().is_some()
+                if let Some(task) = terminal.task()
                     && let Some(pid) = terminal.pid()
                 {
-                    newest = Some(pid.as_u32());
+                    newest = Some(RunContext {
+                        pid: pid.as_u32(),
+                        label: task.spawned_task.full_label.clone(),
+                        command: task.spawned_task.command.clone(),
+                    });
                 }
             }
         }
         newest
+    }
+
+    /// Refreshes the goroutines reading, at most once every
+    /// [`goroutines::POLL_INTERVAL`]. Says whether the reading changed right
+    /// away; a pprof fetch that is still on its way notifies on its own once
+    /// it comes back.
+    fn poll_goroutines(&mut self, context: Option<&RunContext>, cx: &mut Context<Self>) -> bool {
+        let Some(context) = context else {
+            self._goroutines_task = None;
+            self.last_goroutines_poll = None;
+            return self.set_goroutines(None);
+        };
+        let now = Instant::now();
+        if self
+            .last_goroutines_poll
+            .is_some_and(|last| now.duration_since(last) < goroutines::POLL_INTERVAL)
+        {
+            return false;
+        }
+        self.last_goroutines_poll = Some(now);
+
+        if let Some(reading) = self.debugger_goroutines(cx) {
+            self._goroutines_task = None;
+            return self.set_goroutines(Some(reading));
+        }
+
+        if let Some(address) = self.configured_pprof_address(&context.label, cx) {
+            let http_client = cx.http_client();
+            self._goroutines_task = Some(cx.spawn(async move |item, cx| {
+                let reading = goroutines::read_pprof(http_client, &address).await;
+                item.update(cx, |item, cx| {
+                    if item.set_goroutines(Some(reading)) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+            return false;
+        }
+
+        self._goroutines_task = None;
+        let looks_like_go = context
+            .command
+            .as_deref()
+            .is_some_and(goroutines::looks_like_go_command)
+            || self.configured_adapter_is_delve(&context.label, cx);
+        let reading = looks_like_go
+            .then(|| GoroutineReading::Unavailable(goroutines::no_reader_configured()));
+        self.set_goroutines(reading)
+    }
+
+    /// Replaces the reading, saying whether it actually changed -- so a poll
+    /// that read the same thing again does not trigger a repaint for nothing.
+    fn set_goroutines(&mut self, reading: Option<GoroutineReading>) -> bool {
+        if self.goroutines == reading {
+            return false;
+        }
+        self.goroutines = reading;
+        true
+    }
+
+    /// The run's goroutines as the debugger sees them: the threads of a
+    /// running Delve session, Delve being the only debugger that stands for
+    /// Go's own goroutines. `None` when no such session is running, not when
+    /// one is running and reports zero -- a zero from a session that has not
+    /// answered yet would read as "there are none".
+    fn debugger_goroutines(&self, cx: &mut Context<Self>) -> Option<GoroutineReading> {
+        let workspace = self.workspace.upgrade()?;
+        let project = workspace.read(cx).project().clone();
+        let dap_store = project.read(cx).dap_store();
+        let mut delve_session = None;
+        for session in dap_store.read(cx).sessions() {
+            let is_delve = {
+                let session = session.read(cx);
+                !session.is_terminated() && session.adapter().as_ref() == "Delve"
+            };
+            if is_delve {
+                delve_session = Some(session.clone());
+                break;
+            }
+        }
+        let session = delve_session?;
+        let total = session.update(cx, |session, cx| session.threads(cx).len());
+        Some(GoroutineReading::Read(Goroutines {
+            total,
+            by_state: Vec::new(),
+            source: GoroutineSource::Debugger,
+        }))
+    }
+
+    /// The pprof address the run configuration named `label` gives, if the
+    /// project has a saved task by that name and it names one.
+    fn configured_pprof_address(&self, label: &str, cx: &mut Context<Self>) -> Option<String> {
+        let workspace = self.workspace.upgrade()?;
+        let project = workspace.read(cx).project().clone();
+        let store = configurations_store::store_for(&project, cx);
+        store
+            .read(cx)
+            .of_kind(Kind::Task)
+            .configurations
+            .iter()
+            .find(|configuration| configuration.label == label)
+            .and_then(|configuration| configurations_file::pprof_of(&configuration.as_written))
+    }
+
+    /// Whether a saved debug configuration named `label` debugs with Delve --
+    /// the cheap half of "this looks like a Go program" for a run that is not
+    /// under the debugger right now.
+    fn configured_adapter_is_delve(&self, label: &str, cx: &mut Context<Self>) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let project = workspace.read(cx).project().clone();
+        let store = configurations_store::store_for(&project, cx);
+        store
+            .read(cx)
+            .of_kind(Kind::Debug)
+            .configurations
+            .iter()
+            .any(|configuration| {
+                configuration.label == label
+                    && configuration
+                        .scenario
+                        .as_ref()
+                        .is_some_and(|scenario| scenario.adapter.as_ref() == "Delve")
+            })
     }
 }
 
@@ -248,15 +422,6 @@ pub(crate) fn said(label: &'static str, value: String) -> gpui::Div {
                 .color(Color::Muted),
         )
         .child(Label::new(value).size(LabelSize::XSmall))
-}
-
-/// What a number nobody could measure says instead of a zero, which would read
-/// as "it is using none of this".
-pub(crate) fn what_it_says(value: Result<u64, &'static str>) -> String {
-    match value {
-        Ok(bytes) => process_metrics::as_memory(bytes),
-        Err(why) => format!("-- {why}"),
-    }
 }
 
 /// Where each reading falls inside `bounds`, for a series whose top edge stands
@@ -283,22 +448,6 @@ fn plotted(readings: &[(usize, f32)], ceiling: f32, bounds: Bounds<Pixels>) -> V
             )
         })
         .collect()
-}
-
-/// Every process of a reading, largest first, ties broken by pid so the order
-/// does not shuffle between two readings that hold the same amount.
-///
-/// All of them and not a first few: the window they are drawn in is given a
-/// height by the reader, and what that height is for is seeing the whole run.
-pub(crate) fn by_memory(tree: &[ProcessReading]) -> Vec<ProcessReading> {
-    let mut sorted = tree.to_vec();
-    sorted.sort_by(|left, right| {
-        right
-            .memory
-            .cmp(&left.memory)
-            .then_with(|| left.pid.cmp(&right.pid))
-    });
-    sorted
 }
 
 /// One chart: what it is, what it reads right now, and the two minutes behind
@@ -416,50 +565,6 @@ pub(crate) fn a_chart(
         )
 }
 
-/// One process of the run: what it is, how much of the largest one's memory it
-/// holds, and that amount written out. The bar's place on the ramp says the
-/// same thing the number does, so nothing here is carried by colour alone.
-pub(crate) fn a_bar(name: String, memory: u64, largest: u64) -> gpui::Div {
-    let fraction = match largest > 0 {
-        true => (memory as f32 / largest as f32).clamp(0., 1.),
-        false => 0.,
-    };
-    h_flex()
-        .debug_selector({
-            let name = name.clone();
-            move || format!("MEMORY-BAR-{name}")
-        })
-        .gap(cyberpunk::SPACE_4)
-        .child(
-            div()
-                .w(PROCESS_NAME_WIDTH)
-                .flex_none()
-                .overflow_hidden()
-                .child(Label::new(name).size(LabelSize::XSmall).truncate()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .h(BAR_HEIGHT)
-                .rounded(px(2.))
-                .bg(cyberpunk::surface())
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(fraction))
-                        .rounded(px(2.))
-                        .bg(cyberpunk::ramp(fraction)),
-                ),
-        )
-        .child(
-            h_flex()
-                .w(PROCESS_VALUE_WIDTH)
-                .flex_none()
-                .justify_end()
-                .child(Label::new(process_metrics::as_memory(memory)).size(LabelSize::XSmall)),
-        )
-}
-
 impl Render for RunMetricsStatusItem {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(metrics) = self.metrics.clone() else {
@@ -519,7 +624,7 @@ impl StatusItemView for RunMetricsStatusItem {
 mod tests {
     use super::*;
 
-    use gpui::{Entity, KeyBinding, Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use gpui::{Entity, KeyBinding, Modifiers, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
@@ -607,19 +712,7 @@ mod tests {
             threads: 2,
             state: 'S',
             started: 5_000,
-        }
-    }
-
-    fn a_process(pid: u32, memory: u64) -> ProcessReading {
-        ProcessReading {
-            pid,
-            parent: 1,
-            name: "a program".into(),
-            memory,
-            cpu: None,
-            threads: 1,
-            state: 'S',
-            uptime: None,
+            thread_samples: Vec::new(),
         }
     }
 
@@ -904,60 +997,6 @@ mod tests {
         );
     }
 
-    /// The list is ordered by what each process holds and leaves nothing out:
-    /// a run's twelfth-largest process is a row like any other.
-    #[gpui::test]
-    fn every_process_is_listed_largest_first(_cx: &mut TestAppContext) {
-        let megabyte = 1024 * 1024;
-        let tree: Vec<ProcessReading> = (1..=12)
-            .map(|which| a_process(which, which as u64 * megabyte))
-            .collect();
-
-        let rows = by_memory(&tree);
-
-        assert_eq!(
-            rows.iter().map(|one| one.pid).collect::<Vec<_>>(),
-            vec![12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
-            "largest first, and all twelve of them"
-        );
-    }
-
-    /// Two processes holding the same amount keep the same order between two
-    /// readings, or the list jitters once a second for no reason a reader can see.
-    #[gpui::test]
-    fn processes_holding_the_same_amount_keep_their_order(_cx: &mut TestAppContext) {
-        let tree: Vec<ProcessReading> = [4243, 4241, 4242]
-            .into_iter()
-            .map(|pid| a_process(pid, 1024))
-            .collect();
-
-        let rows = by_memory(&tree);
-
-        assert_eq!(
-            rows.iter().map(|one| one.pid).collect::<Vec<_>>(),
-            vec![4241, 4242, 4243],
-            "the pid decides when what they hold does not"
-        );
-    }
-
-    /// A number nobody could measure says why, because a zero there would read
-    /// as "the run is using none of this".
-    #[gpui::test]
-    fn what_the_machine_will_not_say_gives_a_reason_rather_than_a_zero(_cx: &mut TestAppContext) {
-        let said = what_it_says(Err("needs rights this editor does not ask for"));
-
-        assert_eq!(said, "-- needs rights this editor does not ask for");
-        assert!(
-            !said.contains('0'),
-            "a reason, not a zero, and not a zero with a reason after it"
-        );
-        assert_eq!(
-            what_it_says(Ok(84 * 1024 * 1024)),
-            "84 MB",
-            "and a number the machine does give is just the number"
-        );
-    }
-
     /// The reading of a run whose network and video memory the machine will not
     /// report still opens, and still says what it does know.
     #[gpui::test]
@@ -1004,77 +1043,10 @@ mod tests {
         );
     }
 
-    /// A window pulled taller has to spend the height on the reading. The
-    /// charts take whatever the rows and the facts below them do not, so a
-    /// reader who makes room for a build's shape gets a bigger shape and not a
-    /// bigger blank.
+    /// Every process of a wide run has a row of its own, and a window this tall
+    /// shows the ninth-largest without the reader scrolling for it.
     #[gpui::test]
-    async fn a_window_pulled_taller_draws_a_taller_chart(cx: &mut TestAppContext) {
-        let (item, mut cx) = an_item_of_its_own(cx).await;
-        cx.simulate_resize(size(px(1200.), px(900.)));
-        a_run_on_screen(&item, &mut cx, 4242);
-        press_the_plaque(&mut cx);
-
-        let before = cx
-            .debug_bounds("RUN-METRICS-CHART-CPU")
-            .expect("the window opens on the overview");
-        let window_before = cx
-            .debug_bounds("RUN-METRICS-MODAL")
-            .expect("the window is open")
-            .size
-            .height;
-
-        let grip = cx
-            .debug_bounds("DIALOG-GRIP-Bottom")
-            .expect("a window the reader resizes has an edge to pull");
-        let from = grip.center();
-        let to = point(from.x, from.y + PULLED_BY);
-        cx.simulate_mouse_move(from, None, Modifiers::none());
-        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
-        settle(&mut cx);
-
-        let window = cx
-            .debug_bounds("RUN-METRICS-MODAL")
-            .expect("the window is still open after the pull");
-        let grew_by = window.size.height - window_before;
-        assert!(
-            grew_by > PULLED_BY / 2.,
-            "the pull reached the window at all: it was {window_before:?} tall and is {:?}",
-            window.size.height
-        );
-
-        let after = cx
-            .debug_bounds("RUN-METRICS-CHART-CPU")
-            .expect("the chart is still drawn");
-        assert!(
-            after.size.height > before.size.height * 2.,
-            "the chart took the height it can use: it was {:?} and is {:?}, \
-             while the window grew by {grew_by:?}",
-            before.size.height,
-            after.size.height
-        );
-
-        assert!(
-            after.size.height <= CHART_MOST_DRAWN,
-            "and it stops where a plot stops reading better for being taller: {:?}",
-            after.size.height
-        );
-    }
-
-    /// How far the pull in the test above drags the window's bottom edge.
-    const PULLED_BY: Pixels = px(320.);
-
-    /// The tallest a chart is drawn, with the heading above it counted in. The
-    /// cap itself lives in the window; this is what it looks like from outside.
-    const CHART_MOST_DRAWN: Pixels = px(260.);
-
-    /// The charts stop growing, so a window pulled taller than they can use has
-    /// to spend the rest on the processes -- every one of them, not the first
-    /// few with the remainder summed into a row nobody can act on.
-    #[gpui::test]
-    async fn a_pulled_window_lists_every_process(cx: &mut TestAppContext) {
+    async fn a_tall_window_lists_every_process(cx: &mut TestAppContext) {
         let (item, mut cx) = an_item_of_its_own(cx).await;
         cx.simulate_resize(size(px(1200.), px(900.)));
         a_wide_run_on_screen(&item, &mut cx);
@@ -1083,67 +1055,46 @@ mod tests {
         let window = cx
             .debug_bounds("RUN-METRICS-MODAL")
             .expect("the reading is open");
-        // Spelled out rather than built from the pids, because a selector is
-        // matched by a `&'static str`. 4266 holds the most and 4243 the least
-        // of the twenty-four; every one of them is a row now, where the list
-        // used to stop at eight and sum the remainder into one.
         for row in [
-            "MEMORY-BAR-4266 · a compiler",
-            "MEMORY-BAR-4258 · a compiler",
-            "MEMORY-BAR-4243 · a compiler",
+            "RUN-METRICS-PROCESS-4266",
+            "RUN-METRICS-PROCESS-4258",
+            "RUN-METRICS-PROCESS-4243",
         ] {
             assert!(
                 cx.debug_bounds(row).is_some(),
-                "every process of the run has a bar: {row} has none"
+                "every process of the run has a row: {row} has none"
             );
         }
-
-        // Having a row is not being on screen: the ninth-largest is the first
-        // one the old list summed away, so a window this tall has to draw it
-        // without the reader scrolling for it.
         let ninth = cx
-            .debug_bounds("MEMORY-BAR-4258 · a compiler")
-            .expect("the ninth-largest process has a bar");
+            .debug_bounds("RUN-METRICS-PROCESS-4250")
+            .expect("the ninth process has a row");
         assert!(
             ninth.origin.y >= window.origin.y && ninth.bottom() <= window.bottom(),
             "the ninth row is drawn inside the window it was given: {ninth:?} in {window:?}"
         );
     }
 
-    /// The window opens on the overview, and the second tab is where the run's
-    /// processes are drawn as the tree they are. A real press on each, because
-    /// a tab that looks chosen and shows the other half is the failure here.
+    /// The tree is drawn on the same page as the charts: no tab to press first.
     #[gpui::test]
-    async fn the_processes_tab_draws_the_run_as_a_tree(cx: &mut TestAppContext) {
+    async fn the_run_is_drawn_as_a_tree_beside_the_charts(cx: &mut TestAppContext) {
         let (item, mut cx) = an_item_of_its_own(cx).await;
         a_tree_on_screen(&item, &mut cx);
         press_the_plaque(&mut cx);
 
         assert!(
             cx.debug_bounds("RUN-METRICS-CHART-CPU").is_some(),
-            "the window opens on the overview"
+            "the charts are drawn"
         );
-        assert!(
-            cx.debug_bounds("FORK-ROW-4243").is_none(),
-            "and the tree is not drawn until it is asked for"
-        );
-
-        let tab = cx
-            .debug_bounds("BUTTON-Processes")
-            .expect("the second tab is there to press");
-        cx.simulate_click(tab.center(), Modifiers::none());
-        settle(&mut cx);
-
-        for row in ["FORK-ROW-4242", "FORK-ROW-4243", "FORK-ROW-4244"] {
+        for row in [
+            "RUN-METRICS-PROCESS-4242",
+            "RUN-METRICS-PROCESS-4243",
+            "RUN-METRICS-PROCESS-4244",
+        ] {
             assert!(
                 cx.debug_bounds(row).is_some(),
-                "every process of the run has a row of its own: {row} has none"
+                "and every process of the run has a row beside them: {row} has none"
             );
         }
-        assert!(
-            cx.debug_bounds("RUN-METRICS-CHART-CPU").is_none(),
-            "and the overview gives the window over to it"
-        );
     }
 
     /// Depth is what the tree says, and it says it by where a row starts. A
@@ -1153,11 +1104,6 @@ mod tests {
         let (item, mut cx) = an_item_of_its_own(cx).await;
         a_tree_on_screen(&item, &mut cx);
         press_the_plaque(&mut cx);
-        let tab = cx
-            .debug_bounds("BUTTON-Processes")
-            .expect("the second tab is there to press");
-        cx.simulate_click(tab.center(), Modifiers::none());
-        settle(&mut cx);
 
         let at = |name: &'static str, cx: &mut VisualTestContext| {
             cx.debug_bounds(name)
@@ -1165,9 +1111,9 @@ mod tests {
                 .origin
                 .x
         };
-        let root = at("FORK-NAME-4242", &mut cx);
-        let child = at("FORK-NAME-4243", &mut cx);
-        let grandchild = at("FORK-NAME-4244", &mut cx);
+        let root = at("RUN-METRICS-PROCESS-NAME-4242", &mut cx);
+        let child = at("RUN-METRICS-PROCESS-NAME-4243", &mut cx);
+        let grandchild = at("RUN-METRICS-PROCESS-NAME-4244", &mut cx);
 
         assert!(
             child > root,
@@ -1204,7 +1150,7 @@ mod tests {
             "and the memory chart is the one on the right"
         );
 
-        cx.simulate_resize(size(px(640.), px(900.)));
+        cx.simulate_resize(size(px(480.), px(900.)));
         settle(&mut cx);
 
         let processor = cx
@@ -1217,6 +1163,14 @@ mod tests {
             memory.origin.y >= processor.bottom(),
             "in a narrow window the memory chart drops below the processor one \
              rather than standing beside it: {memory:?} against {processor:?}"
+        );
+        let first_process = cx
+            .debug_bounds("RUN-METRICS-PROCESS-4242")
+            .expect("the run's own process is listed");
+        assert!(
+            first_process.origin.y >= memory.bottom(),
+            "the dropped chart pushes the process list down rather than covering it: \
+             {first_process:?} against {memory:?}"
         );
     }
 }

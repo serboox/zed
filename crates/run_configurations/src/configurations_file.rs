@@ -215,6 +215,42 @@ pub fn machine_of(written: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The key a task's `net/http/pprof` address is written under.
+///
+/// Kept beside the entry the same way [`MACHINE_KEY`] is: [`TaskTemplate`]
+/// already has more than a hundred call sites across the editor, and adding a
+/// field there for something only this fork's status bar reads would touch
+/// every one of them for no benefit to anybody upstream.
+pub const PPROF_KEY: &str = "pprof";
+
+/// Adds the fork's pprof address to a written entry. `None` removes the key,
+/// so a task that never named one round-trips exactly as it was written
+/// before pprof existed.
+pub fn with_pprof(mut written: Value, pprof: Option<&str>) -> Value {
+    let Value::Object(fields) = &mut written else {
+        return written;
+    };
+    match pprof.map(str::trim).filter(|named| !named.is_empty()) {
+        Some(named) => {
+            fields.insert(PPROF_KEY.to_string(), Value::String(named.to_string()));
+        }
+        None => {
+            fields.remove(PPROF_KEY);
+        }
+    }
+    written
+}
+
+/// The pprof address an entry names, if it names one.
+pub fn pprof_of(written: &Value) -> Option<String> {
+    written
+        .get(PPROF_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|named| !named.is_empty())
+        .map(str::to_string)
+}
+
 /// A debug configuration as it should be written. Its own type already leaves out
 /// what it did not set, and the adapter's own keys are flattened into it, so it is
 /// written as it is.
@@ -499,6 +535,57 @@ mod tests {
             place_of(&gone, 1, &tests),
             None,
             "it is not in the file at all, so nothing may be written by its old place"
+        );
+    }
+
+    #[test]
+    fn a_pprof_address_round_trips_through_a_saved_task() {
+        let task = TaskTemplate {
+            label: "api server".to_string(),
+            command: "go run ./cmd/api".to_string(),
+            ..TaskTemplate::default()
+        };
+        let written = with_pprof(
+            task_as_written(&task).expect("the task can be written"),
+            Some("localhost:6060"),
+        );
+
+        assert_eq!(
+            pprof_of(&written).as_deref(),
+            Some("localhost:6060"),
+            "the address just written has to read back the same"
+        );
+
+        let file = text_with(Kind::Task.empty_file(), None, &written);
+        let read_back = read(Kind::Task, &file);
+        assert_eq!(
+            pprof_of(&read_back.configurations[0].as_written).as_deref(),
+            Some("localhost:6060"),
+            "and it survives being written to and read back from a file"
+        );
+    }
+
+    #[test]
+    fn clearing_the_pprof_address_removes_the_key_rather_than_writing_it_empty() {
+        let task = TaskTemplate {
+            label: "api server".to_string(),
+            command: "go run ./cmd/api".to_string(),
+            ..TaskTemplate::default()
+        };
+        let with_it = with_pprof(
+            task_as_written(&task).expect("the task can be written"),
+            Some("localhost:6060"),
+        );
+        let cleared = with_pprof(with_it, None);
+
+        assert!(
+            pprof_of(&cleared).is_none(),
+            "no address named, so nothing is written for one -- not even an \
+             empty string: {cleared}"
+        );
+        assert!(
+            cleared.get(PPROF_KEY).is_none(),
+            "the key itself is gone, not just blank: {cleared}"
         );
     }
 

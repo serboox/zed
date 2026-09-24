@@ -52,6 +52,21 @@ pub struct ProcessReading {
     /// How long it has been alive, when the machine says how long it has itself
     /// been up.
     pub uptime: Option<Duration>,
+    /// The threads the machine runs this process on, busiest first.
+    pub thread_readings: Vec<ThreadReading>,
+}
+
+/// One thread of a process, as the machine schedules it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThreadReading {
+    pub tid: u32,
+    /// What the thread calls itself, as `/proc/<pid>/task/<tid>/comm` spells it.
+    pub name: Arc<str>,
+    /// Percentage of one core this thread is using. None until two readings
+    /// have been taken of it.
+    pub cpu: Option<f32>,
+    /// What the machine says it is doing: `R`, `S`, `D`, `Z`, `T`, `I`.
+    pub state: char,
 }
 
 /// What the machine says about one process, before any of it is turned into a
@@ -74,6 +89,25 @@ pub struct Sample {
     /// a fresh process may well have more processor time behind it than the one
     /// that had the number before.
     pub started: u64,
+    /// Every thread the process was running, read the same moment.
+    pub thread_samples: Vec<ThreadSample>,
+}
+
+/// What the machine says about one thread, before any of it is turned into a
+/// rate. The same idea as `Sample`, for `/proc/<pid>/task/<tid>` instead of
+/// `/proc/<pid>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThreadSample {
+    pub tid: u32,
+    /// What the thread calls itself: `/proc/<pid>/task/<tid>/comm` when it has
+    /// something to say, the name from `stat` otherwise.
+    pub name: Arc<str>,
+    pub ticks: u64,
+    pub state: char,
+    /// When the machine started it, in ticks since it itself booted -- a
+    /// reused tid is told apart from the thread that had it before the same
+    /// way a reused pid is.
+    pub started: u64,
 }
 
 /// The ticks a second holds, as the machine itself says. Guessing it skews every
@@ -90,16 +124,27 @@ fn ticks_a_second() -> f32 {
     100.
 }
 
-/// Reads `/proc/<pid>/stat` and `/proc/<pid>/statm` into a sample.
-///
-/// The name of a process may hold spaces and brackets -- `(a b) c` is a real
-/// name -- so the fields after it are found from the *last* `)`, never by
-/// splitting the whole line.
-pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
+/// The fields `sample_of` and `thread_sample_of` both read out of a `stat`
+/// line: `/proc/<pid>/stat` and `/proc/<pid>/task/<tid>/stat` are the same
+/// layout, just for a different id.
+struct StatFields {
+    id: u32,
+    name: Arc<str>,
+    state: char,
+    parent: u32,
+    ticks: u64,
+    threads: u64,
+    started: u64,
+}
+
+/// The name may hold spaces and brackets -- `(a b) c` is a real name -- so the
+/// fields after it are found from the *last* `)`, never by splitting the
+/// whole line.
+fn stat_fields(stat: &str) -> Option<StatFields> {
     let opens = stat.find('(')?;
     let closes = stat.rfind(')')?;
     let name: Arc<str> = stat.get(opens + 1..closes)?.into();
-    let pid: u32 = stat[..stat.find(' ')?].trim().parse().ok()?;
+    let id: u32 = stat[..stat.find(' ')?].trim().parse().ok()?;
     let after_name: Vec<&str> = stat[closes + 1..].split_whitespace().collect();
     // After the name come: state, ppid, pgrp, ... utime is the 12th, stime the
     // 13th, counting the state as the first.
@@ -109,16 +154,50 @@ pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
     let stime: u64 = after_name.get(12)?.parse().ok()?;
     let threads: u64 = after_name.get(17)?.parse().ok()?;
     let started: u64 = after_name.get(19)?.parse().ok()?;
+    Some(StatFields {
+        id,
+        name,
+        state,
+        parent,
+        ticks: utime.saturating_add(stime),
+        threads,
+        started,
+    })
+}
+
+/// Reads `/proc/<pid>/stat` and `/proc/<pid>/statm` into a sample.
+pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
+    let fields = stat_fields(stat)?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
     Some(Sample {
-        pid,
-        parent,
-        name,
-        ticks: utime.saturating_add(stime),
+        pid: fields.id,
+        parent: fields.parent,
+        name: fields.name,
+        ticks: fields.ticks,
         memory: pages.saturating_mul(page_size()),
-        threads,
-        state,
-        started,
+        threads: fields.threads,
+        state: fields.state,
+        started: fields.started,
+        thread_samples: Vec::new(),
+    })
+}
+
+/// Reads `/proc/<pid>/task/<tid>/stat` into a thread sample. `comm` is
+/// `/proc/<pid>/task/<tid>/comm`, which usually names a thread better than the
+/// name in `stat`; when it has nothing to say the name from `stat` is kept.
+pub fn thread_sample_of(stat: &str, comm: &str) -> Option<ThreadSample> {
+    let fields = stat_fields(stat)?;
+    let trimmed = comm.trim();
+    let name: Arc<str> = match trimmed.is_empty() {
+        true => fields.name,
+        false => trimmed.into(),
+    };
+    Some(ThreadSample {
+        tid: fields.id,
+        name,
+        state: fields.state,
+        started: fields.started,
+        ticks: fields.ticks,
     })
 }
 
@@ -180,6 +259,16 @@ struct Who {
     started: u64,
 }
 
+/// Which thread a reading is of, the same idea as `Who` for a thread: a tid is
+/// told apart from whatever had it before by the process it belongs to and the
+/// moment it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ThreadWho {
+    pid: u32,
+    tid: u32,
+    started: u64,
+}
+
 /// What was read last time, so a rate can be worked out from the difference.
 #[derive(Clone, Debug, PartialEq)]
 struct Baseline {
@@ -190,6 +279,27 @@ struct Baseline {
     /// a child ends and rises when a new one starts -- neither of which is work
     /// the machine did in that second.
     ticks: HashMap<Who, u64>,
+    /// Each thread of the tree and the time it had then, the same way `ticks`
+    /// holds it for processes. Rebuilt fresh from what is currently running on
+    /// every reading, so a thread that has ended is not still around to measure
+    /// whatever takes its tid next.
+    thread_ticks: HashMap<ThreadWho, u64>,
+}
+
+/// Sorts thread readings busiest first. A thread with no rate yet -- the
+/// first reading of it -- sorts last rather than first or wherever an
+/// unordered `None` would happen to land; ties are broken by tid so the order
+/// does not jitter from one reading to the next.
+fn sort_threads(threads: &mut [ThreadReading]) {
+    threads.sort_by(|a, b| match (a.cpu, b.cpu) {
+        (Some(left), Some(right)) => right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.tid.cmp(&b.tid)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.tid.cmp(&b.tid),
+    });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -257,17 +367,45 @@ impl Watcher {
             // would read as "it started just now", every second.
             up.checked_sub(started)
         };
+        let mut thread_ticks: HashMap<ThreadWho, u64> = HashMap::new();
         let holdings: Vec<ProcessReading> = tree
             .iter()
-            .map(|sample| ProcessReading {
-                pid: sample.pid,
-                parent: sample.parent,
-                name: sample.name.clone(),
-                memory: sample.memory,
-                cpu: rate_of(&who_of(sample), sample.ticks),
-                threads: sample.threads,
-                state: sample.state,
-                uptime: alive_since(sample),
+            .map(|sample| {
+                let mut thread_readings: Vec<ThreadReading> = sample
+                    .thread_samples
+                    .iter()
+                    .map(|thread| {
+                        let who = ThreadWho {
+                            pid: sample.pid,
+                            tid: thread.tid,
+                            started: thread.started,
+                        };
+                        thread_ticks.insert(who, thread.ticks);
+                        let cpu = since.map(|(last, seconds)| {
+                            let before = last.thread_ticks.get(&who).copied().unwrap_or(0);
+                            thread.ticks.saturating_sub(before) as f32 / ticks_a_second() / seconds
+                                * 100.
+                        });
+                        ThreadReading {
+                            tid: thread.tid,
+                            name: thread.name.clone(),
+                            cpu,
+                            state: thread.state,
+                        }
+                    })
+                    .collect();
+                sort_threads(&mut thread_readings);
+                ProcessReading {
+                    pid: sample.pid,
+                    parent: sample.parent,
+                    name: sample.name.clone(),
+                    memory: sample.memory,
+                    cpu: rate_of(&who_of(sample), sample.ticks),
+                    threads: sample.threads,
+                    state: sample.state,
+                    uptime: alive_since(sample),
+                    thread_readings,
+                }
             })
             .collect();
         // What the whole tree did since the last reading. A process that has
@@ -286,6 +424,7 @@ impl Watcher {
             when: now,
             root: root_now,
             ticks,
+            thread_ticks,
         });
         Some(Metrics {
             pid: root,
@@ -353,8 +492,9 @@ pub fn everything_running() -> Option<Vec<Sample>> {
         let stat = fs::read_to_string(entry.path().join("stat"));
         let statm = fs::read_to_string(entry.path().join("statm"));
         if let (Ok(stat), Ok(statm)) = (stat, statm)
-            && let Some(sample) = sample_of(&stat, &statm)
+            && let Some(mut sample) = sample_of(&stat, &statm)
         {
+            sample.thread_samples = threads_of(sample.pid);
             samples.push(sample);
         }
     }
@@ -362,6 +502,35 @@ pub fn everything_running() -> Option<Vec<Sample>> {
         true => None,
         false => Some(samples),
     }
+}
+
+/// Every thread of `pid`, read from `/proc/<pid>/task`.
+///
+/// A thread that vanishes between listing the directory and reading its files
+/// is skipped, the same way a process is in `everything_running` -- threads
+/// come and go constantly, and that is not an error worth reporting.
+fn threads_of(pid: u32) -> Vec<ThreadSample> {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut threads = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        let stat = fs::read_to_string(entry.path().join("stat"));
+        let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        if let Ok(stat) = stat
+            && let Some(thread) = thread_sample_of(&stat, &comm)
+        {
+            threads.push(thread);
+        }
+    }
+    threads
 }
 
 /// `bytes` as a reader reads it.
@@ -414,6 +583,17 @@ mod tests {
             memory,
             threads: 1,
             state: 'S',
+            started,
+            thread_samples: Vec::new(),
+        }
+    }
+
+    fn a_thread(tid: u32, ticks: u64, started: u64) -> ThreadSample {
+        ThreadSample {
+            tid,
+            name: "a thread".into(),
+            ticks,
+            state: 'R',
             started,
         }
     }
@@ -783,5 +963,252 @@ mod tests {
             .expect("the run was found");
 
         assert_eq!(read.threads, 10);
+    }
+
+    /// A thread name with spaces and brackets parses the same way a process
+    /// name does; `comm`, when it has something to say, wins over it.
+    #[test]
+    fn a_thread_name_with_spaces_parses() {
+        let stat = "77 (worker one (2)) R 10 10 10 0 -1 0 100 0 0 0 5 3 0 0 20 0 3 0 999 0 0";
+        let thread = thread_sample_of(stat, "").expect("the line reads");
+        assert_eq!(thread.tid, 77);
+        assert_eq!(
+            &*thread.name, "worker one (2)",
+            "the name from stat when comm has nothing"
+        );
+        assert_eq!(thread.state, 'R');
+        assert_eq!(thread.ticks, 8, "user and system time together");
+        assert_eq!(thread.started, 999);
+
+        let named = thread_sample_of(stat, "short name\n").expect("the line reads");
+        assert_eq!(
+            &*named.name, "short name",
+            "comm wins, and its newline is trimmed"
+        );
+    }
+
+    /// A rate for a thread needs two readings of it, the same as a process.
+    #[test]
+    fn a_thread_rate_is_computed_from_two_readings() {
+        let mut watcher = Watcher::default();
+        let at = Instant::now();
+        let mut root = a_sample(10, 1, 0, 1_000);
+        root.thread_samples = vec![a_thread(11, 100, 5)];
+        watcher.metrics_of(10, &[a_sample(1, 0, 0, 0), root.clone()], at, None);
+
+        let ticks = ticks_a_second() as u64;
+        let mut busier = root;
+        busier.thread_samples = vec![a_thread(11, 100 + ticks / 2, 5)];
+        let read = watcher
+            .metrics_of(
+                10,
+                &[a_sample(1, 0, 0, 0), busier],
+                at + Duration::from_secs(1),
+                None,
+            )
+            .expect("the run is still going");
+
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        let thread = process.thread_readings.first().expect("the thread");
+        let cpu = thread.cpu.expect("the thread was measured");
+        assert!((cpu - 50.).abs() < 1., "half a second of a core: {cpu}");
+    }
+
+    /// The first reading of a thread has nothing to measure a rate against.
+    #[test]
+    fn the_first_reading_gives_no_thread_a_rate() {
+        let mut watcher = Watcher::default();
+        let mut root = a_sample(10, 1, 0, 1_000);
+        root.thread_samples = vec![a_thread(11, 100, 5)];
+        let read = watcher
+            .metrics_of(10, &[a_sample(1, 0, 0, 0), root], Instant::now(), None)
+            .expect("the run was found");
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        assert!(
+            process
+                .thread_readings
+                .iter()
+                .all(|thread| thread.cpu.is_none())
+        );
+    }
+
+    /// Tids come back too. A different thread under the same number must not be
+    /// measured against the processor time of the one that had it before.
+    #[test]
+    fn a_reused_tid_is_not_measured_against_the_old_thread() {
+        let mut watcher = Watcher::default();
+        let at = Instant::now();
+        let mut busy = a_sample(10, 1, 0, 1_000);
+        busy.thread_samples = vec![a_thread(11, 10_000, 5)];
+        watcher.metrics_of(10, &[a_sample(1, 0, 0, 0), busy], at, None);
+
+        // A different thread altogether takes the same tid, started later, with
+        // far less time behind it.
+        let ticks = ticks_a_second() as u64;
+        let mut fresh = a_sample(10, 1, 0, 1_000);
+        fresh.thread_samples = vec![a_thread(11, ticks, 900)];
+        let read = watcher
+            .metrics_of(
+                10,
+                &[a_sample(1, 0, 0, 0), fresh],
+                at + Duration::from_secs(1),
+                None,
+            )
+            .expect("the run is still going");
+
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        let thread = process.thread_readings.first().expect("the thread");
+        let cpu = thread
+            .cpu
+            .expect("a new thread is measured from when it appeared");
+        assert!(
+            (cpu - 100.).abs() < 1.,
+            "a whole core's worth of its own ticks, not measured against the old thread's 10,000: {cpu}"
+        );
+    }
+
+    /// A thread that is gone for a reading is not still around to lend its old
+    /// ticks to whatever takes its tid next.
+    #[test]
+    fn a_gone_threads_baseline_is_forgotten() {
+        let mut watcher = Watcher::default();
+        let at = Instant::now();
+        let mut root = a_sample(10, 1, 0, 1_000);
+        root.thread_samples = vec![a_thread(11, 1_000, 5)];
+        watcher.metrics_of(10, &[a_sample(1, 0, 0, 0), root], at, None);
+
+        // The thread is gone for one reading.
+        let empty_root = a_sample(10, 1, 0, 1_000);
+        watcher.metrics_of(
+            10,
+            &[a_sample(1, 0, 0, 0), empty_root],
+            at + Duration::from_secs(1),
+            None,
+        );
+
+        // The same tid and start come back. If its old baseline had lingered,
+        // this would be measured against the 1,000 ticks from the first
+        // reading rather than as a thread appearing fresh.
+        let ticks = ticks_a_second() as u64;
+        let mut back = a_sample(10, 1, 0, 1_000);
+        back.thread_samples = vec![a_thread(11, ticks, 5)];
+        let read = watcher
+            .metrics_of(
+                10,
+                &[a_sample(1, 0, 0, 0), back],
+                at + Duration::from_secs(2),
+                None,
+            )
+            .expect("the run is still going");
+
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        let thread = process.thread_readings.first().expect("the thread");
+        let cpu = thread
+            .cpu
+            .expect("a thread reappearing is measured from zero, not skipped");
+        assert!(
+            (cpu - 100.).abs() < 1.,
+            "measured against zero, not against the 1,000 ticks the old baseline had: {cpu}"
+        );
+    }
+
+    /// A build is busy on one thread and idle on another; the busiest one is
+    /// what a reader wants to see first.
+    #[test]
+    fn thread_readings_are_ordered_busiest_first() {
+        let mut watcher = Watcher::default();
+        let at = Instant::now();
+        let mut root = a_sample(10, 1, 0, 1_000);
+        root.thread_samples = vec![a_thread(20, 0, 5), a_thread(21, 0, 5), a_thread(22, 0, 5)];
+        watcher.metrics_of(10, &[a_sample(1, 0, 0, 0), root], at, None);
+
+        let ticks = ticks_a_second() as u64;
+        let mut busier = a_sample(10, 1, 0, 1_000);
+        busier.thread_samples = vec![
+            a_thread(20, ticks / 4, 5),
+            a_thread(21, ticks / 2, 5),
+            a_thread(22, 0, 5),
+        ];
+        let read = watcher
+            .metrics_of(
+                10,
+                &[a_sample(1, 0, 0, 0), busier],
+                at + Duration::from_secs(1),
+                None,
+            )
+            .expect("the run is still going");
+
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        let order: Vec<u32> = process
+            .thread_readings
+            .iter()
+            .map(|thread| thread.tid)
+            .collect();
+        assert_eq!(
+            order,
+            vec![21, 20, 22],
+            "busiest first, an idle thread last"
+        );
+    }
+
+    /// With no rate yet for any thread, tid is the only thing left to order by.
+    #[test]
+    fn threads_with_no_rate_yet_sort_last_by_tid() {
+        let mut watcher = Watcher::default();
+        let mut root = a_sample(10, 1, 0, 1_000);
+        root.thread_samples = vec![a_thread(30, 0, 5), a_thread(10, 0, 5), a_thread(20, 0, 5)];
+        let read = watcher
+            .metrics_of(10, &[a_sample(1, 0, 0, 0), root], Instant::now(), None)
+            .expect("the run was found");
+        let process = read
+            .tree
+            .iter()
+            .find(|one| one.pid == 10)
+            .expect("the root");
+        let order: Vec<u32> = process
+            .thread_readings
+            .iter()
+            .map(|thread| thread.tid)
+            .collect();
+        assert_eq!(
+            order,
+            vec![10, 20, 30],
+            "no rate yet anywhere, so tid breaks every tie"
+        );
+    }
+
+    /// The reading is done against a real machine here, not a fixture: this
+    /// editor's own process has threads of its own to find.
+    #[test]
+    fn this_very_process_can_have_its_threads_read() {
+        // A machine with no /proc has nothing to say, which is its own answer.
+        if everything_running().is_none() {
+            return;
+        }
+        let threads = threads_of(std::process::id());
+        assert!(
+            !threads.is_empty(),
+            "a running process has at least one thread"
+        );
     }
 }

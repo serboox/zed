@@ -5,13 +5,14 @@ use gpui::{
     App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, prelude::*,
 };
-use ui::{Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*};
+use ui::{
+    Disclosure, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*,
+};
 use workspace::{ModalView, Workspace};
 
-use crate::process_metrics::{self, ProcessReading};
-use crate::run_metrics_status_item::{
-    RunMetricsStatusItem, a_bar, a_chart, by_memory, said, what_it_says,
-};
+use crate::goroutines::{GoroutineReading, GoroutineSource};
+use crate::process_metrics::{self, Metrics, ProcessReading, ThreadReading};
+use crate::run_metrics_status_item::{RunMetricsStatusItem, a_chart};
 
 /// How far one step of the fork tree moves a row in from its parent. Wide enough
 /// that the step is visible at a glance, narrow enough that a tree eight deep
@@ -24,65 +25,42 @@ const STATE_WIDTH: Pixels = px(96.);
 const THREADS_WIDTH: Pixels = px(64.);
 const CPU_WIDTH: Pixels = px(72.);
 const MEMORY_WIDTH: Pixels = px(84.);
-const SHARE_WIDTH: Pixels = px(96.);
-const UPTIME_WIDTH: Pixels = px(78.);
 
 /// The least width the tree's columns need between them. Below it the table
 /// scrolls sideways rather than squeezing the name column to nothing.
-const TREE_WIDTH: Pixels = px(720.);
+const TREE_WIDTH: Pixels = px(640.);
 
 /// The least width a chart is given before the row holding the charts wraps and
 /// stands them one above the other instead.
-const CHART_LEAST_WIDTH: Pixels = px(300.);
+const CHART_LEAST_WIDTH: Pixels = px(220.);
 
-/// How short the row of charts may be squeezed before the window scrolls to it
-/// instead. A heading and a plot, and nothing spare.
-const CHART_LEAST_HEIGHT: Pixels = px(88.);
-
-/// How tall a chart grows before the height is better spent on the processes
-/// below it. Two minutes of readings drawn much taller than this turns a short
-/// burst into a needle and a steady figure into a wall.
-const CHART_MOST_HEIGHT: Pixels = px(240.);
-
-/// Which half of the window is being read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tab {
-    /// The two minutes behind the numbers, and every fact that has no series.
-    Overview,
-    /// Every process of the run, each under the one that started it.
-    Forks,
-}
-
-impl Tab {
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Overview => "Overview",
-            Tab::Forks => "Processes",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Tab::Overview => "overview",
-            Tab::Forks => "forks",
-        }
-    }
-}
+/// How tall the row of charts stands. Fixed and modest: this reading is watched
+/// beside the work a run is doing, not the reason the window was opened, so it
+/// gets a sparkline and its current value rather than a plot somebody studies.
+const CHART_ROW_HEIGHT: Pixels = px(80.);
 
 /// What the run is using, in full: the two minutes behind the status bar's
-/// numbers, every fact the machine will say, and the run's processes drawn as
-/// the tree they are.
+/// numbers, the run's processes drawn as the tree they are, and every fact the
+/// machine will say that has no series of its own.
 ///
 /// A window rather than the popover this replaces. A popover is as wide as it
 /// was written to be and goes away the moment anything else is pressed, which
 /// is the wrong shape for a reading somebody watches while a build runs: this
-/// one is carried, resized and left open beside the work.
+/// one is carried, resized and left open beside the work. It is a single
+/// scrolled page rather than tabs, because a process one has to switch a tab to
+/// see is a process that reads as hidden.
 pub struct RunMetricsModal {
     item: WeakEntity<RunMetricsStatusItem>,
     focus: FocusHandle,
-    tab: Tab,
-    overview_scroll: ScrollHandle,
-    forks_scroll: ScrollHandle,
+    body_scroll: ScrollHandle,
+    /// Which processes have their thread and goroutine detail shown. A pid
+    /// stays in this set across readings, so a row a reader opened does not
+    /// close itself the moment the numbers under it change.
+    expanded: HashSet<u32>,
+    /// The root process the reading was last opened on, so that root can be
+    /// expanded by default exactly once and a reader who collapses it again is
+    /// not overridden on the next reading a second later.
+    default_expanded_for: Option<u32>,
     _observation: Option<Subscription>,
 }
 
@@ -94,9 +72,9 @@ impl RunMetricsModal {
         Self {
             item,
             focus: cx.focus_handle(),
-            tab: Tab::Overview,
-            overview_scroll: ScrollHandle::new(),
-            forks_scroll: ScrollHandle::new(),
+            body_scroll: ScrollHandle::new(),
+            expanded: HashSet::new(),
+            default_expanded_for: None,
             _observation: observation,
         }
     }
@@ -111,8 +89,11 @@ impl RunMetricsModal {
         workspace.toggle_modal(window, cx, move |_window, cx| Self::new(item, cx));
     }
 
-    fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {
-        self.tab = tab;
+    /// Shows or hides one process's thread and goroutine detail.
+    fn toggle_process(&mut self, pid: u32, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&pid) {
+            self.expanded.insert(pid);
+        }
         cx.notify();
     }
 }
@@ -231,8 +212,19 @@ fn as_cpu(cpu: Option<f32>) -> String {
     }
 }
 
-/// One figure of the row above the body: what it is, small and quiet, with the
-/// number itself after it in the reading's own voice.
+/// What a number nobody could measure says instead of a zero, which would read
+/// as "it is using none of this" -- said as a plain reason rather than the
+/// dashed-out form the status bar uses, since this line names what it is about
+/// itself.
+fn as_fact(value: Result<u64, &'static str>) -> String {
+    match value {
+        Ok(bytes) => process_metrics::as_memory(bytes),
+        Err(reason) => reason.to_string(),
+    }
+}
+
+/// One figure of the summary row: what it is, small and quiet, with the number
+/// itself after it in the reading's own voice.
 fn headline(label: &'static str, value: String) -> gpui::Div {
     h_flex()
         .gap_1()
@@ -245,7 +237,7 @@ fn headline(label: &'static str, value: String) -> gpui::Div {
         .child(Label::new(value).size(LabelSize::Default))
 }
 
-/// One cell of the tree's numeric columns, right-aligned so the digits of one
+/// One cell of the table's numeric columns, right-aligned so the digits of one
 /// row line up under the digits of the next.
 fn figure(width: Pixels, value: String, muted: bool) -> gpui::Div {
     h_flex().w(width).flex_none().justify_end().child(
@@ -259,8 +251,8 @@ fn figure(width: Pixels, value: String, muted: bool) -> gpui::Div {
     )
 }
 
-/// The naming row of the tree, so a column of bare numbers says what it counts.
-fn tree_head() -> gpui::Div {
+/// The naming row of the table, so a column of bare numbers says what it counts.
+fn process_head() -> gpui::Div {
     h_flex()
         .w_full()
         .min_w(TREE_WIDTH)
@@ -274,40 +266,35 @@ fn tree_head() -> gpui::Div {
                     .color(Color::Muted),
             ),
         )
-        .child(figure(STATE_WIDTH, "State".to_string(), true))
-        .child(figure(THREADS_WIDTH, "Threads".to_string(), true))
-        .child(figure(UPTIME_WIDTH, "Alive".to_string(), true))
         .child(figure(CPU_WIDTH, "CPU".to_string(), true))
         .child(figure(MEMORY_WIDTH, "Memory".to_string(), true))
-        .child(
-            h_flex().w(SHARE_WIDTH).flex_none().justify_end().child(
-                Label::new("Share")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ),
-        )
+        .child(figure(THREADS_WIDTH, "Threads".to_string(), true))
+        .child(figure(STATE_WIDTH, "State".to_string(), true))
 }
 
-/// One process of the tree: how far in it sits, what it is, and everything the
-/// machine says about it.
-fn fork_row(depth: usize, one: &ProcessReading, largest: u64) -> gpui::Stateful<gpui::Div> {
-    let share = match largest > 0 {
-        true => (one.memory as f32 / largest as f32).clamp(0., 1.),
-        false => 0.,
-    };
+/// One process of the tree: how far in it sits, what it is, everything the
+/// machine says about it, and a toggle for the thread and goroutine detail
+/// underneath it. The whole row answers a click, not only the toggle itself --
+/// a target the size of a triangle is a target that is missed.
+fn process_row(
+    depth: usize,
+    one: &ProcessReading,
+    is_open: bool,
+    cx: &mut Context<RunMetricsModal>,
+) -> gpui::Stateful<gpui::Div> {
+    let pid = one.pid;
     h_flex()
-        .id(SharedString::from(format!("fork-{}", one.pid)))
-        .debug_selector({
-            let pid = one.pid;
-            move || format!("FORK-ROW-{pid}")
-        })
+        .id(SharedString::from(format!("run-metrics-process-{pid}")))
+        .debug_selector(move || format!("RUN-METRICS-PROCESS-{pid}"))
         .w_full()
         .min_w(TREE_WIDTH)
         .px_2()
         .py_0p5()
         .gap(cyberpunk::SPACE_8)
         .rounded(px(3.))
+        .cursor_pointer()
         .hover(|row| row.bg(cyberpunk::row_hovered()))
+        .on_click(cx.listener(move |modal, _, _, cx| modal.toggle_process(pid, cx)))
         .child(
             h_flex()
                 .flex_1()
@@ -324,13 +311,17 @@ fn fork_row(depth: usize, one: &ProcessReading, largest: u64) -> gpui::Stateful<
                             rail.border_r_1().border_color(cyberpunk::border_dim())
                         }),
                 )
+                .child(Disclosure::new(
+                    SharedString::from(format!("run-metrics-disclose-{pid}")),
+                    is_open,
+                ))
                 .child(
                     h_flex()
                         .gap_1p5()
                         .min_w_0()
                         .debug_selector({
                             let pid = one.pid;
-                            move || format!("FORK-NAME-{pid}")
+                            move || format!("RUN-METRICS-PROCESS-NAME-{pid}")
                         })
                         .child(
                             Label::new(one.pid.to_string())
@@ -344,30 +335,116 @@ fn fork_row(depth: usize, one: &ProcessReading, largest: u64) -> gpui::Stateful<
                         ),
                 ),
         )
-        .child(figure(STATE_WIDTH, doing(one.state).to_string(), true))
-        .child(figure(THREADS_WIDTH, one.threads.to_string(), false))
-        .child(figure(UPTIME_WIDTH, as_uptime(one.uptime), true))
         .child(figure(CPU_WIDTH, as_cpu(one.cpu), false))
         .child(figure(
             MEMORY_WIDTH,
             process_metrics::as_memory(one.memory),
             false,
         ))
+        .child(figure(THREADS_WIDTH, one.threads.to_string(), false))
+        .child(figure(STATE_WIDTH, doing(one.state).to_string(), true))
+}
+
+/// Every thread a process is running, busiest first, as one wrapped line rather
+/// than a column of rows: a thread's whole story is its name, what it is doing,
+/// and its share of a core, which reads fine run together.
+fn threads_line(pid: u32, threads: &[ThreadReading]) -> gpui::Div {
+    let count = threads.len();
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_1p5()
+        .debug_selector(move || format!("RUN-METRICS-THREADS-{pid}"))
         .child(
-            div()
-                .w(SHARE_WIDTH)
-                .flex_none()
-                .h(px(6.))
-                .rounded(px(2.))
-                .bg(cyberpunk::surface())
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(share))
-                        .rounded(px(2.))
-                        .bg(cyberpunk::ramp(share)),
-                ),
+            Label::new("threads")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
         )
+        .child(if threads.is_empty() {
+            h_flex().child(
+                Label::new("-- no per-thread detail on this platform")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+        } else {
+            h_flex()
+                .flex_1()
+                .flex_wrap()
+                .gap_1p5()
+                .children(threads.iter().enumerate().map(|(at, thread)| {
+                    h_flex()
+                        .gap_1p5()
+                        .when(at > 0, |row| {
+                            row.child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
+                        })
+                        .child(
+                            Label::new(format!(
+                                "{} {} {}",
+                                thread.name,
+                                doing(thread.state),
+                                as_cpu(thread.cpu)
+                            ))
+                            .size(LabelSize::XSmall),
+                        )
+                }))
+                .child(
+                    Label::new(format!("({count})"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        })
+}
+
+/// Where a Go program's goroutines were read from, said in a few words.
+fn goroutine_source(source: &GoroutineSource) -> String {
+    match source {
+        GoroutineSource::Debugger => "the debugger".to_string(),
+        GoroutineSource::Pprof(address) => format!("pprof at {address}"),
+    }
+}
+
+/// A run's goroutines, when it is a Go program: the total and how many are in
+/// each state, or -- when they could not be read -- the reason said as what the
+/// reader can do about it.
+fn goroutines_line(reading: &GoroutineReading) -> gpui::Div {
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_1p5()
+        .debug_selector(|| "RUN-METRICS-GOROUTINES".to_string())
+        .child(
+            Label::new("goroutines")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(match reading {
+            GoroutineReading::Read(goroutines) => {
+                let by_state = goroutines
+                    .by_state
+                    .iter()
+                    .map(|(state, count)| format!("{state} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                h_flex()
+                    .flex_1()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child(
+                        Label::new(format!("{by_state}  ({})", goroutines.total))
+                            .size(LabelSize::XSmall),
+                    )
+                    .child(
+                        Label::new(format!("· {}", goroutine_source(&goroutines.source)))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            }
+            GoroutineReading::Unavailable(hint) => h_flex().child(
+                Label::new(hint.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ),
+        })
 }
 
 impl Render for RunMetricsModal {
@@ -390,9 +467,9 @@ impl Render for RunMetricsModal {
         let Some(item) = self.item.upgrade() else {
             return shell;
         };
-        let (metrics, readings) = {
+        let (metrics, readings, goroutines) = {
             let item = item.read(cx);
-            (item.reading(), item.series())
+            (item.reading(), item.series(), item.goroutines())
         };
         let Some(metrics) = metrics else {
             return shell.child(
@@ -406,61 +483,26 @@ impl Render for RunMetricsModal {
             );
         };
 
-        let tab = self.tab;
-        let tabs = cyberpunk::segmented([Tab::Overview, Tab::Forks].into_iter().map(|which| {
-            Button::new(
-                SharedString::from(format!("run-metrics-tab-{}", which.name())),
-                which.label(),
-            )
-            .label_size(LabelSize::Small)
-            .style(match which == tab {
-                true => cyberpunk::Rank::Accent.style(),
-                false => cyberpunk::Rank::Quiet.style(),
-            })
-            .on_click(cx.listener(move |modal, _, _, cx| modal.show(which, cx)))
-            .into_any_element()
-        }));
+        // The root is expanded by default -- but only the first time this
+        // reading's root is seen, so a reader who collapses it again is not
+        // overridden a second later by the same run's next reading.
+        if self.default_expanded_for != Some(metrics.pid) {
+            self.expanded.insert(metrics.pid);
+            self.default_expanded_for = Some(metrics.pid);
+        }
 
-        // The headline figures ride at the far end of the tab row rather than in
-        // a row of their own: they are four short words, and a row spent on four
-        // short words is a row the charts do not get.
-        let chrome = h_flex()
-            .flex_none()
-            .w_full()
-            .px_3()
-            .pb_2()
-            .gap(cyberpunk::SPACE_8)
-            .items_center()
-            .child(tabs)
-            .child(div().flex_1())
-            .child(
-                h_flex()
-                    .gap(cyberpunk::SPACE_14)
-                    .flex_wrap()
-                    .justify_end()
-                    .child(headline("CPU", as_cpu(metrics.cpu)))
-                    .child(headline("RAM", process_metrics::as_memory(metrics.memory)))
-                    .child(headline("threads", metrics.threads.to_string()))
-                    .child(headline("alive", as_uptime(metrics.uptime))),
-            );
+        let body = self.body(&metrics, &readings, &goroutines, window, cx);
 
-        let body = match tab {
-            Tab::Overview => self.overview(&metrics, &readings, window, cx),
-            Tab::Forks => self.forks(&metrics, window, cx),
-        };
-
-        shell
-            .child(chrome)
-            .child(Divider::horizontal())
-            .child(cyberpunk::dialog_body().child(body))
+        shell.child(cyberpunk::dialog_body().child(body))
     }
 }
 
 impl RunMetricsModal {
-    fn overview(
+    fn body(
         &self,
-        metrics: &crate::process_metrics::Metrics,
+        metrics: &Metrics,
         readings: &[(Option<f32>, u64)],
+        goroutines: &Option<GoroutineReading>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -477,17 +519,15 @@ impl RunMetricsModal {
         let most_held = readings
             .iter()
             .fold(0u64, |most, (_, memory)| most.max(*memory));
-        let busiest = busiest_of(readings);
 
-        let rows = by_memory(&metrics.tree);
-        let largest = rows.first().map(|one| one.memory).unwrap_or(0);
+        let rows = forks_of(&metrics.tree);
 
         div()
-            .id("run-metrics-overview")
-            .debug_selector(|| "RUN-METRICS-OVERVIEW".to_string())
+            .id("run-metrics-body")
+            .debug_selector(|| "RUN-METRICS-BODY".to_string())
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(&self.overview_scroll)
+            .track_scroll(&self.body_scroll)
             .p(cyberpunk::SPACE_14)
             .child(
                 v_flex()
@@ -497,149 +537,187 @@ impl RunMetricsModal {
                     // surplus to give rather than leaving it blank.
                     .min_h_full()
                     .gap(cyberpunk::SPACE_18)
-                    // The two charts stand side by side while there is room for
-                    // both and fall into a column when there is not, which is
-                    // what makes the window worth widening. They grow with it
-                    // too, up to the height past which a plot reads worse rather
-                    // than better; the processes below take the rest.
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .flex_grow_1()
-                            .flex_shrink_0()
-                            .min_h(CHART_LEAST_HEIGHT)
-                            .max_h(CHART_MOST_HEIGHT)
-                            .flex_wrap()
-                            .items_stretch()
-                            .gap(cyberpunk::SPACE_18)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h_full()
-                                    .min_w(CHART_LEAST_WIDTH)
-                                    .debug_selector(|| "RUN-METRICS-CHART-CPU".to_string())
-                                    .child(a_chart(
-                                        "Processor",
-                                        as_cpu(metrics.cpu),
-                                        processor,
-                                        100.,
-                                        cyberpunk::series_processor(),
-                                        vec![(0., "100".to_string()), (0.5, "50".to_string())],
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h_full()
-                                    .min_w(CHART_LEAST_WIDTH)
-                                    .debug_selector(|| "RUN-METRICS-CHART-MEMORY".to_string())
-                                    .child(a_chart(
-                                        "Memory",
-                                        process_metrics::as_memory(metrics.memory),
-                                        held,
-                                        most_held as f32,
-                                        cyberpunk::series_memory(),
-                                        vec![(0., process_metrics::as_memory(most_held))],
-                                    )),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            // What the charts stop taking, the processes get:
-                            // every one of them, in whatever room is left. It
-                            // grows into free height but never shrinks below its
-                            // rows -- this column is scrolled, not clipped.
-                            .flex_grow_1()
-                            .flex_shrink_0()
-                            .gap(cyberpunk::SPACE_4)
-                            .child(
-                                Label::new("Memory by process")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .children(rows.iter().map(|one| {
-                                a_bar(format!("{} · {}", one.pid, one.name), one.memory, largest)
-                            })),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .flex_none()
-                            .debug_selector(|| "RUN-METRICS-FACTS".to_string())
-                            .gap(cyberpunk::SPACE_4)
-                            .child(
-                                Label::new("Everything else the machine says")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .flex_wrap()
-                                    .gap(cyberpunk::SPACE_14)
-                                    .child(said("PID", metrics.pid.to_string()))
-                                    .child(said("processes", metrics.processes.to_string()))
-                                    .child(said("threads", metrics.threads.to_string()))
-                                    .child(said("alive", as_uptime(metrics.uptime)))
-                                    .child(said("busiest", as_cpu(busiest)))
-                                    .child(said(
-                                        "most memory",
-                                        process_metrics::as_memory(most_held),
-                                    ))
-                                    .child(said("network", what_it_says(metrics.network)))
-                                    .child(said(
-                                        "video memory",
-                                        what_it_says(metrics.video_memory),
-                                    )),
-                            ),
-                    ),
+                    .child(self.summary(metrics))
+                    .child(Divider::horizontal())
+                    .child(self.charts(metrics, processor, held, most_held))
+                    .child(Divider::horizontal())
+                    .child(self.processes(&rows, metrics.pid, goroutines, cx))
+                    .child(self.footer_facts(metrics)),
             )
             .custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Vertical)
-                    .tracked_scroll_handle(&self.overview_scroll),
+                    .tracked_scroll_handle(&self.body_scroll),
                 window,
                 cx,
             )
     }
 
-    fn forks(
-        &self,
-        metrics: &crate::process_metrics::Metrics,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let rows = forks_of(&metrics.tree);
-        let largest = metrics
+    /// The header row: the root process on the left, and everything the status
+    /// bar summed up on the right. Four short words are not worth a row of
+    /// their own when there is room for them beside what is already there.
+    fn summary(&self, metrics: &Metrics) -> gpui::Div {
+        let root_name = metrics
             .tree
-            .iter()
-            .fold(0u64, |most, one| most.max(one.memory));
-
-        div()
-            .id("run-metrics-forks")
-            .debug_selector(|| "RUN-METRICS-FORKS".to_string())
-            .size_full()
-            // Sideways as well as up and down: the columns have a width they
-            // cannot go under, and a narrow window scrolls to them rather than
-            // squeezing the names away.
-            .overflow_scroll()
-            .track_scroll(&self.forks_scroll)
-            .p(cyberpunk::SPACE_8)
+            .first()
+            .map(|process| process.name.to_string())
+            .unwrap_or_default();
+        h_flex()
+            .w_full()
+            .flex_none()
+            .flex_wrap()
+            .justify_between()
+            .items_center()
+            .gap(cyberpunk::SPACE_14)
+            .debug_selector(|| "RUN-METRICS-SUMMARY".to_string())
             .child(
-                v_flex()
-                    .w_full()
-                    .child(tree_head())
-                    .child(Divider::horizontal())
-                    .children(
-                        rows.iter()
-                            .map(|(depth, one)| fork_row(*depth, one, largest)),
+                h_flex()
+                    .gap_1p5()
+                    .items_baseline()
+                    .child(Label::new(root_name).size(LabelSize::Default))
+                    .child(
+                        Label::new(format!("PID {}", metrics.pid))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("up {}", as_uptime(metrics.uptime)))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     ),
             )
-            .custom_scrollbars(
-                Scrollbars::always_visible(ScrollAxes::Both)
-                    .tracked_scroll_handle(&self.forks_scroll),
-                window,
-                cx,
+            .child(
+                h_flex()
+                    .gap(cyberpunk::SPACE_14)
+                    .flex_wrap()
+                    .justify_end()
+                    .child(headline("CPU", as_cpu(metrics.cpu)))
+                    .child(headline("RAM", process_metrics::as_memory(metrics.memory)))
+                    .child(headline("proc", metrics.processes.to_string()))
+                    .child(headline("thr", metrics.threads.to_string())),
+            )
+    }
+
+    /// Two compact sparklines, side by side while there is room for both and
+    /// stacked when there is not. Fixed and modest in height: this is what the
+    /// numbers above looked like over the last two minutes, not a plot somebody
+    /// studies on its own.
+    fn charts(
+        &self,
+        metrics: &Metrics,
+        processor: Vec<(usize, f32)>,
+        held: Vec<(usize, f32)>,
+        most_held: u64,
+    ) -> gpui::Div {
+        h_flex()
+            .w_full()
+            .flex_none()
+            .flex_wrap()
+            .gap(cyberpunk::SPACE_18)
+            .child(
+                div()
+                    .flex_1()
+                    .h(CHART_ROW_HEIGHT)
+                    .min_w(CHART_LEAST_WIDTH)
+                    .overflow_hidden()
+                    .debug_selector(|| "RUN-METRICS-CHART-CPU".to_string())
+                    .child(a_chart(
+                        "Processor",
+                        as_cpu(metrics.cpu),
+                        processor,
+                        100.,
+                        cyberpunk::series_processor(),
+                        vec![(0., "100".to_string()), (0.5, "50".to_string())],
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(CHART_ROW_HEIGHT)
+                    .min_w(CHART_LEAST_WIDTH)
+                    .overflow_hidden()
+                    .debug_selector(|| "RUN-METRICS-CHART-MEMORY".to_string())
+                    .child(a_chart(
+                        "Memory",
+                        process_metrics::as_memory(metrics.memory),
+                        held,
+                        most_held as f32,
+                        cyberpunk::series_memory(),
+                        vec![(0., process_metrics::as_memory(most_held))],
+                    )),
+            )
+    }
+
+    /// Every process of the run, as the tree it is, with a toggle on each row
+    /// for the thread and goroutine detail underneath it.
+    fn processes(
+        &self,
+        rows: &[(usize, ProcessReading)],
+        root_pid: u32,
+        goroutines: &Option<GoroutineReading>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        v_flex()
+            .w_full()
+            .flex_none()
+            .gap(cyberpunk::SPACE_4)
+            .child(
+                Label::new("Processes")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(process_head())
+            .child(Divider::horizontal())
+            .children(rows.iter().map(|(depth, process)| {
+                self.process_block(*depth, process, root_pid, goroutines, cx)
+            }))
+    }
+
+    /// One process, and -- when it is open -- its thread detail and, for the
+    /// run's own root, its goroutines.
+    fn process_block(
+        &self,
+        depth: usize,
+        process: &ProcessReading,
+        root_pid: u32,
+        goroutines: &Option<GoroutineReading>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let pid = process.pid;
+        let is_open = self.expanded.contains(&pid);
+        v_flex()
+            .w_full()
+            .child(process_row(depth, process, is_open, cx))
+            .when(is_open, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .pl(STEP * (depth as f32 + 2.))
+                        .pr_2()
+                        .py_1()
+                        .gap(cyberpunk::SPACE_4)
+                        .child(threads_line(pid, &process.thread_readings))
+                        .when(pid == root_pid, |this| {
+                            this.children(goroutines.as_ref().map(goroutines_line))
+                        }),
+                )
+            })
+    }
+
+    /// The facts that have no series of their own, as one muted line at the
+    /// foot of the scrolled content.
+    fn footer_facts(&self, metrics: &Metrics) -> gpui::Div {
+        div()
+            .w_full()
+            .flex_none()
+            .debug_selector(|| "RUN-METRICS-FACTS".to_string())
+            .child(
+                Label::new(format!(
+                    "Network: {} · Video memory: {}",
+                    as_fact(metrics.network),
+                    as_fact(metrics.video_memory),
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
             )
     }
 }
@@ -658,6 +736,7 @@ mod tests {
             threads: 1,
             state: 'S',
             uptime: None,
+            thread_readings: Vec::new(),
         }
     }
 
@@ -779,6 +858,283 @@ mod tests {
             doing('?'),
             "unknown",
             "a letter nobody knows is not invented"
+        );
+    }
+
+    /// A number nobody could measure says why, in this line's own words rather
+    /// than the status bar's dashed-out form.
+    #[test]
+    fn a_fact_nobody_could_measure_says_why_without_a_dash() {
+        assert_eq!(
+            as_fact(Err("needs rights this editor does not ask for")),
+            "needs rights this editor does not ask for"
+        );
+        assert_eq!(as_fact(Ok(84 * 1024 * 1024)), "84 MB");
+    }
+
+    // The tests below draw the real modal and click into it, the way a reader
+    // would. They rely on `RunMetricsStatusItem::set_reading_for_test`, a
+    // test-only setter that stands in for the watcher's poll -- see this
+    // crate's report on the redesign for its exact signature.
+
+    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use util::path;
+
+    use crate::goroutines::Goroutines;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            cx.bind_keys([gpui::KeyBinding::new("escape", menu::Cancel, None)]);
+        });
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// The window asks to be focused two frames after it opens, and a test has
+    /// no platform frame loop to deliver those frames -- so they are delivered
+    /// by hand, the same way `run_metrics_status_item`'s tests do.
+    fn settle(cx: &mut VisualTestContext) {
+        for _ in 0..3 {
+            draw(cx);
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+        }
+        draw(cx);
+    }
+
+    async fn an_item_of_its_own(
+        cx: &mut TestAppContext,
+    ) -> (Entity<RunMetricsStatusItem>, VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // A multi-workspace root rather than a bare workspace: the modal layer
+        // the reading opens into is drawn there, and under a bare workspace the
+        // window opens without being painted at all.
+        let (multi, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            let item = cx.new(|cx| RunMetricsStatusItem::new(workspace, window, cx));
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                status_bar.add_right_item(item.clone(), window, cx);
+            });
+            item
+        });
+        cx.run_until_parked();
+        (item, cx.clone())
+    }
+
+    fn a_thread(tid: u32, name: &str, cpu: f32) -> ThreadReading {
+        ThreadReading {
+            tid,
+            name: name.into(),
+            cpu: Some(cpu),
+            state: 'S',
+        }
+    }
+
+    /// A run of two: the process this crate tracks, and one process it started
+    /// which has no per-thread detail of its own -- the shape a real Go run and
+    /// its shell take.
+    fn a_run() -> (u32, u32, Metrics) {
+        let root_pid = 4241;
+        let child_pid = 4242;
+        let root = ProcessReading {
+            pid: root_pid,
+            parent: 1,
+            name: "cmd-api".into(),
+            memory: 311 * 1024 * 1024,
+            cpu: Some(0.),
+            threads: 2,
+            state: 'S',
+            uptime: Some(Duration::from_secs(125)),
+            thread_readings: vec![a_thread(1, "main", 0.), a_thread(2, "gc", 0.)],
+        };
+        let child = ProcessReading {
+            pid: child_pid,
+            parent: root_pid,
+            name: "bash".into(),
+            memory: 4 * 1024 * 1024,
+            cpu: Some(0.),
+            threads: 1,
+            state: 'S',
+            uptime: Some(Duration::from_secs(125)),
+            thread_readings: Vec::new(),
+        };
+        let metrics = Metrics {
+            pid: root_pid,
+            processes: 2,
+            cpu: Some(0.),
+            memory: 315 * 1024 * 1024,
+            network: Err("needs rights this editor does not ask for"),
+            video_memory: Err("nothing is using it"),
+            threads: 3,
+            uptime: Some(Duration::from_secs(125)),
+            tree: vec![root, child],
+        };
+        (root_pid, child_pid, metrics)
+    }
+
+    fn press_the_plaque(cx: &mut VisualTestContext) {
+        let plaque = cx
+            .debug_bounds("run-metrics-status")
+            .expect("the plaque is on screen");
+        cx.simulate_click(plaque.center(), Modifiers::none());
+        settle(cx);
+    }
+
+    /// Every process, and both charts, are painted from the same open reading:
+    /// nothing here is a tab a reader has to switch to.
+    #[gpui::test]
+    async fn processes_and_charts_share_one_page_without_tabs(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (root_pid, child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+
+        press_the_plaque(&mut cx);
+
+        assert!(
+            cx.debug_bounds("RUN-METRICS-CHART-CPU").is_some(),
+            "the processor chart is on the one page"
+        );
+        assert!(
+            cx.debug_bounds("RUN-METRICS-CHART-MEMORY").is_some(),
+            "the memory chart is on the same page"
+        );
+        assert!(
+            cx.debug_bounds(format!("RUN-METRICS-PROCESS-{root_pid}").leak())
+                .is_some(),
+            "and so is the root process, without pressing anything to see it"
+        );
+        assert!(
+            cx.debug_bounds(format!("RUN-METRICS-PROCESS-{child_pid}").leak())
+                .is_some(),
+            "and every process it started"
+        );
+        assert!(
+            cx.debug_bounds("BUTTON-Processes").is_none(),
+            "there is no tab that hides the processes behind it"
+        );
+        assert!(
+            cx.debug_bounds("BUTTON-Overview").is_none(),
+            "nor a tab for the charts"
+        );
+    }
+
+    /// Clicking a process row is what shows its threads. The root is expanded
+    /// on its own, so this presses the row that starts closed.
+    #[gpui::test]
+    async fn clicking_a_process_row_shows_its_threads(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (_root_pid, child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        assert!(
+            cx.debug_bounds(format!("RUN-METRICS-THREADS-{child_pid}").leak())
+                .is_none(),
+            "a process nobody has asked about keeps its threads closed"
+        );
+
+        let row = cx
+            .debug_bounds(format!("RUN-METRICS-PROCESS-{child_pid}").leak())
+            .expect("the process has a row to press");
+        cx.simulate_click(row.center(), Modifiers::none());
+        settle(&mut cx);
+
+        assert!(
+            cx.debug_bounds(format!("RUN-METRICS-THREADS-{child_pid}").leak())
+                .is_some(),
+            "and pressing its row is what opens them"
+        );
+    }
+
+    /// A run's goroutines show up as their own line, once the status item has a
+    /// reading of them -- and not before.
+    #[gpui::test]
+    async fn a_goroutines_line_appears_once_the_status_item_has_a_reading(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (_root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics.clone()), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        assert!(
+            cx.debug_bounds("RUN-METRICS-GOROUTINES").is_none(),
+            "nothing to show while the run has no goroutine reading"
+        );
+
+        let goroutines = GoroutineReading::Read(Goroutines {
+            total: 37,
+            by_state: vec![("running".into(), 2), ("waiting".into(), 35)],
+            source: GoroutineSource::Debugger,
+        });
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), Some(goroutines), cx);
+        });
+        settle(&mut cx);
+
+        assert!(
+            cx.debug_bounds("RUN-METRICS-GOROUTINES").is_some(),
+            "and the line shows up the moment the status item has one"
+        );
+    }
+
+    /// The charts read at a glance, not as a plot to study: fixed and modest,
+    /// nowhere near the near-empty half-window the old two charts stood in.
+    #[gpui::test]
+    async fn the_charts_are_compact(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (_root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        let processor = cx
+            .debug_bounds("RUN-METRICS-CHART-CPU")
+            .expect("the processor chart is drawn");
+        let memory = cx
+            .debug_bounds("RUN-METRICS-CHART-MEMORY")
+            .expect("the memory chart is drawn");
+
+        assert!(
+            processor.size.height < px(90.),
+            "a chart beside its numbers does not need a plot this tall: {:?}",
+            processor.size.height
+        );
+        assert!(
+            memory.size.height < px(90.),
+            "and neither does the other one: {:?}",
+            memory.size.height
         );
     }
 }
