@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use gpui::{
@@ -26,7 +26,7 @@ const READINGS_KEPT: usize = 120;
 const CHART_HEIGHT: Pixels = px(56.);
 
 /// How wide the column of axis labels beside a chart is.
-const AXIS_WIDTH: Pixels = px(34.);
+const AXIS_WIDTH: Pixels = px(72.);
 
 const LINE_WIDTH: Pixels = px(1.5);
 
@@ -47,6 +47,12 @@ pub struct RunMetricsStatusItem {
     /// or an HTTP request costs far more than the process-metrics poll that
     /// drives this loop, so it is not worth paying every tick of it.
     last_goroutines_poll: Option<Instant>,
+    /// The process of the run that is a Go program, when there is one. A run
+    /// is often a script or a shell that starts it.
+    go_program: Option<u32>,
+    /// Which of the run's processes were found to be Go programs, so a binary
+    /// is looked at once per process rather than on every poll.
+    known_programs: HashMap<u32, bool>,
     /// Whether this window is the one in front. A poll nobody can see is a poll
     /// for nothing, so it stops the moment focus leaves this window and starts
     /// again the moment focus comes back.
@@ -95,6 +101,8 @@ impl RunMetricsStatusItem {
             watcher: Watcher::default(),
             goroutines: None,
             last_goroutines_poll: None,
+            go_program: None,
+            known_programs: HashMap::new(),
             window_active: window.is_window_active(),
             _watching_task: None,
             _goroutines_task: None,
@@ -233,6 +241,28 @@ impl RunMetricsStatusItem {
         self.goroutines.clone()
     }
 
+    /// The run's process that is a Go program, if one is.
+    pub(crate) fn go_program(&self) -> Option<u32> {
+        self.go_program
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_go_program_for_test(&mut self, pid: Option<u32>, cx: &mut Context<Self>) {
+        self.go_program = pid;
+        cx.notify();
+    }
+
+    fn find_go_program(&mut self) -> Option<u32> {
+        let tree = &self.metrics.as_ref()?.tree;
+        let known = &mut self.known_programs;
+        known.retain(|pid, _| tree.iter().any(|process| process.pid == *pid));
+        tree.iter().map(|process| process.pid).find(|pid| {
+            *known
+                .entry(*pid)
+                .or_insert_with(|| goroutines::is_go_program(*pid))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn set_reading_for_test(
         &mut self,
@@ -292,6 +322,8 @@ impl RunMetricsStatusItem {
         let Some(context) = context else {
             self._goroutines_task = None;
             self.last_goroutines_poll = None;
+            self.go_program = None;
+            self.known_programs.clear();
             return self.set_goroutines(None);
         };
         let now = Instant::now();
@@ -302,6 +334,7 @@ impl RunMetricsStatusItem {
             return false;
         }
         self.last_goroutines_poll = Some(now);
+        self.go_program = self.find_go_program();
 
         if let Some(reading) = self.debugger_goroutines(cx) {
             self._goroutines_task = None;
@@ -327,6 +360,7 @@ impl RunMetricsStatusItem {
             .command
             .as_deref()
             .is_some_and(goroutines::looks_like_go_command)
+            || self.go_program.is_some()
             || self.configured_adapter_is_delve(&context.label, cx);
         let reading = looks_like_go
             .then(|| GoroutineReading::Unavailable(goroutines::no_reader_configured()));
@@ -479,7 +513,7 @@ pub(crate) fn a_chart(
                 .items_end()
                 .child(
                     Label::new(heading)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(Color::Muted),
                 )
                 .child(Label::new(reading_now).size(LabelSize::Large)),
@@ -498,8 +532,9 @@ pub(crate) fn a_chart(
                         .children(axis.into_iter().map(|(at, label)| {
                             div().absolute().right_0().top(relative(at)).child(
                                 Label::new(label)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
+                                    .size(LabelSize::Default)
+                                    .color(Color::Muted)
+                                    .single_line(),
                             )
                         })),
                 )

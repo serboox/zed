@@ -61,6 +61,14 @@ pub struct RunMetricsModal {
     /// expanded by default exactly once and a reader who collapses it again is
     /// not overridden on the next reading a second later.
     default_expanded_for: Option<u32>,
+    /// Which threads have their statistics shown, by process and thread id.
+    expanded_threads: HashSet<(u32, u32)>,
+    /// The process the goroutines line goes under: the run's Go program when
+    /// one is found in the tree, since a script or shell that starts it has
+    /// no goroutines of its own; the root otherwise.
+    goroutines_at: Option<u32>,
+    /// The Go program opened by default, once, the same way the root is.
+    default_expanded_go: Option<u32>,
     _observation: Option<Subscription>,
 }
 
@@ -75,6 +83,9 @@ impl RunMetricsModal {
             body_scroll: ScrollHandle::new(),
             expanded: HashSet::new(),
             default_expanded_for: None,
+            expanded_threads: HashSet::new(),
+            goroutines_at: None,
+            default_expanded_go: None,
             _observation: observation,
         }
     }
@@ -93,6 +104,13 @@ impl RunMetricsModal {
     fn toggle_process(&mut self, pid: u32, cx: &mut Context<Self>) {
         if !self.expanded.remove(&pid) {
             self.expanded.insert(pid);
+        }
+        cx.notify();
+    }
+
+    fn toggle_thread(&mut self, pid: u32, tid: u32, cx: &mut Context<Self>) {
+        if !self.expanded_threads.remove(&(pid, tid)) {
+            self.expanded_threads.insert((pid, tid));
         }
         cx.notify();
     }
@@ -231,7 +249,7 @@ fn headline(label: &'static str, value: String) -> gpui::Div {
         .items_baseline()
         .child(
             Label::new(label)
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Default)
                 .color(Color::Muted),
         )
         .child(Label::new(value).size(LabelSize::Default))
@@ -242,7 +260,7 @@ fn headline(label: &'static str, value: String) -> gpui::Div {
 fn figure(width: Pixels, value: String, muted: bool) -> gpui::Div {
     h_flex().w(width).flex_none().justify_end().child(
         Label::new(value)
-            .size(LabelSize::XSmall)
+            .size(LabelSize::Default)
             .color(match muted {
                 true => Color::Muted,
                 false => Color::Default,
@@ -262,7 +280,7 @@ fn process_head() -> gpui::Div {
         .child(
             div().flex_1().min_w(px(160.)).child(
                 Label::new("Process")
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Default)
                     .color(Color::Muted),
             ),
         )
@@ -325,12 +343,12 @@ fn process_row(
                         })
                         .child(
                             Label::new(one.pid.to_string())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Default)
                                 .color(Color::Muted),
                         )
                         .child(
                             Label::new(one.name.to_string())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Default)
                                 .truncate(),
                         ),
                 ),
@@ -345,54 +363,103 @@ fn process_row(
         .child(figure(STATE_WIDTH, doing(one.state).to_string(), true))
 }
 
-/// Every thread a process is running, busiest first, as one wrapped line rather
-/// than a column of rows: a thread's whole story is its name, what it is doing,
-/// and its share of a core, which reads fine run together.
-fn threads_line(pid: u32, threads: &[ThreadReading]) -> gpui::Div {
-    let count = threads.len();
+/// One thread of a process, in the same columns as the processes above it so
+/// its share of a core sits under theirs. Pressing it shows what the machine
+/// says about the thread beyond that.
+fn thread_row(
+    depth: usize,
+    pid: u32,
+    thread: &ThreadReading,
+    is_open: bool,
+    cx: &mut Context<RunMetricsModal>,
+) -> gpui::Stateful<gpui::Div> {
+    let tid = thread.tid;
     h_flex()
+        .id(SharedString::from(format!(
+            "run-metrics-thread-{pid}-{tid}"
+        )))
+        .debug_selector(move || format!("RUN-METRICS-THREAD-{pid}-{tid}"))
         .w_full()
-        .items_start()
-        .gap_1p5()
-        .debug_selector(move || format!("RUN-METRICS-THREADS-{pid}"))
+        .min_w(TREE_WIDTH)
+        .px_2()
+        .py_0p5()
+        .gap(cyberpunk::SPACE_8)
+        .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|row| row.bg(cyberpunk::row_hovered()))
+        .on_click(cx.listener(move |modal, _, _, cx| modal.toggle_thread(pid, tid, cx)))
         .child(
-            Label::new("threads")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(if threads.is_empty() {
-            h_flex().child(
-                Label::new("-- no per-thread detail on this platform")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-        } else {
             h_flex()
                 .flex_1()
-                .flex_wrap()
+                .min_w(px(160.))
                 .gap_1p5()
-                .children(threads.iter().enumerate().map(|(at, thread)| {
-                    h_flex()
-                        .gap_1p5()
-                        .when(at > 0, |row| {
-                            row.child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
-                        })
-                        .child(
-                            Label::new(format!(
-                                "{} {} {}",
-                                thread.name,
-                                doing(thread.state),
-                                as_cpu(thread.cpu)
-                            ))
-                            .size(LabelSize::XSmall),
-                        )
-                }))
+                .overflow_hidden()
                 .child(
-                    Label::new(format!("({count})"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    div()
+                        .w(STEP * (depth as f32 + 1.))
+                        .flex_none()
+                        .border_r_1()
+                        .border_color(cyberpunk::border_dim()),
                 )
-        })
+                .child(Disclosure::new(
+                    SharedString::from(format!("run-metrics-thread-disclose-{pid}-{tid}")),
+                    is_open,
+                ))
+                .child(Label::new(tid.to_string()).color(Color::Muted))
+                .child(
+                    div()
+                        .min_w_0()
+                        .debug_selector(move || format!("RUN-METRICS-THREAD-NAME-{pid}-{tid}"))
+                        .child(Label::new(thread.name.to_string()).truncate()),
+                ),
+        )
+        .child(figure(CPU_WIDTH, as_cpu(thread.cpu), false))
+        .child(figure(MEMORY_WIDTH, String::new(), true))
+        .child(figure(THREADS_WIDTH, String::new(), true))
+        .child(figure(STATE_WIDTH, doing(thread.state).to_string(), true))
+}
+
+/// What the machine says about one thread beyond its row: how much processor
+/// it has had in all, how long it has run, where and how it is scheduled.
+fn thread_details(depth: usize, pid: u32, thread: &ThreadReading) -> gpui::Div {
+    let tid = thread.tid;
+    let or_unknown = |value: Option<String>| value.unwrap_or_else(|| "unknown".to_string());
+    let switches = thread.switches.map(|switches| {
+        format!(
+            "{} waited · {} preempted",
+            switches.voluntary, switches.involuntary
+        )
+    });
+    h_flex()
+        .w_full()
+        .min_w(TREE_WIDTH)
+        .flex_wrap()
+        .gap(cyberpunk::SPACE_14)
+        .pl(STEP * (depth as f32 + 3.))
+        .pr_2()
+        .py_1()
+        .debug_selector(move || format!("RUN-METRICS-THREAD-DETAILS-{pid}-{tid}"))
+        .child(fact("CPU now", as_cpu(thread.cpu)))
+        .child(fact("CPU time", as_uptime(Some(thread.cpu_time))))
+        .child(fact("Running for", as_uptime(thread.uptime)))
+        .child(fact("State", doing(thread.state).to_string()))
+        .child(fact(
+            "Nice",
+            or_unknown(thread.nice.map(|nice| nice.to_string())),
+        ))
+        .child(fact(
+            "Last core",
+            or_unknown(thread.last_core.map(|core| core.to_string())),
+        ))
+        .child(fact("Context switches", or_unknown(switches)))
+}
+
+/// A label and its value, for facts that are read one at a time.
+fn fact(label: &'static str, value: String) -> gpui::Div {
+    h_flex()
+        .gap_1p5()
+        .child(Label::new(label).color(Color::Muted))
+        .child(Label::new(value).single_line())
 }
 
 /// Where a Go program's goroutines were read from, said in a few words.
@@ -414,7 +481,7 @@ fn goroutines_line(reading: &GoroutineReading) -> gpui::Div {
         .debug_selector(|| "RUN-METRICS-GOROUTINES".to_string())
         .child(
             Label::new("goroutines")
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Default)
                 .color(Color::Muted),
         )
         .child(match reading {
@@ -431,17 +498,17 @@ fn goroutines_line(reading: &GoroutineReading) -> gpui::Div {
                     .gap_1p5()
                     .child(
                         Label::new(format!("{by_state}  ({})", goroutines.total))
-                            .size(LabelSize::XSmall),
+                            .size(LabelSize::Default),
                     )
                     .child(
                         Label::new(format!("· {}", goroutine_source(&goroutines.source)))
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     )
             }
             GoroutineReading::Unavailable(hint) => h_flex().child(
                 Label::new(hint.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Default)
                     .color(Color::Muted),
             ),
         })
@@ -449,7 +516,7 @@ fn goroutines_line(reading: &GoroutineReading) -> gpui::Div {
 
 impl Render for RunMetricsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let shell = cyberpunk::dialog_shell("Run metrics", window, cx)
+        let shell = cyberpunk::dialog_shell_large("Run metrics", window, cx)
             .key_context("RunMetrics")
             .track_focus(&self.focus)
             .debug_selector(|| "RUN-METRICS-MODAL".to_string())
@@ -467,16 +534,21 @@ impl Render for RunMetricsModal {
         let Some(item) = self.item.upgrade() else {
             return shell;
         };
-        let (metrics, readings, goroutines) = {
+        let (metrics, readings, goroutines, go_program) = {
             let item = item.read(cx);
-            (item.reading(), item.series(), item.goroutines())
+            (
+                item.reading(),
+                item.series(),
+                item.goroutines(),
+                item.go_program(),
+            )
         };
         let Some(metrics) = metrics else {
             return shell.child(
                 cyberpunk::dialog_body().child(
                     div().p(cyberpunk::SPACE_14).child(
                         Label::new("Nothing is running.")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     ),
                 ),
@@ -490,6 +562,13 @@ impl Render for RunMetricsModal {
             self.expanded.insert(metrics.pid);
             self.default_expanded_for = Some(metrics.pid);
         }
+        if let Some(go_program) = go_program
+            && self.default_expanded_go != Some(go_program)
+        {
+            self.expanded.insert(go_program);
+            self.default_expanded_go = Some(go_program);
+        }
+        self.goroutines_at = Some(go_program.unwrap_or(metrics.pid));
 
         let body = self.body(&metrics, &readings, &goroutines, window, cx);
 
@@ -541,7 +620,7 @@ impl RunMetricsModal {
                     .child(Divider::horizontal())
                     .child(self.charts(metrics, processor, held, most_held))
                     .child(Divider::horizontal())
-                    .child(self.processes(&rows, metrics.pid, goroutines, cx))
+                    .child(self.processes(&rows, goroutines, cx))
                     .child(self.footer_facts(metrics)),
             )
             .custom_scrollbars(
@@ -576,12 +655,12 @@ impl RunMetricsModal {
                     .child(Label::new(root_name).size(LabelSize::Default))
                     .child(
                         Label::new(format!("PID {}", metrics.pid))
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     )
                     .child(
                         Label::new(format!("up {}", as_uptime(metrics.uptime)))
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     ),
             )
@@ -652,7 +731,6 @@ impl RunMetricsModal {
     fn processes(
         &self,
         rows: &[(usize, ProcessReading)],
-        root_pid: u32,
         goroutines: &Option<GoroutineReading>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -661,45 +739,61 @@ impl RunMetricsModal {
             .flex_none()
             .gap(cyberpunk::SPACE_4)
             .child(
-                Label::new("Processes")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                div()
+                    .debug_selector(|| "RUN-METRICS-PROCESSES-HEADING".to_string())
+                    .child(Label::new("Processes").color(Color::Muted)),
             )
             .child(process_head())
             .child(Divider::horizontal())
-            .children(rows.iter().map(|(depth, process)| {
-                self.process_block(*depth, process, root_pid, goroutines, cx)
-            }))
+            .children(
+                rows.iter()
+                    .map(|(depth, process)| self.process_block(*depth, process, goroutines, cx)),
+            )
     }
 
-    /// One process, and -- when it is open -- its thread detail and, for the
-    /// run's own root, its goroutines.
+    /// One process, and -- when it is open -- a row for each of its threads
+    /// and, for the Go program of the run, its goroutines.
     fn process_block(
         &self,
         depth: usize,
         process: &ProcessReading,
-        root_pid: u32,
         goroutines: &Option<GoroutineReading>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let pid = process.pid;
         let is_open = self.expanded.contains(&pid);
+        let goroutines_at = self.goroutines_at;
         v_flex()
             .w_full()
             .child(process_row(depth, process, is_open, cx))
             .when(is_open, |this| {
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .pl(STEP * (depth as f32 + 2.))
-                        .pr_2()
-                        .py_1()
-                        .gap(cyberpunk::SPACE_4)
-                        .child(threads_line(pid, &process.thread_readings))
-                        .when(pid == root_pid, |this| {
-                            this.children(goroutines.as_ref().map(goroutines_line))
-                        }),
-                )
+                let threads = v_flex()
+                    .w_full()
+                    .debug_selector(move || format!("RUN-METRICS-THREADS-{pid}"))
+                    .when(goroutines_at == Some(pid), |this| {
+                        this.children(goroutines.as_ref().map(|reading| {
+                            div()
+                                .pl(STEP * (depth as f32 + 2.))
+                                .pr_2()
+                                .py_1()
+                                .child(goroutines_line(reading))
+                        }))
+                    })
+                    .when(process.thread_readings.is_empty(), |this| {
+                        this.child(div().pl(STEP * (depth as f32 + 2.)).py_1().child(
+                            Label::new("No per-thread detail on this platform").color(Color::Muted),
+                        ))
+                    })
+                    .children(process.thread_readings.iter().map(|thread| {
+                        let thread_open = self.expanded_threads.contains(&(pid, thread.tid));
+                        v_flex()
+                            .w_full()
+                            .child(thread_row(depth, pid, thread, thread_open, cx))
+                            .when(thread_open, |this| {
+                                this.child(thread_details(depth, pid, thread))
+                            })
+                    }));
+                this.child(threads)
             })
     }
 
@@ -716,7 +810,7 @@ impl RunMetricsModal {
                     as_fact(metrics.network),
                     as_fact(metrics.video_memory),
                 ))
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Default)
                 .color(Color::Muted),
             )
     }
@@ -872,12 +966,7 @@ mod tests {
         assert_eq!(as_fact(Ok(84 * 1024 * 1024)), "84 MB");
     }
 
-    // The tests below draw the real modal and click into it, the way a reader
-    // would. They rely on `RunMetricsStatusItem::set_reading_for_test`, a
-    // test-only setter that stands in for the watcher's poll -- see this
-    // crate's report on the redesign for its exact signature.
-
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, size};
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
@@ -949,6 +1038,14 @@ mod tests {
             name: name.into(),
             cpu: Some(cpu),
             state: 'S',
+            cpu_time: Duration::from_millis(1500),
+            uptime: Some(Duration::from_secs(120)),
+            nice: Some(0),
+            last_core: Some(3),
+            switches: Some(crate::process_metrics::ContextSwitches {
+                voluntary: 1520,
+                involuntary: 37,
+            }),
         }
     }
 
@@ -1135,6 +1232,142 @@ mod tests {
             memory.size.height < px(90.),
             "and neither does the other one: {:?}",
             memory.size.height
+        );
+    }
+
+    /// The reading is set in the same size as the rest of the editor's
+    /// interface, not a step or two below it where it cannot be read.
+    #[gpui::test]
+    async fn the_reading_is_set_as_large_as_the_rest_of_the_editor(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        // The heading is set in the editor's own interface size; text any
+        // smaller stands shorter than it.
+        let editor_text = cx
+            .debug_bounds("RUN-METRICS-PROCESSES-HEADING")
+            .expect("the list has its heading")
+            .size
+            .height;
+        for selector in [
+            format!("RUN-METRICS-PROCESS-NAME-{root_pid}"),
+            format!("RUN-METRICS-THREAD-NAME-{root_pid}-1"),
+        ] {
+            let text = cx
+                .debug_bounds(selector.clone().leak())
+                .expect("the name is drawn")
+                .size
+                .height;
+            assert!(
+                text >= editor_text,
+                "{selector} is set smaller than the rest of the editor: \
+                 {text:?} against {editor_text:?}"
+            );
+        }
+    }
+
+    /// A thread is a row of its own that answers a click with what the
+    /// machine says about it.
+    #[gpui::test]
+    async fn clicking_a_thread_shows_its_statistics(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        let details = format!("RUN-METRICS-THREAD-DETAILS-{root_pid}-2");
+        assert!(
+            cx.debug_bounds(details.clone().leak()).is_none(),
+            "a thread nobody has asked about keeps its statistics closed"
+        );
+        let row = cx
+            .debug_bounds(format!("RUN-METRICS-THREAD-{root_pid}-2").leak())
+            .expect("each thread has a row of its own");
+        cx.simulate_click(row.center(), Modifiers::none());
+        settle(&mut cx);
+
+        let opened = cx
+            .debug_bounds(details.clone().leak())
+            .expect("pressing the thread opens its statistics");
+        assert!(
+            opened.origin.y >= row.bottom(),
+            "under its row, not over it: {opened:?} against {row:?}"
+        );
+        assert!(
+            cx.debug_bounds(format!("RUN-METRICS-THREAD-DETAILS-{root_pid}-1").leak())
+                .is_none(),
+            "and only that thread's"
+        );
+
+        let row = cx
+            .debug_bounds(format!("RUN-METRICS-THREAD-{root_pid}-2").leak())
+            .expect("the row is still there");
+        cx.simulate_click(row.center(), Modifiers::none());
+        settle(&mut cx);
+        assert!(
+            cx.debug_bounds(details.leak()).is_none(),
+            "a second press closes them again"
+        );
+    }
+
+    /// A run started through a shell has its goroutines in the Go program the
+    /// shell started, so that is where they are shown.
+    #[gpui::test]
+    async fn goroutines_are_shown_under_the_go_program(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (_root_pid, child_pid, metrics) = a_run();
+        let goroutines = GoroutineReading::Read(Goroutines {
+            total: 12,
+            by_state: vec![("IO wait".into(), 12)],
+            source: GoroutineSource::Debugger,
+        });
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), Some(goroutines), cx);
+            item.set_go_program_for_test(Some(child_pid), cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        let under = cx
+            .debug_bounds(format!("RUN-METRICS-THREADS-{child_pid}").leak())
+            .expect("the Go program is opened by itself");
+        let line = cx
+            .debug_bounds("RUN-METRICS-GOROUTINES")
+            .expect("its goroutines are shown");
+        assert!(
+            line.origin.y >= under.origin.y && line.bottom() <= under.bottom(),
+            "inside the Go program's detail: {line:?} against {under:?}"
+        );
+    }
+
+    /// The reading opens nearly as tall as the editor, not only as tall as
+    /// the few rows a young run has.
+    #[gpui::test]
+    async fn the_reading_opens_large(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.simulate_resize(size(px(1400.), px(900.)));
+        let (_root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        let modal = cx
+            .debug_bounds("RUN-METRICS-MODAL")
+            .expect("the reading is open");
+        assert!(
+            modal.size.height >= px(760.) && modal.size.width >= px(1300.),
+            "a reading opened on a 1400x900 editor fills most of it: {:?}",
+            modal.size
         );
     }
 }

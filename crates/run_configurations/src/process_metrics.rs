@@ -67,6 +67,42 @@ pub struct ThreadReading {
     pub cpu: Option<f32>,
     /// What the machine says it is doing: `R`, `S`, `D`, `Z`, `T`, `I`.
     pub state: char,
+    /// Processor time it has had since it started, user and system together.
+    pub cpu_time: Duration,
+    /// How long it has been running. None when the machine's clock and the
+    /// thread's start do not hold together.
+    pub uptime: Option<Duration>,
+    /// Its nice value, from -20 (first in line) to 19 (last).
+    pub nice: Option<i64>,
+    /// The core it last ran on.
+    pub last_core: Option<u32>,
+    pub switches: Option<ContextSwitches>,
+}
+
+/// How often the scheduler took a thread off its core: because it waited for
+/// something (voluntary), or because its time was up (involuntary). A thread
+/// with many involuntary switches wants more processor than it gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextSwitches {
+    pub voluntary: u64,
+    pub involuntary: u64,
+}
+
+/// Reads the switch counts out of `/proc/<pid>/task/<tid>/status`.
+pub fn context_switches_of(status: &str) -> Option<ContextSwitches> {
+    let count_of = |key: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix(':')?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    Some(ContextSwitches {
+        voluntary: count_of("voluntary_ctxt_switches")?,
+        involuntary: count_of("nonvoluntary_ctxt_switches")?,
+    })
 }
 
 /// What the machine says about one process, before any of it is turned into a
@@ -108,6 +144,9 @@ pub struct ThreadSample {
     /// reused tid is told apart from the thread that had it before the same
     /// way a reused pid is.
     pub started: u64,
+    pub nice: Option<i64>,
+    pub last_core: Option<u32>,
+    pub switches: Option<ContextSwitches>,
 }
 
 /// The ticks a second holds, as the machine itself says. Guessing it skews every
@@ -135,6 +174,8 @@ struct StatFields {
     ticks: u64,
     threads: u64,
     started: u64,
+    nice: Option<i64>,
+    last_core: Option<u32>,
 }
 
 /// The name may hold spaces and brackets -- `(a b) c` is a real name -- so the
@@ -154,6 +195,8 @@ fn stat_fields(stat: &str) -> Option<StatFields> {
     let stime: u64 = after_name.get(12)?.parse().ok()?;
     let threads: u64 = after_name.get(17)?.parse().ok()?;
     let started: u64 = after_name.get(19)?.parse().ok()?;
+    let nice: Option<i64> = after_name.get(16).and_then(|field| field.parse().ok());
+    let last_core: Option<u32> = after_name.get(36).and_then(|field| field.parse().ok());
     Some(StatFields {
         id,
         name,
@@ -162,6 +205,8 @@ fn stat_fields(stat: &str) -> Option<StatFields> {
         ticks: utime.saturating_add(stime),
         threads,
         started,
+        nice,
+        last_core,
     })
 }
 
@@ -198,6 +243,9 @@ pub fn thread_sample_of(stat: &str, comm: &str) -> Option<ThreadSample> {
         state: fields.state,
         started: fields.started,
         ticks: fields.ticks,
+        nice: fields.nice,
+        last_core: fields.last_core,
+        switches: None,
     })
 }
 
@@ -386,11 +434,20 @@ impl Watcher {
                             thread.ticks.saturating_sub(before) as f32 / ticks_a_second() / seconds
                                 * 100.
                         });
+                        let uptime = machine_uptime.and_then(|up| {
+                            up.checked_sub(seconds(thread.started as f32 / ticks_a_second())?)
+                        });
                         ThreadReading {
                             tid: thread.tid,
                             name: thread.name.clone(),
                             cpu,
                             state: thread.state,
+                            cpu_time: seconds(thread.ticks as f32 / ticks_a_second())
+                                .unwrap_or_default(),
+                            uptime,
+                            nice: thread.nice,
+                            last_core: thread.last_core,
+                            switches: thread.switches,
                         }
                     })
                     .collect();
@@ -525,8 +582,11 @@ fn threads_of(pid: u32) -> Vec<ThreadSample> {
         let stat = fs::read_to_string(entry.path().join("stat"));
         let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
         if let Ok(stat) = stat
-            && let Some(thread) = thread_sample_of(&stat, &comm)
+            && let Some(mut thread) = thread_sample_of(&stat, &comm)
         {
+            thread.switches = fs::read_to_string(entry.path().join("status"))
+                .ok()
+                .and_then(|status| context_switches_of(&status));
             threads.push(thread);
         }
     }
@@ -742,6 +802,9 @@ mod tests {
             ticks,
             state: 'R',
             started,
+            nice: None,
+            last_core: None,
+            switches: None,
         }
     }
 
@@ -1114,6 +1177,21 @@ mod tests {
 
     /// A thread name with spaces and brackets parses the same way a process
     /// name does; `comm`, when it has something to say, wins over it.
+    #[test]
+    fn a_threads_switches_are_read_from_its_status() {
+        let status = "Name:\tworker\nState:\tS (sleeping)\n\
+                      voluntary_ctxt_switches:\t1520\n\
+                      nonvoluntary_ctxt_switches:\t37\n";
+        assert_eq!(
+            context_switches_of(status),
+            Some(ContextSwitches {
+                voluntary: 1520,
+                involuntary: 37
+            })
+        );
+        assert_eq!(context_switches_of("Name:\tworker\n"), None);
+    }
+
     #[test]
     fn a_thread_name_with_spaces_parses() {
         let stat = "77 (worker one (2)) R 10 10 10 0 -1 0 100 0 0 0 5 3 0 0 20 0 3 0 999 0 0";

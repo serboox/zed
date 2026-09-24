@@ -53,6 +53,65 @@ pub fn looks_like_go_command(command: &str) -> bool {
         .is_some_and(|first| GO_COMMANDS.contains(&first))
 }
 
+/// Whether the program `pid` runs was built by the Go toolchain.
+///
+/// A run is often a script or a shell that starts the Go program, so the
+/// command it was started with does not say. The binary does: every Go
+/// executable carries a `.go.buildinfo` section. Only the ELF header and the
+/// section table are read, not the program itself.
+pub fn is_go_program(pid: u32) -> bool {
+    let Ok(mut file) = std::fs::File::open(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    has_go_sections(&mut file).unwrap_or(false)
+}
+
+fn has_go_sections(file: &mut (impl std::io::Read + std::io::Seek)) -> std::io::Result<bool> {
+    use std::io::SeekFrom;
+
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    // Only 64-bit little-endian ELF, which is every Linux machine this runs on.
+    if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        return Ok(false);
+    }
+    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let u32_at = |bytes: &[u8], at: usize| {
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    };
+    let u64_at = |bytes: &[u8], at: usize| {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(word)
+    };
+    let table_at = u64_at(&header, 0x28);
+    let entry_size = u16_at(&header, 0x3a) as usize;
+    let count = u16_at(&header, 0x3c) as usize;
+    let names_index = u16_at(&header, 0x3e) as usize;
+    if entry_size < 0x28 || count == 0 || names_index >= count || count > 4096 {
+        return Ok(false);
+    }
+    let mut table = vec![0u8; entry_size * count];
+    file.seek(SeekFrom::Start(table_at))?;
+    file.read_exact(&mut table)?;
+    let entry = |index: usize| &table[index * entry_size..(index + 1) * entry_size];
+
+    let names_entry = entry(names_index);
+    let names_at = u64_at(names_entry, 0x18);
+    let names_size = u64_at(names_entry, 0x20).min(1 << 20) as usize;
+    let mut names = vec![0u8; names_size];
+    file.seek(SeekFrom::Start(names_at))?;
+    file.read_exact(&mut names)?;
+
+    Ok((0..count).any(|index| {
+        let name_at = u32_at(entry(index), 0) as usize;
+        names
+            .get(name_at..)
+            .and_then(|rest| rest.split(|byte| *byte == 0).next())
+            .is_some_and(|name| name == b".go.buildinfo")
+    }))
+}
+
 /// What is said when a run looks like a Go program but neither a debugger nor
 /// a pprof address is telling us its goroutines.
 pub fn no_reader_configured() -> SharedString {
@@ -217,6 +276,58 @@ main.worker()
         assert!(looks_like_go_command("go run ./cmd/api"));
         assert!(looks_like_go_command("gotestsum --format testname"));
         assert!(!looks_like_go_command("cargo test"));
+    }
+
+    /// A 64-bit little-endian ELF with the given section names, laid out the
+    /// way a linker lays it out: header, names, then the section table.
+    fn an_elf_with_sections(section_names: &[&str]) -> Vec<u8> {
+        let mut names = vec![0u8];
+        let mut offsets = Vec::new();
+        for name in section_names.iter().chain([&".shstrtab"]) {
+            offsets.push(names.len() as u32);
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+        }
+        let names_at = 64u64;
+        let table_at = names_at + names.len() as u64;
+        let count = offsets.len() as u16;
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[0x28..0x30].copy_from_slice(&table_at.to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&count.to_le_bytes());
+        elf[0x3e..0x40].copy_from_slice(&(count - 1).to_le_bytes());
+        elf.extend_from_slice(&names);
+        for offset in offsets {
+            let mut entry = vec![0u8; 64];
+            entry[..4].copy_from_slice(&offset.to_le_bytes());
+            entry[0x18..0x20].copy_from_slice(&names_at.to_le_bytes());
+            entry[0x20..0x28].copy_from_slice(&(names.len() as u64).to_le_bytes());
+            elf.extend_from_slice(&entry);
+        }
+        elf
+    }
+
+    #[test]
+    fn a_go_binary_is_told_by_its_build_info_section() {
+        let go = an_elf_with_sections(&[".text", ".go.buildinfo", ".data"]);
+        let other = an_elf_with_sections(&[".text", ".data", ".go.buildinfo.old"]);
+        assert!(has_go_sections(&mut std::io::Cursor::new(go)).expect("reads"));
+        assert!(!has_go_sections(&mut std::io::Cursor::new(other)).expect("reads"));
+        assert!(
+            !has_go_sections(&mut std::io::Cursor::new(b"#!/bin/sh\n".repeat(10))).expect("reads"),
+            "a script is not a Go program"
+        );
+    }
+
+    /// The editor itself is not a Go program; a check that answered yes to
+    /// everything would pass the test above for the wrong reason.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_running_test_is_not_a_go_program() {
+        assert!(!is_go_program(std::process::id()));
     }
 
     #[test]

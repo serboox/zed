@@ -428,8 +428,22 @@ pub fn dialog_title(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div
 /// window whose heading changes with its state (the dev container's does)
 /// passes one name for the whole run of states.
 pub fn dialog_shell(name: impl Into<crate::SharedString>, window: &Window, cx: &App) -> gpui::Div {
+    shell_of(name.into(), false, window, cx)
+}
+
+/// The same frame for a window that is read rather than answered -- a report
+/// with charts and a table -- and so opens nearly as large as the editor and
+/// as tall as it may be, instead of as tall as what it holds at that moment.
+pub fn dialog_shell_large(
+    name: impl Into<crate::SharedString>,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
+    shell_of(name.into(), true, window, cx)
+}
+
+fn shell_of(name: crate::SharedString, large: bool, window: &Window, cx: &App) -> gpui::Div {
     use crate::StyledExt as _;
-    let name = name.into();
     let viewport = window.viewport_size();
     let this = placed(&name, window);
     let held_size = placement_of(&this, cx);
@@ -442,7 +456,11 @@ pub fn dialog_shell(name: impl Into<crate::SharedString>, window: &Window, cx: &
             held(size.height, DIALOG_MIN_HEIGHT, viewport.height - DROPPED_BY),
         )
     });
-    let width = chosen.map_or_else(|| dialog_default_width(viewport), |size| size.width);
+    let default_width = match large {
+        true => (viewport.width - MARGIN * 2.).max(DIALOG_MIN_WIDTH),
+        false => dialog_default_width(viewport),
+    };
+    let width = chosen.map_or(default_width, |size| size.width);
 
     gpui::div()
         .flex()
@@ -452,8 +470,11 @@ pub fn dialog_shell(name: impl Into<crate::SharedString>, window: &Window, cx: &
         // window is as tall as what is in it and no taller, which is what keeps
         // a two-line confirmation from opening as tall as a form.
         .when_some(chosen, |shell, size| shell.h(size.height))
-        .when(chosen.is_none(), |shell| {
+        .when(chosen.is_none() && !large, |shell| {
             shell.max_h(dialog_default_max_height(viewport))
+        })
+        .when(chosen.is_none() && large, |shell| {
+            shell.h((viewport.height - DROPPED_BY - MARGIN).max(DIALOG_MIN_HEIGHT))
         })
         // Where the window has been carried to, as an offset from where the
         // layout would have put it. An offset rather than an absolute place, so
