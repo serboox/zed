@@ -259,7 +259,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --profile release-fast --package gpui_windows -- --nocapture 2>&1 |
+          cargo test --profile release-fast --package gpui_windows --features test-support -- --nocapture 2>&1 |
             tee window-test.log
 
       - name: Say what the window found
