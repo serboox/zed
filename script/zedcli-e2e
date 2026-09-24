@@ -6,6 +6,12 @@ ZEDCLI=${2:-$HOME/.local/lib/zed-fast/zedcli}
 DISPLAY_NUMBER=${ZEDCLI_E2E_DISPLAY:-97}
 MYSQL_PORT=${ZEDCLI_E2E_MYSQL_PORT:-33961}
 HTTP_PORT=${ZEDCLI_E2E_HTTP_PORT:-33962}
+POSTGRES_PORT=${ZEDCLI_E2E_POSTGRES_PORT:-33963}
+REDIS_PORT=${ZEDCLI_E2E_REDIS_PORT:-33964}
+MONGO_PORT=${ZEDCLI_E2E_MONGO_PORT:-33965}
+POSTGRES_IMAGE=mirror.gcr.io/library/postgres:16-alpine
+REDIS_IMAGE=mirror.gcr.io/library/redis:7-alpine
+MONGO_IMAGE=mirror.gcr.io/library/mongo:7
 MYSQL_IMAGE=${ZEDCLI_E2E_MYSQL_IMAGE:-docker.io/library/mysql:8.4}
 
 for tool in podman Xvfb xdotool; do
@@ -13,7 +19,7 @@ for tool in podman Xvfb xdotool; do
 done
 [ -x "$ZED" ] || { echo "zedcli-e2e: no editor at $ZED" >&2; exit 2; }
 [ -x "$ZEDCLI" ] || { echo "zedcli-e2e: no zedcli at $ZEDCLI" >&2; exit 2; }
-for port in "$MYSQL_PORT" "$HTTP_PORT"; do
+for port in "$MYSQL_PORT" "$HTTP_PORT" "$POSTGRES_PORT" "$REDIS_PORT" "$MONGO_PORT"; do
     if ss -ltn | grep -q ":$port "; then
         echo "zedcli-e2e: port $port is taken; set ZEDCLI_E2E_MYSQL_PORT or ZEDCLI_E2E_HTTP_PORT" >&2
         exit 2
@@ -26,6 +32,14 @@ fi
 
 ROOT=$(mktemp -d /tmp/zedcli-e2e.XXXXXX)
 CONTAINER="zedcli-e2e-mysql-$$"
+POSTGRES="zedcli-e2e-postgres-$$"
+REDIS="zedcli-e2e-redis-$$"
+MONGO="zedcli-e2e-mongo-$$"
+# Images this run pulls are removed again at the end; ones already here stay.
+PULLED_IMAGES=()
+for image in "$POSTGRES_IMAGE" "$REDIS_IMAGE" "$MONGO_IMAGE"; do
+    podman image exists "$image" || PULLED_IMAGES+=("$image")
+done
 XVFB_PID=""
 ZED_PID=""
 HTTP_PID=""
@@ -34,7 +48,10 @@ cleanup() {
     [ -n "$ZED_PID" ] && kill "$ZED_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
     [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null || true
-    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    podman rm -f "$CONTAINER" "$POSTGRES" "$REDIS" "$MONGO" >/dev/null 2>&1 || true
+    for image in "${PULLED_IMAGES[@]}"; do
+        podman rmi "$image" >/dev/null 2>&1 || true
+    done
     # A run the editor started may have outlived it; they carry the scratch root.
     pgrep -f "$ROOT" | xargs -r kill -9 2>/dev/null || true
     rm -rf "$ROOT"
@@ -63,7 +80,12 @@ expect_status() {
 
 echo "== MySQL on 127.0.0.1:$MYSQL_PORT"
 podman run -d --rm --name "$CONTAINER" -e MYSQL_ROOT_PASSWORD=e2e-root -e MYSQL_DATABASE=shop \
-    -p "127.0.0.1:$MYSQL_PORT:3306" "$MYSQL_IMAGE" >/dev/null
+    -p "127.0.0.1:$MYSQL_PORT:3306" "$MYSQL_IMAGE" --log-bin-trust-function-creators=1 >/dev/null
+echo "== PostgreSQL, Redis and MongoDB"
+podman run -d --rm --name "$POSTGRES" -e POSTGRES_PASSWORD=e2e-root -e POSTGRES_DB=shop \
+    -p "127.0.0.1:$POSTGRES_PORT:5432" "$POSTGRES_IMAGE" >/dev/null
+podman run -d --rm --name "$REDIS" -p "127.0.0.1:$REDIS_PORT:6379" "$REDIS_IMAGE" >/dev/null
+podman run -d --rm --name "$MONGO" -p "127.0.0.1:$MONGO_PORT:27017" "$MONGO_IMAGE" >/dev/null
 # The image first runs a server of its own to initialise the data directory and
 # then restarts; only the line naming port 3306 is the one that stays up.
 for _ in $(seq 1 120); do
@@ -74,13 +96,43 @@ SEEDED=""
 for _ in $(seq 1 20); do
     if podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -e "
         CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name VARCHAR(40) NULL);
-        REPLACE INTO users VALUES (1, 'Ada'), (2, 'Grace, \"the admiral\"'), (3, NULL);" 2>/dev/null; then
+        REPLACE INTO users VALUES (1, 'Ada'), (2, 'Grace, \"the admiral\"'), (3, NULL);
+        CREATE TABLE IF NOT EXISTS log (id INT);" 2>/dev/null; then
         SEEDED=1
         break
     fi
     sleep 1
 done
 [ -n "$SEEDED" ] || { echo "zedcli-e2e: MySQL never took the seed data"; podman logs "$CONTAINER" 2>&1 | tail -5; exit 1; }
+# The body holds statements of its own, so it goes in with a delimiter the
+# client does not split on.
+printf '%s\n' 'DROP FUNCTION IF EXISTS bump;' 'DELIMITER //' \
+    'CREATE FUNCTION bump() RETURNS INT NOT DETERMINISTIC MODIFIES SQL DATA BEGIN INSERT INTO log VALUES (1); RETURN 1; END//' \
+    'DELIMITER ;' | podman exec -i "$CONTAINER" mysql -uroot -pe2e-root shop 2>/dev/null \
+    || { echo "zedcli-e2e: MySQL did not take the function"; exit 1; }
+
+# A function that writes, called from what reads as a plain SELECT: the one
+# thing no reading of the text can catch, so the database itself has to.
+pg() { podman exec "$POSTGRES" psql -U postgres -d shop -tA -c "$1"; }
+for _ in $(seq 1 60); do
+    pg "SELECT 1" >/dev/null 2>&1 && break
+    sleep 1
+done
+pg "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+    INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace');
+    CREATE TABLE log (id INT);
+    CREATE FUNCTION bump() RETURNS INT VOLATILE LANGUAGE sql AS 'INSERT INTO log VALUES (1) RETURNING 1';" >/dev/null
+for _ in $(seq 1 30); do
+    podman exec "$REDIS" redis-cli ping 2>/dev/null | grep -q PONG && break
+    sleep 1
+done
+podman exec "$REDIS" redis-cli SET greeting hello >/dev/null
+mongo() { podman exec "$MONGO" mongosh --quiet shop --eval "$1"; }
+for _ in $(seq 1 60); do
+    mongo "db.runCommand({ ping: 1 }).ok" 2>/dev/null | grep -q 1 && break
+    sleep 1
+done
+mongo 'db.users.insertMany([{ _id: 1, name: "Ada" }, { _id: 2, name: "Grace" }])' >/dev/null
 
 echo "== Editor on :$DISPLAY_NUMBER"
 # An editor started with --user-data-dir keeps its configuration inside it.
@@ -112,6 +164,35 @@ cat >"$ROOT/data/config/db_connections.json" <<JSON
       "database": "shop",
       "ssl_mode": "Require",
       "read_only": true
+    },
+    {
+      "id": "6b1d0f0e-4c47-4d6a-9d7c-0e2e2e5e0003",
+      "label": "e2e-postgres",
+      "driver": "PostgreSQL",
+      "host": "127.0.0.1",
+      "port": $POSTGRES_PORT,
+      "username": "postgres",
+      "password": "e2e-root",
+      "database": "shop"
+    },
+    {
+      "id": "6b1d0f0e-4c47-4d6a-9d7c-0e2e2e5e0004",
+      "label": "e2e-redis",
+      "driver": "Redis",
+      "host": "127.0.0.1",
+      "port": $REDIS_PORT,
+      "username": "",
+      "password": ""
+    },
+    {
+      "id": "6b1d0f0e-4c47-4d6a-9d7c-0e2e2e5e0005",
+      "label": "e2e-mongo",
+      "driver": "MongoDB",
+      "host": "127.0.0.1",
+      "port": $MONGO_PORT,
+      "username": "",
+      "password": "",
+      "database": "shop"
     }
   ]
 }
@@ -148,6 +229,13 @@ cat >"$ROOT/data/config/api_collections.json" <<JSON
       "name": "Broken",
       "method": "Get",
       "url": "{{host}}/boom"
+    },
+    {
+      "id": "a0000000-0000-4000-8000-000000000005",
+      "collection_id": "a0000000-0000-4000-8000-000000000001",
+      "name": "Cancel order",
+      "method": "Delete",
+      "url": "{{host}}/orders/1"
     }
   ],
   "tree_order": "name"
@@ -224,46 +312,13 @@ echo "== configs"
 out=$(cd "$ROOT/project" && zc configs) || true
 echo "$out" | grep -q sleeper && pass "configurations are found from the project directory" \
     || fail "configurations are found from the project directory" "$out"
-expect_status 4 "an unknown configuration is not found" -- run "no such configuration" --window "$WINDOW"
 
-pids_of_sleeper() {
-    zc ps --window "$WINDOW" --json | /usr/bin/python3 -c '
-import json, sys
-runs = json.load(sys.stdin)["runs"]
-print(" ".join(str(p["pid"]) for r in runs if r["label"] == "sleeper" and r["state"] == "running" for p in r["processes"]))' 2>/dev/null || true
-}
-wait_for_pids() {
-    local pids=""
-    for _ in $(seq 1 30); do
-        pids=$(pids_of_sleeper)
-        [ "$(echo "$pids" | wc -w)" -ge 3 ] && break
-        sleep 1
-    done
-    echo "$pids"
-}
-alive() { local left=""; for pid in $1; do kill -0 "$pid" 2>/dev/null && left="$left $pid"; done; echo "$left"; }
-# Every `sleep 300` this script's editor started, found by the scratch HOME in
-# its environment, so a stray one outside the run's tree is caught as well.
-sleeps_left() { pgrep -x sleep -a | awk '$3 == "300" {print $1}' | while read -r pid; do
-        grep -qs "$ROOT" "/proc/$pid/environ" && echo "$pid"; done | tr '\n' ' '; }
-
-echo "== run, restart, stop"
-expect_status 0 "run starts the configuration" -- run sleeper --window "$WINDOW"
-FIRST=$(wait_for_pids)
-[ "$(echo "$FIRST" | wc -w)" -ge 3 ] && pass "ps shows the run with the programs it started" \
-    || fail "ps shows the run with the programs it started" "$(zc ps --window "$WINDOW")"
-expect_status 0 "run of a running configuration replaces it" -- run sleeper --window "$WINDOW"
-SECOND=$(wait_for_pids)
-[ -z "$(alive "$FIRST")" ] && pass "the previous run is gone, all of it" \
-    || fail "the previous run is gone, all of it" "left: $(alive "$FIRST")"
-expect_status 0 "restart restarts it" -- restart sleeper --window "$WINDOW"
-THIRD=$(wait_for_pids)
-[ -z "$(alive "$SECOND")" ] && [ -n "$THIRD" ] && pass "restart ended the old run and started a new one" \
-    || fail "restart ended the old run and started a new one" "old left: $(alive "$SECOND"), new: $THIRD"
-expect_status 0 "stop stops it" -- stop sleeper --window "$WINDOW"
-sleep 1
-[ -z "$(alive "$THIRD")" ] && [ -z "$(sleeps_left)" ] && pass "nothing of the run is left, not even what left its session" \
-    || fail "nothing of the run is left, not even what left its session" "left: $(alive "$THIRD") $(sleeps_left)"
+echo "== runs are only looked at"
+out=$(zc ps --window "$WINDOW") || true
+echo "$out" | grep -q "No task runs" && pass "ps lists the runs, here none" || fail "ps lists the runs, here none" "$out"
+for command in run stop restart; do
+    expect_status 2 "there is no $command command" -- "$command" sleeper --window "$WINDOW"
+done
 
 echo "== db"
 out=$(zc db connections) || true
@@ -275,13 +330,72 @@ want=$'id,name\n1,Ada\n2,"Grace, ""the admiral"""\n3,'
 out=$(echo "SELECT COUNT(*) AS n FROM users" | zc db query -c e2e-mysql --json) || true
 echo "$out" | grep -q '"n": "3"' && pass "SQL is read from stdin and printed as JSON" || fail "SQL is read from stdin and printed as JSON" "$out"
 expect_status 1 "an SQL error is a failed request" -- db query -c e2e-mysql "SELECT nope FROM users"
+
+echo "== only reads get through"
+mysql_count() { podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -N -e "$1" 2>/dev/null; }
+for write in \
+    "UPDATE users SET name = 'x' WHERE id = 1" \
+    "DELETE FROM users" \
+    "DROP TABLE users" \
+    "INSERT INTO users VALUES (9, 'x')" \
+    "SELECT 1; DELETE FROM users" \
+    "SELECT 1 /*! ; DELETE FROM users */" \
+    "SELECT * FROM users FOR UPDATE" \
+    "SELECT * FROM users INTO OUTFILE '/tmp/x'"; do
+    expect_status 5 "MySQL refuses: $write" -- db query -c e2e-mysql "$write"
+done
+# The database's own refusal, not any error: a missing function would fail too.
+hidden=$(zc db query -c e2e-mysql "SELECT bump()" 2>&1) && status=0 || status=$?
+[ "$status" = 1 ] && echo "$hidden" | grep -qi "read.only" && pass "MySQL itself refuses a write hidden in a function" \
+    || fail "MySQL itself refuses a write hidden in a function" "exit $status: $hidden"
+[ "$(mysql_count 'SELECT COUNT(*) FROM log')" = 0 ] && pass "the function wrote nothing" \
+    || fail "the function wrote nothing" "log holds $(mysql_count 'SELECT COUNT(*) FROM log') rows"
+[ "$(mysql_count 'SELECT COUNT(*) FROM users')" = 3 ] && [ "$(mysql_count 'SELECT name FROM users WHERE id = 1')" = Ada ] \
+    && pass "MySQL data is untouched" || fail "MySQL data is untouched"
+
+out=$(zc db query -c e2e-postgres --csv "SELECT name FROM users ORDER BY id") || true
+[ "$out" = $'name\nAda\nGrace' ] && pass "PostgreSQL reads" || fail "PostgreSQL reads" "$out"
+for write in \
+    "UPDATE users SET name = 'x'" \
+    "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d" \
+    "SELECT \$\$'\$\$; DELETE FROM users; --'" \
+    "SELECT nextval('s')" \
+    "COPY users TO '/tmp/x'"; do
+    expect_status 5 "PostgreSQL refuses: $write" -- db query -c e2e-postgres "$write"
+done
+hidden=$(zc db query -c e2e-postgres "SELECT bump()" 2>&1) && status=0 || status=$?
+[ "$status" = 1 ] && echo "$hidden" | grep -qi "read.only" && pass "PostgreSQL itself refuses a write hidden in a function" \
+    || fail "PostgreSQL itself refuses a write hidden in a function" "exit $status: $hidden"
+[ "$(pg 'SELECT COUNT(*) FROM log')" = 0 ] && pass "the function wrote nothing" \
+    || fail "the function wrote nothing" "log holds $(pg 'SELECT COUNT(*) FROM log') rows"
+[ "$(pg 'SELECT COUNT(*) FROM users')" = 2 ] && pass "PostgreSQL data is untouched" || fail "PostgreSQL data is untouched"
+
+out=$(zc db query -c e2e-redis "GET greeting") || true
+echo "$out" | grep -q hello && pass "Redis reads" || fail "Redis reads" "$out"
+for write in "SET greeting bye" "DEL greeting" "GETDEL greeting" "EVAL \"return redis.call('DEL','greeting')\" 0" "FLUSHALL"; do
+    expect_status 5 "Redis refuses: $write" -- db query -c e2e-redis "$write"
+done
+[ "$(podman exec "$REDIS" redis-cli GET greeting)" = hello ] && pass "Redis data is untouched" || fail "Redis data is untouched"
+
+out=$(zc db query -c e2e-mongo --json 'db.users.find({ name: "Ada" })') || true
+echo "$out" | grep -q Ada && pass "MongoDB reads" || fail "MongoDB reads" "$out"
+for write in \
+    'db.users.deleteMany({})' \
+    'db.users.updateOne({ _id: 1 }, { $set: { name: "x" } })' \
+    'db.users.insertOne({ _id: 9 })' \
+    'db.users.aggregate([{ $match: {} }, { $out: "copy" }])' \
+    'db.users.drop()'; do
+    expect_status 5 "MongoDB refuses: $write" -- db query -c e2e-mongo "$write"
+done
+[ "$(mongo 'db.users.countDocuments({})')" = 2 ] && [ "$(mongo 'db.getCollectionNames().includes("copy")')" = false ] \
+    && pass "MongoDB data is untouched" || fail "MongoDB data is untouched"
 expect_status 4 "an unknown connection is not found" -- db query -c no-such-connection "SELECT 1"
 out=$(zc db query -c e2e-mysql --json "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n WHERE x < 600) SELECT x FROM n") || true
 ROWS=$(echo "$out" | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)["rows"]))' 2>/dev/null || echo "?")
 echo "  info  a 600-row query came back with $ROWS rows"
 [ "$ROWS" -gt 0 ] 2>/dev/null && pass "a large result comes back" || fail "a large result comes back" "$out"
 expect_status 0 "a read-only connection still reads" -- db query -c e2e-mysql-read-only "SELECT COUNT(*) FROM users"
-expect_status 1 "a read-only connection refuses a write" -- db query -c e2e-mysql-read-only "UPDATE users SET name = 'x' WHERE id = 1"
+expect_status 5 "a read-only connection refuses a write" -- db query -c e2e-mysql-read-only "UPDATE users SET name = 'x' WHERE id = 1"
 out=$(zc db query -c e2e-mysql --csv "SELECT name FROM users WHERE id = 1") || true
 [ "$out" = $'name\nAda' ] && pass "the refused write changed nothing" || fail "the refused write changed nothing" "$out"
 
@@ -299,6 +413,7 @@ echo "$err" | grep -q "pass  is found" && pass "the request's test script runs" 
 expect_status 0 "an error status is still an answer" -- api send Broken --env local
 expect_status 1 "--fail makes an error status a failure" -- api send Broken --env local --fail
 expect_status 4 "an unknown request is not found" -- api send "Nowhere" --env local
+expect_status 5 "a request that could change data is refused" -- api send "Cancel order" --env local
 zc api send "Get order" --env local --var id=9 -o "$ROOT/body.json" >/dev/null 2>&1 || true
 grep -q '/orders/9' "$ROOT/body.json" 2>/dev/null && pass "-o writes the body to a file" || fail "-o writes the body to a file"
 

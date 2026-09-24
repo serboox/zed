@@ -293,6 +293,8 @@ pub mod exit_status {
     pub const BAD_ARGUMENTS: i32 = 2;
     pub const EDITOR_UNREACHABLE: i32 = 3;
     pub const NOT_FOUND: i32 = 4;
+    /// The request would change data, and only reads are let through.
+    pub const REFUSED: i32 = 5;
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),

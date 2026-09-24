@@ -104,6 +104,7 @@ copilot_ui.workspace = true
 crashes.workspace = true
 dap_adapters.workspace = true
 db.workspace = true
+db_client.workspace = true
 db_client_ui.workspace = true
 debug_adapter_extension.workspace = true
 debugger_tools.workspace = true

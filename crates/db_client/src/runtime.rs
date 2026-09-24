@@ -176,6 +176,13 @@ impl DbProvider for RuntimeProvider {
         on_runtime(async move { inner.execute_query(&database, &sql).await }).await
     }
 
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        let inner = self.inner.clone();
+        let database = database.to_owned();
+        let query = query.to_owned();
+        on_runtime(async move { inner.execute_read_only(&database, &query).await }).await
+    }
+
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
         let inner = self.inner.clone();
         let database = database.to_owned();

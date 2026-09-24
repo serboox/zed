@@ -4,7 +4,7 @@ use futures::TryStreamExt as _;
 use smol::lock::Mutex as AsyncMutex;
 use sqlx::AssertSqlSafe;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
-use sqlx::{Column as _, Row as _, TypeInfo as _};
+use sqlx::{Column as _, Connection as _, Row as _, TypeInfo as _};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1706,6 +1706,42 @@ impl DbProvider for MySqlProvider {
             .await
             .context("Failed to take a connection for the export")?;
         stream_into_the_sink(&mut connection, sql, sink, self.row_stall_limit).await
+    }
+
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        crate::read_only::check_sql(query, crate::read_only::Language::MySql)?;
+        let mut options = self.connect_options.clone();
+        if !database.is_empty() {
+            options = options.database(database);
+        }
+        // A connection of its own: the pooled one may be inside the console's
+        // open transaction, or carry a `USE` or session setting of theirs.
+        let mut connection = sqlx::MySqlConnection::connect_with(&options)
+            .await
+            .context("Failed to open a read-only connection to MySQL")?;
+        // The session as well as the transaction: a statement that commits
+        // implicitly would end a read-only transaction, and the one after it
+        // must still be refused its write.
+        for statement in [
+            "SET SESSION TRANSACTION READ ONLY",
+            "START TRANSACTION READ ONLY",
+        ] {
+            sqlx::raw_sql(AssertSqlSafe(statement))
+                .execute(&mut connection)
+                .await
+                .with_context(|| format!("Failed to run `{statement}`"))?;
+        }
+        let answer = run_the_statement(&mut connection, query, 0, self.row_stall_limit).await;
+        if let Err(error) = sqlx::raw_sql(AssertSqlSafe("ROLLBACK"))
+            .execute(&mut connection)
+            .await
+        {
+            log::warn!("rolling back a read-only query: {error:#}");
+        }
+        if let Err(error) = connection.close().await {
+            log::warn!("closing a read-only connection: {error:#}");
+        }
+        answer
     }
 
     fn holds_transactions(&self) -> bool {

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use cli::{
     CliRequest, CliResponse, ConfigurationInfo, DbConnectionSummary, IpcHandshake, ProcessInfo,
-    RunAction, RunInfo, RunState, WindowInfo, WorkspaceInfo, exit_status, ipc,
+    RunInfo, RunState, WindowInfo, WorkspaceInfo, exit_status, ipc,
 };
 use smol::io::AsyncWriteExt as _;
 use tempfile::TempDir;
@@ -278,33 +278,15 @@ fn a_window_can_be_named_or_every_window_asked_for() {
 }
 
 #[test]
-fn run_stop_and_restart_ask_for_their_own_action() {
-    for (command, action) in [
-        ("run", RunAction::Run),
-        ("stop", RunAction::Stop),
-        ("restart", RunAction::Restart),
-    ] {
-        let editor = FakeEditor::answering(|_| {
-            vec![
-                CliResponse::Stdout {
-                    message: "Done 'api server'.".into(),
-                },
-                CliResponse::Exit { status: 0 },
-            ]
-        });
-        let output = zedcli(editor.data_dir.path(), &[command, "api server"], None, None);
-        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert!(stdout(&output).contains("Done 'api server'."));
-        let CliRequest::ControlRun {
-            configuration,
-            action: asked,
-            ..
-        } = editor.request()
-        else {
-            panic!("{command} asks to control a run");
-        };
-        assert_eq!(configuration, "api server");
-        assert_eq!(asked, action, "{command}");
+fn there_is_no_command_that_starts_or_stops_a_run() {
+    let data_dir = TempDir::new().expect("a data directory");
+    for command in ["run", "stop", "restart"] {
+        let output = zedcli(data_dir.path(), &[command, "api server"], None, None);
+        assert_eq!(
+            output.status.code(),
+            Some(exit_status::BAD_ARGUMENTS),
+            "{command} is not a zedcli command"
+        );
     }
 }
 
@@ -313,16 +295,16 @@ fn the_status_the_editor_answers_is_the_status_zedcli_exits_with() {
     let editor = FakeEditor::answering(|_| {
         vec![
             CliResponse::Stderr {
-                message: "No run configuration named 'nope'.".into(),
+                message: "No editor window with id 9.".into(),
             },
             CliResponse::Exit {
                 status: exit_status::NOT_FOUND,
             },
         ]
     });
-    let output = zedcli(editor.data_dir.path(), &["run", "nope"], None, None);
+    let output = zedcli(editor.data_dir.path(), &["ps", "--window", "9"], None, None);
     assert_eq!(output.status.code(), Some(exit_status::NOT_FOUND));
-    assert!(stderr(&output).contains("No run configuration named 'nope'."));
+    assert!(stderr(&output).contains("No editor window with id 9."));
     editor.request();
 }
 

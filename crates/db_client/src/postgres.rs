@@ -1000,6 +1000,42 @@ impl DbProvider for PostgresProvider {
         }
     }
 
+    async fn execute_read_only(&self, schema: &str, query: &str) -> Result<QueryResult> {
+        crate::read_only::check_sql(query, crate::read_only::Language::Postgres)?;
+        // A connection of its own: the pooled one may be inside the console's
+        // open transaction or carry a `search_path` of theirs.
+        let mut connection = sqlx::PgConnection::connect_with(&self.connect_options)
+            .await
+            .context("Failed to open a read-only connection to PostgreSQL")?;
+        let mut statements = vec![
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY".to_string(),
+            "BEGIN READ ONLY".to_string(),
+        ];
+        if !schema.is_empty() {
+            statements.push(search_path_statement(schema).replacen("SET ", "SET LOCAL ", 1));
+        }
+        for statement in &statements {
+            sqlx::raw_sql(AssertSqlSafe(statement.as_str()))
+                .execute(&mut connection)
+                .await
+                .with_context(|| format!("Failed to run `{statement}`"))?;
+        }
+        let start = Instant::now();
+        let answer = collect_rows(&mut connection, prefixed_statement(query).as_str())
+            .await
+            .map(|(columns, rows)| rows_result(columns, rows, start));
+        if let Err(error) = sqlx::raw_sql(AssertSqlSafe("ROLLBACK"))
+            .execute(&mut connection)
+            .await
+        {
+            log::warn!("rolling back a read-only query: {error:#}");
+        }
+        if let Err(error) = connection.close().await {
+            log::warn!("closing a read-only connection: {error:#}");
+        }
+        answer
+    }
+
     async fn execute_query_streaming(
         &self,
         schema: &str,

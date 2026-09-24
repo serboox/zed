@@ -207,6 +207,14 @@ impl DbProvider for CassandraProvider {
         Ok(columns)
     }
 
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        // CQL has no read-only session to add underneath, but it has no
+        // statement starting SELECT or DESCRIBE that writes either: the check
+        // is the whole guard here, and it admits nothing else.
+        crate::read_only::check_sql(query, crate::read_only::Language::Cql)?;
+        self.execute_query(database, query).await
+    }
+
     async fn execute_query(&self, database: &str, cql: &str) -> Result<QueryResult> {
         use futures::StreamExt as _;
 

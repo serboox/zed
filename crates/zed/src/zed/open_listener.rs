@@ -700,19 +700,21 @@ pub async fn handle_cli_connection(
             CliRequest::ListConfigurations { selector } => {
                 super::cli_requests::list_configurations(selector, responses.as_ref(), cx).await;
             }
-            CliRequest::ControlRun {
-                selector,
-                configuration,
-                action,
-            } => {
-                super::cli_requests::control_run(
-                    selector,
-                    configuration,
-                    action,
-                    responses.as_ref(),
-                    cx,
-                )
-                .await;
+            CliRequest::ControlRun { .. } => {
+                // A run executes whatever its configuration says, which can
+                // change anything; the socket is for reading only.
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Starting or stopping a run can change data, and zedcli only \
+                                  reads. Use the editor's Run and Stop buttons."
+                            .to_string(),
+                    })
+                    .log_err();
+                responses
+                    .send(CliResponse::Exit {
+                        status: cli::exit_status::REFUSED,
+                    })
+                    .log_err();
             }
             CliRequest::ListApiRequests => {
                 super::cli_requests::list_api_requests(responses.as_ref(), cx).await;
@@ -787,7 +789,7 @@ async fn handle_execute_query(
     };
 
     let task = store.update(cx, |store, cx| {
-        store.run_query_for_cli(connection, database, sql, cx)
+        store.run_read_only_query_for_cli(connection, database, sql, cx)
     });
     let result = task.await;
 
@@ -805,9 +807,12 @@ async fn handle_execute_query(
         }
         Err(error) => {
             let message = format!("{error:#}");
-            let status = match message.starts_with("No database connection matching") {
-                true => cli::exit_status::NOT_FOUND,
-                false => cli::exit_status::FAILED,
+            let status = if db_client::read_only::is_refusal(&error) {
+                cli::exit_status::REFUSED
+            } else if message.starts_with("No database connection matching") {
+                cli::exit_status::NOT_FOUND
+            } else {
+                cli::exit_status::FAILED
             };
             responses.send(CliResponse::Stderr { message }).log_err();
             responses.send(CliResponse::Exit { status }).log_err();

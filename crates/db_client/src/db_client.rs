@@ -7,6 +7,7 @@ pub mod mongo_provider;
 pub mod mysql;
 pub mod postgres;
 pub mod provider;
+pub mod read_only;
 pub mod redis_provider;
 pub mod runtime;
 pub mod schema;

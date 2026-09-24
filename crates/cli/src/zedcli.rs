@@ -8,7 +8,7 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use cli::{
     ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse,
-    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo,
+    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunInfo, RunState, WindowInfo,
     WindowSelector, exit_status, ipc::IpcOneShotServer,
 };
 use serde_json::json;
@@ -47,12 +47,6 @@ enum Command {
     Ps,
     /// List the run configurations of the selected window's projects.
     Configs,
-    /// Start a run configuration, stopping a run of it that is still going.
-    Run { configuration: String },
-    /// Stop every run of a configuration, with everything it started.
-    Stop { configuration: String },
-    /// Stop a configuration's runs, then start it again.
-    Restart { configuration: String },
     /// Database Explorer: saved connections and SQL.
     Db {
         #[command(subcommand)]
@@ -182,21 +176,6 @@ fn run(cli: ZedCli) -> Result<i32> {
         Command::Windows => CliRequest::ListWindows,
         Command::Ps => CliRequest::ListRuns { selector },
         Command::Configs => CliRequest::ListConfigurations { selector },
-        Command::Run { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Run,
-        },
-        Command::Stop { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Stop,
-        },
-        Command::Restart { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Restart,
-        },
         Command::Db { command } => match command {
             DbCommand::Connections => CliRequest::ListConnections,
             DbCommand::Query {

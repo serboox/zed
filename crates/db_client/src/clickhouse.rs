@@ -43,7 +43,18 @@ impl ClickHouseProvider {
         sql: &str,
         database: Option<&str>,
     ) -> Result<ClickHouseJsonResponse> {
-        let url = if let Some(db) = database {
+        self.query_json_as(sql, database, false).await
+    }
+
+    /// `read_only` sends ClickHouse's own `readonly=1`, under which the server
+    /// refuses every write and every change of a setting.
+    async fn query_json_as(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+        read_only: bool,
+    ) -> Result<ClickHouseJsonResponse> {
+        let mut url = if let Some(db) = database {
             format!(
                 "{}/?database={}&default_format=JSONCompact",
                 self.base_url,
@@ -52,6 +63,9 @@ impl ClickHouseProvider {
         } else {
             format!("{}/?default_format=JSONCompact", self.base_url)
         };
+        if read_only {
+            url.push_str("&readonly=1");
+        }
 
         let full_sql = format!("{} FORMAT JSONCompact", sql.trim_end_matches(';'));
         let response = self
@@ -733,6 +747,42 @@ impl DbProvider for ClickHouseProvider {
             .await
             .context("Failed to read database DDL response")?;
         Ok(ddl.trim().to_string())
+    }
+
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        crate::read_only::check_sql(query, crate::read_only::Language::ClickHouse)?;
+        let start = Instant::now();
+        let database = (!database.is_empty()).then_some(database);
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            query
+        );
+        let response = self.query_json_as(&prefixed, database, true).await?;
+        let columns: Vec<String> = response.meta.into_iter().map(|meta| meta.name).collect();
+        let rows: Vec<Vec<Option<String>>> = response
+            .data
+            .into_iter()
+            .take(MAX_RESULT_ROWS)
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(text) => Some(text),
+                        other => Some(other.to_string()),
+                    })
+                    .collect()
+            })
+            .collect();
+        let rows_affected = rows.len() as u64;
+        Ok(QueryResult {
+            raw_documents: None,
+            columns,
+            rows,
+            rows_affected,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+            timing: None,
+        })
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {

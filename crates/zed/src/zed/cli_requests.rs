@@ -3,14 +3,12 @@ use std::time::{Duration, Instant};
 
 use cli::{
     ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, ApiTestInfo, CliResponse, CliResponseSink,
-    ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunAction, RunInfo, RunState, WindowInfo,
+    ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunInfo, RunState, WindowInfo,
     WindowSelector, WorkspaceInfo, exit_status,
 };
-use gpui::{AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
+use gpui::{App, AsyncApp, Entity, WindowHandle};
 use run_configurations::configurations_file::Kind;
-use run_configurations::{
-    configurations_store, configurations_view, process_metrics, run_instances,
-};
+use run_configurations::{configurations_store, process_metrics, run_instances};
 use terminal::TaskStatus;
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
@@ -400,138 +398,6 @@ pub async fn list_configurations(
     responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
-enum Found {
-    Task(Entity<Workspace>, AnyWindowHandle, task::TaskTemplate),
-    Debug(Entity<Workspace>, AnyWindowHandle, task::DebugScenario),
-}
-
-pub async fn control_run(
-    selector: WindowSelector,
-    configuration: String,
-    action: RunAction,
-    responses: &dyn CliResponseSink,
-    cx: &mut AsyncApp,
-) {
-    if selector.all {
-        return say_and_exit(
-            responses,
-            "Name one window for run, stop and restart, not --all.".to_string(),
-            exit_status::BAD_ARGUMENTS,
-        );
-    }
-    let windows = match cx.update(|cx| selected_windows(&selector, cx)) {
-        Ok(windows) => windows,
-        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
-    };
-    let stores = match read_stores(&windows, cx).await {
-        Ok(stores) => stores,
-        Err(message) => return say_and_exit(responses, message, exit_status::FAILED),
-    };
-    let found = cx.update(|cx| {
-        for (_, workspace, store) in stores {
-            let window = editor_windows(cx).into_iter().find(|window| {
-                workspaces_of(window, cx)
-                    .iter()
-                    .any(|candidate| candidate.entity_id() == workspace.entity_id())
-            });
-            let Some(window) = window else {
-                continue;
-            };
-            let store = store.read(cx);
-            for kind in [Kind::Task, Kind::Debug] {
-                let Some(found) = store
-                    .of_kind(kind)
-                    .configurations
-                    .iter()
-                    .find(|candidate| candidate.label == configuration)
-                else {
-                    continue;
-                };
-                if let Some(task) = &found.task {
-                    return Ok(Found::Task(workspace, window.into(), task.clone()));
-                }
-                if let Some(scenario) = &found.scenario {
-                    return Ok(Found::Debug(workspace, window.into(), scenario.clone()));
-                }
-            }
-        }
-        Err(format!(
-            "No run configuration named '{configuration}'. See `zedcli configs`."
-        ))
-    });
-    let found = match found {
-        Ok(found) => found,
-        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
-    };
-
-    match found {
-        Found::Task(workspace, window, task) => {
-            if matches!(action, RunAction::Stop | RunAction::Restart) {
-                let stopping = workspace.update(cx, |workspace, cx| {
-                    run_instances::stop_every_run_of(workspace, &task, cx)
-                });
-                stopping.await;
-            }
-            if matches!(action, RunAction::Run | RunAction::Restart) {
-                let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx))
-                else {
-                    return say_and_exit(
-                        responses,
-                        "The window closed before the run could start.".to_string(),
-                        exit_status::FAILED,
-                    );
-                };
-                let weak = workspace.downgrade();
-                if !configurations_view::run_a_task(&weak, task, &mut window_cx).await {
-                    return say_and_exit(
-                        responses,
-                        format!("'{configuration}' could not be started; the editor says why."),
-                        exit_status::FAILED,
-                    );
-                }
-            }
-        }
-        Found::Debug(workspace, window, scenario) => {
-            if action != RunAction::Run {
-                return say_and_exit(
-                    responses,
-                    format!(
-                        "'{configuration}' is a debug configuration: stop or restart it from the \
-                         debugger."
-                    ),
-                    exit_status::BAD_ARGUMENTS,
-                );
-            }
-            let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx)) else {
-                return say_and_exit(
-                    responses,
-                    "The window closed before the session could start.".to_string(),
-                    exit_status::FAILED,
-                );
-            };
-            let weak = workspace.downgrade();
-            if !configurations_view::start_a_debug_session(&weak, scenario, &mut window_cx).await {
-                return say_and_exit(
-                    responses,
-                    format!("'{configuration}' could not be started; the editor says why."),
-                    exit_status::FAILED,
-                );
-            }
-        }
-    }
-    let done = match action {
-        RunAction::Run => "Started",
-        RunAction::Stop => "Stopped",
-        RunAction::Restart => "Restarted",
-    };
-    responses
-        .send(CliResponse::Stdout {
-            message: format!("{done} '{configuration}'."),
-        })
-        .log_err();
-    responses.send(CliResponse::Exit { status: 0 }).log_err();
-}
-
 /// The API client's store once its saved collections have been read, counted
 /// like [`STORE_LOOKS`] so the wait ends under a test clock too.
 async fn loaded_api_store(cx: &mut AsyncApp) -> Option<Entity<api_client_ui::ApiClientStore>> {
@@ -652,6 +518,13 @@ fn api_request_named(
     }
 }
 
+/// The HTTP methods zedcli sends: the ones that ask for data.
+const READ_METHODS: [api_client::HttpMethod; 3] = [
+    api_client::HttpMethod::Get,
+    api_client::HttpMethod::Head,
+    api_client::HttpMethod::Options,
+];
+
 /// How long a send waits for the server when the CLI did not say: the CLI's
 /// own default wait, so the editor never outlasts the command that asked.
 const API_SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -688,6 +561,28 @@ pub async fn send_api_request(
         Ok(chosen) => chosen,
         Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
     };
+    // Only methods that ask for data rather than send it. Checked before the
+    // request's own pre-request script runs, so nothing of a refused request
+    // happens at all.
+    let method = store.read_with(cx, |store, _| {
+        store
+            .requests
+            .iter()
+            .find(|candidate| candidate.id == request)
+            .map(|candidate| candidate.method.clone())
+    });
+    if let Some(method) = method
+        && !READ_METHODS.contains(&method)
+    {
+        return say_and_exit(
+            responses,
+            format!(
+                "{} can change data, and zedcli only sends GET, HEAD and OPTIONS.",
+                method.as_str()
+            ),
+            exit_status::REFUSED,
+        );
+    }
     let sent = api_client_ui::headless_send::send(
         &store,
         api_client_ui::headless_send::HeadlessSend {
@@ -995,27 +890,31 @@ mod tests {
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
     }
 
+    /// Starting or stopping a run executes whatever the configuration says,
+    /// which can change anything, so the CLI socket does neither.
     #[gpui::test]
-    async fn an_unknown_configuration_is_not_found(cx: &mut TestAppContext) {
+    async fn run_control_is_refused(cx: &mut TestAppContext) {
         let app_state = two_projects(cx).await;
-        let (alpha, _) = window_with(cx, path!("/alpha"));
-        let responses = ask(
-            cx,
-            &app_state,
-            CliRequest::ControlRun {
-                selector: selector_for(alpha),
-                configuration: "no such thing".into(),
-                action: RunAction::Run,
-            },
-        );
-        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
-        assert!(
-            responses.iter().any(|response| matches!(
-                response,
-                CliResponse::Stderr { message } if message.contains("no such thing")
-            )),
-            "{responses:?}"
-        );
+        let (alpha, workspace) = window_with(cx, path!("/alpha"));
+        let run = a_run_in(cx, &workspace, "sleeper").await;
+        for action in [RunAction::Run, RunAction::Stop, RunAction::Restart] {
+            let responses = ask(
+                cx,
+                &app_state,
+                CliRequest::ControlRun {
+                    selector: selector_for(alpha),
+                    configuration: "sleeper".into(),
+                    action,
+                },
+            );
+            assert_eq!(
+                exit_of(&responses),
+                Some(exit_status::REFUSED),
+                "{action:?}: {responses:?}"
+            );
+        }
+        assert!(is_running(&run, cx), "the run was left alone");
+        run.update(cx, |terminal, _| terminal.kill_active_task());
     }
 
     /// A real process on a real PTY, started the way a configuration's run is,
@@ -1081,9 +980,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_run_is_listed_with_its_process_and_stopped_with_everything_it_started(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_run_is_listed_with_its_process(cx: &mut TestAppContext) {
         let app_state = two_projects(cx).await;
         let (alpha, workspace) = window_with(cx, path!("/alpha"));
         let run = a_run_in(cx, &workspace, "sleeper").await;
@@ -1126,93 +1023,7 @@ mod tests {
             "the configuration reads as running: {configured:?}"
         );
 
-        let responses = ask(
-            cx,
-            &app_state,
-            CliRequest::ControlRun {
-                selector: selector_for(alpha),
-                configuration: "sleeper".into(),
-                action: RunAction::Stop,
-            },
-        );
-        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
-        for _ in 0..300 {
-            if !is_running(&run, cx) {
-                break;
-            }
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!is_running(&run, cx), "Stop ends the run");
-    }
-
-    #[gpui::test]
-    async fn control_names_one_window_and_says_when_a_run_did_not_start(cx: &mut TestAppContext) {
-        let app_state = two_projects(cx).await;
-        let (alpha, _) = window_with(cx, path!("/alpha"));
-        let responses = ask(
-            cx,
-            &app_state,
-            CliRequest::ControlRun {
-                selector: WindowSelector {
-                    all: true,
-                    ..WindowSelector::default()
-                },
-                configuration: "sleeper".into(),
-                action: RunAction::Stop,
-            },
-        );
-        assert_eq!(
-            exit_of(&responses),
-            Some(exit_status::BAD_ARGUMENTS),
-            "stopping in every window at once is refused: {responses:?}"
-        );
-
-        let responses = ask(
-            cx,
-            &app_state,
-            CliRequest::ControlRun {
-                selector: selector_for(alpha),
-                configuration: "broken".into(),
-                action: RunAction::Run,
-            },
-        );
-        assert_eq!(
-            exit_of(&responses),
-            Some(exit_status::FAILED),
-            "a run that could not be resolved is not reported as started: {responses:?}"
-        );
-    }
-
-    #[gpui::test]
-    async fn a_debug_configuration_is_only_started_from_here(cx: &mut TestAppContext) {
-        let app_state = init_test(cx);
-        app_state
-            .fs
-            .as_fake()
-            .insert_tree(
-                path!("/gamma"),
-                json!({ ".zed": { "debug.json": r#"[
-                    { "label": "api (Delve)", "adapter": "Delve", "request": "launch", "program": "." }
-                ]"# } }),
-            )
-            .await;
-        open(cx, &app_state, path!("/gamma"));
-        let (gamma, _) = window_with(cx, path!("/gamma"));
-        let responses = ask(
-            cx,
-            &app_state,
-            CliRequest::ControlRun {
-                selector: selector_for(gamma),
-                configuration: "api (Delve)".into(),
-                action: RunAction::Stop,
-            },
-        );
-        assert_eq!(
-            exit_of(&responses),
-            Some(exit_status::BAD_ARGUMENTS),
-            "{responses:?}"
-        );
+        run.update(cx, |terminal, _| terminal.kill_active_task());
     }
 
     #[gpui::test]
@@ -1264,12 +1075,20 @@ mod tests {
             store.create_request(collection, "List".into(), None, cx);
             store.create_request(collection, "Health".into(), None, cx);
             store.create_request(collection, "Health".into(), None, cx);
+            let delete = store.create_request(collection, "Delete order".into(), folder, cx);
+            if let Some(request) = store
+                .requests
+                .iter_mut()
+                .find(|request| request.id == delete)
+            {
+                request.method = api_client::HttpMethod::Delete;
+                request.url = format!("http://127.0.0.1:{port}/orders/1");
+            }
             if let Some(request) = store
                 .requests
                 .iter_mut()
                 .find(|request| request.id == create)
             {
-                request.method = api_client::HttpMethod::Post;
                 request.url = format!("http://127.0.0.1:{port}/orders/{{{{id}}}}");
             }
             store.create_environment("staging".into(), cx);
@@ -1323,7 +1142,7 @@ mod tests {
         assert_eq!(response.environment.as_deref(), Some("staging"));
         let request_line = served.join().expect("the server does not panic");
         assert!(
-            request_line.starts_with("POST /orders/42 "),
+            request_line.starts_with("GET /orders/42 "),
             "the one-off value went into the URL: {request_line}"
         );
         assert_eq!(
@@ -1465,5 +1284,39 @@ mod tests {
             "{responses:?}"
         );
         silent.join().ok();
+    }
+
+    /// A method that sends data is refused before anything of the request
+    /// happens: the server is never even connected to.
+    #[gpui::test]
+    async fn a_request_that_could_change_data_is_never_sent(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let port = listener.local_addr().expect("an address").port();
+        let store = an_api_store(cx, port);
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::SendApiRequest {
+                request: "Shop/Orders/Delete order".into(),
+                environment: None,
+                variables: Vec::new(),
+                timeout_seconds: 30,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::REFUSED),
+            "{responses:?}"
+        );
+        assert!(
+            listener.accept().is_err(),
+            "nothing connected to the server"
+        );
+        assert!(
+            store.read_with(cx, |store, _| store.history.is_empty()),
+            "and nothing was sent to be kept in the history"
+        );
     }
 }

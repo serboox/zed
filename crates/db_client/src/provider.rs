@@ -47,6 +47,16 @@ pub trait DbProvider: Send + Sync {
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
 
+    /// Runs `query` only if it provably reads, and where the database itself
+    /// refuses a write as well, on a connection of its own that no open
+    /// transaction or session setting of the console's reaches.
+    ///
+    /// Refused by default: a driver that has not been taught how to keep a
+    /// query from writing must not run one on a promise that it will not.
+    async fn execute_read_only(&self, _database: &str, _query: &str) -> Result<QueryResult> {
+        anyhow::bail!("read-only queries are not offered for this kind of database")
+    }
+
     /// Whether this driver can hold a transaction open across statements.
     ///
     /// Answered by the driver rather than assumed, because a transaction that

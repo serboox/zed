@@ -1319,6 +1319,55 @@ impl DatabaseStore {
         })
     }
 
+    /// The same lookup as `run_query_for_cli`, for a caller that may only
+    /// read: the query goes to the driver's read-only path, which refuses
+    /// anything but a read and runs it where the database refuses writes too.
+    /// Never through `execute_query`, whose console routing would put it inside
+    /// a transaction the reader has open.
+    pub fn run_read_only_query_for_cli(
+        &mut self,
+        connection: String,
+        database: Option<String>,
+        query: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CliQueryOutput>> {
+        let Some(conn) = self
+            .connections
+            .iter()
+            .find(|c| c.config.id.to_string() == connection || c.config.label == connection)
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "No database connection matching '{connection}'"
+            )));
+        };
+        let id = conn.config.id;
+        // PostgreSQL takes a schema here, not a database: the connection is
+        // already to its database, and naming that as the schema would hide
+        // every table in `public`.
+        let default_database = match conn.config.driver {
+            DatabaseDriver::PostgreSQL => None,
+            _ => conn.config.database.clone(),
+        };
+        let database = database
+            .filter(|database| !database.is_empty())
+            .or(default_database)
+            .unwrap_or_default();
+
+        cx.spawn(async move |this, cx| {
+            let _in_flight = this.update(cx, |store, _| store.a_query_starts(id))?;
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            let result = provider.execute_read_only(&database, &query).await?;
+            Ok(CliQueryOutput {
+                columns: result.columns,
+                rows: result.rows,
+                rows_affected: result.rows_affected,
+                execution_time_ms: result.execution_time_ms,
+            })
+        })
+    }
+
     pub fn active_connection(&self) -> Option<&ActiveConnection> {
         let id = self.active_connection_id?;
         self.connections
@@ -5081,6 +5130,111 @@ mod tests {
             assert_eq!(output.columns, vec!["n".to_string()]);
             assert_eq!(output.rows, vec![vec![Some("1".to_string())]]);
             assert_eq!(output.execution_time_ms, 7);
+        }
+    }
+
+    /// Counts which of the two ways in a query took.
+    struct ReadOnlyTrackingProvider {
+        offers_read_only: bool,
+        console_queries: Arc<std::sync::atomic::AtomicUsize>,
+        read_only_queries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DbProvider for ReadOnlyTrackingProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            self.console_queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(db_client::schema::QueryResult {
+                raw_documents: None,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+                timing: None,
+            })
+        }
+        async fn execute_read_only(
+            &self,
+            _database: &str,
+            _query: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            if !self.offers_read_only {
+                anyhow::bail!("read-only queries are not offered for this kind of database");
+            }
+            self.read_only_queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(db_client::schema::QueryResult {
+                raw_documents: None,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+                timing: None,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// The CLI's way in never reaches the console's `execute_query`, and a
+    /// driver without a read-only path refuses rather than falling back to it.
+    #[gpui::test]
+    async fn the_cli_only_ever_reaches_the_read_only_path(cx: &mut gpui::TestAppContext) {
+        for offers_read_only in [true, false] {
+            let console_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let read_only_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut config = ConnectionConfig::default();
+            config.label = "primary".into();
+            let store = cx.new(DatabaseStore::new);
+            store.update(cx, |store, cx| {
+                store.add_connected_for_test(
+                    config,
+                    Arc::new(ReadOnlyTrackingProvider {
+                        offers_read_only,
+                        console_queries: console_queries.clone(),
+                        read_only_queries: read_only_queries.clone(),
+                    }),
+                    cx,
+                );
+            });
+            let answer = store
+                .update(cx, |store, cx| {
+                    store.run_read_only_query_for_cli("primary".into(), None, "SELECT 1".into(), cx)
+                })
+                .await;
+            assert_eq!(
+                answer.is_ok(),
+                offers_read_only,
+                "{:?}",
+                answer.as_ref().err()
+            );
+            assert_eq!(
+                console_queries.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the console's path is never taken"
+            );
+            assert_eq!(
+                read_only_queries.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(offers_read_only)
+            );
         }
     }
 

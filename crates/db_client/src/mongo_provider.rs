@@ -266,6 +266,24 @@ impl MongoStatement {
     }
 }
 
+/// Refuses a shell command unless it only reads. MongoDB has no read-only
+/// session to run it in, so the parsed command is the whole guard: a write
+/// method is refused, and so is an aggregation that writes its result with
+/// `$out` or `$merge`, which the method alone does not reveal.
+pub fn check_read_only(query: &str) -> Result<()> {
+    let statement = parse_mongo_shell_statement(query)?;
+    if statement.kind() != MongoOperationKind::Read {
+        return Err(crate::read_only::NotARead(
+            "only reads can be run here, and this command writes".to_string(),
+        )
+        .into());
+    }
+    if let MongoStatement::Aggregate { pipeline, .. } = &statement {
+        crate::read_only::check_mongo_pipeline(pipeline)?;
+    }
+    Ok(())
+}
+
 const SUPPORTED_METHODS: &str = "collection-level: find, findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, replaceOne, findOneAndUpdate, findOneAndDelete, findOneAndReplace, aggregate, countDocuments, count, distinct, bulkWrite, drop, createIndex, dropIndex, getIndexes, stats, estimatedDocumentCount, renameCollection; database-level: db.help(), db.stats(), db.getCollectionNames(), show dbs, show collections";
 
 fn unsupported_command_error(text: &str) -> anyhow::Error {
@@ -1582,6 +1600,13 @@ impl DbProvider for MongoProvider {
             .collect())
     }
 
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        check_read_only(query)?;
+        // Parsed again by the same parser, which reads the same text the same
+        // way, so what runs is what was checked.
+        self.execute_query(database, query).await
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let statement = parse_mongo_shell_statement(sql)?;
@@ -2171,6 +2196,34 @@ impl DbProvider for MongoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_commands_that_read_pass_the_read_only_check() {
+        for query in [
+            "db.users.find({ age: { $gt: 30 } })",
+            "db.users.findOne({ _id: 1 })",
+            "db.users.countDocuments({})",
+            "db.users.aggregate([{ $match: { a: 1 } }, { $group: { _id: \"$a\" } }])",
+            "show collections",
+        ] {
+            assert!(check_read_only(query).is_ok(), "{query}");
+        }
+        for query in [
+            "db.users.insertOne({ a: 1 })",
+            "db.users.updateMany({}, { $set: { a: 1 } })",
+            "db.users.deleteMany({})",
+            "db.users.replaceOne({ _id: 1 }, { a: 2 })",
+            "db.users.findOneAndDelete({ _id: 1 })",
+            "db.users.drop()",
+            "db.users.createIndex({ a: 1 })",
+            "db.users.aggregate([{ $match: {} }, { $out: \"copy\" }])",
+            "db.users.aggregate([{ $merge: { into: \"copy\" } }])",
+            "db.dropDatabase()",
+            "",
+        ] {
+            assert!(check_read_only(query).is_err(), "let through: {query}");
+        }
+    }
     use crate::connection::DatabaseDriver;
 
     fn config(driver: DatabaseDriver) -> ConnectionConfig {

@@ -4,7 +4,7 @@ use futures::TryStreamExt as _;
 use smol::lock::Mutex as AsyncMutex;
 use sqlx::AssertSqlSafe;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
-use sqlx::{Column as _, ConnectOptions as _, Row as _, ValueRef as _};
+use sqlx::{Column as _, ConnectOptions as _, Connection as _, Row as _, ValueRef as _};
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Mutex;
@@ -309,6 +309,27 @@ impl DbProvider for SqliteProvider {
             .await
             .context("Failed to rename table")?;
         Ok(())
+    }
+
+    async fn execute_read_only(&self, _database: &str, query: &str) -> Result<QueryResult> {
+        crate::read_only::check_sql(query, crate::read_only::Language::Sqlite)?;
+        // The file opened for reading only, so SQLite itself refuses a write.
+        let mut connection = self
+            .connect_options
+            .clone()
+            .read_only(true)
+            .connect()
+            .await
+            .context("Failed to open the SQLite database for reading")?;
+        sqlx::raw_sql(AssertSqlSafe("PRAGMA query_only = ON"))
+            .execute(&mut connection)
+            .await
+            .context("Failed to make the SQLite connection query-only")?;
+        let answer = run_query(&mut connection, query).await;
+        if let Err(error) = connection.close().await {
+            log::warn!("closing a read-only connection: {error:#}");
+        }
+        answer
     }
 
     async fn execute_query(&self, _database: &str, sql: &str) -> Result<QueryResult> {

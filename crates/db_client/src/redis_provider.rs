@@ -432,6 +432,13 @@ impl DbProvider for RedisProvider {
         Ok(content)
     }
 
+    async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
+        // The text goes out as a single command, so its first word is what it
+        // does; only commands that do nothing but read are let through.
+        crate::read_only::check_redis(query)?;
+        self.execute_query(database, query).await
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let mut conn = self.connection().await?;
