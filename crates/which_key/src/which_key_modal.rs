@@ -9,7 +9,7 @@ use settings::Settings;
 use std::collections::HashMap;
 use theme_settings::ThemeSettings;
 use ui::{
-    Divider, DividerColor, DynamicSpacing, ElevationIndex, LabelSize, WithScrollbar, prelude::*,
+    Divider, DividerColor, DynamicSpacing, LabelSize, WithScrollbar, cyberpunk, prelude::*,
     text_for_keybinding_keystrokes,
 };
 use workspace::{ModalView, Workspace};
@@ -215,25 +215,31 @@ impl Render for WhichKeyModal {
                     })),
             );
 
+        let name: SharedString = "Which Key".into();
+
         div()
             .id("which-key-buffer-panel-scroll")
             .occlude()
             .absolute()
             .bottom(bottom_offset)
             .right(px(16.))
-            .min_w(px(220.))
-            .max_w(max_panel_width)
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
-            .px(px(12.))
-            .child(v_flex().child(title_section).when(has_rows, |el| {
-                el.child(
-                    div()
-                        .max_h(max_content_height)
-                        .child(content)
-                        .vertical_scrollbar_for(&self.scroll_handle, window, cx),
-                )
-            }))
+            .child(
+                cyberpunk::dialog_shell(name.clone(), window, cx)
+                    .when(!cyberpunk::dialog_was_resized(&name, window, cx), |shell| {
+                        shell.min_w(px(220.)).w(max_panel_width)
+                    })
+                    .child(cyberpunk::dialog_header(name, cx))
+                    .child(cyberpunk::dialog_body().px(px(12.)).child(
+                        v_flex().child(title_section).when(has_rows, |el| {
+                            el.child(
+                                div()
+                                    .max_h(max_content_height)
+                                    .child(content)
+                                    .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                            )
+                        }),
+                    )),
+            )
     }
 }
 
@@ -364,6 +370,28 @@ mod tests {
             vec![(vec![keystroke], SharedString::from("test action"))]
         );
         Ok(())
+    }
+
+    #[gpui::test]
+    fn test_which_key_modal_renders_inside_a_framed_dialog_shell(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_modal, cx) = cx.add_window_view(|window, cx| {
+            WhichKeyModal::new(WeakEntity::new_invalid(), window, cx)
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.debug_bounds("DIALOG-SHELL");
+        assert!(
+            bounds.is_some(),
+            "the which-key popup renders inside a framed, draggable dialog shell"
+        );
     }
 
     #[gpui::test]

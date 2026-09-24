@@ -11,7 +11,11 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use std::sync::Arc;
-use ui::{Avatar, Checkbox, ContextMenu, ListItem, ListItemSpacing, prelude::*};
+use ui::{
+    Avatar, Checkbox, ContextMenu, ListItem, ListItemSpacing,
+    cyberpunk::{Rank, dialog_body, dialog_header_marked, dialog_shell},
+    prelude::*,
+};
 use util::TryFutureExt;
 use workspace::{ModalView, notifications::DetachAndPromptErr};
 
@@ -131,105 +135,123 @@ impl Focusable for ChannelModal {
 }
 
 impl Render for ChannelModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let channel_store = self.channel_store.read(cx);
         let Some(channel) = channel_store.channel_for_id(self.channel_id) else {
-            return div();
+            return dialog_shell("Channel Members", window, cx);
         };
         let channel_name = channel.name.clone();
         let channel_id = channel.id;
         let visibility = channel.visibility;
         let mode = self.picker.read(cx).delegate.mode;
 
-        v_flex()
+        dialog_shell("Channel Members", window, cx)
             .key_context("ChannelModal")
             .on_action(cx.listener(Self::toggle_mode))
             .on_action(cx.listener(Self::dismiss))
-            .elevation_3(cx)
             .child(
-                v_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .w_px()
-                            .flex_1()
-                            .gap_1()
-                            .child(Icon::new(IconName::Hash).size(IconSize::Medium))
-                            .child(Label::new(channel_name)),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .h(rems_from_px(22_f32))
-                            .justify_between()
-                            .line_height(rems(1.25))
-                            .child(
-                                Checkbox::new(
-                                    "is-public",
-                                    if visibility == ChannelVisibility::Public {
-                                        ui::ToggleState::Selected
-                                    } else {
-                                        ui::ToggleState::Unselected
-                                    },
-                                )
-                                .label("Public")
-                                .on_click(cx.listener(Self::set_channel_visibility)),
-                            )
-                            .children(
-                                (visibility == ChannelVisibility::Public).then_some(
-                                    Button::new("copy-link", "Copy Link")
-                                        .label_size(LabelSize::Small)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(channel) = this
-                                                .channel_store
-                                                .read(cx)
-                                                .channel_for_id(channel_id)
-                                            {
-                                                let item =
-                                                    ClipboardItem::new_string(channel.link(cx));
-                                                cx.write_to_clipboard(item);
-                                            }
-                                        })),
-                                ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .child(
-                                div()
-                                    .id("manage-members")
-                                    .px_2()
-                                    .py_1()
-                                    .cursor_pointer()
-                                    .border_b_2()
-                                    .when(mode == Mode::ManageMembers, |this| {
-                                        this.border_color(cx.theme().colors().border)
-                                    })
-                                    .child(Label::new("Manage Members"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_mode(Mode::ManageMembers, window, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("invite-members")
-                                    .px_2()
-                                    .py_1()
-                                    .cursor_pointer()
-                                    .border_b_2()
-                                    .when(mode == Mode::InviteMembers, |this| {
-                                        this.border_color(cx.theme().colors().border)
-                                    })
-                                    .child(Label::new("Invite Members"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_mode(Mode::InviteMembers, window, cx);
-                                    })),
-                            ),
-                    ),
+                dialog_header_marked(
+                    Icon::new(IconName::Hash)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    channel_name,
+                    cx,
+                )
+                .child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dismiss(&menu::Cancel, window, cx);
+                        })),
+                ),
             )
-            .child(self.picker.clone())
+            .child(
+                dialog_body().child(
+                    v_flex()
+                        .size_full()
+                        .child(
+                            v_flex()
+                                .px_2()
+                                .py_1()
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .h(rems_from_px(22_f32))
+                                        .justify_between()
+                                        .line_height(rems(1.25))
+                                        .child(
+                                            Checkbox::new(
+                                                "is-public",
+                                                if visibility == ChannelVisibility::Public {
+                                                    ui::ToggleState::Selected
+                                                } else {
+                                                    ui::ToggleState::Unselected
+                                                },
+                                            )
+                                            .label("Public")
+                                            .on_click(cx.listener(Self::set_channel_visibility)),
+                                        )
+                                        .children(
+                                            (visibility == ChannelVisibility::Public).then_some(
+                                                Button::new("copy-link", "Copy Link")
+                                                    .label_size(LabelSize::Small)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            if let Some(channel) = this
+                                                                .channel_store
+                                                                .read(cx)
+                                                                .channel_for_id(channel_id)
+                                                            {
+                                                                let item =
+                                                                    ClipboardItem::new_string(
+                                                                        channel.link(cx),
+                                                                    );
+                                                                cx.write_to_clipboard(item);
+                                                            }
+                                                        },
+                                                    )),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .child(
+                                            div()
+                                                .id("manage-members")
+                                                .px_2()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .border_b_2()
+                                                .when(mode == Mode::ManageMembers, |this| {
+                                                    this.border_color(cx.theme().colors().border)
+                                                })
+                                                .child(Label::new("Manage Members"))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.set_mode(Mode::ManageMembers, window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("invite-members")
+                                                .px_2()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .border_b_2()
+                                                .when(mode == Mode::InviteMembers, |this| {
+                                                    this.border_color(cx.theme().colors().border)
+                                                })
+                                                .child(Label::new("Invite Members"))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.set_mode(Mode::InviteMembers, window, cx);
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(self.picker.clone()),
+                ),
+            )
     }
 }
 

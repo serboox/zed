@@ -67,8 +67,10 @@ fn open_copilot_code_verification_window(copilot: &Entity<Copilot>, window: &Win
         WindowOptions {
             kind: gpui::WindowKind::Floating,
             window_bounds: Some(window_bounds),
-            is_resizable: false,
+            is_resizable: true,
             is_movable: true,
+            window_decorations: Some(gpui::WindowDecorations::Client),
+            window_min_size: Some(gpui::size(px(350.), px(300.))),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("Use GitHub Copilot in Zed".into()),
                 appears_transparent: true,
@@ -99,8 +101,10 @@ fn open_copilot_chat_code_verification_window(
         WindowOptions {
             kind: gpui::WindowKind::Floating,
             window_bounds: Some(window_bounds),
-            is_resizable: false,
+            is_resizable: true,
             is_movable: true,
+            window_decorations: Some(gpui::WindowDecorations::Client),
+            window_min_size: Some(gpui::size(px(350.), px(300.))),
             titlebar: Some(gpui::TitlebarOptions {
                 appears_transparent: true,
                 ..Default::default()
@@ -178,6 +182,7 @@ pub fn initiate_sign_in_impl(
 }
 
 pub struct CopilotCodeVerification {
+    title_bar: Option<Entity<platform_title_bar::PlatformTitleBar>>,
     status: Status,
     connect_clicked: bool,
     focus_handle: FocusHandle,
@@ -215,7 +220,13 @@ impl CopilotCodeVerification {
         .detach();
 
         let status = copilot.read(cx).status();
+        // macOS draws the title bar itself; elsewhere the window carries its
+        // own, which is what it is dragged by.
+        let title_bar = (!cfg!(target_os = "macos")).then(|| {
+            cx.new(|cx| platform_title_bar::PlatformTitleBar::new("copilot-sign-in-title-bar", cx))
+        });
         Self {
+            title_bar,
             status,
             connect_clicked: false,
             focus_handle: cx.focus_handle(),
@@ -454,7 +465,7 @@ impl CopilotCodeVerification {
 }
 
 impl Render for CopilotCodeVerification {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = match &self.status {
             Status::SigningIn { prompt: None } => Icon::new(IconName::ArrowCircle)
                 .color(Color::Muted)
@@ -480,7 +491,7 @@ impl Render for CopilotCodeVerification {
             _ => div().into_any_element(),
         };
 
-        v_flex()
+        let content = v_flex()
             .id("copilot_code_verification")
             .track_focus(&self.focus_handle(cx))
             .size_full()
@@ -489,7 +500,6 @@ impl Render for CopilotCodeVerification {
             .gap_2()
             .items_center()
             .justify_center()
-            .elevation_3(cx)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
                 cx.emit(DismissEvent);
             }))
@@ -500,11 +510,21 @@ impl Render for CopilotCodeVerification {
                 Vector::new(VectorName::ZedXCopilot, rems(8.), rems(4.))
                     .color(Color::Custom(cx.theme().colors().icon)),
             )
-            .child(prompt)
+            .child(prompt);
+        workspace::client_side_decorations(
+            v_flex()
+                .size_full()
+                .bg(cx.theme().colors().elevated_surface_background)
+                .children(self.title_bar.clone())
+                .child(div().flex_1().min_h_0().child(content)),
+            window,
+            cx,
+        )
     }
 }
 
 pub struct CopilotChatCodeVerification {
+    title_bar: Option<Entity<platform_title_bar::PlatformTitleBar>>,
     status: CopilotChatStatus,
     connect_clicked: bool,
     focus_handle: FocusHandle,
@@ -545,7 +565,15 @@ impl CopilotChatCodeVerification {
         .detach();
 
         let status = copilot_chat.read(cx).status();
+        // macOS draws the title bar itself; elsewhere the window carries its
+        // own, which is what it is dragged by.
+        let title_bar = (!cfg!(target_os = "macos")).then(|| {
+            cx.new(|cx| {
+                platform_title_bar::PlatformTitleBar::new("copilot-chat-sign-in-title-bar", cx)
+            })
+        });
         Self {
+            title_bar,
             status,
             connect_clicked: false,
             focus_handle: cx.focus_handle(),
@@ -690,7 +718,7 @@ impl CopilotChatCodeVerification {
 }
 
 impl Render for CopilotChatCodeVerification {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = match self.status.clone() {
             CopilotChatStatus::Starting | CopilotChatStatus::SignedOut => {
                 Icon::new(IconName::ArrowCircle)
@@ -712,7 +740,7 @@ impl Render for CopilotChatCodeVerification {
             }
         };
 
-        v_flex()
+        let content = v_flex()
             .id("copilot_chat_code_verification")
             .track_focus(&self.focus_handle(cx))
             .size_full()
@@ -721,7 +749,6 @@ impl Render for CopilotChatCodeVerification {
             .gap_2()
             .items_center()
             .justify_center()
-            .elevation_3(cx)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
                 cx.emit(DismissEvent);
             }))
@@ -732,7 +759,16 @@ impl Render for CopilotChatCodeVerification {
                 Vector::new(VectorName::ZedXCopilot, rems(8.), rems(4.))
                     .color(Color::Custom(cx.theme().colors().icon)),
             )
-            .child(prompt)
+            .child(prompt);
+        workspace::client_side_decorations(
+            v_flex()
+                .size_full()
+                .bg(cx.theme().colors().elevated_surface_background)
+                .children(self.title_bar.clone())
+                .child(div().flex_1().min_h_0().child(content)),
+            window,
+            cx,
+        )
     }
 }
 

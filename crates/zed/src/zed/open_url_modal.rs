@@ -1,9 +1,8 @@
 use editor::Editor;
 use gpui::{AppContext as _, DismissEvent, Entity, EventEmitter, Focusable, ReadGlobal, Styled};
 use ui::{
-    ActiveTheme, App, Color, Context, FluentBuilder, InteractiveElement, IntoElement, Label,
-    LabelCommon, LabelSize, ParentElement, Render, SharedString, StyledExt, Window, div, h_flex,
-    v_flex,
+    App, Color, Context, InteractiveElement, IntoElement, Label, LabelCommon, LabelSize,
+    ParentElement, Render, SharedString, Window, cyberpunk, div,
 };
 use workspace::ModalView;
 
@@ -77,40 +76,53 @@ impl OpenUrlModal {
 }
 
 impl Render for OpenUrlModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = match self.last_error.clone() {
+            Some(error) => Label::new(error).size(LabelSize::Small).color(Color::Error),
+            None => Label::new("Paste a URL to open.")
+                .color(Color::Muted)
+                .size(LabelSize::Small),
+        };
 
-        v_flex()
+        cyberpunk::dialog_shell("Open URL", window, cx)
             .key_context("OpenUrlModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .elevation_3(cx)
-            .w_96()
-            .overflow_hidden()
-            .child(
-                div()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(theme.colors().border_variant)
-                    .child(self.editor.clone()),
-            )
-            .child(
-                h_flex()
-                    .bg(theme.colors().editor_background)
-                    .rounded_b_sm()
-                    .w_full()
-                    .p_2()
-                    .gap_1()
-                    .when_some(self.last_error.clone(), |this, error| {
-                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-                    })
-                    .when(self.last_error.is_none(), |this| {
-                        this.child(
-                            Label::new("Paste a URL to open.")
-                                .color(Color::Muted)
-                                .size(LabelSize::Small),
-                        )
-                    }),
-            )
+            .child(cyberpunk::dialog_header("Open URL", cx))
+            .child(cyberpunk::dialog_body().child(div().w_full().p_2().child(self.editor.clone())))
+            .child(cyberpunk::dialog_footer().child(cyberpunk::dialog_footer_left().child(hint)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn the_open_url_modal_renders_inside_a_framed_dialog_shell(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| OpenUrlModal::new(window, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.debug_bounds("DIALOG-SHELL");
+        assert!(
+            bounds.is_some(),
+            "the open-URL prompt renders inside a framed, draggable dialog shell"
+        );
     }
 }

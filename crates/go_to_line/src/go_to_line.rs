@@ -13,7 +13,7 @@ use gpui::{
 use language::Buffer;
 use text::{Bias, Point};
 use theme::ActiveTheme;
-use ui::prelude::*;
+use ui::{cyberpunk, prelude::*};
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
 use workspace::{DismissDecision, ModalView};
 
@@ -306,7 +306,7 @@ impl GoToLine {
 }
 
 impl Render for GoToLine {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let help_text = if let Some(offset) = self.relative_line_from_query(cx) {
             let target_line = if offset >= 0 {
                 self.current_line.saturating_add(offset as u32)
@@ -324,27 +324,18 @@ impl Render for GoToLine {
             }
         };
 
-        v_flex()
-            .w(rems(24.))
-            .elevation_2(cx)
+        cyberpunk::dialog_shell("Go to Line", window, cx)
             .key_context("GoToLine")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
+            .child(cyberpunk::dialog_header("Go to Line", cx))
             .child(
-                div()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .px_2()
-                    .py_1()
-                    .child(self.line_editor.clone()),
+                cyberpunk::dialog_body()
+                    .child(div().w_full().px_2().py_1().child(self.line_editor.clone())),
             )
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .child(Label::new(help_text).color(Color::Muted)),
-            )
+            .child(cyberpunk::dialog_footer().child(
+                cyberpunk::dialog_footer_left().child(Label::new(help_text).color(Color::Muted)),
+            ))
     }
 }
 
@@ -1060,5 +1051,50 @@ mod tests {
             scroll_position_after_confirm, scroll_position_after_input,
             "Confirm should maintain new scroll position"
         );
+    }
+
+    #[gpui::test]
+    async fn test_go_to_line_renders_inside_a_framed_dialog_shell(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"a.rs": "struct Line;"}))
+            .await;
+
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            })
+        });
+        let _buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/dir/a.rs"), cx)
+            })
+            .await
+            .unwrap();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+            })
+            .await
+            .unwrap();
+
+        let go_to_line_view = open_go_to_line_view(&workspace, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.debug_bounds("DIALOG-SHELL");
+        assert!(
+            bounds.is_some(),
+            "Go to Line renders inside a framed, draggable dialog shell"
+        );
+
+        drop(go_to_line_view);
     }
 }

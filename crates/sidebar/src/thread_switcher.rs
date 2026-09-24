@@ -8,7 +8,11 @@ use gpui::{
     Action as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
     ModifiersChangedEvent, Render, ScrollHandle, SharedString, prelude::*,
 };
-use ui::{AgentThreadStatus, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar, prelude::*};
+use ui::{
+    AgentThreadStatus, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar,
+    cyberpunk::{dialog_body, dialog_header, dialog_shell},
+    prelude::*,
+};
 use workspace::{ModalView, Workspace};
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
@@ -357,64 +361,68 @@ impl Render for ThreadSwitcher {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_index = self.selected_index;
 
-        v_flex()
+        dialog_shell("Thread Switcher", window, cx)
             .key_context("ThreadSwitcher")
             .track_focus(&self.focus_handle)
-            .p_1p5()
-            .w(rems_from_px(440_f32))
-            .elevation_3(cx)
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::toggle))
+            .child(dialog_header("Switch Thread", cx))
             .child(
-                v_flex()
-                    .id("thread-switcher-list")
-                    .gap_0p5()
-                    .max_h_128()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .children(self.entries.iter().enumerate().map(|(ix, entry)| {
-                        let diff_stats = entry.diff_stats();
+                dialog_body().child(
+                    v_flex()
+                        .id("thread-switcher-list")
+                        .p_1p5()
+                        .gap_0p5()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .children(self.entries.iter().enumerate().map(|(ix, entry)| {
+                            let diff_stats = entry.diff_stats();
 
-                        ThreadItem::new(entry.element_id(), entry.title())
-                            .rounded(true)
-                            .icon(entry.icon())
-                            .when(entry.is_draft(), |this| {
-                                this.icon_color(Color::Custom(
-                                    cx.theme().colors().icon_muted.opacity(0.2),
+                            ThreadItem::new(entry.element_id(), entry.title())
+                                .rounded(true)
+                                .icon(entry.icon())
+                                .when(entry.is_draft(), |this| {
+                                    this.icon_color(Color::Custom(
+                                        cx.theme().colors().icon_muted.opacity(0.2),
+                                    ))
+                                })
+                                .status(entry.status())
+                                .when_some(entry.icon_from_external_svg(), |this, svg| {
+                                    this.custom_icon_from_external_svg(svg)
+                                })
+                                .when_some(entry.project_name(), |this, name| {
+                                    this.project_name(name)
+                                })
+                                .worktrees(entry.worktrees())
+                                .timestamp(entry.timestamp())
+                                .title_generating(entry.is_title_generating())
+                                .notified(entry.notified())
+                                .when(diff_stats.lines_added > 0, |this| {
+                                    this.added(diff_stats.lines_added as usize)
+                                })
+                                .when(diff_stats.lines_removed > 0, |this| {
+                                    this.removed(diff_stats.lines_removed as usize)
+                                })
+                                .selected(ix == selected_index)
+                                .base_bg(cx.theme().colors().elevated_surface_background)
+                                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                                    if *hovered {
+                                        this.select_index(ix, cx);
+                                    }
+                                }))
+                                // TODO: This is not properly propagating to the tread item.
+                                .on_click(cx.listener(
+                                    move |this, _event: &gpui::ClickEvent, _window, cx| {
+                                        this.select_and_confirm(ix, cx);
+                                    },
                                 ))
-                            })
-                            .status(entry.status())
-                            .when_some(entry.icon_from_external_svg(), |this, svg| {
-                                this.custom_icon_from_external_svg(svg)
-                            })
-                            .when_some(entry.project_name(), |this, name| this.project_name(name))
-                            .worktrees(entry.worktrees())
-                            .timestamp(entry.timestamp())
-                            .title_generating(entry.is_title_generating())
-                            .notified(entry.notified())
-                            .when(diff_stats.lines_added > 0, |this| {
-                                this.added(diff_stats.lines_added as usize)
-                            })
-                            .when(diff_stats.lines_removed > 0, |this| {
-                                this.removed(diff_stats.lines_removed as usize)
-                            })
-                            .selected(ix == selected_index)
-                            .base_bg(cx.theme().colors().elevated_surface_background)
-                            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                                if *hovered {
-                                    this.select_index(ix, cx);
-                                }
-                            }))
-                            // TODO: This is not properly propagating to the tread item.
-                            .on_click(cx.listener(
-                                move |this, _event: &gpui::ClickEvent, _window, cx| {
-                                    this.select_and_confirm(ix, cx);
-                                },
-                            ))
-                            .into_any_element()
-                    })),
+                                .into_any_element()
+                        })),
+                ),
             )
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)
     }

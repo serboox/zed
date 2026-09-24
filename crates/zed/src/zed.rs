@@ -1866,6 +1866,7 @@ fn open_about_window(cx: &mut App) {
 
     struct AboutWindow {
         focus_handle: FocusHandle,
+        title_bar: Option<Entity<platform_title_bar::PlatformTitleBar>>,
         ok_entry: NavigableEntry,
         copy_entry: NavigableEntry,
         app_icon: Arc<Image>,
@@ -1893,8 +1894,14 @@ fn open_about_window(cx: &mut App) {
                 .filter(|commit| !commit.is_empty())
                 .map(SharedString::from);
 
+            // macOS draws the title bar itself; elsewhere the window carries its
+            // own, which is what it is dragged by.
+            let title_bar = (!cfg!(target_os = "macos")).then(|| {
+                cx.new(|cx| platform_title_bar::PlatformTitleBar::new("about-title-bar", cx))
+            });
             Self {
                 focus_handle: cx.focus_handle(),
+                title_bar,
                 ok_entry: NavigableEntry::focusable(cx),
                 copy_entry: NavigableEntry::focusable(cx),
                 app_icon: about_window_icon(release_channel),
@@ -1932,7 +1939,7 @@ fn open_about_window(cx: &mut App) {
                 .as_ref()
                 .map(|commit| SharedString::from(commit.chars().take(10).collect::<String>()));
 
-            Navigable::new(
+            let content = Navigable::new(
                 v_flex()
                     .id("about-window")
                     .track_focus(&self.focus_handle)
@@ -2026,7 +2033,16 @@ fn open_about_window(cx: &mut App) {
                     .into_any_element(),
             )
             .entry(self.copy_entry.clone())
-            .entry(self.ok_entry.clone())
+            .entry(self.ok_entry.clone());
+
+            workspace::client_side_decorations(
+                v_flex()
+                    .size_full()
+                    .children(self.title_bar.clone())
+                    .child(div().flex_1().min_h_0().child(content)),
+                window,
+                cx,
+            )
         }
     }
 
@@ -2052,8 +2068,8 @@ fn open_about_window(cx: &mut App) {
     }
 
     let window_size = Size {
-        width: px(420.),
-        height: px(170.),
+        width: px(520.),
+        height: px(260.),
     };
 
     cx.open_window(
@@ -2064,7 +2080,12 @@ fn open_about_window(cx: &mut App) {
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
             window_bounds: Some(WindowBounds::centered(window_size, cx)),
-            is_resizable: false,
+            window_min_size: Some(Size {
+                width: px(420.),
+                height: px(220.),
+            }),
+            window_decorations: Some(gpui::WindowDecorations::Client),
+            is_resizable: true,
             is_minimizable: false,
             kind: WindowKind::Floating,
             app_id: Some(ReleaseChannel::global(cx).app_id().to_owned()),
@@ -6835,7 +6856,12 @@ mod tests {
             window.draw(cx).clear(cx);
         });
 
-        let window_size = cx.update(|window, _| window.viewport_size());
+        let (window_size, is_resizable) =
+            cx.update(|window, _| (window.viewport_size(), window.is_resizable()));
+        assert!(
+            is_resizable,
+            "the window can be made larger than it opens at"
+        );
         let copy = cx
             .debug_bounds("ABOUT-COPY")
             .expect("the Copy button is painted");

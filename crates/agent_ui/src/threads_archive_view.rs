@@ -34,7 +34,9 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, ScrollAxes,
     Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar,
-    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_header, dialog_shell,
+    },
     prelude::*,
     utils::platform_title_bar_height,
 };
@@ -1187,16 +1189,23 @@ impl Focusable for ProjectPickerModal {
 impl ModalView for ProjectPickerModal {}
 
 impl Render for ProjectPickerModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        dialog_shell("Choose a Project", window, cx)
             .key_context("ProjectPickerModal")
-            .elevation_3(cx)
             .on_action(cx.listener(|this, _: &workspace::Open, window, cx| {
                 this.picker.update(cx, |picker, cx| {
                     picker.delegate.open_local_folder(window, cx)
                 })
             }))
-            .child(self.picker.clone())
+            .child(
+                dialog_header("Choose a Project", cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                ),
+            )
+            .child(dialog_body().child(self.picker.clone()))
     }
 }
 

@@ -8,6 +8,7 @@ use gpui::{
 use project::git_store::Repository;
 use ui::{
     FluentBuilder, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip,
+    cyberpunk::{Rank, dialog_body, dialog_header, dialog_shell},
     prelude::*,
 };
 use workspace::{ModalView, Workspace, pane};
@@ -414,23 +415,14 @@ impl Focusable for GitPicker {
 
 impl Render for GitPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .occlude()
-            .w(self.width)
-            .elevation_3(cx)
-            .overflow_hidden()
-            .when(self.popover_style, |el| {
-                el.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    if this
-                        .branch_list
-                        .as_ref()
-                        .is_some_and(|branch_list| branch_list.read(cx).branch_filter_menu_open(cx))
-                    {
-                        return;
-                    }
-                    cx.emit(DismissEvent);
-                }))
-            })
+        // The picker also opens as a small anchored popover from the status bar
+        // (`popover_style`), positioned by its caller rather than by the
+        // reader -- the dialog chrome's own drag/resize/remembered-placement
+        // would fight that anchoring, so only the standalone modal gets it.
+        let content = v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .key_context({
                 let mut key_context = KeyContext::new_with_defaults();
                 key_context.add("Pane");
@@ -440,9 +432,6 @@ impl Render for GitPicker {
                     GitPickerTab::Stashes => key_context.add("StashList"),
                 }
                 key_context
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
             })
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
                 cx.emit(DismissEvent);
@@ -481,7 +470,42 @@ impl Render for GitPicker {
                     .on_action(cx.listener(Self::handle_show_stash))
             })
             .child(self.render_tab_bar(cx))
-            .child(self.render_active_picker(window, cx))
+            .child(self.render_active_picker(window, cx));
+
+        if self.popover_style {
+            v_flex()
+                .occlude()
+                .w(self.width)
+                .elevation_3(cx)
+                .overflow_hidden()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    if this
+                        .branch_list
+                        .as_ref()
+                        .is_some_and(|branch_list| branch_list.read(cx).branch_filter_menu_open(cx))
+                    {
+                        return;
+                    }
+                    cx.emit(DismissEvent);
+                }))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(content)
+        } else {
+            dialog_shell("GitPicker", window, cx)
+                .child(
+                    dialog_header(self.tab.to_string(), cx).child(
+                        IconButton::new("dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(Rank::Quiet.style())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
+                )
+                .child(dialog_body().child(content))
+        }
     }
 }
 

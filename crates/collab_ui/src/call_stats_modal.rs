@@ -12,7 +12,12 @@ use livekit_client::ConnectionQuality;
 use release_channel::{AppVersion, ReleaseChannel};
 use serde::Serialize;
 use std::{cmp::Reverse, path::PathBuf};
-use ui::prelude::*;
+use ui::{
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_header, dialog_shell,
+    },
+    prelude::*,
+};
 use workspace::{ModalView, Workspace};
 use zed_actions::ShowCallStats;
 
@@ -237,7 +242,7 @@ impl Focusable for CallStatsModal {
 }
 
 impl Render for CallStatsModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_connected = ActiveCall::try_global(cx)
             .is_some_and(|active_call| active_call.read(cx).room().is_some());
         let diagnostics = call_diagnostics(cx);
@@ -284,48 +289,55 @@ impl Render for CallStatsModal {
             quality_label(stats.connection_quality.map(|inner| inner.0));
         let has_diagnostics = sample_count > 0;
 
-        v_flex()
+        dialog_shell("Call Stats", window, cx)
             .key_context("CallStatsModal")
             .on_action(cx.listener(Self::dismiss))
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(rems(36.))
-            .max_h(rems(42.))
-            .p_4()
-            .gap_3()
             .child(
-                h_flex()
-                    .justify_between()
-                    .child(Label::new("Call Diagnostics").size(LabelSize::Large))
+                dialog_header("Call Diagnostics", cx)
                     .child(
                         Label::new(quality_text)
                             .size(LabelSize::Large)
                             .color(quality_color),
+                    )
+                    .child(
+                        IconButton::new("dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(Rank::Quiet.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss(&menu::Cancel, window, cx);
+                            })),
                     ),
             )
-            .when(!is_connected && has_diagnostics, |this| {
-                this.child(
-                    h_flex()
-                        .justify_center()
-                        .child(Label::new("Showing diagnostics from the most recent call").color(Color::Muted)),
-                )
-            })
-            .when(!has_diagnostics, |this| {
-                this.child(
-                    h_flex()
-                        .justify_center()
-                        .py_4()
-                        .child(Label::new("No call diagnostics available").color(Color::Muted)),
-                )
-            })
-            .when(has_diagnostics, |this| {
-                this.child(
+            .child(
+                dialog_body().child(
                     v_flex()
-                        .id("call-diagnostics-scroll")
+                        .p_4()
                         .gap_3()
-                        .max_h(rems(32.))
-                        .overflow_y_scroll()
-                        .child(
+                        .size_full()
+                        .when(!is_connected && has_diagnostics, |this| {
+                            this.child(
+                                h_flex()
+                                    .justify_center()
+                                    .child(Label::new("Showing diagnostics from the most recent call").color(Color::Muted)),
+                            )
+                        })
+                        .when(!has_diagnostics, |this| {
+                            this.child(
+                                h_flex()
+                                    .justify_center()
+                                    .py_4()
+                                    .child(Label::new("No call diagnostics available").color(Color::Muted)),
+                            )
+                        })
+                        .when(has_diagnostics, |this| {
+                            this.child(
+                                v_flex()
+                                    .id("call-diagnostics-scroll")
+                                    .gap_3()
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .child(
                             Label::new(format!(
                                 "{sample_count} samples · {:.0}s retained · {recent_issue_count} affected intervals in the last 60s",
                                 retained_duration.as_secs_f64()
@@ -382,19 +394,23 @@ impl Render for CallStatsModal {
                                         .map(|audio| self.render_remote_audio(audio)),
                                 ),
                         ),
-                )
-            })
+                    )
+                }),
+                ),
+            )
             .when(has_diagnostics, |this| {
                 this.child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
+                    dialog_footer()
                         .child(
                             Button::new("copy-call-diagnostics", "Copy Report")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
+                                .style(Rank::Neutral.style())
                                 .on_click(cx.listener(|this, _, _, cx| this.copy_report(cx))),
                         )
                         .child(
                             Button::new("save-call-diagnostics", "Save Report…")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
+                                .style(Rank::Accent.style())
                                 .on_click(cx.listener(|this, _, _, cx| this.save_report(cx))),
                         ),
                 )

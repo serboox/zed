@@ -293,24 +293,48 @@ impl Focusable for StashMessageModal {
 }
 
 impl Render for StashMessageModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::cyberpunk::dialog_shell("StashMessageModal", window, cx)
             .key_context("StashMessageModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .elevation_2(cx)
-            .w(rems(34.))
             .child(
-                h_flex()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .w_full()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
-                    .child(Headline::new(self.kind.title()).size(HeadlineSize::XSmall)),
+                ui::cyberpunk::dialog_header_marked(
+                    Icon::new(IconName::GitBranch).size(IconSize::XSmall),
+                    self.kind.title(),
+                    cx,
+                )
+                .child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(ui::cyberpunk::Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel(&menu::Cancel, window, cx)
+                        })),
+                ),
             )
-            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+            .child(
+                ui::cyberpunk::dialog_body().child(div().p_3().w_full().child(self.editor.clone())),
+            )
+            .child(
+                ui::cyberpunk::dialog_footer()
+                    .child(
+                        Button::new("cancel", "Cancel")
+                            .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
+                            .style(ui::cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm", self.kind.title())
+                            .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
+                            .style(ui::cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx)
+                            })),
+                    ),
+            )
     }
 }
 
@@ -10577,6 +10601,39 @@ mod tests {
         await_git_panel_entries(&panel, &mut cx).await;
 
         (fs, project, workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_stash_message_modal_opens_as_a_framed_dialog(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "file": "modified\n",
+            }),
+            &[("file", StatusCode::Modified)],
+        )
+        .await;
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.prompt_for_stash_message(StashKind::All, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        assert!(
+            cx.debug_bounds("DIALOG-SHELL").is_some(),
+            "the stash message modal is painted as a framed, draggable dialog"
+        );
     }
 
     #[gpui::test]

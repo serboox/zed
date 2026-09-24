@@ -8,8 +8,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use ui::{
-    ActiveTheme, Color, CommonAnimationExt, Icon, IconName, IconSize, IntoElement, Label,
-    LabelCommon, LabelSize, ParentElement, Styled, StyledExt, div, h_flex, v_flex,
+    Color, CommonAnimationExt, Icon, IconName, IconSize, IntoElement, Label, LabelCommon,
+    LabelSize, ParentElement, Styled, cyberpunk, h_flex, v_flex,
 };
 use util::ResultExt;
 use util::command::new_command;
@@ -165,44 +165,33 @@ impl Focusable for InstallingZedModal {
 }
 
 impl Render for InstallingZedModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-
-        v_flex()
-            .elevation_3(cx)
-            .w_80()
-            .overflow_hidden()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cyberpunk::dialog_shell("Installing Zed", window, cx)
+            .child(cyberpunk::dialog_header("Installing Zed", cx))
             .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(theme.colors().border_variant)
-                    .child(Label::new("Installing Zed…")),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_3()
-                    .px_4()
-                    .py_3()
-                    .bg(theme.colors().editor_background)
-                    .child(
-                        Icon::new(IconName::ArrowCircle)
-                            .size(IconSize::Medium)
-                            .color(Color::Accent)
-                            .with_rotate_animation(3),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(Label::new("Moving Zed to Applications"))
-                            .child(
-                                Label::new("Zed will reopen when installation is complete.")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    ),
+                cyberpunk::dialog_body().child(
+                    h_flex()
+                        .w_full()
+                        .gap_3()
+                        .px_4()
+                        .py_3()
+                        .child(
+                            Icon::new(IconName::ArrowCircle)
+                                .size(IconSize::Medium)
+                                .color(Color::Accent)
+                                .with_rotate_animation(3),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(Label::new("Moving Zed to Applications"))
+                                .child(
+                                    Label::new("Zed will reopen when installation is complete.")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                ),
             )
     }
 }
@@ -328,4 +317,36 @@ fn user_applications_directory() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join("Applications"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn the_installing_zed_modal_renders_inside_a_framed_dialog_shell(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|_window, cx| InstallingZedModal::new(cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.debug_bounds("DIALOG-SHELL");
+        assert!(
+            bounds.is_some(),
+            "the installing-Zed modal renders inside a framed, draggable dialog shell"
+        );
+    }
 }

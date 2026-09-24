@@ -166,7 +166,7 @@ fn open_performance_profiler(
                 kind: gpui::WindowKind::Normal,
                 window_background,
                 window_decorations: None,
-                window_min_size: Some(default_bounds),
+                window_min_size: Some(gpui::size(px(800.), px(480.))),
                 window_bounds: Some(WindowBounds::centered(default_bounds, cx)),
                 ..Default::default()
             },

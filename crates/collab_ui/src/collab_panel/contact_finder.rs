@@ -1,11 +1,15 @@
 use client::{ContactRequestStatus, User, UserStore};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ParentElement as _,
-    Render, Styled, Task, WeakEntity, Window,
+    Render, Task, WeakEntity, Window,
 };
 use picker::{Picker, PickerDelegate};
 use std::sync::Arc;
-use ui::{Avatar, ListItem, ListItemSpacing, prelude::*};
+use ui::{
+    Avatar, ListItem, ListItemSpacing,
+    cyberpunk::{Rank, dialog_body, dialog_header, dialog_shell},
+    prelude::*,
+};
 use util::TryFutureExt;
 use workspace::ModalView;
 
@@ -28,20 +32,20 @@ impl ContactFinder {
 }
 
 impl Render for ContactFinder {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .elevation_3(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        dialog_shell("Contacts", window, cx)
+            .key_context("ContactFinder")
             .child(
-                v_flex()
-                    .px_2()
-                    .py_1()
-                    .bg(cx.theme().colors().element_background)
-                    // HACK: Prevent the background color from overflowing the parent container.
-                    .rounded_t(px(8.))
-                    .child(Label::new("Contacts"))
-                    .child(h_flex().child(Label::new("Invite new contacts"))),
+                dialog_header("Contacts", cx)
+                    .child(Label::new("Invite new contacts").color(Color::Muted))
+                    .child(
+                        IconButton::new("dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(Rank::Quiet.style())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
             )
-            .child(self.picker.clone())
+            .child(dialog_body().child(self.picker.clone()))
     }
 }
 

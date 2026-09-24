@@ -11,7 +11,10 @@ use gpui::{
 };
 use language::language_settings::EditPredictionProvider;
 use settings::update_settings_file;
-use ui::prelude::*;
+use ui::{
+    cyberpunk::{Rank, dialog_body, dialog_header, dialog_shell},
+    prelude::*,
+};
 use workspace::{ModalView, Workspace};
 
 #[macro_export]
@@ -117,22 +120,12 @@ impl ModalView for ZedPredictModal {
 
 impl Render for ZedPredictModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let window_height = window.viewport_size().height;
-        let max_height = window_height - px(200.);
         let color = cx.theme().colors();
 
-        v_flex()
+        dialog_shell("ZedPredictModal", window, cx)
             .id("edit-prediction-onboarding")
             .key_context("ZedPredictModal")
-            .relative()
-            .w(px(550.))
-            .h_full()
-            .max_h(max_height)
-            .p_1()
-            .gap_2()
-            .elevation_3(cx)
             .track_focus(&self.focus_handle(cx))
-            .overflow_hidden()
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(|_, _: &menu::Cancel, _window, cx| {
                 onboarding_event!("Cancelled", trigger = "Action");
@@ -142,26 +135,31 @@ impl Render for ZedPredictModal {
                 this.focus_handle.focus(window, cx);
             }))
             .child(
-                div()
-                    .p_3()
-                    .size_full()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded(px(5.))
-                    .bg(linear_gradient(
-                        360.,
-                        linear_color_stop(color.panel_background, 1.0),
-                        linear_color_stop(color.editor_background, 0.45),
-                    ))
-                    .child(self.onboarding.clone()),
+                dialog_header("Edit Prediction", cx).child(
+                    IconButton::new("cancel", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|_, _: &ClickEvent, _window, cx| {
+                            onboarding_event!("Cancelled", trigger = "X click");
+                            cx.emit(DismissEvent);
+                        })),
+                ),
             )
-            .child(h_flex().absolute().top_3().right_3().child(
-                IconButton::new("cancel", IconName::Close).on_click(cx.listener(
-                    |_, _: &ClickEvent, _window, cx| {
-                        onboarding_event!("Cancelled", trigger = "X click");
-                        cx.emit(DismissEvent);
-                    },
-                )),
-            ))
+            .child(
+                dialog_body().child(
+                    div()
+                        .p_3()
+                        .size_full()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .rounded(px(5.))
+                        .bg(linear_gradient(
+                            360.,
+                            linear_color_stop(color.panel_background, 1.0),
+                            linear_color_stop(color.editor_background, 0.45),
+                        ))
+                        .child(self.onboarding.clone()),
+                ),
+            )
     }
 }

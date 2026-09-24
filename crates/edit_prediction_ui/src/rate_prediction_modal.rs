@@ -24,7 +24,9 @@ use std::{fmt::Write, ops::Range, path::Path, sync::Arc};
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DropdownMenu, KeyBinding, List, ListItem, ListItemSpacing, PopoverMenuHandle,
-    Tooltip, prelude::*,
+    Tooltip,
+    cyberpunk::{Rank, dialog_body, dialog_header, dialog_shell},
+    prelude::*,
 };
 use workspace::{ModalView, Workspace};
 use zeta_prompt::{ContextSource, FilePosition, RelatedExcerpt, RelatedFile, Zeta3PromptInput};
@@ -1316,7 +1318,7 @@ impl Render for RatePredictionsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_color = cx.theme().colors().border;
 
-        h_flex()
+        dialog_shell("RatePredictionsModal", window, cx)
             .key_context("RatePredictionModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::dismiss))
@@ -1331,67 +1333,84 @@ impl Render for RatePredictionsModal {
             .on_action(cx.listener(Self::thumbs_down_active))
             .on_action(cx.listener(Self::focus_completions))
             .on_action(cx.listener(Self::preview_completion))
-            .bg(cx.theme().colors().elevated_surface_background)
-            .border_1()
-            .border_color(border_color)
-            .w(window.viewport_size().width - px(320.))
-            .h(window.viewport_size().height - px(300.))
-            .rounded_lg()
-            .shadow_lg()
-            .child(
-                v_flex()
-                    .w_72()
-                    .h_full()
-                    .border_r_1()
-                    .border_color(border_color)
-                    .flex_shrink_0()
-                    .overflow_hidden()
-                    .child({
-                        let icons = self.ep_store.read(cx).icons(cx);
-                        h_flex()
-                            .h_8()
-                            .px_2()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(border_color)
-                            .child(Icon::new(icons.base).size(IconSize::Small))
-                            .child(
-                                Label::new("From most recent to oldest")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
-                            )
-                    })
-                    .child(
-                        div()
-                            .id("completion_list")
-                            .p_0p5()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .child(
-                                List::new()
-                                    .empty_message(
-                                        div()
-                                            .p_2()
-                                            .child(
-                                                Label::new(concat!(
-                                                    "No completions yet. ",
-                                                    "Use the editor to generate some, ",
-                                                    "and make sure to rate them!"
-                                                ))
-                                                .color(Color::Muted),
-                                            )
-                                            .into_any_element(),
-                                    )
-                                    .children(self.render_shown_completions(cx)),
-                            ),
-                    ),
-            )
-            .children(self.render_active_completion(window, cx))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if !this.failure_mode_menu_handle.is_deployed() {
                     cx.emit(DismissEvent);
                 }
             }))
+            .child(
+                dialog_header("Rate Predictions", cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dismiss(&menu::Cancel, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                dialog_body().child(
+                    h_flex()
+                        // A comfortable floor for a two-pane list+detail view. The
+                        // dialog's own resize grips let the reader grow it past
+                        // this; a viewport-derived fixed size would fight both
+                        // that resize and the remembered placement the shell
+                        // otherwise restores.
+                        .min_w(px(900.))
+                        .min_h(px(560.))
+                        .size_full()
+                        .bg(cx.theme().colors().elevated_surface_background)
+                        .child(
+                            v_flex()
+                                .w_72()
+                                .h_full()
+                                .border_r_1()
+                                .border_color(border_color)
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .child({
+                                    let icons = self.ep_store.read(cx).icons(cx);
+                                    h_flex()
+                                        .h_8()
+                                        .px_2()
+                                        .justify_between()
+                                        .border_b_1()
+                                        .border_color(border_color)
+                                        .child(Icon::new(icons.base).size(IconSize::Small))
+                                        .child(
+                                            Label::new("From most recent to oldest")
+                                                .color(Color::Muted)
+                                                .size(LabelSize::Small),
+                                        )
+                                })
+                                .child(
+                                    div()
+                                        .id("completion_list")
+                                        .p_0p5()
+                                        .h_full()
+                                        .overflow_y_scroll()
+                                        .child(
+                                            List::new()
+                                                .empty_message(
+                                                    div()
+                                                        .p_2()
+                                                        .child(
+                                                            Label::new(concat!(
+                                                                "No completions yet. ",
+                                                                "Use the editor to generate some, ",
+                                                                "and make sure to rate them!"
+                                                            ))
+                                                            .color(Color::Muted),
+                                                        )
+                                                        .into_any_element(),
+                                                )
+                                                .children(self.render_shown_completions(cx)),
+                                        ),
+                                ),
+                        )
+                        .children(self.render_active_completion(window, cx)),
+                ),
+            )
     }
 }
 

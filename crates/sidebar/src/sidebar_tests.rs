@@ -3483,6 +3483,53 @@ async fn test_thread_switcher_can_activate_agent_panel_terminal(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn test_thread_switcher_is_painted_inside_a_dialog_shell(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("thread-existing")),
+        Some("Existing Thread".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    // The switcher only opens once there is more than one thread to switch to.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("thread-other")),
+        Some("Other Thread".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        sidebar.read_with(cx, |sidebar, _| sidebar.thread_switcher.is_some()),
+        "the switcher is open"
+    );
+
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+
+    cx.debug_bounds("DIALOG-SHELL")
+        .expect("the thread switcher is painted inside a dialog shell");
+}
+
+#[gpui::test]
 async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
     cx: &mut TestAppContext,
 ) {
