@@ -114,7 +114,6 @@ const NSDragOperationCopy: NSDragOperation = 1;
 #[allow(non_upper_case_globals)]
 const NSDragOperationMove: NSDragOperation = 16;
 const NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION: NSInteger = 0;
-const NSDRAGGING_CONTEXT_WITHIN_APPLICATION: NSInteger = 1;
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -515,17 +514,6 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         decl.add_method(
             sel!(draggingSession:sourceOperationMaskForDraggingContext:),
             dragging_source_operation_mask
-                as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
-        );
-        decl.add_method(
-            sel!(draggingSession:endedAtPoint:operation:),
-            dragging_session_ended as extern "C" fn(&Object, Sel, id, NSPoint, NSUInteger),
-        );
-
-        decl.add_protocol(Protocol::get("NSDraggingSource").unwrap());
-        decl.add_method(
-            sel!(draggingSession:sourceOperationMaskForDraggingContext:),
-            dragging_session_source_operation_mask
                 as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
         );
         decl.add_method(
@@ -3690,13 +3678,10 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     }
 }
 
-/// What a drag started by this window allows wherever it is being carried.
+/// What this window will let the drag it started become.
 ///
-/// Both: only the receiver knows what it is going to do with the file, and
-/// something that can only take a copy -- a chat window, an upload form --
-/// refuses a drag that offers nothing else.
-/// What this window will let the drag it started become: one operation and not
-/// both, either way. A drag that also allowed the other is settled by the
+/// A drag of files out of the editor offers one operation and not both, either
+/// way. A drag that also allowed the other is settled by the
 /// destination, and it can settle either way -- a file manager would copy a
 /// drag that meant to move, and a destination that takes files would have the
 /// original deleted after a drag that meant to copy.
@@ -3704,9 +3689,17 @@ extern "C" fn dragging_source_operation_mask(
     this: &Object,
     _: Sel,
     _: id,
-    _context: NSInteger,
+    context: NSInteger,
 ) -> NSDragOperation {
     let window_state = unsafe { get_window_state(this) };
+    // Any other drag this window starts is an item dragged out of a view,
+    // which the destination may copy or, inside the app, move.
+    if window_state.as_ref().lock().dragged_out.is_empty() {
+        return match context {
+            NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
+            _ => NSDragOperationCopy | NSDragOperationMove,
+        };
+    }
     let means = window_state.as_ref().lock().dragged_out_means;
     match means {
         gpui::DragMeans::Taking => NSDragOperationMove,
@@ -3724,13 +3717,24 @@ extern "C" fn dragging_session_ended(
     _: Sel,
     _: id,
     _: NSPoint,
-    operation: NSUInteger,
+    operation: NSDragOperation,
 ) {
+    // SAFETY: AppKit invokes this selector on the GPUIWindow instance registered in build_classes,
+    // which always has WINDOW_STATE_IVAR initialized to the owning MacWindowState.
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
+    lock.synthetic_drag_counter += 1;
+    lock.last_left_mouse_down_event = None;
     let paths = std::mem::take(&mut lock.dragged_out);
     let ended = lock.file_drag_ended.take();
     drop(lock);
+    send_file_drop_event(window_state.clone(), FileDropEvent::Ended);
+    // A drag this window did not start with files keeps the callback for the
+    // next one that does.
+    if paths.is_empty() {
+        window_state.as_ref().lock().file_drag_ended = ended;
+        return;
+    }
     let Some(mut ended) = ended else {
         return;
     };
@@ -3778,44 +3782,6 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     send_file_drop_event(window_state, FileDropEvent::Exited);
-}
-
-extern "C" fn dragging_session_source_operation_mask(
-    _: &Object,
-    _: Sel,
-    _: id,
-    context: NSInteger,
-) -> NSDragOperation {
-    let operation = match context {
-        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
-        NSDRAGGING_CONTEXT_WITHIN_APPLICATION => NSDragOperationCopy | NSDragOperationMove,
-        _ => NSDragOperationCopy | NSDragOperationMove,
-    };
-    log::debug!(
-        "dragging_session_source_operation_mask: context={}, operation={}",
-        context,
-        operation
-    );
-    operation
-}
-
-extern "C" fn dragging_session_ended(
-    this: &Object,
-    _: Sel,
-    _: id,
-    _: NSPoint,
-    operation: NSDragOperation,
-) {
-    log::debug!("dragging_session_ended operation={operation}");
-    // SAFETY: AppKit invokes this selector on the GPUIWindow instance registered in build_classes,
-    // which always has WINDOW_STATE_IVAR initialized to the owning MacWindowState.
-    let window_state = unsafe { get_window_state(this) };
-    {
-        let mut lock = window_state.lock();
-        lock.synthetic_drag_counter += 1;
-        lock.last_left_mouse_down_event = None;
-    }
-    send_file_drop_event(window_state, FileDropEvent::Ended);
 }
 
 async fn synthetic_drag(

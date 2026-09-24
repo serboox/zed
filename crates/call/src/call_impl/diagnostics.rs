@@ -329,7 +329,7 @@ fn compute_remote_audio_stats(
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -462,7 +462,7 @@ fn compute_remote_audio_stats(
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
