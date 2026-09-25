@@ -394,6 +394,14 @@ fn main() {
         println!("zed is already running");
         return;
     }
+    // On Linux the CLI listener issues the token once it owns the socket; here
+    // the single-instance check is what says this instance is the one asked.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if !*zed_env_vars::ZED_STATELESS && *release_channel::RELEASE_CHANNEL != ReleaseChannel::Dev {
+        crate::zed::cli_requests::issue_token(paths::data_dir())
+            .context("writing the zedcli token")
+            .log_err();
+    }
 
     let should_install_crash_handler =
         client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);

@@ -206,6 +206,9 @@ pub struct ConnectionView {
     ssh_auth_method: SshAuthMethod,
     ssh_password_editor: Entity<Editor>,
     ssl_mode: SslMode,
+    /// Whether the reader picked the SSL mode, rather than it being the
+    /// driver's default; only a default follows a change of driver.
+    ssl_mode_chosen: bool,
     ssl_ca_path_editor: Entity<Editor>,
     ssl_client_cert_path_editor: Entity<Editor>,
     ssl_client_key_path_editor: Entity<Editor>,
@@ -314,7 +317,8 @@ impl ConnectionView {
             ssh_key_path_editor,
             ssh_auth_method: SshAuthMethod::KeyFile,
             ssh_password_editor,
-            ssl_mode: SslMode::Disabled,
+            ssl_mode: DatabaseDriver::MySQL.default_ssl_mode(),
+            ssl_mode_chosen: false,
             ssl_ca_path_editor,
             ssl_client_cert_path_editor,
             ssl_client_key_path_editor,
@@ -469,6 +473,7 @@ impl ConnectionView {
             ssh_auth_method: config.ssh_auth_method,
             ssh_password_editor,
             ssl_mode: config.ssl_mode,
+            ssl_mode_chosen: true,
             ssl_ca_path_editor,
             ssl_client_cert_path_editor,
             ssl_client_key_path_editor,
@@ -609,6 +614,10 @@ impl ConnectionView {
     fn set_driver(&mut self, driver: DatabaseDriver, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_driver == driver {
             return;
+        }
+        // Only a mode the reader has not chosen follows the driver.
+        if !self.ssl_mode_chosen {
+            self.ssl_mode = driver.default_ssl_mode();
         }
         self.selected_driver = driver;
         let default_port = driver.default_port().to_string();
@@ -1439,6 +1448,7 @@ impl Render for ConnectionView {
                                             self.ssl_mode == SslMode::Disabled,
                                             cx,
                                             |this, _, _, cx| {
+                                                this.ssl_mode_chosen = true;
                                                 this.ssl_mode = SslMode::Disabled;
                                                 cx.notify();
                                             },
@@ -1448,6 +1458,7 @@ impl Render for ConnectionView {
                                             self.ssl_mode == SslMode::Require,
                                             cx,
                                             |this, _, _, cx| {
+                                                this.ssl_mode_chosen = true;
                                                 this.ssl_mode = SslMode::Require;
                                                 cx.notify();
                                             },
@@ -1457,6 +1468,7 @@ impl Render for ConnectionView {
                                             self.ssl_mode == SslMode::VerifyCa,
                                             cx,
                                             |this, _, _, cx| {
+                                                this.ssl_mode_chosen = true;
                                                 this.ssl_mode = SslMode::VerifyCa;
                                                 cx.notify();
                                             },
@@ -1466,6 +1478,7 @@ impl Render for ConnectionView {
                                             self.ssl_mode == SslMode::VerifyFull,
                                             cx,
                                             |this, _, _, cx| {
+                                                this.ssl_mode_chosen = true;
                                                 this.ssl_mode = SslMode::VerifyFull;
                                                 cx.notify();
                                             },
@@ -2008,16 +2021,20 @@ mod tests {
             .read_with(cx, |view, cx| view.build_config(cx))
             .unwrap()
             .expect("config should build");
-        assert_eq!(default_config.ssl_mode, SslMode::Disabled);
+        assert_eq!(
+            default_config.ssl_mode,
+            SslMode::Require,
+            "a new MySQL connection starts with TLS required"
+        );
         assert_eq!(default_config.ssh_auth_method, SshAuthMethod::KeyFile);
 
         let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
 
-        let require_chip = cx
-            .debug_bounds("chip-Require")
-            .expect("the SSL Require chip should be rendered for a MySQL connection")
+        let disabled_chip = cx
+            .debug_bounds("chip-Disabled")
+            .expect("the SSL Disabled chip should be rendered for a MySQL connection")
             .center();
-        cx.simulate_click(require_chip, gpui::Modifiers::none());
+        cx.simulate_click(disabled_chip, gpui::Modifiers::none());
 
         let password_chip = cx
             .debug_bounds("chip-Password")
@@ -2038,8 +2055,8 @@ mod tests {
             .expect("config should build");
         assert_eq!(
             config.ssl_mode,
-            SslMode::Require,
-            "a real click on the Require chip must select SSL Require in the built config"
+            SslMode::Disabled,
+            "a real click on the Disabled chip must turn SSL off in the built config"
         );
         assert_eq!(
             config.ssh_auth_method,
@@ -2047,6 +2064,31 @@ mod tests {
             "a real click on the Password chip must switch the built config off key-file auth"
         );
         assert_eq!(config.ssh_password, "tunnel-secret");
+    }
+
+    /// Switching the driver moves an untouched SSL mode to the new driver's
+    /// default, and leaves a mode the reader chose alone.
+    #[gpui::test]
+    async fn the_ssl_default_follows_the_driver_until_it_is_chosen(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.ssl_mode, SslMode::Require, "MySQL starts with TLS");
+                view.set_driver(DatabaseDriver::PostgreSQL, window, cx);
+                assert_eq!(view.ssl_mode, SslMode::Disabled, "PostgreSQL does not");
+                view.set_driver(DatabaseDriver::MySQL, window, cx);
+                assert_eq!(view.ssl_mode, SslMode::Require);
+                view.ssl_mode = SslMode::Require;
+                view.ssl_mode_chosen = true;
+                view.set_driver(DatabaseDriver::PostgreSQL, window, cx);
+                assert_eq!(
+                    view.ssl_mode,
+                    SslMode::Require,
+                    "a mode the reader chose stays, even when it is the old default"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -234,6 +234,13 @@ pub enum BulkWriteOp {
 impl MongoStatement {
     pub fn kind(&self) -> MongoOperationKind {
         match self {
+            // An aggregation that ends in `$out` or `$merge` writes its result
+            // into a collection, whatever the method name suggests.
+            MongoStatement::Aggregate { pipeline, .. }
+                if crate::read_only::check_mongo_pipeline(pipeline).is_err() =>
+            {
+                MongoOperationKind::Write
+            }
             MongoStatement::Find { .. }
             | MongoStatement::FindOne { .. }
             | MongoStatement::Aggregate { .. }
@@ -277,9 +284,6 @@ pub fn check_read_only(query: &str) -> Result<()> {
             "only reads can be run here, and this command writes".to_string(),
         )
         .into());
-    }
-    if let MongoStatement::Aggregate { pipeline, .. } = &statement {
-        crate::read_only::check_mongo_pipeline(pipeline)?;
     }
     Ok(())
 }

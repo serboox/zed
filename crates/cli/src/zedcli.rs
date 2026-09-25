@@ -8,7 +8,7 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use cli::{
     ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse,
-    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunInfo, RunState, WindowInfo,
+    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo,
     WindowSelector, exit_status, ipc::IpcOneShotServer,
 };
 use serde_json::json;
@@ -47,6 +47,12 @@ enum Command {
     Ps,
     /// List the run configurations of the selected window's projects.
     Configs,
+    /// Start a run configuration, stopping a run of it that is still going.
+    Run { configuration: String },
+    /// Stop every run of a configuration, with everything it started.
+    Stop { configuration: String },
+    /// Stop a configuration's runs, then start it again.
+    Restart { configuration: String },
     /// Database Explorer: saved connections and SQL.
     Db {
         #[command(subcommand)]
@@ -176,6 +182,21 @@ fn run(cli: ZedCli) -> Result<i32> {
         Command::Windows => CliRequest::ListWindows,
         Command::Ps => CliRequest::ListRuns { selector },
         Command::Configs => CliRequest::ListConfigurations { selector },
+        Command::Run { configuration } => CliRequest::ControlRun {
+            selector,
+            configuration,
+            action: RunAction::Run,
+        },
+        Command::Stop { configuration } => CliRequest::ControlRun {
+            selector,
+            configuration,
+            action: RunAction::Stop,
+        },
+        Command::Restart { configuration } => CliRequest::ControlRun {
+            selector,
+            configuration,
+            action: RunAction::Restart,
+        },
         Command::Db { command } => match command {
             DbCommand::Connections => CliRequest::ListConnections,
             DbCommand::Query {
@@ -265,9 +286,14 @@ fn exchange(
     format: RowFormat,
     send_options: &SendOptions,
 ) -> Result<i32> {
+    let data_dir = user_data_dir.unwrap_or_else(|| paths::data_dir().clone());
+    let request = CliRequest::Authenticated {
+        token: editor_token(&data_dir)?,
+        request: Box::new(request),
+    };
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("opening a channel for the editor")?;
-    reach_the_editor(format!("zed-cli://{server_name}"), user_data_dir)?;
+    reach_the_editor(format!("zed-cli://{server_name}"), &data_dir)?;
 
     let (accepted_tx, accepted_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -367,14 +393,27 @@ fn exchange(
     }
 }
 
+/// The token the running editor wrote for its CLI requests to carry. Only its
+/// own user can read it, and a missing one means no editor of this channel
+/// is running.
+pub(crate) fn editor_token(data_dir: &std::path::Path) -> Result<String> {
+    let path = cli::token_path(data_dir);
+    let token = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow!(
+            "no editor token at {} ({error}). Start Zed (Fast/DB dev) first.",
+            path.display()
+        )
+    })?;
+    Ok(token.trim().to_string())
+}
+
 /// Hands the editor the address to connect back to. Only an editor that is
 /// already running is asked: starting a whole editor window is not something a
 /// command meant to answer a question should do on its own.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn reach_the_editor(url: String, user_data_dir: Option<PathBuf>) -> Result<()> {
+fn reach_the_editor(url: String, data_dir: &std::path::Path) -> Result<()> {
     use std::os::unix::net::UnixDatagram;
 
-    let data_dir = user_data_dir.unwrap_or_else(|| paths::data_dir().clone());
     let socket = data_dir.join(format!(
         "zed-{}.sock",
         *release_channel::RELEASE_CHANNEL_NAME
@@ -393,7 +432,7 @@ fn reach_the_editor(url: String, user_data_dir: Option<PathBuf>) -> Result<()> {
 /// Elsewhere the only way in is the one that starts an editor when none is
 /// running, which a question must not do.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-fn reach_the_editor(_url: String, _user_data_dir: Option<PathBuf>) -> Result<()> {
+fn reach_the_editor(_url: String, _data_dir: &std::path::Path) -> Result<()> {
     Err(anyhow!("zedcli only runs on Linux for now"))
 }
 

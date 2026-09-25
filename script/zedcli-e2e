@@ -300,6 +300,10 @@ echo "== the socket"
 [ "$(stat -c %a "$SOCKET")" = 600 ] && pass "only its own user can reach the socket" \
     || fail "only its own user can reach the socket" "$(stat -c '%a %U' "$SOCKET")"
 
+TOKEN_FILE=$(ls "$ROOT/data"/zedcli-*.token 2>/dev/null | head -1 || true)
+[ -n "$TOKEN_FILE" ] && [ "$(stat -c %a "$TOKEN_FILE")" = 600 ] && pass "the editor's token is readable by its user only" \
+    || fail "the editor's token is readable by its user only" "${TOKEN_FILE:-no token file}"
+
 echo "== windows"
 out=$(zc windows --json) || true
 echo "$out" | grep -q "\"$ROOT/project\"" && pass "the project's window is listed" || fail "the project's window is listed" "$out"
@@ -312,13 +316,46 @@ echo "== configs"
 out=$(cd "$ROOT/project" && zc configs) || true
 echo "$out" | grep -q sleeper && pass "configurations are found from the project directory" \
     || fail "configurations are found from the project directory" "$out"
+expect_status 4 "an unknown configuration is not found" -- run "no such configuration" --window "$WINDOW"
 
-echo "== runs are only looked at"
-out=$(zc ps --window "$WINDOW") || true
-echo "$out" | grep -q "No task runs" && pass "ps lists the runs, here none" || fail "ps lists the runs, here none" "$out"
-for command in run stop restart; do
-    expect_status 2 "there is no $command command" -- "$command" sleeper --window "$WINDOW"
-done
+pids_of_sleeper() {
+    zc ps --window "$WINDOW" --json | /usr/bin/python3 -c '
+import json, sys
+runs = json.load(sys.stdin)["runs"]
+print(" ".join(str(p["pid"]) for r in runs if r["label"] == "sleeper" and r["state"] == "running" for p in r["processes"]))' 2>/dev/null || true
+}
+wait_for_pids() {
+    local pids=""
+    for _ in $(seq 1 30); do
+        pids=$(pids_of_sleeper)
+        [ "$(echo "$pids" | wc -w)" -ge 3 ] && break
+        sleep 1
+    done
+    echo "$pids"
+}
+alive() { local left=""; for pid in $1; do kill -0 "$pid" 2>/dev/null && left="$left $pid"; done; echo "$left"; }
+# Every `sleep 300` this script's editor started, found by the scratch HOME in
+# its environment, so a stray one outside the run's tree is caught as well.
+sleeps_left() { pgrep -x sleep -a | awk '$3 == "300" {print $1}' | while read -r pid; do
+        grep -qs "$ROOT" "/proc/$pid/environ" && echo "$pid"; done | tr '\n' ' '; }
+
+echo "== run, restart, stop"
+expect_status 0 "run starts the configuration" -- run sleeper --window "$WINDOW"
+FIRST=$(wait_for_pids)
+[ "$(echo "$FIRST" | wc -w)" -ge 3 ] && pass "ps shows the run with the programs it started" \
+    || fail "ps shows the run with the programs it started" "$(zc ps --window "$WINDOW")"
+expect_status 0 "run of a running configuration replaces it" -- run sleeper --window "$WINDOW"
+SECOND=$(wait_for_pids)
+[ -z "$(alive "$FIRST")" ] && pass "the previous run is gone, all of it" \
+    || fail "the previous run is gone, all of it" "left: $(alive "$FIRST")"
+expect_status 0 "restart restarts it" -- restart sleeper --window "$WINDOW"
+THIRD=$(wait_for_pids)
+[ -z "$(alive "$SECOND")" ] && [ -n "$THIRD" ] && pass "restart ended the old run and started a new one" \
+    || fail "restart ended the old run and started a new one" "old left: $(alive "$SECOND"), new: $THIRD"
+expect_status 0 "stop stops it" -- stop sleeper --window "$WINDOW"
+sleep 1
+[ -z "$(alive "$THIRD")" ] && [ -z "$(sleeps_left)" ] && pass "nothing of the run is left, not even what left its session" \
+    || fail "nothing of the run is left, not even what left its session" "left: $(alive "$THIRD") $(sleeps_left)"
 
 echo "== db"
 out=$(zc db connections) || true

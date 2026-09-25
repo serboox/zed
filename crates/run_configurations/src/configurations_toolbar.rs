@@ -655,7 +655,7 @@ impl ConfigurationsToolbar {
 
     /// Stops every run of what the plaque points at, with everything each
     /// run started, and resolves once none of it is left.
-    fn stop_every_run(&self, cx: &mut Context<Self>) -> Option<Task<()>> {
+    fn stop_every_run(&self, cx: &mut Context<Self>) -> Option<Task<bool>> {
         let template = self.task_it_points_at(cx)?;
         let workspace = self.workspace.upgrade()?;
         Some(workspace.update(cx, |workspace, cx| {

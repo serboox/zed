@@ -424,6 +424,7 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
     }
+    super::cli_requests::issue_token(paths::data_dir())?;
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         while let Ok(len) = listener.recv(&mut buf) {
@@ -587,6 +588,14 @@ pub async fn handle_cli_connection(
     cx: &mut AsyncApp,
 ) {
     if let Some(request) = requests.next().await {
+        let request = match super::cli_requests::admit(request, cx) {
+            Ok(request) => request,
+            Err((message, status)) => {
+                responses.send(CliResponse::Stderr { message }).log_err();
+                responses.send(CliResponse::Exit { status }).log_err();
+                return;
+            }
+        };
         match request {
             CliRequest::Open {
                 urls,
@@ -700,21 +709,22 @@ pub async fn handle_cli_connection(
             CliRequest::ListConfigurations { selector } => {
                 super::cli_requests::list_configurations(selector, responses.as_ref(), cx).await;
             }
-            CliRequest::ControlRun { .. } => {
-                // A run executes whatever its configuration says, which can
-                // change anything; the socket is for reading only.
-                responses
-                    .send(CliResponse::Stderr {
-                        message: "Starting or stopping a run can change data, and zedcli only \
-                                  reads. Use the editor's Run and Stop buttons."
-                            .to_string(),
-                    })
-                    .log_err();
-                responses
-                    .send(CliResponse::Exit {
-                        status: cli::exit_status::REFUSED,
-                    })
-                    .log_err();
+            CliRequest::ControlRun {
+                selector,
+                configuration,
+                action,
+            } => {
+                super::cli_requests::control_run(
+                    selector,
+                    configuration,
+                    action,
+                    responses.as_ref(),
+                    cx,
+                )
+                .await;
+            }
+            CliRequest::Authenticated { .. } => {
+                debug_panic!("admit unwraps an authenticated request before this match");
             }
             CliRequest::ListApiRequests => {
                 super::cli_requests::list_api_requests(responses.as_ref(), cx).await;

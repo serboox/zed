@@ -69,6 +69,16 @@ impl fmt::Display for DatabaseDriver {
 }
 
 impl DatabaseDriver {
+    /// The SSL mode a new connection of this kind starts with. MySQL 8 lets a
+    /// `caching_sha2_password` account in only over TLS until the server has
+    /// cached its password, so an unencrypted default fails the first connect.
+    pub fn default_ssl_mode(self) -> SslMode {
+        match self {
+            DatabaseDriver::MySQL => SslMode::Require,
+            _ => SslMode::Disabled,
+        }
+    }
+
     pub fn default_port(self) -> u16 {
         match self {
             DatabaseDriver::MySQL => 3306,

@@ -1,5 +1,5 @@
 mod app_menus;
-mod cli_requests;
+pub(crate) mod cli_requests;
 pub mod edit_prediction_registry;
 pub mod launchpad;
 #[cfg(target_os = "macos")]

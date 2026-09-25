@@ -101,6 +101,13 @@ pub enum CliRequest {
     ListApiRequests,
     /// Lists the API client's environments.
     ListApiEnvironments,
+    /// One of the requests below, carrying the token the editor wrote to its
+    /// data directory. Every request that reads the editor's state or data
+    /// must come this way; only the one who can read that file can ask.
+    Authenticated {
+        token: String,
+        request: Box<CliRequest>,
+    },
     /// Sends a saved request. `request` is its id or its `Collection/.../Name`
     /// path; `environment` an environment's id or name.
     SendApiRequest {
@@ -233,6 +240,35 @@ pub struct ConfigurationInfo {
     pub kind: String,
     pub command: String,
     pub running: bool,
+}
+
+impl CliRequest {
+    /// Whether this request reaches the editor's state or data, and so must
+    /// come wrapped in [`CliRequest::Authenticated`].
+    pub fn needs_token(&self) -> bool {
+        match self {
+            CliRequest::Open { .. } | CliRequest::SetOpenBehavior { .. } => false,
+            CliRequest::Authenticated { .. }
+            | CliRequest::ExecuteQuery { .. }
+            | CliRequest::ListConnections
+            | CliRequest::ListWindows
+            | CliRequest::ListRuns { .. }
+            | CliRequest::ListConfigurations { .. }
+            | CliRequest::ControlRun { .. }
+            | CliRequest::ListApiRequests
+            | CliRequest::ListApiEnvironments
+            | CliRequest::SendApiRequest { .. } => true,
+        }
+    }
+}
+
+/// Where a running editor keeps the token its CLI requests must carry: next to
+/// its socket, in its data directory, readable by its own user only.
+pub fn token_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(format!(
+        "zedcli-{}.token",
+        *release_channel::RELEASE_CHANNEL_NAME
+    ))
 }
 
 /// A saved database connection, without any credentials.

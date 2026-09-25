@@ -916,6 +916,10 @@ fn run_db_command(args: &[String]) -> Result<()> {
         },
         DbCommand::ListConnections => CliRequest::ListConnections,
     };
+    let request = CliRequest::Authenticated {
+        token: zedcli::editor_token(paths::data_dir())?,
+        request: Box::new(request),
+    };
 
     let app = Detect::detect(None).context("Bundle detection")?;
     let (server, server_name) =

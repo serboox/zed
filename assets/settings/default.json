@@ -1749,6 +1749,11 @@
     // Whether the strip of readings for a running configuration is shown.
     "show_process_metrics": true
   },
+  "zedcli": {
+    // Whether zedcli may ask this editor anything: its windows, runs,
+    // databases and saved requests. Off, every such request is refused.
+    "enabled": true
+  },
   // The misspelling check over names and comments, which runs with no
   // language server.
   "typo_diagnostics": {

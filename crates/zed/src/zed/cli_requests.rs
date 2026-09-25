@@ -2,16 +2,145 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cli::{
-    ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, ApiTestInfo, CliResponse, CliResponseSink,
-    ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunInfo, RunState, WindowInfo,
-    WindowSelector, WorkspaceInfo, exit_status,
+    ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, ApiTestInfo, CliRequest, CliResponse,
+    CliResponseSink, ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunAction, RunInfo,
+    RunState, WindowInfo, WindowSelector, WorkspaceInfo, exit_status,
 };
-use gpui::{App, AsyncApp, Entity, WindowHandle};
+use gpui::{AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 use run_configurations::configurations_file::Kind;
-use run_configurations::{configurations_store, process_metrics, run_instances};
+use run_configurations::{
+    configurations_store, configurations_view, process_metrics, run_instances,
+};
 use terminal::TaskStatus;
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
+
+/// Whether zedcli may ask this editor anything, as the reader set it.
+#[derive(Clone, Debug, settings::RegisterSetting)]
+pub struct ZedcliSettings {
+    pub enabled: bool,
+}
+
+impl settings::Settings for ZedcliSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            enabled: content
+                .zedcli
+                .as_ref()
+                .and_then(|configured| configured.enabled)
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// The token this editor wrote to its data directory for zedcli to present.
+static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Writes a fresh token beside the CLI socket, readable by this user only, for
+/// every request that reaches the editor's state or data to carry. Written to
+/// a new file and renamed into place, so a reader never sees half of one.
+pub fn issue_token(data_dir: &Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let token = TOKEN.get_or_init(|| {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    });
+    let path = cli::token_path(data_dir);
+    let writing = path.with_extension("token.writing");
+    match std::fs::remove_file(&writing) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Elsewhere the file sits in the user's own profile, which only they
+        // can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&writing)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&writing, &path)
+    })();
+    if written.is_err()
+        && let Err(error) = std::fs::remove_file(&writing)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("leaving {} behind: {error}", writing.display());
+    }
+    Ok(written?)
+}
+
+/// Compared in full whatever the first difference, so how long an answer
+/// takes says nothing about how much of a guess was right.
+fn token_is(given: &str) -> bool {
+    let Some(token) = TOKEN.get() else {
+        return false;
+    };
+    token.len() == given.len()
+        && token
+            .bytes()
+            .zip(given.bytes())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
+#[cfg(test)]
+pub(crate) fn token_for_tests() -> String {
+    TOKEN
+        .get_or_init(|| "a-token-for-tests".to_string())
+        .clone()
+}
+
+/// Lets a request through, unwrapped, or says why it is not: a request that
+/// reaches the editor's state or data must carry this editor's token, and none
+/// gets through while zedcli is turned off in the settings.
+pub fn admit(request: CliRequest, cx: &mut AsyncApp) -> Result<CliRequest, (String, i32)> {
+    match request {
+        CliRequest::Authenticated { token, request } => {
+            if !token_is(&token) {
+                return Err((
+                    "The token does not match this editor's: zedcli is reaching a different \
+                     or restarted instance."
+                        .to_string(),
+                    exit_status::EDITOR_UNREACHABLE,
+                ));
+            }
+            if matches!(*request, CliRequest::Authenticated { .. }) {
+                return Err((
+                    "A request is wrapped only once.".to_string(),
+                    exit_status::BAD_ARGUMENTS,
+                ));
+            }
+            let enabled = cx.update(|cx| {
+                use settings::Settings as _;
+                ZedcliSettings::get_global(cx).enabled
+            });
+            if !enabled {
+                return Err((
+                    "zedcli is turned off in this editor's settings (\"zedcli\": { \"enabled\": \
+                     false })."
+                        .to_string(),
+                    exit_status::REFUSED,
+                ));
+            }
+            Ok(*request)
+        }
+        request if request.needs_token() => Err((
+            "This request must carry the editor's token; send it with zedcli.".to_string(),
+            exit_status::EDITOR_UNREACHABLE,
+        )),
+        request => Ok(request),
+    }
+}
 
 /// How far apart the two readings a processor share is worked out from are.
 /// Long enough for a busy process to show, short enough not to keep the reader
@@ -398,6 +527,146 @@ pub async fn list_configurations(
     responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
+enum Found {
+    Task(Entity<Workspace>, AnyWindowHandle, task::TaskTemplate),
+    Debug(Entity<Workspace>, AnyWindowHandle, task::DebugScenario),
+}
+
+pub async fn control_run(
+    selector: WindowSelector,
+    configuration: String,
+    action: RunAction,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    if selector.all {
+        return say_and_exit(
+            responses,
+            "Name one window for run, stop and restart, not --all.".to_string(),
+            exit_status::BAD_ARGUMENTS,
+        );
+    }
+    let windows = match cx.update(|cx| selected_windows(&selector, cx)) {
+        Ok(windows) => windows,
+        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
+    };
+    let stores = match read_stores(&windows, cx).await {
+        Ok(stores) => stores,
+        Err(message) => return say_and_exit(responses, message, exit_status::FAILED),
+    };
+    let found = cx.update(|cx| {
+        for (_, workspace, store) in stores {
+            let window = editor_windows(cx).into_iter().find(|window| {
+                workspaces_of(window, cx)
+                    .iter()
+                    .any(|candidate| candidate.entity_id() == workspace.entity_id())
+            });
+            let Some(window) = window else {
+                continue;
+            };
+            let store = store.read(cx);
+            for kind in [Kind::Task, Kind::Debug] {
+                let Some(found) = store
+                    .of_kind(kind)
+                    .configurations
+                    .iter()
+                    .find(|candidate| candidate.label == configuration)
+                else {
+                    continue;
+                };
+                if let Some(task) = &found.task {
+                    return Ok(Found::Task(workspace, window.into(), task.clone()));
+                }
+                if let Some(scenario) = &found.scenario {
+                    return Ok(Found::Debug(workspace, window.into(), scenario.clone()));
+                }
+            }
+        }
+        Err(format!(
+            "No run configuration named '{configuration}'. See `zedcli configs`."
+        ))
+    });
+    let found = match found {
+        Ok(found) => found,
+        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
+    };
+
+    match found {
+        Found::Task(workspace, window, task) => {
+            if matches!(action, RunAction::Stop | RunAction::Restart) {
+                let stopping = workspace.update(cx, |workspace, cx| {
+                    run_instances::stop_every_run_of(workspace, &task, cx)
+                });
+                if !stopping.await {
+                    return say_and_exit(
+                        responses,
+                        format!(
+                            "Some processes of '{configuration}' are still running after SIGKILL."
+                        ),
+                        exit_status::FAILED,
+                    );
+                }
+            }
+            if matches!(action, RunAction::Run | RunAction::Restart) {
+                let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx))
+                else {
+                    return say_and_exit(
+                        responses,
+                        "The window closed before the run could start.".to_string(),
+                        exit_status::FAILED,
+                    );
+                };
+                let weak = workspace.downgrade();
+                if !configurations_view::run_a_task(&weak, task, &mut window_cx).await {
+                    return say_and_exit(
+                        responses,
+                        format!("'{configuration}' could not be started; the editor says why."),
+                        exit_status::FAILED,
+                    );
+                }
+            }
+        }
+        Found::Debug(workspace, window, scenario) => {
+            if action != RunAction::Run {
+                return say_and_exit(
+                    responses,
+                    format!(
+                        "'{configuration}' is a debug configuration: stop or restart it from the \
+                         debugger."
+                    ),
+                    exit_status::BAD_ARGUMENTS,
+                );
+            }
+            let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx)) else {
+                return say_and_exit(
+                    responses,
+                    "The window closed before the session could start.".to_string(),
+                    exit_status::FAILED,
+                );
+            };
+            let weak = workspace.downgrade();
+            if !configurations_view::start_a_debug_session(&weak, scenario, &mut window_cx).await {
+                return say_and_exit(
+                    responses,
+                    format!("'{configuration}' could not be started; the editor says why."),
+                    exit_status::FAILED,
+                );
+            }
+        }
+    }
+    let done = match action {
+        RunAction::Run => "Started",
+        RunAction::Stop => "Stopped",
+        RunAction::Restart => "Restarted",
+    };
+    responses
+        .send(CliResponse::Stdout {
+            message: format!("{done} '{configuration}'."),
+        })
+        .log_err();
+    responses.send(CliResponse::Exit { status: 0 }).log_err();
+}
+
 /// The API client's store once its saved collections have been read, counted
 /// like [`STORE_LOOKS`] so the wait ends under a test clock too.
 async fn loaded_api_store(cx: &mut AsyncApp) -> Option<Entity<api_client_ui::ApiClientStore>> {
@@ -636,7 +905,7 @@ mod tests {
 
     use cli::{CliRequest, CliResponse, CliResponseSink, RunAction, RunState, WindowSelector};
     use futures::channel::mpsc;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
     use serde_json::json;
     use terminal::Terminal;
     use util::path;
@@ -659,6 +928,22 @@ mod tests {
     /// Sends one request through the same handler the socket feeds, and
     /// returns every response up to and including `Exit`.
     fn ask(
+        cx: &mut TestAppContext,
+        app_state: &Arc<AppState>,
+        request: CliRequest,
+    ) -> Vec<CliResponse> {
+        let request = match request {
+            CliRequest::Open { .. } => request,
+            request => CliRequest::Authenticated {
+                token: token_for_tests(),
+                request: Box::new(request),
+            },
+        };
+        ask_as_sent(cx, app_state, request)
+    }
+
+    /// The same, with the request sent exactly as given.
+    fn ask_as_sent(
         cx: &mut TestAppContext,
         app_state: &Arc<AppState>,
         request: CliRequest,
@@ -890,31 +1175,27 @@ mod tests {
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
     }
 
-    /// Starting or stopping a run executes whatever the configuration says,
-    /// which can change anything, so the CLI socket does neither.
     #[gpui::test]
-    async fn run_control_is_refused(cx: &mut TestAppContext) {
+    async fn an_unknown_configuration_is_not_found(cx: &mut TestAppContext) {
         let app_state = two_projects(cx).await;
-        let (alpha, workspace) = window_with(cx, path!("/alpha"));
-        let run = a_run_in(cx, &workspace, "sleeper").await;
-        for action in [RunAction::Run, RunAction::Stop, RunAction::Restart] {
-            let responses = ask(
-                cx,
-                &app_state,
-                CliRequest::ControlRun {
-                    selector: selector_for(alpha),
-                    configuration: "sleeper".into(),
-                    action,
-                },
-            );
-            assert_eq!(
-                exit_of(&responses),
-                Some(exit_status::REFUSED),
-                "{action:?}: {responses:?}"
-            );
-        }
-        assert!(is_running(&run, cx), "the run was left alone");
-        run.update(cx, |terminal, _| terminal.kill_active_task());
+        let (alpha, _) = window_with(cx, path!("/alpha"));
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(alpha),
+                configuration: "no such thing".into(),
+                action: RunAction::Run,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
+        assert!(
+            responses.iter().any(|response| matches!(
+                response,
+                CliResponse::Stderr { message } if message.contains("no such thing")
+            )),
+            "{responses:?}"
+        );
     }
 
     /// A real process on a real PTY, started the way a configuration's run is,
@@ -980,7 +1261,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_run_is_listed_with_its_process(cx: &mut TestAppContext) {
+    async fn a_run_is_listed_with_its_process_and_stopped_with_everything_it_started(
+        cx: &mut TestAppContext,
+    ) {
         let app_state = two_projects(cx).await;
         let (alpha, workspace) = window_with(cx, path!("/alpha"));
         let run = a_run_in(cx, &workspace, "sleeper").await;
@@ -1023,7 +1306,93 @@ mod tests {
             "the configuration reads as running: {configured:?}"
         );
 
-        run.update(cx, |terminal, _| terminal.kill_active_task());
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(alpha),
+                configuration: "sleeper".into(),
+                action: RunAction::Stop,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
+        for _ in 0..300 {
+            if !is_running(&run, cx) {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_running(&run, cx), "Stop ends the run");
+    }
+
+    #[gpui::test]
+    async fn control_names_one_window_and_says_when_a_run_did_not_start(cx: &mut TestAppContext) {
+        let app_state = two_projects(cx).await;
+        let (alpha, _) = window_with(cx, path!("/alpha"));
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: WindowSelector {
+                    all: true,
+                    ..WindowSelector::default()
+                },
+                configuration: "sleeper".into(),
+                action: RunAction::Stop,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::BAD_ARGUMENTS),
+            "stopping in every window at once is refused: {responses:?}"
+        );
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(alpha),
+                configuration: "broken".into(),
+                action: RunAction::Run,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::FAILED),
+            "a run that could not be resolved is not reported as started: {responses:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_debug_configuration_is_only_started_from_here(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/gamma"),
+                json!({ ".zed": { "debug.json": r#"[
+                    { "label": "api (Delve)", "adapter": "Delve", "request": "launch", "program": "." }
+                ]"# } }),
+            )
+            .await;
+        open(cx, &app_state, path!("/gamma"));
+        let (gamma, _) = window_with(cx, path!("/gamma"));
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(gamma),
+                configuration: "api (Delve)".into(),
+                action: RunAction::Stop,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::BAD_ARGUMENTS),
+            "{responses:?}"
+        );
     }
 
     #[gpui::test]
@@ -1317,6 +1686,56 @@ mod tests {
         assert!(
             store.read_with(cx, |store, _| store.history.is_empty()),
             "and nothing was sent to be kept in the history"
+        );
+    }
+
+    /// A request for the editor's state or data gets through only with this
+    /// editor's token, and not at all while zedcli is turned off.
+    #[gpui::test]
+    async fn only_the_holder_of_the_token_is_answered(cx: &mut TestAppContext) {
+        let app_state = two_projects(cx).await;
+        token_for_tests();
+
+        let bare = ask_as_sent(cx, &app_state, CliRequest::ListWindows);
+        assert_eq!(
+            exit_of(&bare),
+            Some(exit_status::EDITOR_UNREACHABLE),
+            "{bare:?}"
+        );
+        assert!(
+            !bare
+                .iter()
+                .any(|response| matches!(response, CliResponse::Windows { .. })),
+            "nothing is told without the token"
+        );
+
+        let guessed = ask_as_sent(
+            cx,
+            &app_state,
+            CliRequest::Authenticated {
+                token: "a-guess".into(),
+                request: Box::new(CliRequest::ListConnections),
+            },
+        );
+        assert_eq!(exit_of(&guessed), Some(exit_status::EDITOR_UNREACHABLE));
+
+        let answered = ask(cx, &app_state, CliRequest::ListWindows);
+        assert_eq!(exit_of(&answered), Some(0), "{answered:?}");
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.zedcli = Some(settings::ZedcliSettingsContent {
+                        enabled: Some(false),
+                    });
+                });
+            });
+        });
+        let turned_off = ask(cx, &app_state, CliRequest::ListWindows);
+        assert_eq!(
+            exit_of(&turned_off),
+            Some(exit_status::REFUSED),
+            "{turned_off:?}"
         );
     }
 }

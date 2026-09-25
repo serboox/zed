@@ -218,6 +218,9 @@ pub struct SettingsContent {
     /// Configuration of the run configurations.
     pub run_configurations: Option<RunConfigurationsSettingsContent>,
 
+    /// Configuration of zedcli, the command line that talks to this editor.
+    pub zedcli: Option<ZedcliSettingsContent>,
+
     /// Configuration of the misspelling check over names and comments.
     pub typo_diagnostics: Option<TypoDiagnosticsSettingsContent>,
 
@@ -428,7 +431,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation, html_preview, run_configurations, typo_diagnostics, prose_diagnostics,
+        instrumentation, html_preview, run_configurations, zedcli, typo_diagnostics, prose_diagnostics,
         open_in_preview,
     },
     defaults: {},
@@ -619,6 +622,17 @@ pub struct RunConfigurationsSettingsContent {
     ///
     /// Default: true
     pub show_process_metrics: Option<bool>,
+}
+
+/// Configuration of zedcli.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ZedcliSettingsContent {
+    /// Whether zedcli may ask this editor anything at all: its windows, runs,
+    /// databases and saved requests. Off, every such request is refused.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Configuration of the HTML preview.

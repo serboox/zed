@@ -1,6 +1,6 @@
 ---
 name: zedcli
-description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, read data through the Database Explorer's saved connections (SQL, MongoDB, Redis, CQL; reads only), and send the API Client's saved GET requests. Use when you need to know what the editor has open or running, look at data in a database the user configured in the editor, or call a read endpoint the user saved there — all without asking for credentials. zedcli refuses anything that could change data.
+description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, start/stop/restart run configurations, read data through the Database Explorer's saved connections (SQL, MongoDB, Redis, CQL; reads only), and send the API Client's saved GET requests. Use when you need to know what the editor has open or running, look at data in a database the user configured in the editor, or call a read endpoint the user saved there — all without asking for credentials. zedcli refuses anything that could change data.
 ---
 
 # zedcli
@@ -8,11 +8,12 @@ description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell wit
 `zedcli` is a command-line client for an editor that is **already running**. It
 never starts the editor. Every command is one question to it and one answer.
 
-**zedcli only reads.** It cannot change data, schema, files or processes: a SQL
-statement or Mongo/Redis command that could write, an HTTP request other than
-GET/HEAD/OPTIONS, and starting or stopping a run are all refused with exit 5.
+**zedcli only reads data.** A SQL statement or Mongo/Redis command that could
+write, and an HTTP request other than GET/HEAD/OPTIONS, are refused with exit 5.
 The refusal is enforced by the editor, not by this client. When a task needs a
 write, tell the user what to run and where; do not look for a way around it.
+Starting and stopping the project's run configurations is allowed: that is the
+editor's Run button, running exactly what the configuration says.
 
 Check it is there: `zedcli --version`. If the command is missing, it is
 installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
@@ -24,6 +25,7 @@ installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
 | See which windows are open, their projects and active file | `zedcli windows` |
 | See what is running in the project you are in | `zedcli ps` |
 | Know which run configurations a project has | `zedcli configs` |
+| Start / restart / stop a configuration | `zedcli run NAME` · `zedcli restart NAME` · `zedcli stop NAME` |
 | List the database connections the user saved | `zedcli db connections` |
 | Run SQL on one of them | `zedcli db query -c LABEL "SQL"` |
 | List the HTTP requests saved in the API Client | `zedcli api list` |
@@ -36,7 +38,7 @@ people.
 
 ## Which window a command acts on
 
-Commands that act on a window (`ps`, `configs`) pick it
+Commands that act on a window (`ps`, `configs`, `run`, `stop`, `restart`) pick it
 like this, in order:
 
 1. `--window ID` — the id `zedcli windows` prints.
@@ -58,9 +60,17 @@ WINDOW  RUN         PID      STATE    CPU   MEMORY  COMMAND
 
 - `ps` lists task runs (running and finished) and debug sessions. Each running
   run carries its whole process tree with CPU (share of one core) and memory.
-- There is no command to start, stop or restart a run: those execute whatever
-  the configuration says and can change anything. Ask the user to use the
-  editor's Run and Stop buttons.
+- `run NAME` starts a configuration **and first stops any run of it that is
+  still going, with every process it started** — the editor never keeps two
+  instances of one configuration. So `run` on a running server is a restart.
+- `restart NAME` is the same, stated explicitly. `stop NAME` ends every run of it.
+- `NAME` is the configuration's label exactly as `zedcli configs` shows it.
+- A debug configuration (kind `debug`) can be started with `run`; stopping it is
+  done from the debugger, and `stop`/`restart` answer exit 2 for it.
+- `run` answers once the run is scheduled, not once it works: a command that fails
+  shows up as `failed` in `zedcli ps`, and its output is in the editor's terminal,
+  not on your stdout. To wait for a server, poll `zedcli ps --json` or the port
+  it listens on.
 
 ## SQL
 
@@ -134,6 +144,15 @@ HTTP 200 OK  84 ms  GET https://staging.example.com/orders/42   <- on stderr
   runs. A GET that a badly designed service treats as a write is still sent,
   so prefer requests the user has told you are safe.
 
+## Access
+
+zedcli presents a token the editor writes, at start-up, to
+`zedcli-dev.token` in its data directory (readable by its own user only).
+A request without it, or with a stale one from an earlier run of the editor,
+answers exit 3. The reader can turn zedcli off entirely with
+`"zedcli": { "enabled": false }` in their settings; every request then
+answers exit 5. Neither is something to work around: tell the user.
+
 ## Exit statuses
 
 | Status | Meaning | What to do |
@@ -143,7 +162,7 @@ HTTP 200 OK  84 ms  GET https://staging.example.com/orders/42   <- on stderr
 | 2 | Bad arguments | Check `zedcli <command> --help` |
 | 3 | The editor is not running or did not answer | Ask the user to start "Zed (Fast/DB dev)"; do not start it yourself |
 | 4 | No such window, configuration, connection, request or environment | List them first (`windows`, `configs`, `db connections`, `api list`, `api envs`) |
-| 5 | Refused: it could change data (a write, a non-GET request, a run) | Do not retry or rephrase it to get around the check; tell the user |
+| 5 | Refused: it could change data (a write, a non-GET request) | Do not retry or rephrase it to get around the check; tell the user |
 
 `--timeout SECONDS` (default 30) bounds how long zedcli waits for an answer.
 

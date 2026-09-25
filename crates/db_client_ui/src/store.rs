@@ -210,6 +210,17 @@ fn redact_password(config: &ConnectionConfig) -> ConnectionConfig {
     redacted
 }
 
+/// Whether `text` could change data, read in the connection's own language:
+/// a MongoDB or Redis command is not SQL, and reading it as SQL refuses every
+/// one of them, reads included.
+fn writes(driver: DatabaseDriver, text: &str) -> bool {
+    match driver {
+        DatabaseDriver::MongoDB => db_client::mongo_provider::check_read_only(text).is_err(),
+        DatabaseDriver::Redis => db_client::read_only::check_redis(text).is_err(),
+        _ => crate::db_agent_tools::requires_confirmation(text),
+    }
+}
+
 fn read_only_error(label: &str) -> anyhow::Error {
     anyhow::anyhow!("Connection '{label}' is read-only — write and DDL statements are blocked.")
 }
@@ -2682,7 +2693,7 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
-        if conn.config.read_only && crate::db_agent_tools::requires_confirmation(&sql) {
+        if conn.config.read_only && writes(conn.config.driver, &sql) {
             return Task::ready(Err(read_only_error(&conn.config.label)));
         }
         // Read before the statement runs, so what it did to the transaction can
@@ -5235,6 +5246,44 @@ mod tests {
                 read_only_queries.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(offers_read_only)
             );
+        }
+    }
+
+    /// A read-only MongoDB or Redis connection reads in its own language and
+    /// still refuses a write, `aggregate` into a collection included.
+    #[gpui::test]
+    async fn a_read_only_connection_reads_mongo_and_redis_in_their_own_language(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for (driver, reads, writes) in [
+            (
+                DatabaseDriver::MongoDB,
+                "db.users.find({})",
+                "db.users.aggregate([{ $out: \"copy\" }])",
+            ),
+            (DatabaseDriver::Redis, "GET greeting", "SET greeting bye"),
+        ] {
+            let mut config = ConnectionConfig::default();
+            config.label = "prod".into();
+            config.driver = driver;
+            config.read_only = true;
+            let id = config.id;
+            let store = cx.new(DatabaseStore::new);
+            store.update(cx, |store, cx| {
+                store.add_connected_for_test(config, Arc::new(CliMockProvider), cx);
+            });
+            let read = store
+                .update(cx, |store, cx| {
+                    store.execute_query(id, String::new(), reads.into(), cx)
+                })
+                .await;
+            assert!(read.is_ok(), "{driver:?} reads: {:?}", read.err());
+            let write = store
+                .update(cx, |store, cx| {
+                    store.execute_query(id, String::new(), writes.into(), cx)
+                })
+                .await;
+            assert!(write.is_err(), "{driver:?} refuses: {writes}");
         }
     }
 

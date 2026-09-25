@@ -372,6 +372,10 @@ const REDIS_READS: &[&str] = &[
     "GEORADIUSBYMEMBER_RO",
     "SORT_RO",
     "LCS",
+    "BITFIELD_RO",
+    "SUBSTR",
+    "XINFO",
+    "XPENDING",
     "JSON.GET",
     "JSON.MGET",
     "JSON.TYPE",
@@ -588,6 +592,11 @@ mod tests {
             "SCAN 0 MATCH a*",
             "OBJECT ENCODING k",
             "MEMORY USAGE k",
+            "BITFIELD_RO k GET u8 0",
+            "ZRANGEBYSCORE z 0 10",
+            "XRANGE s - +",
+            "SMEMBERS set",
+            "LRANGE list 0 -1",
         ] {
             assert!(check_redis(text).is_ok(), "{text}");
         }

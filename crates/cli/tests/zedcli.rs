@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use cli::{
     CliRequest, CliResponse, ConfigurationInfo, DbConnectionSummary, IpcHandshake, ProcessInfo,
-    RunInfo, RunState, WindowInfo, WorkspaceInfo, exit_status, ipc,
+    RunAction, RunInfo, RunState, WindowInfo, WorkspaceInfo, exit_status, ipc,
 };
 use smol::io::AsyncWriteExt as _;
 use tempfile::TempDir;
@@ -25,6 +25,8 @@ struct FakeEditor {
 impl FakeEditor {
     fn answering(answer: impl FnOnce(&CliRequest) -> Vec<CliResponse> + Send + 'static) -> Self {
         let data_dir = TempDir::new().expect("a data directory");
+        std::fs::write(cli::token_path(data_dir.path()), EDITOR_TOKEN)
+            .expect("the token is written");
         let socket = UnixDatagram::bind(socket_in(data_dir.path())).expect("the socket binds");
         let served = std::thread::spawn(move || {
             let mut buffer = [0u8; 1024];
@@ -40,7 +42,15 @@ impl FakeEditor {
                     responses: response_rx,
                 })
                 .ok()?;
-            let request = request_rx.recv().ok()?;
+            // Every request comes wrapped with the editor's token; the fake
+            // unwraps it only when the token is the one it wrote.
+            let CliRequest::Authenticated { token, request } = request_rx.recv().ok()? else {
+                return None;
+            };
+            if token != EDITOR_TOKEN {
+                return None;
+            }
+            let request = *request;
             for response in answer(&request) {
                 response_tx.send(response).ok()?;
             }
@@ -52,6 +62,8 @@ impl FakeEditor {
     /// A socket that is there but never answers, the way a hung editor is.
     fn silent() -> (TempDir, UnixDatagram) {
         let data_dir = TempDir::new().expect("a data directory");
+        std::fs::write(cli::token_path(data_dir.path()), EDITOR_TOKEN)
+            .expect("the token is written");
         let socket = UnixDatagram::bind(socket_in(data_dir.path())).expect("the socket binds");
         (data_dir, socket)
     }
@@ -63,6 +75,8 @@ impl FakeEditor {
             .expect("the fake editor was sent a request")
     }
 }
+
+const EDITOR_TOKEN: &str = "the-editor's-token";
 
 fn socket_in(data_dir: &Path) -> PathBuf {
     data_dir.join(format!(
@@ -278,15 +292,33 @@ fn a_window_can_be_named_or_every_window_asked_for() {
 }
 
 #[test]
-fn there_is_no_command_that_starts_or_stops_a_run() {
-    let data_dir = TempDir::new().expect("a data directory");
-    for command in ["run", "stop", "restart"] {
-        let output = zedcli(data_dir.path(), &[command, "api server"], None, None);
-        assert_eq!(
-            output.status.code(),
-            Some(exit_status::BAD_ARGUMENTS),
-            "{command} is not a zedcli command"
-        );
+fn run_stop_and_restart_ask_for_their_own_action() {
+    for (command, action) in [
+        ("run", RunAction::Run),
+        ("stop", RunAction::Stop),
+        ("restart", RunAction::Restart),
+    ] {
+        let editor = FakeEditor::answering(|_| {
+            vec![
+                CliResponse::Stdout {
+                    message: "Done 'api server'.".into(),
+                },
+                CliResponse::Exit { status: 0 },
+            ]
+        });
+        let output = zedcli(editor.data_dir.path(), &[command, "api server"], None, None);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(stdout(&output).contains("Done 'api server'."));
+        let CliRequest::ControlRun {
+            configuration,
+            action: asked,
+            ..
+        } = editor.request()
+        else {
+            panic!("{command} asks to control a run");
+        };
+        assert_eq!(configuration, "api server");
+        assert_eq!(asked, action, "{command}");
     }
 }
 
@@ -420,7 +452,7 @@ fn no_running_editor_is_said_as_such_and_starts_nothing() {
     let output = zedcli(data_dir.path(), &["windows"], None, None);
     assert_eq!(output.status.code(), Some(exit_status::EDITOR_UNREACHABLE));
     assert!(
-        stderr(&output).contains("no running editor"),
+        stderr(&output).contains("Start Zed (Fast/DB dev) first"),
         "{}",
         stderr(&output)
     );
@@ -685,4 +717,17 @@ fn a_body_that_cannot_be_written_is_a_failure() {
         stderr(&output)
     );
     editor.request();
+}
+
+#[test]
+fn without_the_editor_token_nothing_is_sent() {
+    let data_dir = TempDir::new().expect("a data directory");
+    let _socket = UnixDatagram::bind(socket_in(data_dir.path())).expect("the socket binds");
+    let output = zedcli(data_dir.path(), &["windows", "--timeout", "1"], None, None);
+    assert_eq!(output.status.code(), Some(exit_status::EDITOR_UNREACHABLE));
+    assert!(
+        stderr(&output).contains("no editor token"),
+        "{}",
+        stderr(&output)
+    );
 }
