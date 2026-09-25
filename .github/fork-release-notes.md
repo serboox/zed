@@ -14,11 +14,12 @@ does. What follows is what it adds, and what that costs.
 | Find references and rename without a server | ✗ | ✓ |
 | Run configurations with live resource usage | ✗ | ✓ |
 | Git history as a graph | ✗ | ✓ |
+| A command line agents can read the editor with | ✗ | ✓ |
 | Download size | **1×** | **2–8×** |
 | Signed and notarised | ✓ | ✗ |
 | Automatic updates | ✓ | ✗ |
 | Desktop platforms | 6, plus remote servers | 3 |
-| Newest upstream work | ✓ | ✗ (based on 1.13.0) |
+| Newest upstream work | ✓ | follows upstream releases (now 1.21.0) |
 
 
 ### 1. It checks code without a language server
@@ -94,14 +95,26 @@ you.
 ### 6. Run configurations are first class
 
 Runs and debug targets are edited as configurations rather than typed as
-commands, with a panel that says what the running one is using: processor,
-memory, threads, and its process tree.
+commands, with a window that says what the running one is using: processor,
+memory, every process of its tree and every thread of each, and the
+goroutines of a Go program. Run and Restart first stop everything the earlier
+run started, so a configuration never has two instances.
 
 ### 7. History is drawn as a graph
 
 The git history is a full-page graph with lanes and branches, not a list.
 
-### 8. What floats has its own look
+### 8. `zedcli` reads the editor from a terminal
+
+`zedcli` lists the windows and their projects, the runs of a window with their
+process trees, and the run configurations; starts, stops and restarts them;
+runs read-only queries through the Database Explorer's saved connections
+(SQL, MongoDB, Redis, CQL) and sends the API Client's saved GET requests. It
+cannot change data: a write is refused by the editor and, for MySQL,
+PostgreSQL, SQLite and ClickHouse, by the database as well. It comes with a
+skill that teaches an agent to use it.
+
+### 9. What floats has its own look
 
 Modals, pickers, the command palette, completion and hover popovers, tooltips
 and context menus are drawn from one fixed near-black palette with exactly two
@@ -148,9 +161,9 @@ checks, all linked in rather than downloaded on demand.
   Windows  aarch64       ✓           ✗
   remote server          ✓           ✗
 
-  upstream  1.13 ──── 1.14 ──── ... ──── 1.20.2   ◀── upstream today
-             ▲
-             └── this build is based here, plus its own changes
+  upstream  ... ──── 1.20.2 ──── 1.21.0   ◀── upstream today
+                                    ▲
+                                    └── this build is based here, plus its own changes
 ```
 - **Unsupported.** It is one person's editor, published because a link is
   easier than a build. There is no support, and no promise that the next build

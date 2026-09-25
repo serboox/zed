@@ -9,6 +9,7 @@ on:
     branches: [personal_zed_fork]
     paths:
       - .github/fork-release-notes.md
+      - .github/release-changes/**
       - .github/workflows/fork_release_notes.yml
   workflow_dispatch:
 
@@ -26,7 +27,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # The part above the document -- the build line, the file table and the
-      # commit list -- belongs to that release and is kept as it was.
+      # commit list -- belongs to that release and is kept as it was, unless
+      # .github/release-changes/<tag>.md says what changed in words: then that
+      # replaces the commit list.
       - name: Rewrite the description and publish as a full release
         run: |
           set -euo pipefail
@@ -35,8 +38,15 @@ jobs:
             echo "there is no release to refresh"
             exit 0
           fi
-          gh release view "$tag" --json body -q .body \
-            | awk '/^## What this build is$/ { exit } { print }' > head.md
+          changes=".github/release-changes/$tag.md"
+          if [ -f "$changes" ]; then
+            gh release view "$tag" --json body -q .body \
+              | awk '/^## What changed since/ || /^## What this build is$/ { exit } { print }' > head.md
+            cat "$changes" >> head.md
+          else
+            gh release view "$tag" --json body -q .body \
+              | awk '/^## What this build is$/ { exit } { print }' > head.md
+          fi
           {
             cat head.md
             echo

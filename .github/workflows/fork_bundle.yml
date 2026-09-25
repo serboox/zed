@@ -638,7 +638,9 @@ jobs:
               echo
               echo "## What changed since \`$previous\`"
               echo
-              git log --no-merges --pretty='- %s' -n 50 "$previous..HEAD" || true
+              # This branch's own commits: an upstream merge is one line, not
+              # the thousands of upstream commits it brought in.
+              git log --first-parent --pretty='- %s' -n 50 "$previous..HEAD" || true
             fi
           } > notes.md
           # What this fork is and what it costs, which is the same every time
