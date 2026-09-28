@@ -4566,7 +4566,7 @@ List of `integer` column numbers
   "terminal": {
     "alternate_scroll": "off",
     "blinking": "terminal_controlled",
-    "copy_on_select": false,
+    "copy_on_select": true,
     "keep_selection_on_copy": true,
     "open_links_in_mouse_mode": true,
     "dock": "bottom",
@@ -4696,9 +4696,9 @@ List of `integer` column numbers
 
 ### Terminal: Copy On Select
 
-- Description: Whether or not selecting text in the terminal will automatically copy to the system clipboard.
+- Description: Whether or not selecting text in the terminal will automatically copy to the system clipboard when the mouse button is released.
 - Setting: `copy_on_select`
-- Default: `false`
+- Default: `true`
 
 **Options**
 
@@ -4709,7 +4709,7 @@ List of `integer` column numbers
 ```json [settings]
 {
   "terminal": {
-    "copy_on_select": true
+    "copy_on_select": false
   }
 }
 ```

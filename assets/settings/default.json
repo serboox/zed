@@ -2155,8 +2155,8 @@
     //         "option_as_meta": true,
     "option_as_meta": false,
     // Whether or not selecting text in the terminal will automatically
-    // copy to the system clipboard.
-    "copy_on_select": false,
+    // copy to the system clipboard when the mouse button is released.
+    "copy_on_select": true,
     // Whether to keep the text selection after copying it to the clipboard.
     "keep_selection_on_copy": true,
     // Whether cmd-click (ctrl-click on Linux and Windows) opens hyperlinks even

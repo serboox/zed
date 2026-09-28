@@ -2273,6 +2273,126 @@ mod tests {
         });
     }
 
+    /// A focused terminal showing `output`, drawn, and where its first cell is.
+    async fn a_drawn_terminal_showing(
+        output: &str,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Terminal>, VisualTestContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(output.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".to_string()));
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        (terminal, cx)
+    }
+
+    /// The middle of the cell at `column` on the first line, where it is painted.
+    fn cell_center(
+        terminal: &Entity<Terminal>,
+        column: usize,
+        cx: &VisualTestContext,
+    ) -> GpuiPoint<Pixels> {
+        terminal.read_with(cx, |terminal, _| {
+            let bounds = terminal.last_content.terminal_bounds;
+            gpui::point(
+                bounds.bounds.origin.x + bounds.cell_width * (column as f32 + 0.5),
+                bounds.bounds.origin.y + bounds.line_height * 0.5,
+            )
+        })
+    }
+
+    fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+            cx.read_from_clipboard().and_then(|item| item.text())
+        })
+    }
+
+    /// Selecting with the mouse copies the selection as soon as the button is
+    /// released, the way kitty's `copy_on_select clipboard` does, with nothing
+    /// set in the settings.
+    #[gpui::test]
+    async fn dragging_over_text_copies_it_by_default(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+        // A selection starts at the side of the cell the press is nearer to,
+        // so the drag begins at the left edge of the first letter.
+        let cell_width = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.cell_width
+        });
+        let start = cell_center(&terminal, 0, &cx) - gpui::point(cell_width * 0.4, px(0.));
+        let end = cell_center(&terminal, 4, &cx);
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            clipboard_text(&mut cx).as_deref(),
+            Some("hello"),
+            "releasing the button over a selection puts it on the clipboard"
+        );
+        terminal.read_with(&cx, |terminal, _| {
+            assert!(
+                terminal.last_content.selection.is_some(),
+                "and the selection stays on screen, as in kitty"
+            );
+        });
+    }
+
+    /// A double click selects a word and copies it too.
+    #[gpui::test]
+    async fn double_clicking_a_word_copies_it_by_default(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+        let on_world = cell_center(&terminal, 8, &cx);
+
+        for click_count in [1, 2] {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: on_world,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: on_world,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+            });
+        }
+        cx.run_until_parked();
+
+        assert_eq!(clipboard_text(&mut cx).as_deref(), Some("world"));
+    }
+
+    /// A click that selects nothing must not wipe what is on the clipboard.
+    #[gpui::test]
+    async fn a_plain_click_leaves_the_clipboard_alone(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+        let on_hello = cell_center(&terminal, 2, &cx);
+
+        cx.simulate_mouse_down(on_hello, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(on_hello, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(clipboard_text(&mut cx).as_deref(), Some("before"));
+    }
+
     #[gpui::test]
     async fn shift_up_scrolls_history_in_normal_screen(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
