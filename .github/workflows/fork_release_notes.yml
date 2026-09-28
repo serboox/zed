@@ -1,14 +1,14 @@
-name: Refresh the fork release description
+name: Refresh the fork release descriptions
 
-# The description of what this build is lives in fork-release-notes.md and is
-# written into each release when it is published. Editing that document should
-# not need a three-hour rebuild to reach the release people download from, so
-# this rewrites the latest release's description in place and keeps its files.
+# Only the first release describes the fork against upstream Zed; every later
+# one says what changed since the release before it, and nothing else. Those
+# words live in .github/release-changes/<tag>.md, so rewording one should not
+# need a three-hour rebuild: this rewrites each release that has such a file
+# in place and keeps its files.
 on:
   push:
     branches: [personal_zed_fork]
     paths:
-      - .github/fork-release-notes.md
       - .github/release-changes/**
       - .github/workflows/fork_release_notes.yml
   workflow_dispatch:
@@ -19,40 +19,28 @@ concurrency:
 
 jobs:
   refresh:
-    name: Write the description into the latest release
+    name: Write what changed into each release
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      # The part above the document -- the build line, the file table and the
-      # commit list -- belongs to that release and is kept as it was, unless
-      # .github/release-changes/<tag>.md says what changed in words: then that
-      # replaces the commit list.
-      - name: Rewrite the description and publish as a full release
+      # The build line and the file table above the first heading belong to
+      # the release and are kept as they were; everything from the first
+      # heading on is replaced by the release's own file.
+      - name: Rewrite the descriptions
         run: |
           set -euo pipefail
-          tag="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
-          if [ -z "$tag" ]; then
-            echo "there is no release to refresh"
-            exit 0
-          fi
-          changes=".github/release-changes/$tag.md"
-          if [ -f "$changes" ]; then
+          gh release list --limit 100 --json tagName -q '.[].tagName' > tags.txt
+          while read -r tag; do
+            changes=".github/release-changes/$tag.md"
+            [ -f "$changes" ] || continue
             gh release view "$tag" --json body -q .body \
-              | awk '/^## What changed since/ || /^## What this build is$/ { exit } { print }' > head.md
-            cat "$changes" >> head.md
-          else
-            gh release view "$tag" --json body -q .body \
-              | awk '/^## What this build is$/ { exit } { print }' > head.md
-          fi
-          {
-            cat head.md
-            echo
-            cat .github/fork-release-notes.md
-          } > notes.md
-          gh release edit "$tag" --notes-file notes.md --prerelease=false --latest
-          echo "Refreshed the description of \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+              | awk '/^## / { exit } { print }' > notes.md
+            cat "$changes" >> notes.md
+            gh release edit "$tag" --notes-file notes.md < /dev/null
+            echo "Rewrote the description of \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+          done < tags.txt
         env:
           GH_TOKEN: ${{ github.token }}

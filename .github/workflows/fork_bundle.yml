@@ -22,6 +22,7 @@ on:
     # The description has its own workflow that edits the release in place.
     paths-ignore:
       - .github/fork-release-notes.md
+      - .github/release-changes/**
       - .github/workflows/fork_release_notes.yml
   workflow_dispatch:
     inputs:
@@ -641,12 +642,13 @@ jobs:
               # This branch's own commits: an upstream merge is one line, not
               # the thousands of upstream commits it brought in.
               git log --first-parent --pretty='- %s' -n 50 "$previous..HEAD" || true
+            else
+              # Only the first release says what the fork is against upstream
+              # Zed; every later one says what changed since the one before.
+              echo
+              cat .github/fork-release-notes.md
             fi
           } > notes.md
-          # What this fork is and what it costs, which is the same every time
-          # and so is kept as a document rather than written out here.
-          echo >> notes.md
-          cat .github/fork-release-notes.md >> notes.md
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
         env:
           GH_TOKEN: ${{ github.token }}
