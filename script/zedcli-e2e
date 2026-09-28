@@ -48,7 +48,7 @@ cleanup() {
     [ -n "$ZED_PID" ] && kill "$ZED_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
     [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null || true
-    podman rm -f "$CONTAINER" "$POSTGRES" "$REDIS" "$MONGO" >/dev/null 2>&1 || true
+    podman rm -f -v "$CONTAINER" "$POSTGRES" "$REDIS" "$MONGO" >/dev/null 2>&1 || true
     for image in "${PULLED_IMAGES[@]}"; do
         podman rmi "$image" >/dev/null 2>&1 || true
     done
