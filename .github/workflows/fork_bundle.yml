@@ -585,7 +585,7 @@ jobs:
         id: changed
         run: |
           set -euo pipefail
-          previous="$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)"
+          previous="$(gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName' || true)"
           if [ -z "$previous" ] || ! git rev-parse -q --verify "$previous^{commit}" > /dev/null; then
             echo "there is no release to compare against, so this is the first"
             echo "commits=1" >> "$GITHUB_OUTPUT"
@@ -669,10 +669,28 @@ jobs:
             echo "nothing was built, so there is nothing to publish" >&2
             exit 1
           fi
-          gh release create "${{ steps.name.outputs.tag }}" \
-            --target "$GITHUB_SHA" \
-            --title "Zed fork ${{ steps.name.outputs.tag }}" \
-            --notes-file notes.md \
-            "${files[@]}"
+          tag="${{ steps.name.outputs.tag }}"
+          # Created as a draft and filled one file at a time: an upload GitHub
+          # times out (HTTP 408) is retried on its own, and a run that is
+          # started again finds its draft and carries on instead of failing on
+          # a tag that already exists.
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Zed fork $tag" \
+              --notes-file notes.md
+          fi
+          for file in "${files[@]}"; do
+            for attempt in 1 2 3 4 5; do
+              gh release upload "$tag" "$file" --clobber && break
+              if [ "$attempt" = 5 ]; then
+                echo "could not upload $file" >&2
+                exit 1
+              fi
+              sleep 30
+            done
+          done
+          gh release edit "$tag" --draft=false --latest
         env:
           GH_TOKEN: ${{ github.token }}
