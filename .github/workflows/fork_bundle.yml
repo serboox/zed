@@ -519,7 +519,13 @@ jobs:
           test -x "$mount/Zed.app/Contents/MacOS/zed"
           test -L "$mount/Applications"
           plutil -lint "$mount/Zed.app/Contents/Info.plist"
-          hdiutil detach -quiet "$mount"
+          # The runner's indexer can still hold the fresh volume, and detach
+          # then answers "resource busy" (exit 16) about an image that is fine.
+          for attempt in 1 2 3 4 5; do
+            hdiutil detach -quiet "$mount" && break
+            sleep 3
+            [ "$attempt" = 5 ] && hdiutil detach -quiet -force "$mount"
+          done
           echo "the disk image mounts and holds the app" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
