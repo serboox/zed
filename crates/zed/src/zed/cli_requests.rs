@@ -191,7 +191,7 @@ async fn read_stores(
     Err("The project's run configurations are still being read; try again.".to_string())
 }
 
-fn say_and_exit(responses: &dyn CliResponseSink, message: String, status: i32) {
+pub(crate) fn say_and_exit(responses: &dyn CliResponseSink, message: String, status: i32) {
     responses.send(CliResponse::Stderr { message }).log_err();
     responses.send(CliResponse::Exit { status }).log_err();
 }
@@ -709,7 +709,9 @@ pub async fn control_run(
 
 /// The API client's store once its saved collections have been read, counted
 /// like [`STORE_LOOKS`] so the wait ends under a test clock too.
-async fn loaded_api_store(cx: &mut AsyncApp) -> Option<Entity<api_client_ui::ApiClientStore>> {
+pub(crate) async fn loaded_api_store(
+    cx: &mut AsyncApp,
+) -> Option<Entity<api_client_ui::ApiClientStore>> {
     for _ in 0..STORE_LOOKS {
         let store = cx.update(|cx| api_client_ui::ApiClientStore::global(cx));
         if let Some(store) = store
@@ -722,7 +724,7 @@ async fn loaded_api_store(cx: &mut AsyncApp) -> Option<Entity<api_client_ui::Api
     None
 }
 
-const API_NOT_READY: &str = "The API client is not ready: no editor window is open, or the \
+pub(crate) const API_NOT_READY: &str = "The API client is not ready: no editor window is open, or the \
      saved collections are still being read.";
 
 pub async fn list_api_requests(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
@@ -774,7 +776,7 @@ pub async fn list_api_environments(responses: &dyn CliResponseSink, cx: &mut Asy
 
 /// The saved request `named` means: its id, its whole path, or a name no other
 /// request shares.
-fn api_request_named(
+pub(crate) fn api_request_named(
     store: &api_client_ui::ApiClientStore,
     named: &str,
 ) -> Result<api_client::RequestId, String> {
@@ -827,71 +829,51 @@ fn api_request_named(
     }
 }
 
-/// The HTTP methods zedcli sends: the ones that ask for data.
-const READ_METHODS: [api_client::HttpMethod; 3] = [
-    api_client::HttpMethod::Get,
-    api_client::HttpMethod::Head,
-    api_client::HttpMethod::Options,
-];
-
 /// How long a send waits for the server when the CLI did not say: the CLI's
 /// own default wait, so the editor never outlasts the command that asked.
 const API_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn send_api_request(
-    request: String,
-    environment: Option<String>,
-    variables: Vec<(String, String)>,
-    timeout_seconds: u64,
-    responses: &dyn CliResponseSink,
-    cx: &mut AsyncApp,
-) {
+pub struct ApiSend {
+    pub request: String,
+    pub environment: Option<String>,
+    pub variables: Vec<(String, String)>,
+    pub timeout_seconds: u64,
+    pub changes: cli::ApiRequestChanges,
+}
+
+pub async fn send_api_request(send: ApiSend, responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
     let Some(store) = loaded_api_store(cx).await else {
         return say_and_exit(responses, API_NOT_READY.to_string(), exit_status::FAILED);
     };
     let chosen = store.read_with(cx, |store, _| {
-        let request = api_request_named(store, &request)?;
-        let environment = match &environment {
-            None => None,
-            Some(named) => Some(
-                store
-                    .environments
+        let request =
+            api_request_named(store, &send.request).map_err(super::cli_api::Refusal::not_found)?;
+        let environment = super::cli_api::environment_named(store, send.environment.as_deref())?;
+        let edited = match send.changes == cli::ApiRequestChanges::default() {
+            true => None,
+            false => {
+                let mut edited = store
+                    .requests
                     .iter()
-                    .find(|candidate| {
-                        candidate.id.to_string() == *named || candidate.name == *named
-                    })
-                    .map(|candidate| candidate.id)
-                    .ok_or_else(|| format!("No environment '{named}'. See `zedcli api envs`."))?,
-            ),
+                    .find(|candidate| candidate.id == request)
+                    .cloned()
+                    .ok_or_else(|| {
+                        super::cli_api::Refusal::not_found(
+                            "The request no longer exists.".to_string(),
+                        )
+                    })?;
+                super::cli_api::apply_changes(&mut edited, &send.changes)?;
+                Some(edited)
+            }
         };
-        Ok::<_, String>((request, environment))
+        Ok::<_, super::cli_api::Refusal>((request, environment, edited))
     });
-    let (request, environment) = match chosen {
+    let (request, environment, edited) = match chosen {
         Ok(chosen) => chosen,
-        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
+        Err(refusal) => return say_and_exit(responses, refusal.message, refusal.status),
     };
-    // Only methods that ask for data rather than send it. Checked before the
-    // request's own pre-request script runs, so nothing of a refused request
-    // happens at all.
-    let method = store.read_with(cx, |store, _| {
-        store
-            .requests
-            .iter()
-            .find(|candidate| candidate.id == request)
-            .map(|candidate| candidate.method.clone())
-    });
-    if let Some(method) = method
-        && !READ_METHODS.contains(&method)
-    {
-        return say_and_exit(
-            responses,
-            format!(
-                "{} can change data, and zedcli only sends GET, HEAD and OPTIONS.",
-                method.as_str()
-            ),
-            exit_status::REFUSED,
-        );
-    }
+    let variables = send.variables;
+    let timeout_seconds = send.timeout_seconds;
     let sent = api_client_ui::headless_send::send(
         &store,
         api_client_ui::headless_send::HeadlessSend {
@@ -904,6 +886,7 @@ pub async fn send_api_request(
                 0 => API_SEND_TIMEOUT,
                 seconds => Duration::from_secs(seconds).mul_f32(0.9),
             },
+            edited,
         },
         cx,
     )
@@ -1587,6 +1570,7 @@ mod tests {
                 environment: Some("staging".into()),
                 variables: vec![("id".into(), "42".into())],
                 timeout_seconds: 30,
+                changes: Default::default(),
             },
         );
         assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
@@ -1624,6 +1608,7 @@ mod tests {
                 environment: None,
                 variables: Vec::new(),
                 timeout_seconds: 30,
+                changes: Default::default(),
             },
         );
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
@@ -1636,6 +1621,7 @@ mod tests {
                 environment: None,
                 variables: Vec::new(),
                 timeout_seconds: 30,
+                changes: Default::default(),
             },
         );
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
@@ -1655,6 +1641,7 @@ mod tests {
                 environment: Some("production".into()),
                 variables: Vec::new(),
                 timeout_seconds: 30,
+                changes: Default::default(),
             },
         );
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
@@ -1696,6 +1683,7 @@ mod tests {
                 environment: None,
                 variables: Vec::new(),
                 timeout_seconds: 30,
+                changes: Default::default(),
             },
         );
         assert_eq!(exit_of(&responses), Some(exit_status::NOT_FOUND));
@@ -1729,6 +1717,7 @@ mod tests {
                 environment: None,
                 variables: vec![("id".into(), "1".into())],
                 timeout_seconds: 1,
+                changes: Default::default(),
             },
         );
         assert_eq!(
@@ -1746,14 +1735,14 @@ mod tests {
         silent.join().ok();
     }
 
-    /// A method that sends data is refused before anything of the request
-    /// happens: the server is never even connected to.
+    /// Any method is sent, and changes given for one send go out with it
+    /// without being saved into the request.
     #[gpui::test]
-    async fn a_request_that_could_change_data_is_never_sent(cx: &mut TestAppContext) {
+    async fn a_delete_is_sent_with_its_one_off_changes_and_nothing_is_saved(
+        cx: &mut TestAppContext,
+    ) {
         let app_state = init_test(cx);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
-        listener.set_nonblocking(true).expect("non-blocking");
-        let port = listener.local_addr().expect("an address").port();
+        let (port, served) = a_server_answering_once();
         let store = an_api_store(cx, port);
         let responses = ask(
             cx,
@@ -1763,21 +1752,336 @@ mod tests {
                 environment: None,
                 variables: Vec::new(),
                 timeout_seconds: 30,
+                changes: cli::ApiRequestChanges {
+                    set_params: vec![("force".into(), "1".into())],
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
+        let request_line = served.join().expect("the server does not panic");
+        assert!(
+            request_line.starts_with("DELETE /orders/1?force=1 "),
+            "the method and the one-off parameter went out: {request_line}"
+        );
+        let saved_params = store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|request| request.name == "Delete order")
+                .map(|request| request.params.len())
+        });
+        assert_eq!(saved_params, Some(0), "the saved request is left as it was");
+    }
+
+    fn manage(
+        cx: &mut TestAppContext,
+        app_state: &Arc<AppState>,
+        operation: cli::ApiOperation,
+    ) -> (Option<i32>, Option<cli::ApiData>, Vec<CliResponse>) {
+        let responses = ask(cx, app_state, CliRequest::ManageApi { operation });
+        let data = responses.iter().find_map(|response| match response {
+            CliResponse::Api { data } => Some(data.clone()),
+            _ => None,
+        });
+        (exit_of(&responses), data, responses)
+    }
+
+    /// Collections, folders and requests are made, read, changed, moved and
+    /// deleted from the CLI, and each change lands in the store the panel shows.
+    #[gpui::test]
+    async fn collections_folders_and_requests_are_managed_from_the_cli(cx: &mut TestAppContext) {
+        use cli::{ApiData, ApiOperation, ApiRequestChanges};
+        let app_state = init_test(cx);
+        let store = an_api_store(cx, 9);
+
+        let (status, data, responses) = manage(
+            cx,
+            &app_state,
+            ApiOperation::CreateCollection {
+                name: "Billing".into(),
+            },
+        );
+        assert_eq!(status, Some(0), "{responses:?}");
+        assert!(matches!(data, Some(ApiData::Changed(changed)) if changed.path == "Billing"));
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::CreateCollection {
+                name: "Billing".into(),
             },
         );
         assert_eq!(
-            exit_of(&responses),
-            Some(exit_status::REFUSED),
-            "{responses:?}"
+            status,
+            Some(exit_status::FAILED),
+            "a name is not taken twice"
         );
+
+        let (status, data, responses) = manage(
+            cx,
+            &app_state,
+            ApiOperation::CreateFolder {
+                path: "Billing/Invoices".into(),
+            },
+        );
+        assert_eq!(status, Some(0), "{responses:?}");
         assert!(
-            listener.accept().is_err(),
-            "nothing connected to the server"
+            matches!(&data, Some(ApiData::Changed(changed)) if changed.path == "Billing/Invoices"),
+            "{data:?}"
         );
+
+        let (status, _, responses) = manage(
+            cx,
+            &app_state,
+            ApiOperation::CreateRequest {
+                path: "Billing/Invoices/Create invoice".into(),
+                changes: ApiRequestChanges {
+                    method: Some("post".into()),
+                    url: Some("https://billing.example.com/invoices".into()),
+                    set_headers: vec![("X-Trace".into(), "1".into())],
+                    body: Some(r#"{"amount": 100}"#.into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(status, Some(0), "{responses:?}");
+        let saved = store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|request| store.path_of(request) == "Billing/Invoices/Create invoice")
+                .cloned()
+        });
+        let saved = saved.expect("the request is in the store the panel shows");
+        assert_eq!(saved.method, api_client::HttpMethod::Post);
+        assert!(matches!(
+            &saved.body,
+            api_client::RequestBody::Raw { content_type: api_client::RawBodyContentType::Json, text }
+                if text == r#"{"amount": 100}"#
+        ));
+
+        let (status, data, _) = manage(
+            cx,
+            &app_state,
+            ApiOperation::ShowRequest {
+                request: "Create invoice".into(),
+            },
+        );
+        assert_eq!(status, Some(0));
+        let Some(ApiData::Request(detail)) = data else {
+            panic!("the request is shown: {data:?}");
+        };
+        assert_eq!(detail.method, "POST");
+        assert_eq!(detail.body_kind, "json");
+        assert_eq!(detail.headers.len(), 1);
+
+        let (status, _, responses) = manage(
+            cx,
+            &app_state,
+            ApiOperation::UpdateRequest {
+                request: "Billing/Invoices/Create invoice".into(),
+                rename: Some("New invoice".into()),
+                move_to: Some("Billing".into()),
+                changes: ApiRequestChanges {
+                    remove_headers: vec!["x-trace".into()],
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(status, Some(0), "{responses:?}");
+        let moved = store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|request| request.name == "New invoice")
+                .map(|request| (store.path_of(request), request.headers.len()))
+        });
+        assert_eq!(moved, Some(("Billing/New invoice".to_string(), 0)));
+
+        let (status, data, _) = manage(cx, &app_state, ApiOperation::ListFolders);
+        assert_eq!(status, Some(0));
         assert!(
-            store.read_with(cx, |store, _| store.history.is_empty()),
-            "and nothing was sent to be kept in the history"
+            matches!(&data, Some(ApiData::Folders(folders))
+                if folders.iter().any(|folder| folder.path == "Billing/Invoices" && folder.requests == 0)),
+            "{data:?}"
         );
+
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::DeleteCollection {
+                collection: "Billing".into(),
+                recursive: false,
+            },
+        );
+        assert_eq!(
+            status,
+            Some(exit_status::FAILED),
+            "a collection that holds something is not deleted without --recursive"
+        );
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::DeleteRequest {
+                request: "Billing/New invoice".into(),
+            },
+        );
+        assert_eq!(status, Some(0));
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::DeleteCollection {
+                collection: "Billing".into(),
+                recursive: true,
+            },
+        );
+        assert_eq!(status, Some(0));
+        let (status, data, _) = manage(cx, &app_state, ApiOperation::ListCollections);
+        assert_eq!(status, Some(0));
+        assert!(
+            matches!(&data, Some(ApiData::Collections(collections))
+                if collections.iter().map(|collection| collection.name.as_str()).collect::<Vec<_>>() == ["Shop"]),
+            "{data:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_bad_change_creates_nothing(cx: &mut TestAppContext) {
+        use cli::{ApiOperation, ApiRequestChanges};
+        let app_state = init_test(cx);
+        let store = an_api_store(cx, 9);
+        let before = store.read_with(cx, |store, _| store.requests.len());
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::CreateRequest {
+                path: "Shop/Broken".into(),
+                changes: ApiRequestChanges {
+                    method: Some("NOT A METHOD".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(status, Some(exit_status::BAD_ARGUMENTS));
+        assert_eq!(store.read_with(cx, |store, _| store.requests.len()), before);
+    }
+
+    /// A literal credential never leaves the editor, in a shown request or in
+    /// a snippet; a `{{variable}}` reference is shown as written.
+    #[gpui::test]
+    async fn secrets_are_masked_in_a_shown_request_and_in_a_snippet(cx: &mut TestAppContext) {
+        use cli::{ApiData, ApiOperation};
+        let app_state = init_test(cx);
+        let store = an_api_store(cx, 9);
+        store.update(cx, |store, cx| {
+            if let Some(environment) = store.environments.first_mut() {
+                environment.variables.push(api_client::Variable {
+                    key: "token".into(),
+                    initial_value: "s3cret-token".into(),
+                    current_value: "s3cret-token".into(),
+                    secret: true,
+                    enabled: true,
+                });
+            }
+            let id = store
+                .requests
+                .iter()
+                .find(|request| request.name == "Create order")
+                .map(|request| request.id);
+            if let Some(id) = id {
+                store.update_request(id, cx, |request| {
+                    request.headers.push(api_client::Header {
+                        key: "Authorization".into(),
+                        value: "Bearer {{token}}".into(),
+                        enabled: true,
+                        description: None,
+                    });
+                    request.headers.push(api_client::Header {
+                        key: "X-Api-Key".into(),
+                        value: "literal-k3y".into(),
+                        enabled: true,
+                        description: None,
+                    });
+                    request.params.push(api_client::QueryParam {
+                        key: "api_key".into(),
+                        value: "literal-param".into(),
+                        enabled: true,
+                        description: None,
+                    });
+                    request.url = request.url.replace("http://", "http://alice:hunter2@");
+                    request.auth = api_client::AuthConfig::Basic {
+                        username: "alice".into(),
+                        password: "literal-basic".into(),
+                    };
+                });
+            }
+        });
+
+        let (status, data, _) = manage(
+            cx,
+            &app_state,
+            ApiOperation::ShowRequest {
+                request: "Create order".into(),
+            },
+        );
+        assert_eq!(status, Some(0));
+        let shown = format!("{data:?}");
+        assert!(shown.contains("Bearer {{token}}"), "{shown}");
+        for literal in ["literal-k3y", "literal-param", "hunter2", "literal-basic"] {
+            assert!(!shown.contains(literal), "{literal} is shown: {shown}");
+        }
+
+        let (status, data, responses) = manage(
+            cx,
+            &app_state,
+            ApiOperation::Snippet {
+                request: "Create order".into(),
+                language: "curl".into(),
+                environment: Some("staging".into()),
+                variables: vec![("id".into(), "7".into())],
+                changes: Default::default(),
+            },
+        );
+        assert_eq!(status, Some(0), "{responses:?}");
+        let Some(ApiData::Snippet(snippet)) = data else {
+            panic!("a snippet is answered: {data:?}");
+        };
+        assert_eq!(snippet.label, "cURL");
+        assert!(snippet.code.starts_with("curl"), "{}", snippet.code);
+        assert!(snippet.code.contains("/orders/7"), "{}", snippet.code);
+        assert!(
+            !snippet.code.contains("s3cret-token"),
+            "a secret variable is masked in code: {}",
+            snippet.code
+        );
+        // "alice:literal-basic" as Basic auth puts it on the wire.
+        let basic = "YWxpY2U6bGl0ZXJhbC1iYXNpYw==";
+        for literal in [
+            "literal-k3y",
+            "literal-param",
+            "hunter2",
+            "literal-basic",
+            basic,
+        ] {
+            assert!(
+                !snippet.code.contains(literal),
+                "{literal} is in the code: {}",
+                snippet.code
+            );
+        }
+
+        let (status, ..) = manage(
+            cx,
+            &app_state,
+            ApiOperation::Snippet {
+                request: "Create order".into(),
+                language: "cobol".into(),
+                environment: None,
+                variables: Vec::new(),
+                changes: Default::default(),
+            },
+        );
+        assert_eq!(status, Some(exit_status::BAD_ARGUMENTS));
     }
 
     /// A request for the editor's state or data gets through only with this

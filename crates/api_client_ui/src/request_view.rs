@@ -5598,7 +5598,7 @@ impl CodeSnippetModal {
 
         // The colouring follows the shape, and the language has to be fetched, so
         // it arrives a moment after the text.
-        let wanted = language_of(snippet);
+        let wanted = snippet.language_name();
         let language = self.languages.language_for_name(wanted);
         let editor = self.code_editor.clone();
         cx.spawn(async move |_, cx| {
@@ -5706,21 +5706,6 @@ impl CodeSnippetModal {
 }
 
 /// What each shape is written in, so the editor colours it.
-fn language_of(snippet: Snippet) -> &'static str {
-    match snippet {
-        Snippet::Curl | Snippet::Wget => "Shell Script",
-        Snippet::HttpText => "Plain Text",
-        Snippet::Go => "Go",
-        Snippet::Python => "Python",
-        Snippet::JavaScript | Snippet::NodeAxios => "JavaScript",
-        Snippet::Rust => "Rust",
-        Snippet::Php => "PHP",
-        Snippet::CSharp => "C#",
-        Snippet::Java => "Java",
-        Snippet::Ruby => "Ruby",
-    }
-}
-
 impl EventEmitter<gpui::DismissEvent> for CodeSnippetModal {}
 
 impl workspace::ModalView for CodeSnippetModal {

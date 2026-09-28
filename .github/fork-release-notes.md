@@ -104,15 +104,16 @@ run started, so a configuration never has two instances.
 
 The git history is a full-page graph with lanes and branches, not a list.
 
-### 8. `zedcli` reads the editor from a terminal
+### 8. `zedcli` drives the editor from a terminal
 
 `zedcli` lists the windows and their projects, the runs of a window with their
-process trees, and the run configurations; starts, stops and restarts them;
-runs read-only queries through the Database Explorer's saved connections
-(SQL, MongoDB, Redis, CQL) and sends the API Client's saved GET requests. It
-cannot change data: a write is refused by the editor and, for MySQL,
-PostgreSQL, SQLite and ClickHouse, by the database as well. It comes with a
-skill that teaches an agent to use it.
+process trees, and the run configurations; starts, stops and restarts several
+at once; runs read-only queries through the Database Explorer's saved
+connections (SQL, MongoDB, Redis, CQL), where a write is refused by the editor
+and, for MySQL, PostgreSQL, SQLite and ClickHouse, by the database as well.
+It manages the API Client's collections, folders and requests, sends them with
+one-off changes, and prints them as code in the editor's colours. It comes with
+a skill that teaches an agent to use it.
 
 ### 9. What floats has its own look
 

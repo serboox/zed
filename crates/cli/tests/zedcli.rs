@@ -679,6 +679,7 @@ fn api_send_prints_the_body_on_stdout_and_the_status_on_stderr() {
             environment: Some("staging".into()),
             variables: vec![("id".into(), "42".into()), ("note".into(), "a=b".into())],
             timeout_seconds: 30,
+            changes: Default::default(),
         },
         "a value may itself hold an equals sign"
     );
@@ -870,6 +871,355 @@ fn without_the_editor_token_nothing_is_sent() {
         stderr(&output).contains("no editor token"),
         "{}",
         stderr(&output)
+    );
+}
+
+fn managed(request: CliRequest) -> cli::ApiOperation {
+    match request {
+        CliRequest::ManageApi { operation } => operation,
+        other => panic!("an API client operation was asked for, not {other:?}"),
+    }
+}
+
+fn a_change(action: &str, kind: &str, path: &str) -> Vec<CliResponse> {
+    vec![
+        CliResponse::Api {
+            data: cli::ApiData::Changed(cli::ApiChangeInfo {
+                action: action.into(),
+                kind: kind.into(),
+                id: "0000-id".into(),
+                path: path.into(),
+            }),
+        },
+        CliResponse::Exit { status: 0 },
+    ]
+}
+
+#[test]
+fn a_request_is_created_from_curl_like_flags() {
+    let editor =
+        FakeEditor::answering(|_| a_change("created", "request", "Shop/Orders/Create order"));
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "api",
+            "create",
+            "Shop/Orders/Create order",
+            "-X",
+            "post",
+            "--url",
+            "https://shop.example.com/orders",
+            "-H",
+            "Content-Type: application/json",
+            "--query",
+            "dry_run=1",
+            "-d",
+            r#"{"sku": "a-1"}"#,
+        ],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "Created request 'Shop/Orders/Create order' (0000-id).\n"
+    );
+    let cli::ApiOperation::CreateRequest { path, changes } = managed(editor.request()) else {
+        panic!("create asks to create a request");
+    };
+    assert_eq!(path, "Shop/Orders/Create order");
+    assert_eq!(changes.method.as_deref(), Some("post"));
+    assert_eq!(
+        changes.set_headers,
+        vec![("Content-Type".to_string(), "application/json".to_string())]
+    );
+    assert_eq!(
+        changes.set_params,
+        vec![("dry_run".to_string(), "1".to_string())]
+    );
+    assert_eq!(changes.body.as_deref(), Some(r#"{"sku": "a-1"}"#));
+}
+
+#[test]
+fn a_body_is_read_from_stdin_or_a_file() {
+    let editor = FakeEditor::answering(|_| a_change("updated", "request", "Shop/Orders/List"));
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "update", "Shop/Orders/List", "-d", "-"],
+        Some("from stdin"),
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let cli::ApiOperation::UpdateRequest { changes, .. } = managed(editor.request()) else {
+        panic!("update asks to update a request");
+    };
+    assert_eq!(changes.body.as_deref(), Some("from stdin"));
+
+    let body_file = tempfile::NamedTempFile::new().expect("a file");
+    std::fs::write(body_file.path(), "from a file").expect("the body is written");
+    let editor = FakeEditor::answering(|_| a_change("updated", "request", "Shop/Orders/List"));
+    let body_argument = format!("@{}", body_file.path().display());
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "api",
+            "update",
+            "Shop/Orders/List",
+            "--body",
+            &body_argument,
+        ],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let cli::ApiOperation::UpdateRequest { changes, .. } = managed(editor.request()) else {
+        panic!("update asks to update a request");
+    };
+    assert_eq!(changes.body.as_deref(), Some("from a file"));
+}
+
+#[test]
+fn a_body_file_that_cannot_be_read_is_a_bad_argument_and_sends_nothing() {
+    let (data_dir, socket) = FakeEditor::silent();
+    socket.set_nonblocking(true).expect("non-blocking");
+    let output = zedcli(
+        data_dir.path(),
+        &["api", "create", "Shop/New", "-d", "@/nonexistent/body.json"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(exit_status::BAD_ARGUMENTS));
+    let mut buffer = [0u8; 16];
+    assert!(
+        socket.recv(&mut buffer).is_err(),
+        "the editor was not asked"
+    );
+}
+
+#[test]
+fn send_carries_its_one_off_changes() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::ApiResponse {
+                response: an_api_response(204, b""),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "api",
+            "send",
+            "Shop/Orders/Delete order",
+            "-X",
+            "DELETE",
+            "--query",
+            "force=1",
+            "--remove-header",
+            "X-Trace",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let CliRequest::SendApiRequest { changes, .. } = editor.request() else {
+        panic!("send asks to send");
+    };
+    assert_eq!(changes.method.as_deref(), Some("DELETE"));
+    assert_eq!(changes.set_params, vec![("force".into(), "1".into())]);
+    assert_eq!(changes.remove_headers, vec!["X-Trace".to_string()]);
+}
+
+#[test]
+fn folders_and_collections_are_made_renamed_and_deleted() {
+    for (arguments, expected) in [
+        (
+            vec!["api", "folder", "create", "Shop/Archive"],
+            cli::ApiOperation::CreateFolder {
+                path: "Shop/Archive".into(),
+            },
+        ),
+        (
+            vec!["api", "folder", "rename", "Shop/Archive", "Old"],
+            cli::ApiOperation::RenameFolder {
+                folder: "Shop/Archive".into(),
+                name: "Old".into(),
+            },
+        ),
+        (
+            vec!["api", "folder", "delete", "Shop/Old", "--recursive"],
+            cli::ApiOperation::DeleteFolder {
+                folder: "Shop/Old".into(),
+                recursive: true,
+            },
+        ),
+        (
+            vec!["api", "collection", "create", "Billing"],
+            cli::ApiOperation::CreateCollection {
+                name: "Billing".into(),
+            },
+        ),
+        (
+            vec!["api", "collection", "delete", "Billing"],
+            cli::ApiOperation::DeleteCollection {
+                collection: "Billing".into(),
+                recursive: false,
+            },
+        ),
+        (
+            vec!["api", "delete", "Shop/Health"],
+            cli::ApiOperation::DeleteRequest {
+                request: "Shop/Health".into(),
+            },
+        ),
+    ] {
+        let editor = FakeEditor::answering(|_| a_change("done", "item", "somewhere"));
+        let output = zedcli(editor.data_dir.path(), &arguments, None, None);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(managed(editor.request()), expected, "{arguments:?}");
+    }
+}
+
+#[test]
+fn collections_and_a_shown_request_are_printed_for_reading() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::Api {
+                data: cli::ApiData::Collections(vec![cli::ApiCollectionInfo {
+                    id: "c-1".into(),
+                    name: "Shop".into(),
+                    folders: 2,
+                    requests: 7,
+                }]),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(editor.data_dir.path(), &["api", "collections"], None, None);
+    let printed = stdout(&output);
+    assert!(printed.contains("NAME") && printed.contains("Shop") && printed.contains('7'));
+    editor.request();
+
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::Api {
+                data: cli::ApiData::Request(cli::ApiRequestDetail {
+                    id: "r-1".into(),
+                    path: "Shop/Orders/Create order".into(),
+                    method: "POST".into(),
+                    url: "https://shop.example.com/orders".into(),
+                    description: None,
+                    params: Vec::new(),
+                    headers: vec![cli::ApiPair {
+                        key: "Authorization".into(),
+                        value: "Bearer {{token}}".into(),
+                        enabled: true,
+                    }],
+                    body_kind: "json".into(),
+                    body: Some("{\"sku\": 1}".into()),
+                    auth: "inherit".into(),
+                    pre_request_script: false,
+                    test_script: true,
+                }),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "show", "Create order"],
+        None,
+        None,
+    );
+    let printed = stdout(&output);
+    assert!(
+        printed.starts_with("POST https://shop.example.com/orders\n"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("Headers\n  Authorization: Bearer {{token}}\n"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("Body (json)\n  {\"sku\": 1}\n"),
+        "{printed}"
+    );
+    assert!(printed.contains("Scripts: tests"), "{printed}");
+    editor.request();
+}
+
+fn a_snippet() -> Vec<CliResponse> {
+    vec![
+        CliResponse::Api {
+            data: cli::ApiData::Snippet(cli::ApiSnippetInfo {
+                label: "Python - requests".into(),
+                code: "import requests".into(),
+                highlights: vec![cli::ApiHighlight {
+                    start: 0,
+                    end: 6,
+                    color: 0xc678dd,
+                    bold: true,
+                    italic: false,
+                }],
+            }),
+        },
+        CliResponse::Exit { status: 0 },
+    ]
+}
+
+#[test]
+fn a_snippet_is_coloured_on_request_and_plain_through_a_pipe() {
+    let editor = FakeEditor::answering(|_| a_snippet());
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "api",
+            "snippet",
+            "Create order",
+            "--lang",
+            "python",
+            "--color",
+            "always",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "\u{1b}[38;2;198;120;221;1mimport\u{1b}[0m requests\n",
+        "the keyword carries the editor's colour"
+    );
+    let cli::ApiOperation::Snippet { language, .. } = managed(editor.request()) else {
+        panic!("snippet asks for a snippet");
+    };
+    assert_eq!(language, "python");
+
+    let editor = FakeEditor::answering(|_| a_snippet());
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["api", "snippet", "Create order"],
+        None,
+        None,
+    );
+    assert_eq!(
+        stdout(&output),
+        "import requests\n",
+        "piped, the code is left plain"
+    );
+    assert!(stderr(&output).contains("# Python - requests"));
+    let cli::ApiOperation::Snippet { language, .. } = managed(editor.request()) else {
+        panic!("snippet asks for a snippet");
+    };
+    assert_eq!(
+        language, "curl",
+        "curl unless another language is asked for"
     );
 }
 

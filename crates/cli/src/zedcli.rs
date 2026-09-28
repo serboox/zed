@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cli::{
-    ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse,
-    ConfigurationInfo, DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo,
-    WindowSelector, exit_status, ipc::IpcOneShotServer,
+    ApiData, ApiEnvironmentInfo, ApiHighlight, ApiOperation, ApiPair, ApiRequestChanges,
+    ApiRequestDetail, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse, ConfigurationInfo,
+    DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo, WindowSelector,
+    exit_status, ipc::IpcOneShotServer,
 };
 use serde_json::json;
 
@@ -73,7 +74,7 @@ enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
-    /// API Client: saved requests and environments.
+    /// API Client: collections, folders, requests and environments.
     Api {
         #[command(subcommand)]
         command: ApiCommand,
@@ -84,12 +85,72 @@ enum Command {
 enum ApiCommand {
     /// List the saved requests with their paths.
     List,
+    /// List the collections with how much each holds.
+    Collections,
+    /// List the folders with their paths.
+    Folders,
     /// List the environments and the names of their variables.
     Envs,
+    /// Show a saved request: method, URL, parameters, headers, body and auth,
+    /// with literal secrets masked.
+    Show {
+        /// The request's id, its `Collection/Folder/Name` path, or a unique name.
+        request: String,
+    },
+    /// Save a new request at `Collection/Folder/.../Name`.
+    Create {
+        path: String,
+        #[command(flatten)]
+        changes: ChangeArgs,
+    },
+    /// Change a saved request, rename it or move it elsewhere.
+    Update {
+        request: String,
+        /// A new name.
+        #[arg(long)]
+        rename: Option<String>,
+        /// A collection's name or a folder's path to move it into.
+        #[arg(long)]
+        move_to: Option<String>,
+        #[command(flatten)]
+        changes: ChangeArgs,
+    },
+    /// Delete a saved request.
+    Delete { request: String },
+    /// Create, rename or delete a folder.
+    Folder {
+        #[command(subcommand)]
+        command: FolderCommand,
+    },
+    /// Create, rename or delete a collection.
+    Collection {
+        #[command(subcommand)]
+        command: CollectionCommand,
+    },
+    /// Print a saved request as code, in the editor's syntax colours on a
+    /// terminal; secret values are masked.
+    Snippet {
+        request: String,
+        /// curl, http, go, python, javascript, axios, rust, php, csharp, java,
+        /// ruby or wget.
+        #[arg(short, long, default_value = "curl")]
+        lang: String,
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(long = "var", value_parser = key_value)]
+        variables: Vec<(String, String)>,
+        #[arg(long, value_enum, default_value_t = Colour::Auto)]
+        color: Colour,
+        #[command(flatten)]
+        changes: ChangeArgs,
+    },
     /// Send a saved request, the way its Send button does, and print the body.
     Send {
         /// The request's id, its `Collection/Folder/Name` path, or a unique name.
         request: String,
+        /// Changes for this send only; the saved request is left as it is.
+        #[command(flatten)]
+        changes: ChangeArgs,
         /// Resolve against this environment (id or name) instead of the request's own.
         #[arg(short, long)]
         env: Option<String>,
@@ -108,6 +169,116 @@ enum ApiCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum FolderCommand {
+    /// Create `Collection/Parent/.../Name`.
+    Create { path: String },
+    /// Rename a folder, given by id or path.
+    Rename { folder: String, name: String },
+    /// Delete a folder; one that holds anything needs --recursive.
+    Delete {
+        folder: String,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CollectionCommand {
+    Create {
+        name: String,
+    },
+    /// Rename a collection, given by id or name.
+    Rename {
+        collection: String,
+        name: String,
+    },
+    /// Delete a collection; one that holds anything needs --recursive.
+    Delete {
+        collection: String,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Colour {
+    Auto,
+    Always,
+    Never,
+}
+
+/// Changes to a request, in the shape curl takes them.
+#[derive(Args, Debug, Default)]
+struct ChangeArgs {
+    /// The HTTP method.
+    #[arg(short = 'X', long)]
+    method: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+    /// Set a header, `-H 'Name: value'`; repeatable.
+    #[arg(short = 'H', long = "header", value_parser = header_pair)]
+    headers: Vec<(String, String)>,
+    /// Remove a header by name; repeatable.
+    #[arg(long = "remove-header")]
+    remove_headers: Vec<String>,
+    /// Set a query parameter, `--query key=value`; repeatable.
+    #[arg(long = "query", value_parser = key_value)]
+    params: Vec<(String, String)>,
+    /// Remove a query parameter by name; repeatable.
+    #[arg(long = "remove-query")]
+    remove_params: Vec<String>,
+    /// A raw body: the text itself, `@file` to read a file, or `-` for stdin.
+    /// An empty one removes the body.
+    #[arg(short = 'd', long)]
+    body: Option<String>,
+    /// The raw body's type: text, json, xml, html or javascript.
+    #[arg(long)]
+    content_type: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+}
+
+impl ChangeArgs {
+    fn into_changes(self) -> Result<ApiRequestChanges> {
+        let body = match self.body {
+            Some(body) if body == "-" => {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                Some(text)
+            }
+            Some(body) => match body.strip_prefix('@') {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("cannot read the body from {path}"))?,
+                ),
+                None => Some(body),
+            },
+            None => None,
+        };
+        Ok(ApiRequestChanges {
+            method: self.method,
+            url: self.url,
+            set_headers: self.headers,
+            remove_headers: self.remove_headers,
+            set_params: self.params,
+            remove_params: self.remove_params,
+            body,
+            content_type: self.content_type,
+            description: self.description,
+        })
+    }
+}
+
+fn header_pair(text: &str) -> Result<(String, String), String> {
+    match text.split_once(':') {
+        Some((name, value)) if !name.trim().is_empty() => {
+            Ok((name.trim().to_string(), value.trim().to_string()))
+        }
+        _ => Err(format!("expected 'Name: value', got '{text}'")),
+    }
+}
+
 fn key_value(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
@@ -121,6 +292,8 @@ struct SendOptions {
     include: bool,
     output: Option<PathBuf>,
     fail: bool,
+    /// Whether a snippet is printed in colour.
+    colour: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -277,6 +450,7 @@ fn run(cli: ZedCli) -> Result<i32> {
             ApiCommand::Envs => CliRequest::ListApiEnvironments,
             ApiCommand::Send {
                 request,
+                changes,
                 env,
                 variables,
                 include,
@@ -287,13 +461,91 @@ fn run(cli: ZedCli) -> Result<i32> {
                     include,
                     output,
                     fail,
+                    colour: false,
                 };
                 CliRequest::SendApiRequest {
                     request,
                     environment: env,
                     variables,
                     timeout_seconds: cli.timeout,
+                    changes: match changes.into_changes() {
+                        Ok(changes) => changes,
+                        Err(error) => return Ok(bad_arguments(error)),
+                    },
                 }
+            }
+            ApiCommand::Collections => manage(ApiOperation::ListCollections),
+            ApiCommand::Folders => manage(ApiOperation::ListFolders),
+            ApiCommand::Show { request } => manage(ApiOperation::ShowRequest { request }),
+            ApiCommand::Create { path, changes } => manage(ApiOperation::CreateRequest {
+                path,
+                changes: match changes.into_changes() {
+                    Ok(changes) => changes,
+                    Err(error) => return Ok(bad_arguments(error)),
+                },
+            }),
+            ApiCommand::Update {
+                request,
+                rename,
+                move_to,
+                changes,
+            } => manage(ApiOperation::UpdateRequest {
+                request,
+                rename,
+                move_to,
+                changes: match changes.into_changes() {
+                    Ok(changes) => changes,
+                    Err(error) => return Ok(bad_arguments(error)),
+                },
+            }),
+            ApiCommand::Delete { request } => manage(ApiOperation::DeleteRequest { request }),
+            ApiCommand::Folder { command } => manage(match command {
+                FolderCommand::Create { path } => ApiOperation::CreateFolder { path },
+                FolderCommand::Rename { folder, name } => {
+                    ApiOperation::RenameFolder { folder, name }
+                }
+                FolderCommand::Delete { folder, recursive } => {
+                    ApiOperation::DeleteFolder { folder, recursive }
+                }
+            }),
+            ApiCommand::Collection { command } => manage(match command {
+                CollectionCommand::Create { name } => ApiOperation::CreateCollection { name },
+                CollectionCommand::Rename { collection, name } => {
+                    ApiOperation::RenameCollection { collection, name }
+                }
+                CollectionCommand::Delete {
+                    collection,
+                    recursive,
+                } => ApiOperation::DeleteCollection {
+                    collection,
+                    recursive,
+                },
+            }),
+            ApiCommand::Snippet {
+                request,
+                lang,
+                env,
+                variables,
+                color,
+                changes,
+            } => {
+                send_options.colour = match color {
+                    Colour::Always => true,
+                    Colour::Never => false,
+                    Colour::Auto => {
+                        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+                    }
+                };
+                manage(ApiOperation::Snippet {
+                    request,
+                    language: lang,
+                    environment: env,
+                    variables,
+                    changes: match changes.into_changes() {
+                        Ok(changes) => changes,
+                        Err(error) => return Ok(bad_arguments(error)),
+                    },
+                })
             }
         },
     };
@@ -511,6 +763,7 @@ fn exchange(
             CliResponse::ApiEnvironments { items } => {
                 print!("{}", api_environments_as(format, &items))
             }
+            CliResponse::Api { data } => print!("{}", api_data_as(format, &data, send_options)),
             CliResponse::ApiResponse { response } => {
                 let failed = print_api_response(format, &response, send_options)?;
                 // The editor's own Exit follows; its status is replaced here
@@ -1105,4 +1358,164 @@ mod tests {
     fn a_window_and_every_window_cannot_both_be_asked_for() {
         assert!(ZedCli::try_parse_from(["zedcli", "ps", "--all", "--window", "7"]).is_err());
     }
+}
+
+fn bad_arguments(error: anyhow::Error) -> i32 {
+    eprintln!("zedcli: {error:#}");
+    exit_status::BAD_ARGUMENTS
+}
+
+fn manage(operation: ApiOperation) -> CliRequest {
+    CliRequest::ManageApi { operation }
+}
+
+fn api_data_as(format: RowFormat, data: &ApiData, options: &SendOptions) -> String {
+    if format != RowFormat::Table {
+        return match data {
+            ApiData::Collections(items) => json_line(items),
+            ApiData::Folders(items) => json_line(items),
+            ApiData::Request(detail) => json_line(detail),
+            ApiData::Snippet(snippet) => json_line(snippet),
+            ApiData::Changed(changed) => json_line(changed),
+        };
+    }
+    match data {
+        ApiData::Collections(items) => table(
+            &["ID", "NAME", "FOLDERS", "REQUESTS"],
+            items
+                .iter()
+                .map(|item| {
+                    vec![
+                        item.id.clone(),
+                        item.name.clone(),
+                        item.folders.to_string(),
+                        item.requests.to_string(),
+                    ]
+                })
+                .collect(),
+        ),
+        ApiData::Folders(items) => table(
+            &["ID", "PATH", "FOLDERS", "REQUESTS"],
+            items
+                .iter()
+                .map(|item| {
+                    vec![
+                        item.id.clone(),
+                        item.path.clone(),
+                        item.folders.to_string(),
+                        item.requests.to_string(),
+                    ]
+                })
+                .collect(),
+        ),
+        ApiData::Request(detail) => request_detail_as_text(detail),
+        ApiData::Snippet(snippet) => {
+            // The label goes to stderr, so what is on stdout is only the code
+            // and can be piped or saved as it is.
+            match options.colour {
+                true => eprintln!("\x1b[2m# {}\x1b[0m", snippet.label),
+                false => eprintln!("# {}", snippet.label),
+            }
+            let mut code = match options.colour {
+                true => coloured(&snippet.code, &snippet.highlights),
+                false => snippet.code.clone(),
+            };
+            if !code.ends_with('\n') {
+                code.push('\n');
+            }
+            code
+        }
+        ApiData::Changed(changed) => {
+            let mut action = changed.action.clone();
+            if let Some(first) = action.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!(
+                "{action} {} '{}' ({}).\n",
+                changed.kind, changed.path, changed.id
+            )
+        }
+    }
+}
+
+fn request_detail_as_text(detail: &ApiRequestDetail) -> String {
+    let mut text = format!("{} {}\n", detail.method, detail.url);
+    text.push_str(&format!("Path:  {}\nID:    {}\n", detail.path, detail.id));
+    text.push_str(&format!("Auth:  {}\n", detail.auth));
+    if let Some(description) = &detail.description {
+        text.push_str(&format!("About: {description}\n"));
+    }
+    let pairs = |title: &str, pairs: &[ApiPair], separator: &str| {
+        if pairs.is_empty() {
+            return String::new();
+        }
+        let mut section = format!("\n{title}\n");
+        for pair in pairs {
+            let on = if pair.enabled { "  " } else { "- " };
+            section.push_str(&format!("{on}{}{separator}{}\n", pair.key, pair.value));
+        }
+        section
+    };
+    text.push_str(&pairs("Query", &detail.params, " = "));
+    text.push_str(&pairs("Headers", &detail.headers, ": "));
+    if let Some(body) = &detail.body {
+        text.push_str(&format!("\nBody ({})\n", detail.body_kind));
+        for line in body.lines() {
+            text.push_str(&format!("  {line}\n"));
+        }
+    }
+    let scripts: Vec<&str> = [
+        detail.pre_request_script.then_some("pre-request"),
+        detail.test_script.then_some("tests"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !scripts.is_empty() {
+        text.push_str(&format!("\nScripts: {}\n", scripts.join(", ")));
+    }
+    text
+}
+
+/// `code` with each highlighted range in its 24-bit colour. A range the
+/// editor sent that does not fall on character boundaries is left plain.
+fn coloured(code: &str, highlights: &[ApiHighlight]) -> String {
+    let mut text = String::with_capacity(code.len() * 2);
+    let mut at = 0;
+    for highlight in highlights {
+        let (Ok(start), Ok(end)) = (
+            usize::try_from(highlight.start),
+            usize::try_from(highlight.end),
+        ) else {
+            continue;
+        };
+        if start < at
+            || end <= start
+            || end > code.len()
+            || !code.is_char_boundary(start)
+            || !code.is_char_boundary(end)
+        {
+            continue;
+        }
+        text.push_str(&code[at..start]);
+        let mut style = format!(
+            "\x1b[38;2;{};{};{}",
+            highlight.color >> 16 & 0xff,
+            highlight.color >> 8 & 0xff,
+            highlight.color & 0xff
+        );
+        if highlight.bold {
+            style.push_str(";1");
+        }
+        if highlight.italic {
+            style.push_str(";3");
+        }
+        text.push_str(&style);
+        text.push('m');
+        text.push_str(&code[start..end]);
+        text.push_str("\x1b[0m");
+        at = end;
+    }
+    text.push_str(&code[at..]);
+    text
 }

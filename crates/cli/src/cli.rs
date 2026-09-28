@@ -117,7 +117,181 @@ pub enum CliRequest {
         /// How long the server has to answer; the editor gives up after it.
         #[serde(default)]
         timeout_seconds: u64,
+        /// Changes to the saved request for this one send; nothing is saved.
+        #[serde(default)]
+        changes: ApiRequestChanges,
     },
+    /// Reads or changes the API client's saved collections, folders and
+    /// requests, or writes a request out as code.
+    ManageApi {
+        operation: ApiOperation,
+    },
+}
+
+/// Changes to a saved request given on the command line: saved with it by
+/// `ApiOperation::CreateRequest` and `UpdateRequest`, applied to one send or
+/// snippet only by the others.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ApiRequestChanges {
+    pub method: Option<String>,
+    pub url: Option<String>,
+    /// A header of the same name, in any case, is replaced; otherwise added.
+    pub set_headers: Vec<(String, String)>,
+    pub remove_headers: Vec<String>,
+    /// A query parameter of the same name is replaced; otherwise added.
+    pub set_params: Vec<(String, String)>,
+    pub remove_params: Vec<String>,
+    /// A raw body; an empty one removes the body.
+    pub body: Option<String>,
+    /// `text`, `json`, `xml`, `html` or `javascript`: the raw body's type.
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+}
+
+/// A collection is named by its id or its name, a folder by its id or its
+/// `Collection/Folder/...` path, and a request by its id, its path or a name
+/// no other request shares.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ApiOperation {
+    ListCollections,
+    ListFolders,
+    ShowRequest {
+        request: String,
+    },
+    CreateCollection {
+        name: String,
+    },
+    RenameCollection {
+        collection: String,
+        name: String,
+    },
+    /// Refuses a collection that holds anything unless `recursive`.
+    DeleteCollection {
+        collection: String,
+        recursive: bool,
+    },
+    /// `Collection/Parent/.../Name`: every folder before the last must exist.
+    CreateFolder {
+        path: String,
+    },
+    RenameFolder {
+        folder: String,
+        name: String,
+    },
+    /// Refuses a folder that holds anything unless `recursive`.
+    DeleteFolder {
+        folder: String,
+        recursive: bool,
+    },
+    /// `Collection/Folder/.../Name`; the request goes into the collection
+    /// itself when no folder is named.
+    CreateRequest {
+        path: String,
+        changes: ApiRequestChanges,
+    },
+    UpdateRequest {
+        request: String,
+        rename: Option<String>,
+        /// A collection's name or a folder's path to move the request into.
+        move_to: Option<String>,
+        changes: ApiRequestChanges,
+    },
+    DeleteRequest {
+        request: String,
+    },
+    /// The request as code in `language`, resolved the way a send would be.
+    Snippet {
+        request: String,
+        language: String,
+        environment: Option<String>,
+        variables: Vec<(String, String)>,
+        changes: ApiRequestChanges,
+    },
+}
+
+/// What a [`CliRequest::ManageApi`] answers with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ApiData {
+    Collections(Vec<ApiCollectionInfo>),
+    Folders(Vec<ApiFolderInfo>),
+    Request(ApiRequestDetail),
+    Snippet(ApiSnippetInfo),
+    Changed(ApiChangeInfo),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiCollectionInfo {
+    pub id: String,
+    pub name: String,
+    pub folders: u64,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiFolderInfo {
+    pub id: String,
+    /// `Collection/Folder/...`.
+    pub path: String,
+    /// Everything under it, however deep.
+    pub folders: u64,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiPair {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+/// A saved request with every literal secret masked; `{{variable}}`
+/// references are shown as written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiRequestDetail {
+    pub id: String,
+    pub path: String,
+    pub method: String,
+    pub url: String,
+    pub description: Option<String>,
+    pub params: Vec<ApiPair>,
+    pub headers: Vec<ApiPair>,
+    /// `none`, `json`, `text`, `form-data`, `graphql` and the like.
+    pub body_kind: String,
+    pub body: Option<String>,
+    /// The auth scheme and whatever of it is not secret.
+    pub auth: String,
+    pub pre_request_script: bool,
+    pub test_script: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiSnippetInfo {
+    /// The language as the editor names it, e.g. `cURL` or `Python - requests`.
+    pub label: String,
+    pub code: String,
+    /// Byte ranges of `code` in the editor's syntax colours; empty when the
+    /// editor has no grammar for the language.
+    pub highlights: Vec<ApiHighlight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiHighlight {
+    pub start: u64,
+    pub end: u64,
+    /// `0xRRGGBB`.
+    pub color: u32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiChangeInfo {
+    /// `created`, `renamed`, `updated`, `moved` or `deleted`.
+    pub action: String,
+    /// `collection`, `folder` or `request`.
+    pub kind: String,
+    pub id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -257,7 +431,8 @@ impl CliRequest {
             | CliRequest::ControlRun { .. }
             | CliRequest::ListApiRequests
             | CliRequest::ListApiEnvironments
-            | CliRequest::SendApiRequest { .. } => true,
+            | CliRequest::SendApiRequest { .. }
+            | CliRequest::ManageApi { .. } => true,
         }
     }
 }
@@ -319,6 +494,9 @@ pub enum CliResponse {
     },
     ApiResponse {
         response: ApiResponseInfo,
+    },
+    Api {
+        data: ApiData,
     },
 }
 

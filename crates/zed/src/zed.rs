@@ -1,4 +1,5 @@
 mod app_menus;
+pub(crate) mod cli_api;
 pub(crate) mod cli_requests;
 pub mod edit_prediction_registry;
 pub mod launchpad;

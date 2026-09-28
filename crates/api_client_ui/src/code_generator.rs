@@ -59,6 +59,46 @@ impl Snippet {
             Snippet::Wget => "Shell - wget",
         }
     }
+
+    /// The name `zedcli api snippet --lang` knows it by.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Snippet::Curl => "curl",
+            Snippet::HttpText => "http",
+            Snippet::Go => "go",
+            Snippet::Python => "python",
+            Snippet::JavaScript => "javascript",
+            Snippet::NodeAxios => "axios",
+            Snippet::Rust => "rust",
+            Snippet::Php => "php",
+            Snippet::CSharp => "csharp",
+            Snippet::Java => "java",
+            Snippet::Ruby => "ruby",
+            Snippet::Wget => "wget",
+        }
+    }
+
+    pub fn from_cli_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|snippet| snippet.cli_name().eq_ignore_ascii_case(name))
+    }
+
+    /// The language the editor colours it as.
+    pub fn language_name(self) -> &'static str {
+        match self {
+            Snippet::Curl | Snippet::Wget => "Shell Script",
+            Snippet::HttpText => "Plain Text",
+            Snippet::Go => "Go",
+            Snippet::Python => "Python",
+            Snippet::JavaScript | Snippet::NodeAxios => "JavaScript",
+            Snippet::Rust => "Rust",
+            Snippet::Php => "PHP",
+            Snippet::CSharp => "C#",
+            Snippet::Java => "Java",
+            Snippet::Ruby => "Ruby",
+        }
+    }
 }
 
 /// The request in the shape asked for. `files` is what

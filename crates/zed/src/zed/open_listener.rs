@@ -737,16 +737,23 @@ pub async fn handle_cli_connection(
                 environment,
                 variables,
                 timeout_seconds,
+                changes,
             } => {
                 super::cli_requests::send_api_request(
-                    request,
-                    environment,
-                    variables,
-                    timeout_seconds,
+                    super::cli_requests::ApiSend {
+                        request,
+                        environment,
+                        variables,
+                        timeout_seconds,
+                        changes,
+                    },
                     responses.as_ref(),
                     cx,
                 )
                 .await;
+            }
+            CliRequest::ManageApi { operation } => {
+                super::cli_api::manage_api(operation, &app_state, responses.as_ref(), cx).await;
             }
         }
     }
@@ -2701,7 +2708,8 @@ mod tests {
                     | CliResponse::Configurations { .. }
                     | CliResponse::ApiRequests { .. }
                     | CliResponse::ApiEnvironments { .. }
-                    | CliResponse::ApiResponse { .. } => {}
+                    | CliResponse::ApiResponse { .. }
+                    | CliResponse::Api { .. } => {}
                 }
             }
 

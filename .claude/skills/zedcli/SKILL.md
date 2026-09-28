@@ -1,6 +1,6 @@
 ---
 name: zedcli
-description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, start/stop/restart run configurations, read data through the Database Explorer's saved connections (SQL, MongoDB, Redis, CQL; reads only), and send the API Client's saved GET requests. Use when you need to know what the editor has open or running, look at data in a database the user configured in the editor, or call a read endpoint the user saved there — all without asking for credentials. zedcli refuses anything that could change data.
+description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell with `zedcli` — list its windows and open projects, see the task runs of a window with their process trees, start/stop/restart run configurations, read data through the Database Explorer's saved connections (SQL, MongoDB, Redis, CQL; reads only), and manage the API Client — create, show, change, move and delete its collections, folders and saved requests, send them with one-off parameters, and print them as code (curl, Python, Go...) in the editor's colours. Use when you need to know what the editor has open or running, look at data in a database the user configured in the editor, or work with the HTTP requests saved there — all without asking for credentials. Database writes are refused.
 ---
 
 # zedcli
@@ -8,10 +8,15 @@ description: Drive the running Zed fork ("Zed (Fast/DB dev)") from the shell wit
 `zedcli` is a command-line client for an editor that is **already running**. It
 never starts the editor. Every command is one question to it and one answer.
 
-**zedcli only reads data.** A SQL statement or Mongo/Redis command that could
-write, and an HTTP request other than GET/HEAD/OPTIONS, are refused with exit 5.
-The refusal is enforced by the editor, not by this client. When a task needs a
-write, tell the user what to run and where; do not look for a way around it.
+**zedcli only reads databases.** A SQL statement or Mongo/Redis command that
+could write is refused with exit 5, by the editor rather than by this client.
+When a task needs a database write, tell the user what to run and where; do not
+look for a way around it.
+
+**The API Client is fully managed**, and `api send` sends any method. A POST,
+PUT, PATCH or DELETE reaches a real service, so send one only when the user
+asked for it or the request is plainly theirs to change (a local server, a
+sandbox); when unsure, show the request with `api show` or `api snippet` and ask.
 Starting and stopping the project's run configurations is allowed: that is the
 editor's Run button, running exactly what the configuration says.
 
@@ -30,8 +35,14 @@ installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
 | List the database connections the user saved | `zedcli db connections` |
 | Run SQL on one of them | `zedcli db query -c LABEL "SQL"` |
 | List the HTTP requests saved in the API Client | `zedcli api list` |
+| List its collections / folders | `zedcli api collections` · `zedcli api folders` |
+| See one request in full | `zedcli api show "Collection/Folder/Name"` |
 | See its environments (variable names only) | `zedcli api envs` |
 | Send a saved request and get the body | `zedcli api send "Collection/Folder/Name" --env ENV` |
+| Send it with one-off changes | `zedcli api send NAME -X POST -H 'K: v' --query k=v -d BODY` |
+| Save a new request / change one / delete one | `zedcli api create PATH ...` · `api update NAME ...` · `api delete NAME` |
+| Make, rename, delete a folder or collection | `zedcli api folder create\|rename\|delete ...` · `zedcli api collection ...` |
+| Get a request as code | `zedcli api snippet NAME --lang python` |
 
 Add `--json` to any command when you are going to read the result
 programmatically: the shape is stable and fields are named, the table is for
@@ -148,10 +159,66 @@ HTTP 200 OK  84 ms  GET https://staging.example.com/orders/42   <- on stderr
   of 400 or more or on a failed test.
 - Variable values (tokens, passwords) are never printed; `api envs` shows names
   only.
-- Only GET, HEAD and OPTIONS requests are sent; any other method answers
-  exit 5 before anything of the request (its pre-request script included)
-  runs. A GET that a badly designed service treats as a write is still sent,
-  so prefer requests the user has told you are safe.
+- Every method is sent. See the rule at the top before sending one that writes.
+
+### Changing a request, for one send or for good
+
+The same curl-like flags work on `api send`, `api snippet`, `api create` and
+`api update`:
+
+| Flag | Does |
+|---|---|
+| `-X METHOD` | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS or a custom one |
+| `--url URL` | Replace the URL; `{{variables}}` are kept and resolved at send |
+| `-H 'Name: value'` / `--remove-header Name` | Set (replace, case-insensitively) or drop a header; repeatable |
+| `--query key=value` / `--remove-query key` | Set or drop a query parameter; repeatable |
+| `-d TEXT`, `-d @FILE`, `-d -` | A raw body from the argument, a file or stdin; `-d ''` removes it |
+| `--content-type json\|text\|xml\|html\|javascript` | The raw body's type; guessed from the body otherwise |
+| `--description TEXT` | The request's description |
+
+On `send` and `snippet` the changes are for that one call and are never saved.
+On `create` and `update` they are saved, and the API Client panel shows them at
+once.
+
+```
+$ zedcli api collection create Billing
+Created collection 'Billing' (5f0c…).
+$ zedcli api folder create Billing/Invoices
+$ zedcli api create "Billing/Invoices/Create invoice" -X POST \
+    --url '{{host}}/invoices' -H 'Authorization: Bearer {{token}}' -d '{"amount": 100}'
+$ zedcli api update "Create invoice" --rename "New invoice" --move-to Billing
+$ zedcli api delete "Billing/New invoice"
+$ zedcli api collection delete Billing --recursive
+```
+
+- Paths are `Collection/Folder/.../Name`; every folder before the last must
+  exist. A collection is named by its name or id, a folder by its path or id.
+- A folder or collection that still holds something is not deleted (exit 1)
+  unless `--recursive` is given. Deleting cannot be undone from zedcli.
+- `api show` prints the method, URL, query, headers, body, auth and whether it
+  has scripts. A literal credential (an `Authorization`, `Cookie` or API-key
+  header, a password or token in its auth) is shown as `••••`;
+  `{{variable}}` references are shown as written.
+
+### Code snippets
+
+```
+$ zedcli api snippet "Shop/Orders/Get order" --env staging --lang python
+# Python - requests                         <- on stderr
+import requests                             <- stdout: the code only
+...
+```
+
+- `--lang` is one of curl (the default), http, go, python, javascript, axios,
+  rust, php, csharp, java, ruby, wget. Anything else answers exit 2 with the
+  list.
+- The snippet is resolved the way a send would be (`--env`, `--var` and the
+  change flags apply), but no script runs and nothing is sent.
+- Secret variables' values are masked as `••••` in the code; tell the user to
+  fill them in rather than looking for the value.
+- On a terminal the code is coloured with the editor's own theme; through a
+  pipe it is plain. `--color always|never` overrides that, and `NO_COLOR` is
+  honoured.
 
 ## Access
 
@@ -170,8 +237,8 @@ answers exit 5. Neither is something to work around: tell the user.
 | 1 | The request failed on its own terms (SQL error, lost connection, the database refused a hidden write) | Read stderr; fix the query or the connection |
 | 2 | Bad arguments | Check `zedcli <command> --help` |
 | 3 | The editor is not running or did not answer | Ask the user to start "Zed (Fast/DB dev)"; do not start it yourself |
-| 4 | No such window, configuration, connection, request or environment | List them first (`windows`, `configs`, `db connections`, `api list`, `api envs`) |
-| 5 | Refused: it could change data (a write, a non-GET request) | Do not retry or rephrase it to get around the check; tell the user |
+| 4 | No such window, configuration, connection, collection, folder, request or environment | List them first (`windows`, `configs`, `db connections`, `api list`, `api collections`, `api folders`, `api envs`) |
+| 5 | Refused: a database write, or zedcli is turned off | Do not retry or rephrase it to get around the check; tell the user |
 
 `--timeout SECONDS` (default 30) bounds how long zedcli waits for an answer.
 

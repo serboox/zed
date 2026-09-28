@@ -732,7 +732,7 @@ impl ApiClientStore {
         false
     }
 
-    fn next_order_in(&self, collection_id: CollectionId, parent_id: Option<FolderId>) -> i64 {
+    pub fn next_order_in(&self, collection_id: CollectionId, parent_id: Option<FolderId>) -> i64 {
         let max_folder = self
             .folders
             .iter()

@@ -201,7 +201,8 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
                         | CliResponse::Configurations { .. }
                         | CliResponse::ApiRequests { .. }
                         | CliResponse::ApiEnvironments { .. }
-                        | CliResponse::ApiResponse { .. } => {}
+                        | CliResponse::ApiResponse { .. }
+                        | CliResponse::Api { .. } => {}
                     }
                 }
                 Ok(())

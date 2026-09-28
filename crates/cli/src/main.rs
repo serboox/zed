@@ -814,7 +814,8 @@ fn run() -> Result<()> {
                         | CliResponse::Configurations { .. }
                         | CliResponse::ApiRequests { .. }
                         | CliResponse::ApiEnvironments { .. }
-                        | CliResponse::ApiResponse { .. } => {}
+                        | CliResponse::ApiResponse { .. }
+                        | CliResponse::Api { .. } => {}
                     }
                 }
 
@@ -968,7 +969,8 @@ fn run_db_command(args: &[String]) -> Result<()> {
                         | CliResponse::Configurations { .. }
                         | CliResponse::ApiRequests { .. }
                         | CliResponse::ApiEnvironments { .. }
-                        | CliResponse::ApiResponse { .. } => {}
+                        | CliResponse::ApiResponse { .. }
+                        | CliResponse::Api { .. } => {}
                     }
                 }
 

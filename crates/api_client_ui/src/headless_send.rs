@@ -22,6 +22,10 @@ pub struct HeadlessSend {
     pub variables: Vec<(String, String)>,
     /// How long the server has to answer before the send is given up.
     pub timeout: Duration,
+    /// What to send in place of the saved request, for changes made to this
+    /// one send only. It keeps the saved request's id, so its history and its
+    /// scripts' variables are the saved request's.
+    pub edited: Option<Request>,
 }
 
 pub struct HeadlessOutcome {
@@ -43,15 +47,7 @@ pub async fn send(
     send: HeadlessSend,
     cx: &mut AsyncApp,
 ) -> Result<HeadlessOutcome> {
-    let request = store
-        .read_with(cx, |store, _| {
-            store
-                .requests
-                .iter()
-                .find(|request| request.id == send.request)
-                .cloned()
-        })
-        .ok_or_else(|| anyhow!("the request no longer exists"))?;
+    let request = request_to_send(store, &send, cx)?;
 
     if !request.pre_request_script.trim().is_empty() {
         let (before_environment, before_collection) =
@@ -241,6 +237,59 @@ pub async fn send(
         store.record_history_entry(entry, cx);
     });
     Ok(outcome)
+}
+
+fn request_to_send(
+    store: &Entity<ApiClientStore>,
+    send: &HeadlessSend,
+    cx: &mut AsyncApp,
+) -> Result<Request> {
+    if let Some(edited) = &send.edited {
+        return Ok(edited.clone());
+    }
+    store
+        .read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|request| request.id == send.request)
+                .cloned()
+        })
+        .ok_or_else(|| anyhow!("the request no longer exists"))
+}
+
+/// The request as `snippet` code, resolved against the environment a send
+/// would use, with every secret variable's value masked: code is copied and
+/// pasted, and a secret in it would travel with it. No script runs.
+pub async fn snippet(
+    store: &Entity<ApiClientStore>,
+    send: HeadlessSend,
+    snippet: crate::Snippet,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    let request = request_to_send(store, &send, cx)?;
+    let files =
+        api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body)).await;
+    if let Some((path, why)) = files.unreadable().first() {
+        return Err(anyhow!("could not read {}: {why}", path.display()));
+    }
+    Ok(store.read_with(cx, |store, _| {
+        let secrets = secret_values(store, &request, &send);
+        let environment = environment_for(store, &request, &send);
+        let context = VariableContext {
+            environment: Some(&environment),
+            collection: store
+                .collections
+                .iter()
+                .find(|collection| collection.id == request.collection_id),
+            global: &store.global_environment,
+        };
+        let mut code = crate::code_generator::generate(snippet, &request, &context, &files);
+        for secret in &secrets {
+            code = code.replace(secret.as_str(), MASK);
+        }
+        code
+    }))
 }
 
 /// What a script sees: the environment this send resolves against, one-off
@@ -472,6 +521,7 @@ mod tests {
                     ("token".into(), "abc".into()),
                 ],
                 timeout: Duration::from_secs(30),
+                edited: None,
             };
             let resolved = environment_for(store, &request, &send);
             let value = |key: &str| {
@@ -520,6 +570,7 @@ mod tests {
                 environment: Some(chosen),
                 variables: vec![("id".into(), "42".into())],
                 timeout: Duration::from_secs(30),
+                edited: None,
             };
             let (before, collection_before) = script_maps(store, &request, &send);
             assert_eq!(

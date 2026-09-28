@@ -257,8 +257,15 @@ JSON
 import http.server, json, sys
 class Echo(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        self.answer({"path": self.path})
+    def do_ANY(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        sent = self.rfile.read(length).decode() if length else ""
+        self.answer({"method": self.command, "path": self.path, "body": sent})
+    do_POST = do_PUT = do_PATCH = do_DELETE = do_ANY
+    def answer(self, answered):
         code = 500 if self.path == "/boom" else 200
-        body = json.dumps({"path": self.path}).encode()
+        body = json.dumps(answered).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -450,7 +457,41 @@ echo "$err" | grep -q "pass  is found" && pass "the request's test script runs" 
 expect_status 0 "an error status is still an answer" -- api send Broken --env local
 expect_status 1 "--fail makes an error status a failure" -- api send Broken --env local --fail
 expect_status 4 "an unknown request is not found" -- api send "Nowhere" --env local
-expect_status 5 "a request that could change data is refused" -- api send "Cancel order" --env local
+out=$(zc api send "Cancel order" --env local 2>/dev/null) || true
+echo "$out" | grep -q '"method": "DELETE"' && pass "a DELETE is sent" || fail "a DELETE is sent" "$out"
+out=$(zc api send "Get order" --env local --var id=5 -X POST -d '{"qty": 2}' --query force=1 2>/dev/null) || true
+echo "$out" | grep -q '"method": "POST", "path": "/orders/5?force=1", "body": "{\\"qty\\": 2}"' \
+    && pass "one-off changes go out with a send" || fail "one-off changes go out with a send" "$out"
+out=$(zc api show "Get order") || true
+echo "$out" | grep -q "^GET {{host}}/orders/{{id}}" && pass "a one-off change is not saved" || fail "a one-off change is not saved" "$out"
+
+expect_status 0 "a collection is created" -- api collection create Billing
+expect_status 0 "a folder is created" -- api folder create Billing/Invoices
+expect_status 0 "a request is created" -- api create "Billing/Invoices/Create invoice" \
+    -X POST --url '{{host}}/invoices' -H 'Authorization: Bearer {{token}}' -H 'X-Api-Key: literal-e2e-key' -d '{"amount": 100}'
+grep -q '"Create invoice"' "$ROOT/data/config/api_collections.json" \
+    && pass "the new request is saved to disk" || fail "the new request is saved to disk"
+out=$(zc api show "Billing/Invoices/Create invoice") || true
+echo "$out" | grep -q "Authorization: Bearer {{token}}" && pass "a variable reference is shown as written" \
+    || fail "a variable reference is shown as written" "$out"
+echo "$out" | grep -q "literal-e2e-key" && fail "a literal credential is masked when shown" "$out" \
+    || pass "a literal credential is masked when shown"
+out=$(zc api snippet "Create invoice" --env local 2>/dev/null) || true
+echo "$out" | grep -q "^curl" && pass "a request is printed as curl" || fail "a request is printed as curl" "$out"
+echo "$out" | grep -q "e2e-secret-token" && fail "a secret is masked in a snippet" "$out" \
+    || pass "a secret is masked in a snippet"
+out=$(zc api snippet "Create invoice" --env local --lang python --color always 2>/dev/null) || true
+printf '%s' "$out" | grep -q $'\e\[38;2;' && pass "a snippet comes in the editor's colours" \
+    || fail "a snippet comes in the editor's colours" "$out"
+expect_status 2 "an unknown snippet language is a bad argument" -- api snippet "Create invoice" --lang cobol
+expect_status 0 "a request is renamed and moved" -- api update "Create invoice" --rename "New invoice" --move-to Billing
+out=$(zc api list) || true
+echo "$out" | grep -q "Billing/New invoice" && pass "the moved request is listed at its new path" \
+    || fail "the moved request is listed at its new path" "$out"
+expect_status 1 "a collection that holds something needs --recursive" -- api collection delete Billing
+expect_status 0 "and is deleted with it" -- api collection delete Billing --recursive
+out=$(zc api collections) || true
+echo "$out" | grep -q Billing && fail "the deleted collection is gone" "$out" || pass "the deleted collection is gone"
 zc api send "Get order" --env local --var id=9 -o "$ROOT/body.json" >/dev/null 2>&1 || true
 grep -q '/orders/9' "$ROOT/body.json" 2>/dev/null && pass "-o writes the body to a file" || fail "-o writes the body to a file"
 
