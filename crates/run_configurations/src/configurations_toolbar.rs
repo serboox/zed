@@ -386,11 +386,6 @@ impl ConfigurationsToolbar {
         }
     }
 
-    /// The task the switcher would run, if it is a task at all.
-    fn task_it_points_at(&self, cx: &App) -> Option<TaskTemplate> {
-        self.task_at(self.pointing.as_ref()?, cx)
-    }
-
     /// The debug scenario this pointing would start, if it already is one. A
     /// temporary one is always a plain task, never a debug scenario.
     fn scenario_at(&self, pointing: &Pointing, cx: &App) -> Option<task::DebugScenario> {
@@ -492,19 +487,25 @@ impl ConfigurationsToolbar {
     }
 
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let scenario = match self.pointing.as_ref() {
-            Some(Pointing::Kept { kind, at }) => store
-                .get(*kind, *at)
-                .and_then(|configuration| configuration.scenario.clone()),
-            _ => None,
-        };
-        if let Some(scenario) = scenario {
+        if let Some(pointing) = self.pointing.clone() {
+            self.run_of(&pointing, window, cx);
+        }
+    }
+
+    /// Starts `pointing`, whichever configuration the plaque shows: the list
+    /// starts one after another from its own rows without moving the plaque.
+    pub(crate) fn run_of(
+        &mut self,
+        pointing: &Pointing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(scenario) = self.scenario_at(pointing, cx) {
             // A debug configuration has only one way of being started.
             self.start_debugging(scenario, window, cx);
             return;
         }
-        let Some(task) = self.task_it_points_at(cx) else {
+        let Some(task) = self.task_at(pointing, cx) else {
             return;
         };
         let workspace = self.workspace.clone();
@@ -569,7 +570,11 @@ impl ConfigurationsToolbar {
     /// configuration the answer is `None`, so the pair keeps offering Run and
     /// Debug rather than offering to stop a run it cannot name.
     fn the_run_it_points_at(&self, cx: &App) -> Option<(Entity<Terminal>, TaskId)> {
-        let template = self.task_it_points_at(cx)?;
+        self.the_run_of(self.pointing.as_ref()?, cx)
+    }
+
+    fn the_run_of(&self, pointing: &Pointing, cx: &App) -> Option<(Entity<Terminal>, TaskId)> {
+        let template = self.task_at(pointing, cx)?;
         let workspace = self.workspace.upgrade()?;
         let terminal = crate::run_instances::runs_of(workspace.read(cx), &template, cx)
             .into_iter()
@@ -583,11 +588,11 @@ impl ConfigurationsToolbar {
     /// A run started through the debugger lives in the debugger, not in a
     /// terminal, so looking only there answers "nothing is running" about a
     /// program the reader can plainly see running.
-    fn the_session_it_points_at(
+    fn the_session_of(
         &self,
+        pointing: &Pointing,
         cx: &App,
     ) -> Option<Entity<project::debugger::session::Session>> {
-        let pointing = self.pointing.as_ref()?;
         let scenario = self.scenario_at(pointing, cx)?;
         let project = self.workspace.upgrade()?.read(cx).project().clone();
         project
@@ -605,18 +610,64 @@ impl ConfigurationsToolbar {
 
     /// Whether what this points at is running, by either way of starting it.
     fn it_is_running(&self, cx: &App) -> bool {
-        self.the_run_it_points_at(cx).is_some() || self.the_session_it_points_at(cx).is_some()
+        self.pointing
+            .as_ref()
+            .is_some_and(|pointing| self.is_running_of(pointing, cx))
+    }
+
+    pub(crate) fn is_running_of(&self, pointing: &Pointing, cx: &App) -> bool {
+        self.the_run_of(pointing, cx).is_some() || self.the_session_of(pointing, cx).is_some()
+    }
+
+    /// Every listed configuration that has a run going on.
+    pub(crate) fn running(&self, cx: &App) -> Vec<Pointing> {
+        self.listed(cx)
+            .into_iter()
+            .map(|(_, pointing)| pointing)
+            .filter(|pointing| self.is_running_of(pointing, cx))
+            .collect()
+    }
+
+    /// The running configurations Restart can start again: runs in a
+    /// terminal. A debug session is stopped from here, and restarted from the
+    /// debugger.
+    pub(crate) fn restartable(&self, cx: &App) -> Vec<Pointing> {
+        self.running(cx)
+            .into_iter()
+            .filter(|pointing| self.the_run_of(pointing, cx).is_some())
+            .collect()
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(stopping) = self.stop_every_run(cx) {
+        if let Some(pointing) = self.pointing.clone() {
+            self.stop_of(&pointing, cx);
+        }
+    }
+
+    pub(crate) fn stop_of(&mut self, pointing: &Pointing, cx: &mut Context<Self>) {
+        if let Some(stopping) = self.stop_every_run_of(pointing, cx) {
             stopping.detach();
             return;
         }
-        if let Some(session) = self.the_session_it_points_at(cx) {
+        if let Some(session) = self.the_session_of(pointing, cx) {
             session
                 .update(cx, |session, cx| session.shutdown(cx))
                 .detach();
+        }
+    }
+
+    /// Stops every run of every configuration at once.
+    pub(crate) fn stop_all(&mut self, cx: &mut Context<Self>) {
+        for pointing in self.running(cx) {
+            self.stop_of(&pointing, cx);
+        }
+    }
+
+    /// Restarts every configuration that runs in a terminal, each the way its
+    /// own Restart does.
+    pub(crate) fn restart_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for pointing in self.restartable(cx) {
+            self.restart_of(&pointing, window, cx);
         }
     }
 
@@ -629,10 +680,21 @@ impl ConfigurationsToolbar {
     /// second process from starting while the first still holds a port, which
     /// fails to bind rather than replacing it.
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, task_id)) = self.the_run_it_points_at(cx) else {
+        if let Some(pointing) = self.pointing.clone() {
+            self.restart_of(&pointing, window, cx);
+        }
+    }
+
+    pub(crate) fn restart_of(
+        &mut self,
+        pointing: &Pointing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, task_id)) = self.the_run_of(pointing, cx) else {
             return;
         };
-        let Some(gone) = self.stop_every_run(cx) else {
+        let Some(gone) = self.stop_every_run_of(pointing, cx) else {
             return;
         };
         cx.spawn_in(window, async move |_, cx| {
@@ -653,10 +715,10 @@ impl ConfigurationsToolbar {
         .detach();
     }
 
-    /// Stops every run of what the plaque points at, with everything each
-    /// run started, and resolves once none of it is left.
-    fn stop_every_run(&self, cx: &mut Context<Self>) -> Option<Task<bool>> {
-        let template = self.task_it_points_at(cx)?;
+    /// Stops every run of `pointing`, with everything each run started, and
+    /// resolves once none of it is left.
+    fn stop_every_run_of(&self, pointing: &Pointing, cx: &mut Context<Self>) -> Option<Task<bool>> {
+        let template = self.task_at(pointing, cx)?;
         let workspace = self.workspace.upgrade()?;
         Some(workspace.update(cx, |workspace, cx| {
             crate::run_instances::stop_every_run_of(workspace, &template, cx)
@@ -751,6 +813,7 @@ impl Render for ConfigurationsToolbar {
             true => self.stop_and_restart(cx),
             false => self.run_and_debug(cannot_be_debugged, cx),
         });
+        let running = self.running(cx).len();
 
         h_flex()
             .id("run-configurations-toolbar")
@@ -778,6 +841,16 @@ impl Render for ConfigurationsToolbar {
             )
             .when_some(pair, |plaque, pair| {
                 plaque.child(ui::cyberpunk::segmented(pair))
+            })
+            .when(running > 1, |plaque| {
+                plaque.child(
+                    div()
+                        .debug_selector(|| "run-configurations-running-count".to_string())
+                        .px_1()
+                        .text_size(px(11.))
+                        .text_color(cyberpunk::text_secondary())
+                        .child(format!("{running} running")),
+                )
             })
     }
 }
@@ -1176,6 +1249,13 @@ impl ConfigurationsToolbar {
 
 /// One row of the list: what it is called, what pointing at it means, and which
 /// of the three kinds it is -- which is the whole of its look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowAction {
+    Run,
+    Restart,
+    Stop,
+}
+
 struct Row {
     name: SharedString,
     pointing: Pointing,
@@ -1375,6 +1455,16 @@ impl ConfigurationsList {
         let chosen = at == self.highlighted;
         let keeping = temporary.then(|| row.name.clone());
         let can_be_debugged = row.can_be_debugged;
+        let (running, restartable) = self
+            .toolbar
+            .read_with(cx, |toolbar, cx| {
+                (
+                    toolbar.is_running_of(&row.pointing, cx),
+                    toolbar.the_run_of(&row.pointing, cx).is_some(),
+                )
+            })
+            .unwrap_or((false, false));
+        let controls = self.render_row_controls(at, running, restartable, cx);
         h_flex()
             .id(("configuration-row", at))
             .debug_selector(move || format!("CONFIGURATION-{at}"))
@@ -1446,8 +1536,132 @@ impl ConfigurationsList {
                     ))
                 })
             })
+            .child(controls)
             .on_click(cx.listener(move |list, _, _, cx| list.point_at(at, cx)))
             .into_any_element()
+    }
+
+    /// A row's own Run, or its Restart and Stop while it runs: several
+    /// configurations are started and stopped from the list one after another
+    /// without closing it or moving the plaque.
+    fn render_row_controls(
+        &self,
+        at: usize,
+        running: bool,
+        restartable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = |name: &'static str,
+                      icon: IconName,
+                      colour: Color,
+                      tooltip: &'static str,
+                      action: RowAction,
+                      cx: &mut Context<Self>| {
+            div()
+                .debug_selector(move || format!("{name}-{at}"))
+                .child(
+                    IconButton::new((name, at), icon)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(colour)
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(cx.listener(move |list, _, window, cx| {
+                            list.act_on_row(at, action, window, cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        let buttons = match running {
+            true => {
+                let mut buttons = Vec::new();
+                if restartable {
+                    buttons.push(button(
+                        "ROW-RESTART",
+                        IconName::Rerun,
+                        Color::Accent,
+                        "Stop this one and start it again",
+                        RowAction::Restart,
+                        cx,
+                    ));
+                }
+                buttons.push(button(
+                    "ROW-STOP",
+                    IconName::Stop,
+                    Color::Error,
+                    "Stop this one",
+                    RowAction::Stop,
+                    cx,
+                ));
+                buttons
+            }
+            false => vec![button(
+                "ROW-RUN",
+                IconName::PlayFilled,
+                Color::Success,
+                "Start this one as well",
+                RowAction::Run,
+                cx,
+            )],
+        };
+        cyberpunk::segmented(buttons).into_any_element()
+    }
+
+    /// One row below the list that acts on every configuration running at once.
+    fn render_every_run_action(
+        &self,
+        selector: &'static str,
+        icon: IconName,
+        label: String,
+        action: RowAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(selector)
+            .debug_selector(move || selector.to_string())
+            .h(px(Self::ROW_HEIGHT))
+            .w_full()
+            .px_2()
+            .gap_2()
+            .items_center()
+            .hover(|row| row.bg(cyberpunk::row_hovered()))
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.))
+                    .text_color(cyberpunk::text_secondary())
+                    .child(label),
+            )
+            .on_click(cx.listener(move |list, _, window, cx| {
+                list.toolbar
+                    .update(cx, |toolbar, cx| match action {
+                        RowAction::Stop => toolbar.stop_all(cx),
+                        _ => toolbar.restart_all(window, cx),
+                    })
+                    .log_err();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn act_on_row(
+        &mut self,
+        at: usize,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.rows.get(at) else {
+            return;
+        };
+        let pointing = row.pointing.clone();
+        self.toolbar
+            .update(cx, |toolbar, cx| match action {
+                RowAction::Run => toolbar.run_of(&pointing, window, cx),
+                RowAction::Restart => toolbar.restart_of(&pointing, window, cx),
+                RowAction::Stop => toolbar.stop_of(&pointing, cx),
+            })
+            .log_err();
+        cx.notify();
     }
 
     fn render_action(
@@ -1513,6 +1727,12 @@ impl Render for ConfigurationsList {
             rows.push(self.render_row(at, window, cx));
         }
         let nothing_yet = self.rows.is_empty();
+        let (running, restartable) = self
+            .toolbar
+            .read_with(cx, |toolbar, cx| {
+                (toolbar.running(cx).len(), toolbar.restartable(cx).len())
+            })
+            .unwrap_or((0, 0));
 
         v_flex()
             .key_context("RunConfigurationsList")
@@ -1567,6 +1787,24 @@ impl Render for ConfigurationsList {
                     .flex_none()
                     .bg(cyberpunk::border_dim()),
             )
+            .when(restartable > 0, |list| {
+                list.child(self.render_every_run_action(
+                    "RESTART-ALL",
+                    IconName::Rerun,
+                    format!("Restart all {restartable} running"),
+                    RowAction::Restart,
+                    cx,
+                ))
+            })
+            .when(running > 0, |list| {
+                list.child(self.render_every_run_action(
+                    "STOP-ALL",
+                    IconName::Stop,
+                    format!("Stop all {running} running"),
+                    RowAction::Stop,
+                    cx,
+                ))
+            })
             .child(self.render_action(
                 "NEW-CONFIGURATION",
                 IconName::Plus,
@@ -1925,7 +2163,9 @@ mod tests {
         cx: &VisualTestContext,
     ) -> TaskTemplate {
         toolbar
-            .read_with(cx, |toolbar, cx| toolbar.task_it_points_at(cx))
+            .read_with(cx, |toolbar, cx| {
+                toolbar.task_at(toolbar.pointing.as_ref()?, cx)
+            })
             .expect("the plaque points at a task")
     }
 
@@ -3152,6 +3392,176 @@ mod tests {
         assert!(
             wait_until_it_is_over(&their_run, &mut cx).await,
             "the other run this test started has to be left dead too"
+        );
+    }
+
+    fn open_the_list(bar: gpui::WindowHandle<BarWithThePlaque>, cx: &mut VisualTestContext) {
+        let plaque = cx
+            .debug_bounds("run-configurations-plaque")
+            .expect("the plaque is painted");
+        cx.simulate_click(plaque.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw_the_bar(bar, cx);
+        assert!(
+            cx.debug_bounds("run-configurations-list").is_some(),
+            "clicking the plaque opens the list"
+        );
+    }
+
+    fn press(
+        selector: &'static str,
+        bar: gpui::WindowHandle<BarWithThePlaque>,
+        cx: &mut VisualTestContext,
+    ) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is painted"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw_the_bar(bar, cx);
+    }
+
+    /// Two configurations run side by side: each row of the list offers its own
+    /// Stop and Restart, the one that is not running offers Run, and the plaque
+    /// says how many are going on.
+    #[gpui::test]
+    async fn the_list_offers_each_row_its_own_controls_while_several_run(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let first = the_kept_configuration(&over.toolbar, 0, &cx);
+        let second = the_kept_configuration(&over.toolbar, 1, &cx);
+        let first_run = a_run_of(&first, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+        assert!(
+            cx.debug_bounds("run-configurations-running-count")
+                .is_none(),
+            "one run is what the plaque's own Stop already says"
+        );
+        let second_run = a_run_of(&second, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+        assert!(
+            cx.debug_bounds("run-configurations-running-count")
+                .is_some(),
+            "with two going on the plaque says how many"
+        );
+
+        open_the_list(over.bar, &mut cx);
+        for (row, controls, run) in [
+            (
+                "CONFIGURATION-0",
+                ["ROW-STOP-0", "ROW-RESTART-0"],
+                "ROW-RUN-0",
+            ),
+            (
+                "CONFIGURATION-1",
+                ["ROW-STOP-1", "ROW-RESTART-1"],
+                "ROW-RUN-1",
+            ),
+        ] {
+            let row = cx.debug_bounds(row).expect("the row is listed");
+            for control in controls {
+                let bounds = cx
+                    .debug_bounds(control)
+                    .unwrap_or_else(|| panic!("a running row offers {control}"));
+                assert!(
+                    bounds.origin.x >= row.origin.x && bounds.right() <= row.right() + px(1.),
+                    "{control} is inside its row: {bounds:?} against {row:?}"
+                );
+            }
+            assert!(
+                cx.debug_bounds(run).is_none(),
+                "a running row does not offer Run"
+            );
+        }
+        assert!(
+            cx.debug_bounds("ROW-RUN-2").is_some(),
+            "the row that is not running offers Run"
+        );
+        assert!(cx.debug_bounds("ROW-STOP-2").is_none(), "and no Stop");
+        assert!(cx.debug_bounds("STOP-ALL").is_some());
+        assert!(cx.debug_bounds("RESTART-ALL").is_some());
+
+        press("ROW-STOP-1", over.bar, &mut cx);
+        assert!(
+            wait_until_it_is_over(&second_run, &mut cx).await,
+            "the row's own Stop ends that row's run"
+        );
+        assert!(
+            still_running(&first_run, &cx),
+            "and leaves the run of the plaque's configuration alone"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-list").is_some(),
+            "the list stays open, so the next one can be stopped from it too"
+        );
+
+        over.toolbar.update(&mut cx, |toolbar, cx| toolbar.stop(cx));
+        assert!(
+            wait_until_it_is_over(&first_run, &mut cx).await,
+            "the run this test started has to be left dead"
+        );
+    }
+
+    /// Stop all ends every run at once, whichever configuration it belongs to.
+    #[gpui::test]
+    async fn stop_all_ends_every_run_at_once(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let first = the_kept_configuration(&over.toolbar, 0, &cx);
+        let third = the_kept_configuration(&over.toolbar, 2, &cx);
+        let first_run = a_run_of(&first, &over, &mut cx).await;
+        let third_run = a_run_of(&third, &over, &mut cx).await;
+        open_the_list(over.bar, &mut cx);
+
+        press("STOP-ALL", over.bar, &mut cx);
+        assert!(
+            wait_until_it_is_over(&first_run, &mut cx).await,
+            "Stop all ends the plaque's run"
+        );
+        assert!(
+            wait_until_it_is_over(&third_run, &mut cx).await,
+            "and the run of a configuration the plaque does not point at"
+        );
+        draw_the_bar(over.bar, &mut cx);
+        assert!(
+            cx.debug_bounds("STOP-ALL").is_none(),
+            "with nothing running there is nothing to stop all of"
+        );
+    }
+
+    /// A row's own Run starts that row, not the one the plaque points at, and
+    /// neither closes the list nor moves the plaque.
+    #[gpui::test]
+    async fn a_rows_run_starts_that_row_and_keeps_the_plaque(cx: &mut TestAppContext) {
+        let (toolbar, bar, mut cx) = a_bar_with_the_plaque(
+            r#"[
+              { "label": "api server", "command": "echo api" },
+              { "label": "broken", "command": "$ZED_CUSTOM_UNKNOWN_VARIABLE" }
+            ]"#,
+            cx,
+        )
+        .await;
+        let workspace = toolbar
+            .read_with(&cx, |toolbar, _| toolbar.workspace.clone())
+            .upgrade()
+            .expect("the workspace is still open");
+        let pointed_before = toolbar.read_with(&cx, |toolbar, cx| toolbar.what_it_points_at(cx));
+        open_the_list(bar, &mut cx);
+
+        press("ROW-RUN-1", bar, &mut cx);
+        assert!(
+            !workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .is_empty(),
+            "the second row was the one started: only its command cannot be \
+             resolved, and saying so is how the press shows it landed there"
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, cx| toolbar.what_it_points_at(cx)),
+            pointed_before,
+            "a row's Run leaves the plaque where it was"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-list").is_some(),
+            "and the list open"
         );
     }
 

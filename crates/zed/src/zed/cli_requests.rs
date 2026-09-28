@@ -527,9 +527,76 @@ pub async fn list_configurations(
     responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
+#[derive(Clone)]
 enum Found {
     Task(Entity<Workspace>, AnyWindowHandle, task::TaskTemplate),
     Debug(Entity<Workspace>, AnyWindowHandle, task::DebugScenario),
+}
+
+async fn act_on(
+    found: Found,
+    action: RunAction,
+    configuration: &str,
+    cx: &mut AsyncApp,
+) -> Result<(), (String, i32)> {
+    match found {
+        Found::Task(workspace, window, task) => {
+            if matches!(action, RunAction::Stop | RunAction::Restart) {
+                let stopping = workspace.update(cx, |workspace, cx| {
+                    run_instances::stop_every_run_of(workspace, &task, cx)
+                });
+                if !stopping.await {
+                    return Err((
+                        format!(
+                            "Some processes of '{configuration}' are still running after SIGKILL."
+                        ),
+                        exit_status::FAILED,
+                    ));
+                }
+            }
+            if matches!(action, RunAction::Run | RunAction::Restart) {
+                let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx))
+                else {
+                    return Err((
+                        "The window closed before the run could start.".to_string(),
+                        exit_status::FAILED,
+                    ));
+                };
+                let weak = workspace.downgrade();
+                if !configurations_view::run_a_task(&weak, task, &mut window_cx).await {
+                    return Err((
+                        format!("'{configuration}' could not be started; the editor says why."),
+                        exit_status::FAILED,
+                    ));
+                }
+            }
+        }
+        Found::Debug(workspace, window, scenario) => {
+            if action != RunAction::Run {
+                return Err((
+                    format!(
+                        "'{configuration}' is a debug configuration: stop or restart it from the \
+                         debugger."
+                    ),
+                    exit_status::BAD_ARGUMENTS,
+                ));
+            }
+            let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx)) else {
+                return Err((
+                    "The window closed before the session could start.".to_string(),
+                    exit_status::FAILED,
+                ));
+            };
+            let weak = workspace.downgrade();
+            if !configurations_view::start_a_debug_session(&weak, scenario, &mut window_cx).await {
+                return Err((
+                    format!("'{configuration}' could not be started; the editor says why."),
+                    exit_status::FAILED,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn control_run(
@@ -555,6 +622,7 @@ pub async fn control_run(
         Err(message) => return say_and_exit(responses, message, exit_status::FAILED),
     };
     let found = cx.update(|cx| {
+        let mut found = Vec::new();
         for (_, workspace, store) in stores {
             let window = editor_windows(cx).into_iter().find(|window| {
                 workspaces_of(window, cx)
@@ -566,91 +634,63 @@ pub async fn control_run(
             };
             let store = store.read(cx);
             for kind in [Kind::Task, Kind::Debug] {
-                let Some(found) = store
+                for candidate in store
                     .of_kind(kind)
                     .configurations
                     .iter()
-                    .find(|candidate| candidate.label == configuration)
-                else {
-                    continue;
-                };
-                if let Some(task) = &found.task {
-                    return Ok(Found::Task(workspace, window.into(), task.clone()));
-                }
-                if let Some(scenario) = &found.scenario {
-                    return Ok(Found::Debug(workspace, window.into(), scenario.clone()));
+                    .filter(|candidate| candidate.label == configuration)
+                {
+                    if let Some(task) = &candidate.task {
+                        found.push(Found::Task(workspace.clone(), window.into(), task.clone()));
+                    } else if let Some(scenario) = &candidate.scenario {
+                        found.push(Found::Debug(
+                            workspace.clone(),
+                            window.into(),
+                            scenario.clone(),
+                        ));
+                    }
                 }
             }
         }
-        Err(format!(
-            "No run configuration named '{configuration}'. See `zedcli configs`."
-        ))
+        found
     });
-    let found = match found {
-        Ok(found) => found,
-        Err(message) => return say_and_exit(responses, message, exit_status::NOT_FOUND),
+    if found.is_empty() {
+        return say_and_exit(
+            responses,
+            format!("No run configuration named '{configuration}'. See `zedcli configs`."),
+            exit_status::NOT_FOUND,
+        );
+    }
+    // Stopping every configuration of that name is what a reader asking to
+    // stop it means; starting one of several is a guess.
+    if found.len() > 1 && action == RunAction::Run {
+        return say_and_exit(
+            responses,
+            format!(
+                "{} run configurations are named '{configuration}'; rename one to start it \
+                 from zedcli.",
+                found.len()
+            ),
+            exit_status::NOT_FOUND,
+        );
+    }
+    // Every run is stopped before any is started again: configurations that
+    // share a name can share their runs' label, and stopping the second would
+    // end the first one's new run.
+    let steps = match action {
+        RunAction::Restart => vec![RunAction::Stop, RunAction::Run],
+        action => vec![action],
     };
-
-    match found {
-        Found::Task(workspace, window, task) => {
-            if matches!(action, RunAction::Stop | RunAction::Restart) {
-                let stopping = workspace.update(cx, |workspace, cx| {
-                    run_instances::stop_every_run_of(workspace, &task, cx)
-                });
-                if !stopping.await {
-                    return say_and_exit(
-                        responses,
-                        format!(
-                            "Some processes of '{configuration}' are still running after SIGKILL."
-                        ),
-                        exit_status::FAILED,
-                    );
-                }
-            }
-            if matches!(action, RunAction::Run | RunAction::Restart) {
-                let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx))
-                else {
-                    return say_and_exit(
-                        responses,
-                        "The window closed before the run could start.".to_string(),
-                        exit_status::FAILED,
-                    );
-                };
-                let weak = workspace.downgrade();
-                if !configurations_view::run_a_task(&weak, task, &mut window_cx).await {
-                    return say_and_exit(
-                        responses,
-                        format!("'{configuration}' could not be started; the editor says why."),
-                        exit_status::FAILED,
-                    );
-                }
-            }
-        }
-        Found::Debug(workspace, window, scenario) => {
-            if action != RunAction::Run {
-                return say_and_exit(
-                    responses,
-                    format!(
-                        "'{configuration}' is a debug configuration: stop or restart it from the \
-                         debugger."
-                    ),
-                    exit_status::BAD_ARGUMENTS,
-                );
-            }
-            let Ok(mut window_cx) = window.update(cx, |_, window, cx| window.to_async(cx)) else {
-                return say_and_exit(
-                    responses,
-                    "The window closed before the session could start.".to_string(),
-                    exit_status::FAILED,
-                );
+    for step in steps {
+        for found in &found {
+            let step = match (action, step, found) {
+                // A debug configuration is refused as a whole, not stopped
+                // half-way through a restart.
+                (RunAction::Restart, _, Found::Debug(..)) => RunAction::Restart,
+                _ => step,
             };
-            let weak = workspace.downgrade();
-            if !configurations_view::start_a_debug_session(&weak, scenario, &mut window_cx).await {
-                return say_and_exit(
-                    responses,
-                    format!("'{configuration}' could not be started; the editor says why."),
-                    exit_status::FAILED,
-                );
+            if let Err((message, status)) = act_on(found.clone(), step, &configuration, cx).await {
+                return say_and_exit(responses, message, status);
             }
         }
     }
@@ -1362,6 +1402,57 @@ mod tests {
             Some(exit_status::FAILED),
             "a run that could not be resolved is not reported as started: {responses:?}"
         );
+    }
+
+    /// Two configurations of one name: starting one of them would be a guess,
+    /// so it is refused; stopping them stops both.
+    #[gpui::test]
+    async fn a_name_two_configurations_share_is_not_guessed_between(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/delta"),
+                json!({ ".zed": { "tasks.json": r#"[
+                    { "label": "twin", "command": "sleep", "args": ["60"] },
+                    { "label": "twin", "command": "sleep", "args": ["61"] }
+                ]"# } }),
+            )
+            .await;
+        open(cx, &app_state, path!("/delta"));
+        let (delta, _) = window_with(cx, path!("/delta"));
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(delta),
+                configuration: "twin".into(),
+                action: RunAction::Run,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::NOT_FOUND),
+            "{responses:?}"
+        );
+        assert!(
+            responses.iter().any(|response| matches!(
+                response,
+                CliResponse::Stderr { message } if message.contains("2 run configurations are named 'twin'")
+            )),
+            "{responses:?}"
+        );
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(delta),
+                configuration: "twin".into(),
+                action: RunAction::Stop,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
     }
 
     #[gpui::test]

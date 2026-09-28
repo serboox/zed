@@ -47,12 +47,27 @@ enum Command {
     Ps,
     /// List the run configurations of the selected window's projects.
     Configs,
-    /// Start a run configuration, stopping a run of it that is still going.
-    Run { configuration: String },
-    /// Stop every run of a configuration, with everything it started.
-    Stop { configuration: String },
-    /// Stop a configuration's runs, then start it again.
-    Restart { configuration: String },
+    /// Start run configurations, each stopping a run of itself still going.
+    Run {
+        #[arg(required = true)]
+        configurations: Vec<String>,
+    },
+    /// Stop every run of these configurations, with everything they started.
+    Stop {
+        #[arg(required_unless_present = "running")]
+        configurations: Vec<String>,
+        /// Every configuration that is running in the window.
+        #[arg(long, conflicts_with = "configurations")]
+        running: bool,
+    },
+    /// Stop these configurations' runs, then start them again.
+    Restart {
+        #[arg(required_unless_present = "running")]
+        configurations: Vec<String>,
+        /// Every configuration that is running in the window.
+        #[arg(long, conflicts_with = "configurations")]
+        running: bool,
+    },
     /// Database Explorer: saved connections and SQL.
     Db {
         #[command(subcommand)]
@@ -178,25 +193,38 @@ fn run(cli: ZedCli) -> Result<i32> {
         false => RowFormat::Table,
     };
     let mut send_options = SendOptions::default();
+    let connection = cli.connection();
     let request = match cli.command {
         Command::Windows => CliRequest::ListWindows,
         Command::Ps => CliRequest::ListRuns { selector },
         Command::Configs => CliRequest::ListConfigurations { selector },
-        Command::Run { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Run,
-        },
-        Command::Stop { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Stop,
-        },
-        Command::Restart { configuration } => CliRequest::ControlRun {
-            selector,
-            configuration,
-            action: RunAction::Restart,
-        },
+        Command::Run { configurations } => {
+            return control(RunAction::Run, configurations, false, selector, &connection);
+        }
+        Command::Stop {
+            configurations,
+            running,
+        } => {
+            return control(
+                RunAction::Stop,
+                configurations,
+                running,
+                selector,
+                &connection,
+            );
+        }
+        Command::Restart {
+            configurations,
+            running,
+        } => {
+            return control(
+                RunAction::Restart,
+                configurations,
+                running,
+                selector,
+                &connection,
+            );
+        }
         Command::Db { command } => match command {
             DbCommand::Connections => CliRequest::ListConnections,
             DbCommand::Query {
@@ -278,14 +306,26 @@ fn run(cli: ZedCli) -> Result<i32> {
     )
 }
 
-/// Sends one request to the running editor and prints what it answers.
-fn exchange(
-    request: CliRequest,
+/// Where the editor is and how long to wait for it.
+struct Connection {
     user_data_dir: Option<PathBuf>,
     timeout: Duration,
-    format: RowFormat,
-    send_options: &SendOptions,
-) -> Result<i32> {
+}
+
+impl ZedCli {
+    fn connection(&self) -> Connection {
+        Connection {
+            user_data_dir: self.user_data_dir.clone(),
+            timeout: Duration::from_secs(self.timeout),
+        }
+    }
+}
+
+/// Sends one request to the running editor and hands back its answers as they
+/// come.
+fn connect(request: CliRequest, connection: &Connection) -> Result<mpsc::Receiver<CliResponse>> {
+    let user_data_dir = connection.user_data_dir.clone();
+    let timeout = connection.timeout;
     let data_dir = user_data_dir.unwrap_or_else(|| paths::data_dir().clone());
     let request = CliRequest::Authenticated {
         token: editor_token(&data_dir)?,
@@ -322,6 +362,99 @@ fn exchange(
             }
         }
     });
+    Ok(response_rx)
+}
+
+/// Runs, stops or restarts each configuration in turn, and exits with the
+/// first failure's status, after trying every one of them.
+fn control(
+    action: RunAction,
+    mut configurations: Vec<String>,
+    running: bool,
+    selector: WindowSelector,
+    connection: &Connection,
+) -> Result<i32> {
+    if running {
+        configurations = match running_configurations(&selector, connection)? {
+            Ok(configurations) => configurations,
+            Err(status) => return Ok(status),
+        };
+        if configurations.is_empty() {
+            println!("Nothing is running.");
+            return Ok(0);
+        }
+    }
+    let mut status = 0;
+    for configuration in configurations {
+        let answered = exchange(
+            CliRequest::ControlRun {
+                selector: selector.clone(),
+                configuration,
+                action,
+            },
+            connection.user_data_dir.clone(),
+            connection.timeout,
+            RowFormat::Table,
+            &SendOptions::default(),
+        )?;
+        if status == 0 {
+            status = answered;
+        }
+    }
+    Ok(status)
+}
+
+/// The names of the selected window's configurations that have a run going
+/// on, each once: the editor acts on every configuration of a name. An editor
+/// that answers with a failure gives its exit status instead.
+fn running_configurations(
+    selector: &WindowSelector,
+    connection: &Connection,
+) -> Result<Result<Vec<String>, i32>> {
+    let responses = connect(
+        CliRequest::ListConfigurations {
+            selector: selector.clone(),
+        },
+        connection,
+    )?;
+    let mut running = Vec::new();
+    loop {
+        match responses.recv_timeout(connection.timeout) {
+            Ok(CliResponse::Configurations { items }) => {
+                for item in items.into_iter().filter(|item| item.running) {
+                    if !running.contains(&item.label) {
+                        running.push(item.label);
+                    }
+                }
+            }
+            Ok(CliResponse::Stderr { message }) => eprintln!("{message}"),
+            Ok(CliResponse::Exit { status: 0 }) => return Ok(Ok(running)),
+            Ok(CliResponse::Exit { status }) => return Ok(Err(status)),
+            Ok(_) => {}
+            Err(_) => {
+                return Err(anyhow!(
+                    "the editor closed the connection without an answer"
+                ));
+            }
+        }
+    }
+}
+
+/// Sends one request to the running editor and prints what it answers.
+fn exchange(
+    request: CliRequest,
+    user_data_dir: Option<PathBuf>,
+    timeout: Duration,
+    format: RowFormat,
+    send_options: &SendOptions,
+) -> Result<i32> {
+    let response_rx = connect(
+        request,
+        &Connection {
+            user_data_dir,
+            timeout,
+        },
+    )?;
     loop {
         let response = match response_rx.recv_timeout(timeout) {
             Ok(response) => response,

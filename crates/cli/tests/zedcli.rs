@@ -19,16 +19,48 @@ use tempfile::TempDir;
 /// the request it was sent, so a test can check what the command asked for.
 struct FakeEditor {
     data_dir: TempDir,
-    served: JoinHandle<Option<CliRequest>>,
+    served: JoinHandle<Vec<CliRequest>>,
 }
 
 impl FakeEditor {
     fn answering(answer: impl FnOnce(&CliRequest) -> Vec<CliResponse> + Send + 'static) -> Self {
+        let mut answer = Some(answer);
+        Self::serving(1, move |request| {
+            answer
+                .take()
+                .map(|answer| answer(request))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Answers `count` requests in a row, the way one command that asks the
+    /// editor several things in turn needs.
+    fn serving(
+        count: usize,
+        mut answer: impl FnMut(&CliRequest) -> Vec<CliResponse> + Send + 'static,
+    ) -> Self {
         let data_dir = TempDir::new().expect("a data directory");
         std::fs::write(cli::token_path(data_dir.path()), EDITOR_TOKEN)
             .expect("the token is written");
         let socket = UnixDatagram::bind(socket_in(data_dir.path())).expect("the socket binds");
         let served = std::thread::spawn(move || {
+            let mut served = Vec::new();
+            for _ in 0..count {
+                match Self::serve_one(&socket, &mut answer) {
+                    Some(request) => served.push(request),
+                    None => break,
+                }
+            }
+            served
+        });
+        Self { data_dir, served }
+    }
+
+    fn serve_one(
+        socket: &UnixDatagram,
+        answer: &mut impl FnMut(&CliRequest) -> Vec<CliResponse>,
+    ) -> Option<CliRequest> {
+        {
             let mut buffer = [0u8; 1024];
             let length = socket.recv(&mut buffer).ok()?;
             let url = String::from_utf8_lossy(&buffer[..length]).to_string();
@@ -55,8 +87,7 @@ impl FakeEditor {
                 response_tx.send(response).ok()?;
             }
             Some(request)
-        });
-        Self { data_dir, served }
+        }
     }
 
     /// A socket that is there but never answers, the way a hung editor is.
@@ -69,10 +100,14 @@ impl FakeEditor {
     }
 
     fn request(self) -> CliRequest {
-        self.served
-            .join()
-            .expect("the fake editor does not panic")
+        self.requests()
+            .into_iter()
+            .next()
             .expect("the fake editor was sent a request")
+    }
+
+    fn requests(self) -> Vec<CliRequest> {
+        self.served.join().expect("the fake editor does not panic")
     }
 }
 
@@ -320,6 +355,112 @@ fn run_stop_and_restart_ask_for_their_own_action() {
         assert_eq!(configuration, "api server");
         assert_eq!(asked, action, "{command}");
     }
+}
+
+fn controlled(requests: Vec<CliRequest>) -> Vec<(String, RunAction)> {
+    requests
+        .into_iter()
+        .filter_map(|request| match request {
+            CliRequest::ControlRun {
+                configuration,
+                action,
+                ..
+            } => Some((configuration, action)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn several_configurations_are_controlled_one_after_another() {
+    let editor = FakeEditor::serving(3, |_| vec![CliResponse::Exit { status: 0 }]);
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["run", "api", "worker", "frontend"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        controlled(editor.requests()),
+        vec![
+            ("api".to_string(), RunAction::Run),
+            ("worker".to_string(), RunAction::Run),
+            ("frontend".to_string(), RunAction::Run),
+        ]
+    );
+}
+
+#[test]
+fn a_configuration_that_fails_does_not_stop_the_rest_and_sets_the_exit_status() {
+    let editor = FakeEditor::serving(2, |request| {
+        let status = match request {
+            CliRequest::ControlRun { configuration, .. } if configuration == "missing" => {
+                exit_status::NOT_FOUND
+            }
+            _ => 0,
+        };
+        vec![CliResponse::Exit { status }]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["stop", "missing", "api"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(exit_status::NOT_FOUND));
+    assert_eq!(
+        controlled(editor.requests()),
+        vec![
+            ("missing".to_string(), RunAction::Stop),
+            ("api".to_string(), RunAction::Stop),
+        ]
+    );
+}
+
+#[test]
+fn running_restarts_only_what_the_editor_says_is_running() {
+    let editor = FakeEditor::serving(3, |request| match request {
+        CliRequest::ListConfigurations { .. } => vec![
+            CliResponse::Configurations {
+                items: ["api", "idle", "worker"]
+                    .into_iter()
+                    .map(|label| cli::ConfigurationInfo {
+                        window: 1,
+                        label: label.to_string(),
+                        kind: "task".to_string(),
+                        command: format!("run {label}"),
+                        running: label != "idle",
+                    })
+                    .collect(),
+            },
+            CliResponse::Exit { status: 0 },
+        ],
+        _ => vec![CliResponse::Exit { status: 0 }],
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["restart", "--running"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        controlled(editor.requests()),
+        vec![
+            ("api".to_string(), RunAction::Restart),
+            ("worker".to_string(), RunAction::Restart),
+        ]
+    );
+}
+
+#[test]
+fn stop_needs_a_configuration_or_running() {
+    let data_dir = TempDir::new().expect("a data directory");
+    let output = zedcli(data_dir.path(), &["stop"], None, None);
+    assert_eq!(output.status.code(), Some(exit_status::BAD_ARGUMENTS));
+    let output = zedcli(data_dir.path(), &["stop", "api", "--running"], None, None);
+    assert_eq!(output.status.code(), Some(exit_status::BAD_ARGUMENTS));
 }
 
 #[test]
@@ -730,4 +871,56 @@ fn without_the_editor_token_nothing_is_sent() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn running_names_a_configuration_once_however_many_share_its_name() {
+    let editor = FakeEditor::serving(2, |request| match request {
+        CliRequest::ListConfigurations { .. } => vec![
+            CliResponse::Configurations {
+                items: ["server", "server"]
+                    .into_iter()
+                    .map(|label| cli::ConfigurationInfo {
+                        window: 1,
+                        label: label.to_string(),
+                        kind: "task".to_string(),
+                        command: "run".to_string(),
+                        running: true,
+                    })
+                    .collect(),
+            },
+            CliResponse::Exit { status: 0 },
+        ],
+        _ => vec![CliResponse::Exit { status: 0 }],
+    });
+    let output = zedcli(editor.data_dir.path(), &["stop", "--running"], None, None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        controlled(editor.requests()),
+        vec![("server".to_string(), RunAction::Stop)],
+        "the editor stops every configuration of the name at once"
+    );
+}
+
+#[test]
+fn a_window_that_is_not_there_is_not_found_for_running_too() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::Stderr {
+                message: "No editor window with id 9.".into(),
+            },
+            CliResponse::Exit {
+                status: exit_status::NOT_FOUND,
+            },
+        ]
+    });
+    let output = zedcli(
+        editor.data_dir.path(),
+        &["restart", "--running", "--window", "9"],
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(exit_status::NOT_FOUND));
+    assert!(stderr(&output).contains("No editor window with id 9."));
+    editor.request();
 }

@@ -25,7 +25,8 @@ installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
 | See which windows are open, their projects and active file | `zedcli windows` |
 | See what is running in the project you are in | `zedcli ps` |
 | Know which run configurations a project has | `zedcli configs` |
-| Start / restart / stop a configuration | `zedcli run NAME` · `zedcli restart NAME` · `zedcli stop NAME` |
+| Start / restart / stop configurations | `zedcli run NAME...` · `zedcli restart NAME...` · `zedcli stop NAME...` |
+| Restart / stop everything that runs | `zedcli restart --running` · `zedcli stop --running` |
 | List the database connections the user saved | `zedcli db connections` |
 | Run SQL on one of them | `zedcli db query -c LABEL "SQL"` |
 | List the HTTP requests saved in the API Client | `zedcli api list` |
@@ -64,6 +65,14 @@ WINDOW  RUN         PID      STATE    CPU   MEMORY  COMMAND
   still going, with every process it started** — the editor never keeps two
   instances of one configuration. So `run` on a running server is a restart.
 - `restart NAME` is the same, stated explicitly. `stop NAME` ends every run of it.
+- Each of the three takes several names and handles them one after another
+  (`zedcli run api worker frontend`); every name is tried even when one fails,
+  and the exit status is the first failure's. `stop --running` and
+  `restart --running` act on every configuration of the window that is running
+  now; with nothing running they print so and exit 0.
+- When several configurations of a window share a name, `stop` and `restart`
+  act on all of them (every one is stopped before any starts again), and `run`
+  refuses with exit 4: starting one of them would be a guess.
 - `NAME` is the configuration's label exactly as `zedcli configs` shows it.
 - A debug configuration (kind `debug`) can be started with `run`; stopping it is
   done from the debugger, and `stop`/`restart` answer exit 2 for it.
