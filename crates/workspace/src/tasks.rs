@@ -151,8 +151,9 @@ impl Workspace {
                         Some(Err(e)) => {
                             log::error!("Task spawn failed: {e:#}");
                             _ = workspace.update(cx, |w, cx| {
-                                let id = NotificationId::unique::<ResolvedTask>();
-                                w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
+                                let said = format!("Task spawn failed: {e}");
+                                let id = NotificationId::named(said.clone().into());
+                                w.show_toast(Toast::new(id, said), cx);
                             });
                             ScheduledTaskResult::SpawnFailed
                         }

@@ -656,10 +656,51 @@ impl ConfigurationsToolbar {
         }
     }
 
-    /// Stops every run of every configuration at once.
+    /// The debug sessions still alive that were started by the reader, not by
+    /// another session of the program being debugged.
+    fn live_sessions(&self, cx: &App) -> Vec<Entity<project::debugger::session::Session>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        let project = workspace.read(cx).project().clone();
+        project
+            .read(cx)
+            .dap_store()
+            .read(cx)
+            .sessions()
+            .filter(|session| {
+                let session = session.read(cx);
+                !session.is_terminated() && session.parent_id(cx).is_none()
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// How many runs are going on in the window: every task that is still
+    /// running, however it was started, and every debug session. The list of
+    /// configurations knows only the runs it started itself, and a count that
+    /// left the others out would say "2 running" beside a third that nothing on
+    /// screen could stop.
+    pub(crate) fn running_count(&self, cx: &App) -> usize {
+        let runs = self
+            .workspace
+            .upgrade()
+            .map(|workspace| crate::run_instances::running_terminals(workspace.read(cx), cx).len())
+            .unwrap_or(0);
+        runs + self.live_sessions(cx).len()
+    }
+
+    /// Stops every run at once, the ones the list does not know included.
     pub(crate) fn stop_all(&mut self, cx: &mut Context<Self>) {
-        for pointing in self.running(cx) {
-            self.stop_of(&pointing, cx);
+        if let Some(workspace) = self.workspace.upgrade() {
+            for terminal in crate::run_instances::running_terminals(workspace.read(cx), cx) {
+                crate::run_instances::stop_for_good(&terminal, cx).detach();
+            }
+        }
+        for session in self.live_sessions(cx) {
+            session
+                .update(cx, |session, cx| session.shutdown(cx))
+                .detach();
         }
     }
 
@@ -674,11 +715,12 @@ impl ConfigurationsToolbar {
     /// Stops the run, waits for the process to be gone, and only then starts the
     /// same configuration again.
     ///
-    /// `Rerun` with `allow_concurrent_runs` off waits for a run of the same task
-    /// to finish but never ends it, so a server that runs until it is stopped
-    /// would be waited on forever. Ending it here first is also what keeps the
-    /// second process from starting while the first still holds a port, which
-    /// fails to bind rather than replacing it.
+    /// Ending it here first is what keeps the second process from starting
+    /// while the first still holds a port, which fails to bind rather than
+    /// replacing it. The start is the configuration's own, not a `Rerun` of
+    /// whatever the task history holds: the history forgets a task when its
+    /// file is edited, and a restart that asked for a forgotten task would
+    /// stop the run and then open a picker.
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pointing) = self.pointing.clone() {
             self.restart_of(&pointing, window, cx);
@@ -691,26 +733,19 @@ impl ConfigurationsToolbar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, task_id)) = self.the_run_of(pointing, cx) else {
+        if self.the_run_of(pointing, cx).is_none() {
+            return;
+        }
+        let Some(task) = self.task_at(pointing, cx) else {
             return;
         };
         let Some(gone) = self.stop_every_run_of(pointing, cx) else {
             return;
         };
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
             gone.await;
-            cx.update(|window, cx| {
-                window.dispatch_action(
-                    Box::new(zed_actions::Rerun {
-                        task_id: Some(task_id.0),
-                        allow_concurrent_runs: Some(false),
-                        use_new_terminal: Some(false),
-                        reevaluate_context: false,
-                    }),
-                    cx,
-                );
-            })
-            .log_err();
+            crate::configurations_view::run_a_task(&workspace, task, cx).await;
         })
         .detach();
     }
@@ -813,7 +848,7 @@ impl Render for ConfigurationsToolbar {
             true => self.stop_and_restart(cx),
             false => self.run_and_debug(cannot_be_debugged, cx),
         });
-        let running = self.running(cx).len();
+        let running = self.running_count(cx);
 
         h_flex()
             .id("run-configurations-toolbar")
@@ -840,19 +875,47 @@ impl Render for ConfigurationsToolbar {
                     }),
             )
             .when_some(pair, |plaque, pair| {
-                plaque.child(ui::cyberpunk::segmented(pair))
-            })
-            .when(running > 1, |plaque| {
+                // The count sits on the pair's corner rather than beside it:
+                // the middle of the title bar is only so wide, and a word after
+                // the pair is what it cuts off.
                 plaque.child(
                     div()
-                        .debug_selector(|| "run-configurations-running-count".to_string())
-                        .px_1()
-                        .text_size(px(11.))
-                        .text_color(cyberpunk::text_secondary())
-                        .child(format!("{running} running")),
+                        .relative()
+                        .child(ui::cyberpunk::segmented(pair))
+                        .when(running > 1, |frame| frame.child(running_badge(running))),
                 )
             })
     }
+}
+
+/// How many runs are going on, on the corner of the frame the run controls
+/// stand in: a number, so it takes no more room than a corner, with the
+/// accent that stands for data.
+fn running_badge(running: usize) -> gpui::Stateful<gpui::Div> {
+    let accent = cyberpunk::Accent::Cyan;
+    div()
+        .id("run-configurations-running-count")
+        .debug_selector(|| "run-configurations-running-count".to_string())
+        .absolute()
+        .top(px(-3.))
+        .right(px(-4.))
+        .h(px(14.))
+        .min_w(px(14.))
+        .px(px(3.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(accent.border())
+        .bg(cyberpunk::canvas())
+        .text_size(px(9.))
+        .text_color(accent.bright())
+        .child(if running > 99 {
+            "99+".to_string()
+        } else {
+            running.to_string()
+        })
 }
 
 impl ConfigurationsToolbar {
@@ -1730,7 +1793,7 @@ impl Render for ConfigurationsList {
         let (running, restartable) = self
             .toolbar
             .read_with(cx, |toolbar, cx| {
-                (toolbar.running(cx).len(), toolbar.restartable(cx).len())
+                (toolbar.running_count(cx), toolbar.restartable(cx).len())
             })
             .unwrap_or((0, 0));
 
@@ -1830,8 +1893,6 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use terminal::TaskStatus;
     use terminal_view::terminal_panel::TerminalPanel;
     use util::path;
@@ -1962,33 +2023,14 @@ mod tests {
         /// only the dispatch tree's own root and never the handler below, so the
         /// bar is given something to focus.
         focus_handle: FocusHandle,
-        /// The run a test expects Restart to end, so the handler below can say
-        /// whether it was still going on at the moment the rerun was asked for.
-        watching: Option<Entity<Terminal>>,
-        /// Every rerun the bar's window was asked for: the id, and whether
-        /// `watching` was still running when the ask arrived.
-        asked_to_rerun: Rc<RefCell<Vec<(String, bool)>>>,
     }
 
     impl Render for BarWithThePlaque {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let watching = self.watching.clone();
-            let asked_to_rerun = self.asked_to_rerun.clone();
             div()
                 .track_focus(&self.focus_handle)
                 .w(px(900.))
                 .h(px(600.))
-                .on_action(move |rerun: &zed_actions::Rerun, _window, cx| {
-                    let still_running = watching.as_ref().is_some_and(|terminal| {
-                        terminal
-                            .read(cx)
-                            .task()
-                            .is_some_and(|task| task.status == TaskStatus::Running)
-                    });
-                    asked_to_rerun
-                        .borrow_mut()
-                        .push((rerun.task_id.clone().unwrap_or_default(), still_running));
-                })
                 .child(
                     h_flex()
                         .h(px(40.))
@@ -2033,8 +2075,6 @@ mod tests {
             toolbar: toolbar.clone(),
             gauge,
             focus_handle: cx.focus_handle(),
-            watching: None,
-            asked_to_rerun: Rc::default(),
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
@@ -2079,8 +2119,6 @@ mod tests {
             toolbar: toolbar.clone(),
             gauge,
             focus_handle: cx.focus_handle(),
-            watching: None,
-            asked_to_rerun: Rc::default(),
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
@@ -2983,8 +3021,6 @@ mod tests {
             toolbar: toolbar.clone(),
             gauge,
             focus_handle: cx.focus_handle(),
-            watching: None,
-            asked_to_rerun: Rc::default(),
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
@@ -3527,6 +3563,92 @@ mod tests {
         );
     }
 
+    /// A run started some other way -- from the tasks modal, the gutter -- has no
+    /// row in the list, and it is a run all the same: counted, and ended by
+    /// Stop all.
+    #[gpui::test]
+    async fn stop_all_reaches_a_run_the_list_does_not_know(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let known = the_kept_configuration(&over.toolbar, 0, &cx);
+        let stranger = TaskTemplate {
+            label: "started from the tasks modal".to_string(),
+            command: "sleep".to_string(),
+            args: vec!["60".to_string()],
+            ..Default::default()
+        };
+        let known_run = a_run_of(&known, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+        let with_one = cx
+            .debug_bounds("run-configurations-toolbar")
+            .expect("the toolbar is painted with one run")
+            .size
+            .width;
+        let stranger_run = a_run_of(&stranger, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+        assert_eq!(
+            over.toolbar
+                .read_with(&cx, |toolbar, cx| toolbar.running_count(cx)),
+            2,
+            "both runs are counted"
+        );
+        let badge = cx
+            .debug_bounds("run-configurations-running-count")
+            .expect("and the plaque says so");
+        let toolbar = cx
+            .debug_bounds("run-configurations-toolbar")
+            .expect("the toolbar is painted with two runs");
+        assert_eq!(
+            toolbar.size.width, with_one,
+            "the count takes no room of its own: the middle of the title bar is only \
+             so wide, and whatever the plaque grows by is cut off"
+        );
+        assert!(
+            badge.right() <= toolbar.right() + px(6.),
+            "the count is inside the toolbar's own bounds: {badge:?} against {toolbar:?}"
+        );
+
+        open_the_list(over.bar, &mut cx);
+        press("STOP-ALL", over.bar, &mut cx);
+        assert!(
+            wait_until_it_is_over(&known_run, &mut cx).await,
+            "Stop all ends the run the list knows"
+        );
+        assert!(
+            wait_until_it_is_over(&stranger_run, &mut cx).await,
+            "and the one it does not"
+        );
+    }
+
+    /// Several runs that cannot start each say why. One shared notification id
+    /// would leave only the last reason on screen.
+    #[gpui::test]
+    async fn every_run_that_cannot_start_says_why_on_its_own(cx: &mut TestAppContext) {
+        let (toolbar, bar, mut cx) = a_bar_with_the_plaque(
+            r#"[
+              { "label": "first", "command": "$ZED_CUSTOM_UNKNOWN_VARIABLE" },
+              { "label": "second", "command": "$ZED_CUSTOM_UNKNOWN_VARIABLE" }
+            ]"#,
+            cx,
+        )
+        .await;
+        let workspace = toolbar
+            .read_with(&cx, |toolbar, _| toolbar.workspace.clone())
+            .upgrade()
+            .expect("the workspace is still open");
+        open_the_list(bar, &mut cx);
+
+        press("ROW-RUN-0", bar, &mut cx);
+        press("ROW-RUN-1", bar, &mut cx);
+
+        assert_eq!(
+            workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .len(),
+            2,
+            "each of the two runs that could not start is told, not only the last"
+        );
+    }
+
     /// A row's own Run starts that row, not the one the plaque points at, and
     /// neither closes the list nor moves the plaque.
     #[gpui::test]
@@ -3575,22 +3697,18 @@ mod tests {
         let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
         let template = what_it_would_run(&over.toolbar, &cx);
         let run = a_run_of(&template, &over, &mut cx).await;
-        let task_id = run
-            .read_with(&cx, |terminal, _| {
-                terminal.task().map(|task| task.spawned_task.id.0.clone())
-            })
-            .expect("the run carries the id it was resolved with");
-        let (asked_to_rerun, focus_handle) = over
+        let focus_handle = over
             .bar
-            .update(&mut cx, |bar, _window, _cx| {
-                bar.watching = Some(run.clone());
-                (bar.asked_to_rerun.clone(), bar.focus_handle.clone())
-            })
+            .update(&mut cx, |bar, _window, _cx| bar.focus_handle.clone())
             .expect("the bar is still open");
         draw_the_bar(over.bar, &mut cx);
         cx.update(|window, cx| window.focus(&focus_handle, cx));
         draw_the_bar(over.bar, &mut cx);
 
+        assert!(
+            !the_history_holds(&template, &over, &mut cx),
+            "nothing has scheduled the configuration before Restart is pressed"
+        );
         let restart = cx
             .debug_bounds("run-configurations-restart-button")
             .expect("Restart is painted while the run is going on");
@@ -3600,31 +3718,55 @@ mod tests {
             wait_until_it_is_over(&run, &mut cx).await,
             "Restart has to end the run it points at"
         );
+        assert!(
+            restart_was_scheduled(&template, &over, &mut cx).await,
+            "the configuration is started again, from the configuration itself: \
+             the task history held nothing to ask for"
+        );
+        assert!(
+            !still_running(&run, &cx),
+            "the new run must not be started while the process it is replacing is still going"
+        );
+    }
+
+    fn the_history_holds(
+        template: &TaskTemplate,
+        over: &APlaqueOverRuns,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        over.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .task_store()
+                .read(cx)
+                .task_inventory()
+                .and_then(|inventory| inventory.read(cx).last_scheduled_task(None))
+                .is_some_and(|(_, task)| task.resolved.label == template.label)
+        })
+    }
+
+    /// Whether `template` has been scheduled to run again, once it is. The
+    /// workspace of these tests has no terminal provider, so nothing is spawned;
+    /// what a start leaves behind is the task history, where the configuration
+    /// is recorded the moment it is scheduled. Nothing else in these tests puts
+    /// anything there, so a `template` in it was started by the restart -- and
+    /// from the configuration itself, since the history it came from was empty.
+    async fn restart_was_scheduled(
+        template: &TaskTemplate,
+        over: &APlaqueOverRuns,
+        cx: &mut VisualTestContext,
+    ) -> bool {
         for _ in 0..300 {
             cx.run_until_parked();
-            if !asked_to_rerun.borrow().is_empty() {
-                break;
+            if the_history_holds(template, over, cx) {
+                return true;
             }
             cx.background_executor
                 .timer(Duration::from_millis(20))
                 .await;
         }
-
-        let asked = asked_to_rerun.borrow().clone();
-        assert_eq!(
-            asked.len(),
-            1,
-            "one rerun, for the configuration that was stopped"
-        );
-        assert_eq!(
-            asked[0].0, task_id,
-            "and for that run's own task rather than whatever ran last"
-        );
-        assert!(
-            !asked[0].1,
-            "the rerun must not be asked for while the process it is replacing \
-             is still going"
-        );
+        false
     }
 
     #[cfg(target_os = "linux")]
@@ -3690,16 +3832,17 @@ mod tests {
         let started = what_the_run_started(&run, &mut cx).await;
         assert!(!started.is_empty(), "the run's program is running");
 
-        let (asked_to_rerun, focus_handle) = over
+        let focus_handle = over
             .bar
-            .update(&mut cx, |bar, _window, _cx| {
-                bar.watching = Some(run.clone());
-                (bar.asked_to_rerun.clone(), bar.focus_handle.clone())
-            })
+            .update(&mut cx, |bar, _window, _cx| bar.focus_handle.clone())
             .expect("the bar is still open");
         draw_the_bar(over.bar, &mut cx);
         cx.update(|window, cx| window.focus(&focus_handle, cx));
         draw_the_bar(over.bar, &mut cx);
+        assert!(
+            !the_history_holds(&template, &over, &mut cx),
+            "nothing has scheduled the configuration before Restart is pressed"
+        );
         let restart = cx
             .debug_bounds("run-configurations-restart-button")
             .expect("Restart is painted while the run is going on");
@@ -3709,17 +3852,11 @@ mod tests {
             wait_until_it_is_over(&run, &mut cx).await,
             "Restart has to end the run it points at"
         );
-        for _ in 0..300 {
-            cx.run_until_parked();
-            if !asked_to_rerun.borrow().is_empty() {
-                break;
-            }
-            cx.background_executor
-                .timer(Duration::from_millis(20))
-                .await;
-        }
+        assert!(
+            restart_was_scheduled(&template, &over, &mut cx).await,
+            "the run is started again"
+        );
         let outlived = what_outlived(&started);
-        assert_eq!(asked_to_rerun.borrow().len(), 1, "the run is started again");
         assert!(
             outlived.is_empty(),
             "nothing of the old run may be left running when the new one \

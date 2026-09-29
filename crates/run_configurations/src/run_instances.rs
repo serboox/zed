@@ -72,6 +72,21 @@ pub fn task_terminals(workspace: &Workspace, cx: &App) -> Vec<Entity<Terminal>> 
     unique
 }
 
+/// Every task terminal of this workspace whose task is still running, whether
+/// or not the run configurations list knows it: a run started from the tasks
+/// modal, the gutter or an unsaved form is as much a run.
+pub fn running_terminals(workspace: &Workspace, cx: &App) -> Vec<Entity<Terminal>> {
+    task_terminals(workspace, cx)
+        .into_iter()
+        .filter(|terminal| {
+            terminal
+                .read(cx)
+                .task()
+                .is_some_and(|task| task.status == TaskStatus::Running)
+        })
+        .collect()
+}
+
 /// Stops a run and resolves only once nothing it started is left running,
 /// with whether that is so: false when a caught process outlived `SIGKILL`.
 ///

@@ -732,21 +732,15 @@ pub async fn run_a_task_on(
         }
         None => {
             let label = task.label;
-            workspace
-                .update_in(cx, |workspace, _window, cx| {
-                    workspace.show_toast(
-                        Toast::new(
-                            NotificationId::unique::<TaskTemplate>(),
-                            format!(
-                                "\"{label}\" could not be run: its command or a variable in \
-                                 it (such as $ZED_WORKTREE_ROOT) could not be resolved for \
-                                 this project."
-                            ),
-                        ),
-                        cx,
-                    );
-                })
-                .ok();
+            say_why(
+                workspace,
+                format!(
+                    "\"{label}\" could not be run: its command or a variable in \
+                     it (such as $ZED_WORKTREE_ROOT) could not be resolved for \
+                     this project."
+                ),
+                cx,
+            );
             false
         }
     }
@@ -754,11 +748,15 @@ pub async fn run_a_task_on(
 
 /// Tells the reader why a run did not happen. A press that does nothing looks
 /// exactly like a press that never landed.
+///
+/// Each reason is a notification of its own, told apart by what it says: with
+/// several runs started at once, one shared id would leave only the last
+/// reason on screen and the others unsaid.
 fn say_why(workspace: &WeakEntity<Workspace>, said: String, cx: &mut gpui::AsyncWindowContext) {
     workspace
         .update_in(cx, |workspace, _window, cx| {
             workspace.show_toast(
-                Toast::new(NotificationId::unique::<TaskTemplate>(), said),
+                Toast::new(NotificationId::named(said.clone().into()), said),
                 cx,
             );
         })
