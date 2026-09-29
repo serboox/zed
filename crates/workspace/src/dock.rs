@@ -13,6 +13,7 @@ use gpui::{
     Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
     px,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
@@ -23,6 +24,17 @@ use ui::{
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
+
+/// Shows, focuses or hides the panel whose button is at this position among
+/// the left dock's buttons, counting from zero. The buttons keep whatever order
+/// the reader dragged them into, so the position follows the button and not
+/// the panel behind it.
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = workspace)]
+pub struct ActivateLeftDockPanel(pub usize);
+
+/// The most buttons a dock numbers: one per digit key.
+const NUMBERED_BUTTONS: usize = 9;
 
 pub enum PanelEvent {
     ZoomIn,
@@ -283,6 +295,10 @@ impl From<&dyn PanelHandle> for AnyView {
 pub struct Dock {
     position: DockPosition,
     panel_entries: Vec<PanelEntry>,
+    /// The panel keys in the order the reader dragged their buttons into. A
+    /// panel that is not named here comes after every panel that is, in the
+    /// order of its activation priority.
+    button_order: Vec<String>,
     workspace: WeakEntity<Workspace>,
     is_open: bool,
     active_panel_index: Option<usize>,
@@ -397,6 +413,27 @@ pub struct PanelButtons {
 }
 
 pub(crate) const PANEL_SIZE_STATE_KEY: &str = "dock_panel_size";
+const BUTTON_ORDER_KEY: &str = "dock_button_order";
+
+/// A panel button being dragged to another place in its dock's row.
+#[derive(Clone)]
+pub struct DraggedDockPanel {
+    dock: Entity<Dock>,
+    ix: usize,
+    icon: ui::IconName,
+}
+
+impl Render for DraggedDockPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .p_1()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .child(Icon::new(self.icon).size(IconSize::Small))
+    }
+}
 
 fn panel_uses_flexible_width(
     position: DockPosition,
@@ -424,6 +461,16 @@ fn resize_panel_entry(
     }
     entry.panel.size_state_changed(window, cx);
     (entry.panel.panel_key(), entry.size_state)
+}
+
+fn load_button_order(position: DockPosition, cx: &App) -> Vec<String> {
+    KeyValueStore::global(cx)
+        .scoped(BUTTON_ORDER_KEY)
+        .read(position.label())
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).log_err())
+        .unwrap_or_default()
 }
 
 impl Dock {
@@ -455,6 +502,7 @@ impl Dock {
                 position,
                 workspace: workspace.downgrade(),
                 panel_entries: Default::default(),
+                button_order: load_button_order(position, cx),
                 active_panel_index: None,
                 is_open: false,
                 focus_handle: focus_handle.clone(),
@@ -631,6 +679,74 @@ impl Dock {
         }
     }
 
+    fn button_rank(&self, panel_key: &str) -> usize {
+        self.button_order
+            .iter()
+            .position(|key| key == panel_key)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The panel behind the button at `index`, counting the buttons the way the
+    /// row shows them: a panel with nothing to show has no button and no number.
+    pub fn button_panel(
+        &self,
+        index: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Arc<dyn PanelHandle>> {
+        self.panel_entries
+            .iter()
+            .filter(|entry| {
+                entry.panel.icon(window, cx).is_some()
+                    && entry.panel.icon_tooltip(window, cx).is_some()
+            })
+            .nth(index)
+            .map(|entry| entry.panel.clone())
+    }
+
+    /// Moves the button at entry `from` to where the one at entry `to` is, and
+    /// remembers the order for every window and every later start.
+    pub fn move_panel(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let count = self.panel_entries.len();
+        if from == to || from >= count || to >= count {
+            return;
+        }
+        let active_panel = self
+            .active_panel_index
+            .and_then(|ix| self.panel_entries.get(ix))
+            .map(|entry| entry.panel.panel_id());
+        let moved = self.panel_entries.remove(from);
+        self.panel_entries.insert(to, moved);
+        self.active_panel_index = active_panel.and_then(|panel_id| {
+            self.panel_entries
+                .iter()
+                .position(|entry| entry.panel.panel_id() == panel_id)
+        });
+        self.button_order = self
+            .panel_entries
+            .iter()
+            .map(|entry| entry.panel.panel_key().to_string())
+            .collect();
+        self.save_button_order(cx);
+        cx.notify();
+    }
+
+    fn save_button_order(&self, cx: &App) {
+        let Some(json) = serde_json::to_string(&self.button_order).log_err() else {
+            return;
+        };
+        let store = KeyValueStore::global(cx);
+        let position = self.position.label().to_string();
+        cx.background_spawn(async move {
+            store
+                .scoped(BUTTON_ORDER_KEY)
+                .write(position, json)
+                .await
+                .log_err();
+        })
+        .detach();
+    }
+
     pub(crate) fn add_panel<T: Panel>(
         &mut self,
         panel: Entity<T>,
@@ -786,23 +902,26 @@ impl Dock {
             ),
         ];
 
-        let index = match self
-            .panel_entries
-            .binary_search_by_key(&panel.read(cx).activation_priority(), |entry| {
-                entry.panel.activation_priority(cx)
-            }) {
-            Ok(ix) => {
-                if cfg!(debug_assertions) {
-                    panic!(
-                        "Panels `{}` and `{}` have the same activation priority. Each panel must have a unique priority so the status bar order is deterministic.",
-                        T::panel_key(),
-                        self.panel_entries[ix].panel.panel_key()
-                    );
-                }
-                ix
-            }
-            Err(ix) => ix,
-        };
+        let priority = panel.read(cx).activation_priority();
+        if cfg!(debug_assertions)
+            && let Some(existing) = self
+                .panel_entries
+                .iter()
+                .find(|entry| entry.panel.activation_priority(cx) == priority)
+        {
+            panic!(
+                "Panels `{}` and `{}` have the same activation priority. Each panel must have a unique priority so the status bar order is deterministic.",
+                T::panel_key(),
+                existing.panel.panel_key()
+            );
+        }
+        let new_position = (self.button_rank(T::panel_key()), priority);
+        let index = self.panel_entries.partition_point(|entry| {
+            (
+                self.button_rank(entry.panel.panel_key()),
+                entry.panel.activation_priority(cx),
+            ) < new_position
+        });
         if let Some(active_index) = self.active_panel_index.as_mut()
             && *active_index >= index
         {
@@ -1465,6 +1584,7 @@ impl Render for PanelButtons {
 
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
+        let mut numbered_buttons = 0;
         let mut buttons: Vec<_> = dock
             .panel_entries
             .iter()
@@ -1483,7 +1603,12 @@ impl Render for PanelButtons {
                 let supports_flexible = panel.supports_flexible_size(cx);
                 let currently_flexible = panel.has_flexible_size(window, cx);
                 let dock_for_menu = dock_entity.clone();
+                let dock_for_drag = dock_entity.clone();
                 let workspace_for_menu = workspace.clone();
+                numbered_buttons += 1;
+                let hotkey = (dock_position == DockPosition::Left
+                    && numbered_buttons <= NUMBERED_BUTTONS)
+                    .then(|| ActivateLeftDockPanel(numbered_buttons - 1));
 
                 let is_active_button = Some(i) == active_index && is_open;
                 let (action, tooltip) = if is_active_button {
@@ -1501,6 +1626,10 @@ impl Render for PanelButtons {
 
                 let focus_handle = dock.focus_handle(cx);
                 let icon_label = entry.panel.icon_label(window, cx);
+                let tooltip_action = match hotkey {
+                    Some(hotkey) => hotkey.boxed_clone(),
+                    None => action.boxed_clone(),
+                };
 
                 Some(
                     right_click_menu(name)
@@ -1611,17 +1740,59 @@ impl Render for PanelButtons {
                                 })
                                 .when(!is_active, |this| {
                                     this.tooltip(move |_window, cx| {
-                                        Tooltip::for_action(tooltip.clone(), &*action, cx)
+                                        Tooltip::for_action(tooltip.clone(), &*tooltip_action, cx)
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            let dock_for_drop = dock_for_drag.clone();
+                            let dragged_from = dock_for_drag.clone();
+                            let dragged_over = dock_for_drag.clone();
+                            div()
+                                .id(SharedString::from(format!("{name}-slot")))
+                                .debug_selector(move || format!("DOCK-BUTTON-{name}"))
+                                .relative()
+                                .on_drag(
+                                    DraggedDockPanel {
+                                        dock: dragged_from,
+                                        ix: i,
+                                        icon,
+                                    },
+                                    |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                                )
+                                .drag_over::<DraggedDockPanel>(move |style, dragged, _, cx| {
+                                    if dragged.dock != dragged_over {
+                                        return style;
+                                    }
+                                    let colors = cx.theme().colors();
+                                    let style = style
+                                        .bg(colors.drop_target_background)
+                                        .border_color(colors.drop_target_border)
+                                        .border_0();
+                                    // The moved button lands on this one's side of
+                                    // the row it came from; a right dock lists its
+                                    // buttons backwards.
+                                    let lands_before = i < dragged.ix;
+                                    match lands_before != (dock_position == DockPosition::Right) {
+                                        true => style.border_l_2(),
+                                        false => style.border_r_2(),
+                                    }
+                                })
+                                .on_drop(move |dragged: &DraggedDockPanel, _, cx| {
+                                    if dragged.dock != dock_for_drop {
+                                        return;
+                                    }
+                                    let from = dragged.ix;
+                                    dock_for_drop
+                                        .update(cx, |dock, cx| dock.move_panel(from, i, cx));
+                                })
+                                .child(button)
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_active_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
                         }),
                 )
             })
@@ -1821,5 +1992,122 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+
+    macro_rules! button_test_panel {
+        ($panel:ident, $toggle:ident, $key:literal, $icon:expr) => {
+            actions!(test_only, [$toggle]);
+
+            /// A left-dock panel with a button, unlike [`TestPanel`], and a key of
+            /// its own, so several of them can stand side by side in one dock.
+            pub struct $panel {
+                focus_handle: FocusHandle,
+                activation_priority: u32,
+            }
+
+            impl $panel {
+                pub fn new(activation_priority: u32, cx: &mut App) -> Self {
+                    Self {
+                        focus_handle: cx.focus_handle(),
+                        activation_priority,
+                    }
+                }
+
+                /// Makes the panel's toggle action do what the real panels' do.
+                pub fn register_toggle(workspace: &mut Workspace) {
+                    workspace.register_action(|workspace, _: &$toggle, window, cx| {
+                        workspace.toggle_panel_focus::<$panel>(window, cx);
+                    });
+                }
+            }
+
+            impl EventEmitter<PanelEvent> for $panel {}
+
+            impl Focusable for $panel {
+                fn focus_handle(&self, _cx: &App) -> FocusHandle {
+                    self.focus_handle.clone()
+                }
+            }
+
+            impl Render for $panel {
+                fn render(
+                    &mut self,
+                    _window: &mut Window,
+                    _cx: &mut Context<Self>,
+                ) -> impl IntoElement {
+                    div().id($key).track_focus(&self.focus_handle)
+                }
+            }
+
+            impl Panel for $panel {
+                fn persistent_name() -> &'static str {
+                    $key
+                }
+
+                fn panel_key() -> &'static str {
+                    $key
+                }
+
+                fn position(&self, _window: &Window, _: &App) -> DockPosition {
+                    DockPosition::Left
+                }
+
+                fn position_is_valid(&self, position: DockPosition) -> bool {
+                    position == DockPosition::Left
+                }
+
+                fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {
+                }
+
+                fn default_size(&self, _window: &Window, _: &App) -> Pixels {
+                    px(300.)
+                }
+
+                fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
+                    Some($icon)
+                }
+
+                fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+                    Some($key)
+                }
+
+                fn toggle_action(&self) -> Box<dyn Action> {
+                    $toggle.boxed_clone()
+                }
+
+                fn activation_priority(&self) -> u32 {
+                    self.activation_priority
+                }
+            }
+        };
+    }
+
+    button_test_panel!(
+        FirstButtonPanel,
+        ToggleFirstButtonPanel,
+        "FirstButtonPanel",
+        ui::IconName::Folder
+    );
+    button_test_panel!(
+        SecondButtonPanel,
+        ToggleSecondButtonPanel,
+        "SecondButtonPanel",
+        ui::IconName::GitBranch
+    );
+    button_test_panel!(
+        ThirdButtonPanel,
+        ToggleThirdButtonPanel,
+        "ThirdButtonPanel",
+        ui::IconName::ListTree
+    );
+    button_test_panel!(
+        FourthButtonPanel,
+        ToggleFourthButtonPanel,
+        "FourthButtonPanel",
+        ui::IconName::DatabaseZap
+    );
+
+    pub fn saved_button_order(position: DockPosition, cx: &App) -> Vec<String> {
+        super::load_button_order(position, cx)
     }
 }

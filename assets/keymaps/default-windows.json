@@ -730,6 +730,15 @@
       "ctrl-shift-d": "debug_panel::ToggleFocus",
       "ctrl-alt-8": "database_panel::ToggleFocus",
       "ctrl-alt-9": "api_client_panel::ToggleFocus",
+      "ctrl-1": ["workspace::ActivateLeftDockPanel", 0],
+      "ctrl-2": ["workspace::ActivateLeftDockPanel", 1],
+      "ctrl-3": ["workspace::ActivateLeftDockPanel", 2],
+      "ctrl-4": ["workspace::ActivateLeftDockPanel", 3],
+      "ctrl-5": ["workspace::ActivateLeftDockPanel", 4],
+      "ctrl-6": ["workspace::ActivateLeftDockPanel", 5],
+      "ctrl-7": ["workspace::ActivateLeftDockPanel", 6],
+      "ctrl-8": ["workspace::ActivateLeftDockPanel", 7],
+      "ctrl-9": ["workspace::ActivateLeftDockPanel", 8],
       "ctrl-shift-/": "agent::ToggleFocus",
       "ctrl-k s": "workspace::SaveAll",
       "ctrl-k n": "encoding_selector::Toggle",
@@ -1097,8 +1106,8 @@
   {
     "context": "GitPanel",
     "bindings": {
-      "ctrl-1": "git_panel::ActivateChangesTab",
-      "ctrl-2": "git_panel::ActivateHistoryTab",
+      "ctrl-alt-1": "git_panel::ActivateChangesTab",
+      "ctrl-alt-2": "git_panel::ActivateHistoryTab",
     },
   },
   {

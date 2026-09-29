@@ -56,7 +56,9 @@ use client::{
     proto::{self, ErrorCode, PanelId, PeerId},
 };
 use collections::{HashMap, HashSet, TypeIdHashMap, hash_map};
-use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
+use dock::{
+    ActivateLeftDockPanel, Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE,
+};
 use fs::Fs;
 use futures::{
     Future, FutureExt, StreamExt,
@@ -5981,6 +5983,20 @@ impl Workspace {
         }
     }
 
+    fn activate_left_dock_panel(
+        &mut self,
+        action: &ActivateLeftDockPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.left_dock.read(cx).button_panel(action.0, window, cx) else {
+            return;
+        };
+        // Dispatched from where the focus is, like the panel's own key: it
+        // shows the panel, focuses it, or hides it when it already has focus.
+        window.dispatch_action(panel.toggle_action(window, cx), cx);
+    }
+
     fn activate_pane_at_index(
         &mut self,
         action: &ActivatePane,
@@ -8642,6 +8658,7 @@ impl Workspace {
             .on_action(cx.listener(Self::add_folder_to_project))
             .on_action(cx.listener(Self::follow_next_collaborator))
             .on_action(cx.listener(Self::activate_pane_at_index))
+            .on_action(cx.listener(Self::activate_left_dock_panel))
             .on_action(cx.listener(Self::move_item_to_other_window))
             .on_action(cx.listener(Self::move_item_to_pane_at_index))
             .on_action(cx.listener(Self::move_focused_panel_to_next_position))
@@ -15325,6 +15342,226 @@ mod tests {
             assert_eq!(*top.flexes.lock(), vec![1.0; top.members.len()]);
             assert_eq!(*nested.flexes.lock(), vec![1.0; nested.members.len()]);
         });
+    }
+
+    /// The keys the shipped keymap gives the left dock's buttons, through the
+    /// modifiers each platform binds them with.
+    #[cfg(target_os = "macos")]
+    const DOCK_BUTTON_KEY_PREFIX: &str = "ctrl-cmd-";
+    #[cfg(not(target_os = "macos"))]
+    const DOCK_BUTTON_KEY_PREFIX: &str = "ctrl-";
+
+    /// Three buttons in the left dock, the shipped keymap loaded, the window
+    /// drawn once, and something in the centre for the focus to start in.
+    async fn a_left_dock_of_buttons(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        use crate::dock::test::{FirstButtonPanel, SecondButtonPanel, ThirdButtonPanel};
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    settings::DEFAULT_KEYMAP_PATH,
+                    cx,
+                )
+                .unwrap(),
+            );
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        // Only under a `MultiWorkspace` does the window carry the workspace's key
+        // context and action listeners, which the number keys go through.
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            FirstButtonPanel::register_toggle(workspace);
+            SecondButtonPanel::register_toggle(workspace);
+            ThirdButtonPanel::register_toggle(workspace);
+            // Added out of order on purpose: the buttons follow the priorities.
+            let third = cx.new(|cx| ThirdButtonPanel::new(30, cx));
+            let first = cx.new(|cx| FirstButtonPanel::new(10, cx));
+            let second = cx.new(|cx| SecondButtonPanel::new(20, cx));
+            workspace.add_panel(third, window, cx);
+            workspace.add_panel(first, window, cx);
+            workspace.add_panel(second, window, cx);
+        });
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            let item = cx.new(TestItem::new);
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_center_pane(window, cx)
+        });
+        draw_the_window(cx);
+        (workspace, cx)
+    }
+
+    fn draw_the_window(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn button_keys(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<&'static str> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock().read(cx);
+            (0..9)
+                .map_while(|ix| dock.button_panel(ix, window, cx))
+                .map(|panel| panel.panel_key())
+                .collect()
+        })
+    }
+
+    fn visible_panel_key(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<&'static str> {
+        workspace.read_with(cx, |workspace, cx| {
+            let dock = workspace.left_dock().read(cx);
+            dock.is_open()
+                .then(|| dock.visible_panel().map(|panel| panel.panel_key()))
+                .flatten()
+        })
+    }
+
+    fn press_button_number(number: usize, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes(&format!("{DOCK_BUTTON_KEY_PREFIX}{number}"));
+        draw_the_window(cx);
+    }
+
+    /// Drags a button, with the mouse, onto another one.
+    fn drag_button(from: &str, onto: &str, cx: &mut VisualTestContext) {
+        // `debug_bounds` wants a name that lives for the whole run.
+        let selector = |panel: &str| -> &'static str {
+            Box::leak(format!("DOCK-BUTTON-{panel}").into_boxed_str())
+        };
+        let from = cx
+            .debug_bounds(selector(from))
+            .expect("the dragged button is painted")
+            .center();
+        let onto = cx
+            .debug_bounds(selector(onto))
+            .expect("the button dropped on is painted")
+            .center();
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+        for step in 1..=8 {
+            let along = step as f32 / 8.;
+            cx.simulate_mouse_move(
+                from + (onto - from) * along,
+                gpui::MouseButton::Left,
+                gpui::Modifiers::none(),
+            );
+        }
+        cx.simulate_mouse_up(onto, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_the_window(cx);
+    }
+
+    /// Ctrl+1, Ctrl+2... open the panels of the left dock in the order the
+    /// buttons are painted in, whichever panel that is.
+    #[gpui::test]
+    async fn the_number_keys_open_the_left_docks_panels_in_button_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, cx) = a_left_dock_of_buttons(cx).await;
+        assert_eq!(
+            button_keys(&workspace, cx),
+            ["FirstButtonPanel", "SecondButtonPanel", "ThirdButtonPanel"]
+        );
+        assert_eq!(visible_panel_key(&workspace, cx), None);
+
+        press_button_number(2, cx);
+        assert_eq!(visible_panel_key(&workspace, cx), Some("SecondButtonPanel"));
+        press_button_number(3, cx);
+        assert_eq!(visible_panel_key(&workspace, cx), Some("ThirdButtonPanel"));
+        press_button_number(1, cx);
+        assert_eq!(visible_panel_key(&workspace, cx), Some("FirstButtonPanel"));
+        press_button_number(4, cx);
+        assert_eq!(
+            visible_panel_key(&workspace, cx),
+            Some("FirstButtonPanel"),
+            "there is no fourth button, so the key does nothing"
+        );
+    }
+
+    /// The number belongs to the place of the button, not to the panel: after a
+    /// drag, the key that opened one panel opens the panel now standing there.
+    #[gpui::test]
+    async fn dragging_a_button_moves_its_number_with_it(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = a_left_dock_of_buttons(cx).await;
+
+        drag_button("FirstButtonPanel", "ThirdButtonPanel", cx);
+
+        assert_eq!(
+            button_keys(&workspace, cx),
+            ["SecondButtonPanel", "ThirdButtonPanel", "FirstButtonPanel"],
+            "the dragged button lands where the one dropped on was"
+        );
+        press_button_number(1, cx);
+        assert_eq!(visible_panel_key(&workspace, cx), Some("SecondButtonPanel"));
+        press_button_number(3, cx);
+        assert_eq!(visible_panel_key(&workspace, cx), Some("FirstButtonPanel"));
+
+        drag_button("FirstButtonPanel", "SecondButtonPanel", cx);
+        assert_eq!(
+            button_keys(&workspace, cx),
+            ["FirstButtonPanel", "SecondButtonPanel", "ThirdButtonPanel"],
+            "and it can be dragged back the other way"
+        );
+        assert_eq!(
+            visible_panel_key(&workspace, cx),
+            Some("FirstButtonPanel"),
+            "the panel that is showing keeps showing while its button moves"
+        );
+    }
+
+    /// The order is kept for the next start: panels added later, in their own
+    /// order, take the places the reader left them in.
+    #[gpui::test]
+    async fn the_order_of_the_buttons_is_kept_for_the_next_start(
+        test_cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::dock::test::{FirstButtonPanel, FourthButtonPanel, saved_button_order};
+
+        let (_workspace, cx) = a_left_dock_of_buttons(test_cx).await;
+        drag_button("FirstButtonPanel", "ThirdButtonPanel", cx);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| saved_button_order(DockPosition::Left, cx)),
+            ["SecondButtonPanel", "ThirdButtonPanel", "FirstButtonPanel"]
+        );
+
+        // A second window of the same editor, its panels added in priority order.
+        let fs = FakeFs::new(test_cx.executor());
+        let project = Project::test(fs, [], test_cx).await;
+        let (restarted, cx) =
+            test_cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        restarted.update_in(cx, |workspace, window, cx| {
+            use crate::dock::test::{SecondButtonPanel, ThirdButtonPanel};
+            let first = cx.new(|cx| FirstButtonPanel::new(10, cx));
+            let second = cx.new(|cx| SecondButtonPanel::new(20, cx));
+            let third = cx.new(|cx| ThirdButtonPanel::new(30, cx));
+            // Priority 5 would put this one first, but it was never placed.
+            let fourth = cx.new(|cx| FourthButtonPanel::new(5, cx));
+            workspace.add_panel(first, window, cx);
+            workspace.add_panel(second, window, cx);
+            workspace.add_panel(third, window, cx);
+            workspace.add_panel(fourth, window, cx);
+        });
+        assert_eq!(
+            button_keys(&restarted, cx),
+            [
+                "SecondButtonPanel",
+                "ThirdButtonPanel",
+                "FirstButtonPanel",
+                "FourthButtonPanel"
+            ]
+        );
     }
 
     #[gpui::test]
