@@ -6,6 +6,7 @@ use gpui::{
     fill, point, prelude::*, size,
 };
 use settings::Settings;
+use terminal::TaskStatus;
 use ui::{ButtonLike, Tooltip, cyberpunk, prelude::*};
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
@@ -30,13 +31,34 @@ const AXIS_WIDTH: Pixels = px(72.);
 
 const LINE_WIDTH: Pixels = px(1.5);
 
-/// The status-bar plaque saying what the project's running configuration is
-/// using: CPU and memory, and the process count when there is more than one.
-/// Pressing it opens the reading in full -- the two minutes behind those
-/// numbers, which of the run's processes hold the memory, and the facts that
-/// have no time series. Nothing at all is painted while nothing runs.
+/// The status-bar plaque saying what the project's running configurations are
+/// using: CPU and memory added up over every run, and the process count when
+/// there is more than one, and the run count when there are several.
+/// Pressing it opens the reading in full -- one tab per run, each with the two
+/// minutes behind its numbers, which of its processes hold the memory, and the
+/// facts that have no time series. Nothing at all is painted while nothing
+/// runs.
 pub struct RunMetricsStatusItem {
     workspace: WeakEntity<Workspace>,
+    /// Every run going on, in the order the terminal panel holds them, which is
+    /// the order they were started in.
+    runs: Vec<WatchedRun>,
+    /// Whether this window is the one in front. A poll nobody can see is a poll
+    /// for nothing, so it stops the moment focus leaves this window and starts
+    /// again the moment focus comes back.
+    window_active: bool,
+    _watching_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// One run and everything read about it, kept apart from the others: two
+/// programs share a machine, but not a baseline for their processor rates, nor
+/// their goroutines, nor their history.
+struct WatchedRun {
+    pid: u32,
+    /// The label and command of the task that started it.
+    label: String,
+    command: Option<String>,
     metrics: Option<Metrics>,
     /// The last [`READINGS_KEPT`] readings, oldest first. The charts draw only
     /// these, so a run a few seconds old draws a few seconds.
@@ -53,21 +75,72 @@ pub struct RunMetricsStatusItem {
     /// Which of the run's processes were found to be Go programs, so a binary
     /// is looked at once per process rather than on every poll.
     known_programs: HashMap<u32, bool>,
-    /// Whether this window is the one in front. A poll nobody can see is a poll
-    /// for nothing, so it stops the moment focus leaves this window and starts
-    /// again the moment focus comes back.
-    window_active: bool,
-    _watching_task: Option<Task<()>>,
     /// A pprof fetch in flight. Dropping it -- because the run ended, or
     /// another reading started first -- cancels it, so a slow answer from a
     /// run that is already gone never lands on top of what came after it.
     _goroutines_task: Option<Task<()>>,
-    _subscriptions: Vec<Subscription>,
+}
+
+impl WatchedRun {
+    fn new(context: &RunContext) -> Self {
+        Self {
+            pid: context.pid,
+            label: context.label.clone(),
+            command: context.command.clone(),
+            metrics: None,
+            readings: VecDeque::new(),
+            watcher: Watcher::default(),
+            goroutines: None,
+            last_goroutines_poll: None,
+            go_program: None,
+            known_programs: HashMap::new(),
+            _goroutines_task: None,
+        }
+    }
+
+    /// Replaces the reading, saying whether it actually changed -- so a poll
+    /// that read the same thing again does not trigger a repaint for nothing.
+    fn set_goroutines(&mut self, reading: Option<GoroutineReading>) -> bool {
+        if self.goroutines == reading {
+            return false;
+        }
+        self.goroutines = reading;
+        true
+    }
+
+    fn find_go_program(&mut self) -> Option<u32> {
+        let tree = &self.metrics.as_ref()?.tree;
+        let known = &mut self.known_programs;
+        known.retain(|pid, _| tree.iter().any(|process| process.pid == *pid));
+        tree.iter().map(|process| process.pid).find(|pid| {
+            *known
+                .entry(*pid)
+                .or_insert_with(|| goroutines::is_go_program(*pid))
+        })
+    }
+}
+
+/// What a window that draws one run in full needs of it.
+#[derive(Clone)]
+pub(crate) struct RunReading {
+    /// The run's root process, which is what tells one run from another.
+    pub pid: u32,
+    /// The label of the task that started it.
+    pub label: String,
+    pub metrics: Metrics,
+    /// What the processor read and how much memory was held, oldest first.
+    pub series: Vec<(Option<f32>, u64)>,
+    /// The run's goroutines, when it is a Go program. None when it is not one,
+    /// or nothing has been read yet.
+    pub goroutines: Option<crate::goroutines::GoroutineReading>,
+    /// The run's process that is a Go program, if one is.
+    pub go_program: Option<u32>,
 }
 
 /// What is needed about a run to decide where its goroutines, if any, come
 /// from: the process to measure, and the label and command of the task that
 /// started it.
+#[derive(Clone)]
 struct RunContext {
     pid: u32,
     label: String,
@@ -84,31 +157,24 @@ struct Reading {
 }
 
 impl RunMetricsStatusItem {
-    /// Starts watching the project's running configuration the moment the
-    /// status bar is built: a run already going should be reported at once,
+    /// Starts watching the project's running configurations the moment the
+    /// status bar is built: runs already going should be reported at once,
     /// not a second after the bar is first drawn.
     pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
             cx.observe_window_activation(window, Self::window_activation_changed),
             // Turning the reading off by setting should stop the poll right
             // away, not wait for the window to lose and regain focus first.
-            cx.observe_global::<settings::SettingsStore>(|item, cx| item.watch_the_run(cx)),
+            cx.observe_global::<settings::SettingsStore>(|item, cx| item.watch_the_runs(cx)),
         ];
         let mut item = Self {
             workspace: workspace.weak_handle(),
-            metrics: None,
-            readings: VecDeque::new(),
-            watcher: Watcher::default(),
-            goroutines: None,
-            last_goroutines_poll: None,
-            go_program: None,
-            known_programs: HashMap::new(),
+            runs: Vec::new(),
             window_active: window.is_window_active(),
             _watching_task: None,
-            _goroutines_task: None,
             _subscriptions: subscriptions,
         };
-        item.watch_the_run(cx);
+        item.watch_the_runs(cx);
         item
     }
 
@@ -117,35 +183,30 @@ impl RunMetricsStatusItem {
     /// along with it; gaining it back starts the poll again.
     fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_active = window.is_window_active();
-        self.watch_the_run(cx);
+        self.watch_the_runs(cx);
     }
 
-    /// Reads what the run is using, once a second, for as long as this item is
-    /// on screen, its window has focus, and the reader has not turned the
+    /// Reads what the runs are using, once a second, for as long as this item
+    /// is on screen, its window has focus, and the reader has not turned the
     /// reading off. The reading itself happens off the drawing thread: `/proc`
-    /// holds a few hundred files and none of that belongs in a frame.
-    fn watch_the_run(&mut self, cx: &mut Context<Self>) {
+    /// holds a few hundred files and none of that belongs in a frame, and it
+    /// is read once for all the runs rather than once for each.
+    fn watch_the_runs(&mut self, cx: &mut Context<Self>) {
         if !self.window_active || !RunConfigurationsSettings::get_global(cx).show_process_metrics {
-            // Neither of these means the run itself stopped, but nobody can
+            // Neither of these means the runs themselves stopped, but nobody can
             // see the reading right now, or the reader turned it off -- either
             // way it is not worth keeping stale numbers around for.
             self._watching_task = None;
-            self.metrics = None;
-            self.readings.clear();
-            self.watcher.forget();
-            self.goroutines = None;
-            self.last_goroutines_poll = None;
-            self._goroutines_task = None;
+            self.runs.clear();
             return;
         }
         self._watching_task = Some(cx.spawn(async move |item, cx| {
             loop {
-                let Ok(context) = item.read_with(cx, |item, cx| item.run_context(cx)) else {
+                let Ok(contexts) = item.read_with(cx, |item, cx| item.run_contexts(cx)) else {
                     return;
                 };
-                let pid = context.as_ref().map(|context| context.pid);
-                let read = match pid {
-                    Some(_) => {
+                let read = match contexts.is_empty() {
+                    false => {
                         cx.background_spawn(async move {
                             (
                                 process_metrics::everything_running(),
@@ -154,15 +215,15 @@ impl RunMetricsStatusItem {
                         })
                         .await
                     }
-                    None => (None, None),
+                    true => (None, None),
                 };
                 let (samples, machine_uptime) = read;
                 let now = Instant::now();
                 if item
                     .update(cx, |item, cx| {
                         let mut changed =
-                            item.read_the_run(pid, samples.as_deref(), now, machine_uptime);
-                        if item.poll_goroutines(context.as_ref(), cx) {
+                            item.read_the_runs(&contexts, samples.as_deref(), now, machine_uptime);
+                        if item.poll_goroutines(cx) {
                             changed = true;
                         }
                         if changed {
@@ -178,13 +239,79 @@ impl RunMetricsStatusItem {
         }));
     }
 
-    /// One reading. `samples` is every process the machine talked about, or
-    /// nothing when it did not answer; `pid` is the run to look for among them.
-    /// Says whether the reading changed.
+    /// One reading of every run in `contexts`. `samples` is every process the
+    /// machine talked about, or nothing when it did not answer. Says whether
+    /// anything changed.
     ///
     /// A run the machine has nothing to say about is over, and the reading
-    /// says so. A machine that did not answer at all leaves the reading as it
-    /// was, rather than reporting a running thing as gone.
+    /// says so. A machine that did not answer at all leaves the readings as
+    /// they were, rather than reporting running things as gone. A run that
+    /// is no longer in `contexts` is forgotten, with its history and its
+    /// goroutines; one that is new starts from nothing.
+    fn read_the_runs(
+        &mut self,
+        contexts: &[RunContext],
+        samples: Option<&[Sample]>,
+        now: Instant,
+        machine_uptime: Option<std::time::Duration>,
+    ) -> bool {
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(contexts.len());
+        // The runs already known stay where they were, so the tabs of a
+        // window somebody is reading do not swap places under the pointer.
+        for mut run in std::mem::take(&mut self.runs) {
+            match contexts.iter().find(|context| context.pid == run.pid) {
+                Some(context) => {
+                    run.label.clone_from(&context.label);
+                    run.command.clone_from(&context.command);
+                    kept.push(run);
+                }
+                None => changed = true,
+            }
+        }
+        // Those seen for the first time, in the order the machine numbered them:
+        // several started within one poll are found in the order the terminal
+        // panel holds them, which is not the order they began in.
+        let mut fresh: Vec<&RunContext> = contexts
+            .iter()
+            .filter(|context| !kept.iter().any(|run| run.pid == context.pid))
+            .collect();
+        fresh.sort_by_key(|context| context.pid);
+        for context in fresh {
+            kept.push(WatchedRun::new(context));
+            changed = true;
+        }
+        self.runs = kept;
+
+        let Some(samples) = samples else {
+            return changed;
+        };
+        for run in &mut self.runs {
+            let read = run
+                .watcher
+                .metrics_of(run.pid, samples, now, machine_uptime);
+            match &read {
+                Some(metrics) => {
+                    if run.readings.len() >= READINGS_KEPT {
+                        run.readings.pop_front();
+                    }
+                    run.readings.push_back(Reading {
+                        cpu: metrics.cpu,
+                        memory: metrics.memory,
+                    });
+                }
+                None => run.readings.clear(),
+            }
+            if read != run.metrics {
+                changed = true;
+            }
+            run.metrics = read;
+        }
+        changed
+    }
+
+    /// One reading of a single run, or of none when `pid` is `None`.
+    #[cfg(test)]
     fn read_the_run(
         &mut self,
         pid: Option<u32>,
@@ -192,30 +319,15 @@ impl RunMetricsStatusItem {
         now: Instant,
         machine_uptime: Option<std::time::Duration>,
     ) -> bool {
-        let Some(pid) = pid else {
-            self.watcher.forget();
-            self.readings.clear();
-            return self.metrics.take().is_some();
-        };
-        let Some(samples) = samples else {
-            return false;
-        };
-        let read = self.watcher.metrics_of(pid, samples, now, machine_uptime);
-        match &read {
-            Some(metrics) => {
-                if self.readings.len() >= READINGS_KEPT {
-                    self.readings.pop_front();
-                }
-                self.readings.push_back(Reading {
-                    cpu: metrics.cpu,
-                    memory: metrics.memory,
-                });
-            }
-            None => self.readings.clear(),
-        }
-        let changed = read != self.metrics;
-        self.metrics = read;
-        changed
+        let contexts: Vec<RunContext> = pid
+            .map(|pid| RunContext {
+                pid,
+                label: "a run".to_string(),
+                command: None,
+            })
+            .into_iter()
+            .collect();
+        self.read_the_runs(&contexts, samples, now, machine_uptime)
     }
 
     /// Opens the reading in full, over the workspace this item's status bar
@@ -230,39 +342,37 @@ impl RunMetricsStatusItem {
         });
     }
 
-    /// What the last reading said, for a window that draws it in full.
-    pub(crate) fn reading(&self) -> Option<Metrics> {
-        self.metrics.clone()
-    }
-
-    /// The goroutines of the run, when it is a Go program. None when the run is
-    /// not one, or nothing has been read yet.
-    pub(crate) fn goroutines(&self) -> Option<crate::goroutines::GoroutineReading> {
-        self.goroutines.clone()
-    }
-
-    /// The run's process that is a Go program, if one is.
-    pub(crate) fn go_program(&self) -> Option<u32> {
-        self.go_program
+    /// What the last reading said about every run that has one, in the order
+    /// the runs were started, for a window that draws them in full.
+    pub(crate) fn runs(&self) -> Vec<RunReading> {
+        self.runs
+            .iter()
+            .filter_map(|run| {
+                Some(RunReading {
+                    pid: run.pid,
+                    label: run.label.clone(),
+                    metrics: run.metrics.clone()?,
+                    series: run
+                        .readings
+                        .iter()
+                        .map(|reading| (reading.cpu, reading.memory))
+                        .collect(),
+                    goroutines: run.goroutines.clone(),
+                    go_program: run.go_program,
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn set_go_program_for_test(&mut self, pid: Option<u32>, cx: &mut Context<Self>) {
-        self.go_program = pid;
+        if let Some(run) = self.runs.last_mut() {
+            run.go_program = pid;
+        }
         cx.notify();
     }
 
-    fn find_go_program(&mut self) -> Option<u32> {
-        let tree = &self.metrics.as_ref()?.tree;
-        let known = &mut self.known_programs;
-        known.retain(|pid, _| tree.iter().any(|process| process.pid == *pid));
-        tree.iter().map(|process| process.pid).find(|pid| {
-            *known
-                .entry(*pid)
-                .or_insert_with(|| goroutines::is_go_program(*pid))
-        })
-    }
-
+    /// Puts a single run, with this reading, in place of whatever was there.
     #[cfg(test)]
     pub(crate) fn set_reading_for_test(
         &mut self,
@@ -270,83 +380,122 @@ impl RunMetricsStatusItem {
         goroutines: Option<crate::goroutines::GoroutineReading>,
         cx: &mut Context<Self>,
     ) {
-        self.metrics = metrics;
-        self.goroutines = goroutines;
+        self.runs.clear();
+        if let Some(metrics) = metrics {
+            let mut run = WatchedRun::new(&RunContext {
+                pid: metrics.pid,
+                label: "a run".to_string(),
+                command: None,
+            });
+            run.metrics = Some(metrics);
+            run.goroutines = goroutines;
+            self.runs.push(run);
+        }
         cx.notify();
     }
 
-    /// The readings the charts draw, oldest first: what the processor read and
-    /// how much memory was held at each of them.
-    pub(crate) fn series(&self) -> Vec<(Option<f32>, u64)> {
-        self.readings
-            .iter()
-            .map(|reading| (reading.cpu, reading.memory))
-            .collect()
+    /// Puts these runs in place of whatever was there: a label, a reading and a
+    /// history of memory readings each.
+    #[cfg(test)]
+    pub(crate) fn set_runs_for_test(
+        &mut self,
+        runs: Vec<(String, Metrics, Vec<u64>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.runs = runs
+            .into_iter()
+            .map(|(label, metrics, memory)| {
+                let mut run = WatchedRun::new(&RunContext {
+                    pid: metrics.pid,
+                    label,
+                    command: None,
+                });
+                run.readings = memory
+                    .into_iter()
+                    .map(|memory| Reading { cpu: None, memory })
+                    .collect();
+                run.metrics = Some(metrics);
+                run
+            })
+            .collect();
+        cx.notify();
     }
 
-    /// The process a run of this project is going on in, if one is, and what
-    /// started it. The terminal panel holds the runs; a task terminal is one
-    /// that was started from a task, which is what a configuration is.
-    fn run_context(&self, cx: &App) -> Option<RunContext> {
-        let workspace = self.workspace.upgrade()?;
-        let panel = workspace
-            .read(cx)
-            .panel::<terminal_view::terminal_panel::TerminalPanel>(cx)?;
-        let panel = panel.read(cx);
-        let mut newest = None;
-        for pane in panel.panes() {
-            for item in pane.read(cx).items() {
-                let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
-                    continue;
-                };
-                let terminal = view.read(cx).terminal().read(cx);
-                if let Some(task) = terminal.task()
-                    && let Some(pid) = terminal.pid()
-                {
-                    newest = Some(RunContext {
-                        pid: pid.as_u32(),
-                        label: task.spawned_task.full_label.clone(),
-                        command: task.spawned_task.command.clone(),
-                    });
-                }
+    /// Every task run going on in this workspace, and what started each: a
+    /// task terminal that is still running, wherever it was put -- the
+    /// terminal panel or the centre of the window. One that has ended keeps
+    /// its tab, but it is not a run any more, and reading it would keep the
+    /// poll going for nothing.
+    fn run_contexts(&self, cx: &App) -> Vec<RunContext> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        let mut contexts: Vec<RunContext> = Vec::new();
+        for terminal in crate::run_instances::task_terminals(workspace.read(cx), cx) {
+            let terminal = terminal.read(cx);
+            let (Some(task), Some(pid)) = (terminal.task(), terminal.pid()) else {
+                continue;
+            };
+            let pid = pid.as_u32();
+            if task.status != TaskStatus::Running
+                || contexts.iter().any(|context| context.pid == pid)
+            {
+                continue;
             }
+            contexts.push(RunContext {
+                pid,
+                label: task.spawned_task.full_label.clone(),
+                command: task.spawned_task.command.clone(),
+            });
         }
-        newest
+        contexts
     }
 
-    /// Refreshes the goroutines reading, at most once every
-    /// [`goroutines::POLL_INTERVAL`]. Says whether the reading changed right
+    /// Refreshes the goroutines reading of every run, each at most once every
+    /// [`goroutines::POLL_INTERVAL`]. Says whether a reading changed right
     /// away; a pprof fetch that is still on its way notifies on its own once
     /// it comes back.
-    fn poll_goroutines(&mut self, context: Option<&RunContext>, cx: &mut Context<Self>) -> bool {
-        let Some(context) = context else {
-            self._goroutines_task = None;
-            self.last_goroutines_poll = None;
-            self.go_program = None;
-            self.known_programs.clear();
-            return self.set_goroutines(None);
-        };
+    fn poll_goroutines(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for at in 0..self.runs.len() {
+            if self.poll_goroutines_of(at, cx) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn poll_goroutines_of(&mut self, at: usize, cx: &mut Context<Self>) -> bool {
         let now = Instant::now();
-        if self
-            .last_goroutines_poll
-            .is_some_and(|last| now.duration_since(last) < goroutines::POLL_INTERVAL)
-        {
-            return false;
-        }
-        self.last_goroutines_poll = Some(now);
-        self.go_program = self.find_go_program();
+        let run_count = self.runs.len();
+        let (pid, label, command) = {
+            let run = &mut self.runs[at];
+            if run
+                .last_goroutines_poll
+                .is_some_and(|last| now.duration_since(last) < goroutines::POLL_INTERVAL)
+            {
+                return false;
+            }
+            run.last_goroutines_poll = Some(now);
+            run.go_program = run.find_go_program();
+            (run.pid, run.label.clone(), run.command.clone())
+        };
 
-        if let Some(reading) = self.debugger_goroutines(cx) {
-            self._goroutines_task = None;
-            return self.set_goroutines(Some(reading));
+        if let Some(reading) = self.debugger_goroutines(&label, run_count, cx) {
+            let run = &mut self.runs[at];
+            run._goroutines_task = None;
+            return run.set_goroutines(Some(reading));
         }
 
-        if let Some(address) = self.configured_pprof_address(&context.label, cx) {
+        if let Some(address) = self.configured_pprof_address(&label, cx) {
             let http_client = cx.http_client();
-            self._goroutines_task = Some(cx.spawn(async move |item, cx| {
+            self.runs[at]._goroutines_task = Some(cx.spawn(async move |item, cx| {
                 let reading = goroutines::read_pprof(http_client, &address).await;
                 item.update(cx, |item, cx| {
-                    if item.set_goroutines(Some(reading)) {
+                    let Some(run) = item.runs.iter_mut().find(|run| run.pid == pid) else {
+                        return;
+                    };
+                    if run.set_goroutines(Some(reading)) {
                         cx.notify();
                     }
                 })
@@ -355,49 +504,58 @@ impl RunMetricsStatusItem {
             return false;
         }
 
-        self._goroutines_task = None;
-        let looks_like_go = context
-            .command
+        self.runs[at]._goroutines_task = None;
+        let looks_like_go = command
             .as_deref()
             .is_some_and(goroutines::looks_like_go_command)
-            || self.go_program.is_some()
-            || self.configured_adapter_is_delve(&context.label, cx);
+            || self.runs[at].go_program.is_some()
+            || self.configured_adapter_is_delve(&label, cx);
         let reading = looks_like_go
             .then(|| GoroutineReading::Unavailable(goroutines::no_reader_configured()));
-        self.set_goroutines(reading)
-    }
-
-    /// Replaces the reading, saying whether it actually changed -- so a poll
-    /// that read the same thing again does not trigger a repaint for nothing.
-    fn set_goroutines(&mut self, reading: Option<GoroutineReading>) -> bool {
-        if self.goroutines == reading {
-            return false;
-        }
-        self.goroutines = reading;
-        true
+        self.runs[at].set_goroutines(reading)
     }
 
     /// The run's goroutines as the debugger sees them: the threads of a
     /// running Delve session, Delve being the only debugger that stands for
-    /// Go's own goroutines. `None` when no such session is running, not when
-    /// one is running and reports zero -- a zero from a session that has not
-    /// answered yet would read as "there are none".
-    fn debugger_goroutines(&self, cx: &mut Context<Self>) -> Option<GoroutineReading> {
+    /// Go's own goroutines. The session is the one named like the run; a
+    /// session named otherwise is taken for the run's only when the run is the
+    /// only one going and the session is the only Delve one, since with
+    /// several of either there is no telling whose it is, and another run's
+    /// goroutines are worse than none. `None` when no such session is
+    /// running, not when one is running and reports zero -- a zero from a
+    /// session that has not answered yet would read as "there are none".
+    fn debugger_goroutines(
+        &self,
+        label: &str,
+        run_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<GoroutineReading> {
         let workspace = self.workspace.upgrade()?;
         let project = workspace.read(cx).project().clone();
         let dap_store = project.read(cx).dap_store();
-        let mut delve_session = None;
+        let mut delve_sessions = Vec::new();
         for session in dap_store.read(cx).sessions() {
-            let is_delve = {
+            let (is_delve, named_like_the_run) = {
                 let session = session.read(cx);
-                !session.is_terminated() && session.adapter().as_ref() == "Delve"
+                (
+                    !session.is_terminated() && session.adapter().as_ref() == "Delve",
+                    session
+                        .label()
+                        .is_some_and(|session_label| session_label.as_ref() == label),
+                )
             };
             if is_delve {
-                delve_session = Some(session.clone());
-                break;
+                delve_sessions.push((session.clone(), named_like_the_run));
             }
         }
-        let session = delve_session?;
+        let session = match delve_sessions
+            .iter()
+            .find(|(_, named_like_the_run)| *named_like_the_run)
+        {
+            Some((session, _)) => session.clone(),
+            None if run_count == 1 && delve_sessions.len() == 1 => delve_sessions[0].0.clone(),
+            None => return None,
+        };
         let total = session.update(cx, |session, cx| session.threads(cx).len());
         Some(GoroutineReading::Read(Goroutines {
             total,
@@ -443,6 +601,32 @@ impl RunMetricsStatusItem {
                         .is_some_and(|scenario| scenario.adapter.as_ref() == "Delve")
             })
     }
+}
+
+/// What every run added together comes to, for the plaque.
+struct Totals {
+    runs: usize,
+    processes: usize,
+    /// Added over the runs that have a rate yet; `None` when none has.
+    cpu: Option<f32>,
+    memory: u64,
+}
+
+fn totals_of(runs: &[WatchedRun]) -> Option<Totals> {
+    let read: Vec<&Metrics> = runs.iter().filter_map(|run| run.metrics.as_ref()).collect();
+    if read.is_empty() {
+        return None;
+    }
+    let cpu = read
+        .iter()
+        .filter_map(|metrics| metrics.cpu)
+        .fold(None, |sum, cpu| Some(sum.unwrap_or(0.) + cpu));
+    Some(Totals {
+        runs: read.len(),
+        processes: read.iter().map(|metrics| metrics.processes).sum(),
+        cpu,
+        memory: read.iter().map(|metrics| metrics.memory).sum(),
+    })
 }
 
 /// A label and the value after it, the way both the plaque and the reading say
@@ -602,15 +786,15 @@ pub(crate) fn a_chart(
 
 impl Render for RunMetricsStatusItem {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(metrics) = self.metrics.clone() else {
+        let Some(totals) = totals_of(&self.runs) else {
             return div().into_any_element();
         };
 
-        let cpu = match metrics.cpu {
+        let cpu = match totals.cpu {
             Some(cpu) => format!("{cpu:.1}%"),
             None => "-- reading".to_string(),
         };
-        let processes = metrics.processes;
+        let (runs, processes) = (totals.runs, totals.processes);
 
         let plaque = ButtonLike::new("run-metrics-plaque")
             .style(cyberpunk::Rank::Quiet.style())
@@ -620,15 +804,20 @@ impl Render for RunMetricsStatusItem {
                     .debug_selector(|| "run-metrics-status".to_string())
                     .gap_2()
                     .items_center()
+                    .when(runs > 1, |row| row.child(said("runs", runs.to_string())))
                     .child(said("CPU", cpu))
-                    .child(said("RAM", process_metrics::as_memory(metrics.memory)))
+                    .child(said("RAM", process_metrics::as_memory(totals.memory)))
                     .when(processes > 1, |row| {
                         row.child(said("processes", processes.to_string()))
                     }),
             );
 
+        let tooltip = match runs > 1 {
+            true => "Show what each of the runs is using",
+            false => "Show what the run is using",
+        };
         plaque
-            .tooltip(Tooltip::text("Show what the run is using"))
+            .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(|item, _, window, cx| item.open_the_reading(window, cx)))
             .into_any_element()
     }
@@ -1039,7 +1228,7 @@ mod tests {
         let (item, mut cx) = an_item_of_its_own(cx).await;
         a_run_on_screen(&item, &mut cx, 4242);
         item.read_with(&cx, |item, _| {
-            let metrics = item.metrics.as_ref().expect("the run was read");
+            let metrics = item.runs[0].metrics.as_ref().expect("the run was read");
             assert!(
                 metrics.network.is_err() && metrics.video_memory.is_err(),
                 "this platform reports neither, which is what the row has to survive"
@@ -1207,5 +1396,318 @@ mod tests {
             "the dropped chart pushes the process list down rather than covering it: \
              {first_process:?} against {memory:?}"
         );
+    }
+
+    fn context(pid: u32, label: &str) -> RunContext {
+        RunContext {
+            pid,
+            label: label.to_string(),
+            command: None,
+        }
+    }
+
+    /// Three runs, and the machine's processes: each run is read from its own
+    /// root, with its own children, and none of the numbers spill into another.
+    #[gpui::test]
+    async fn every_run_is_read_from_its_own_process_tree(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let megabyte = 1024 * 1024;
+        let machine = [
+            started_by(4242, 1, "the api", 10 * megabyte),
+            started_by(4243, 4242, "a helper", 5 * megabyte),
+            started_by(4300, 1, "the worker", 20 * megabyte),
+            started_by(4400, 1, "the site", 40 * megabyte),
+            started_by(4401, 4400, "a bundler", 40 * megabyte),
+            started_by(4402, 4400, "a watcher", megabyte),
+        ];
+        let contexts = [
+            context(4242, "api"),
+            context(4300, "worker"),
+            context(4400, "site"),
+        ];
+        item.update(&mut cx, |item, _| {
+            assert!(item.read_the_runs(&contexts, Some(&machine), Instant::now(), None));
+            let runs = item.runs();
+            let seen: Vec<_> = runs
+                .iter()
+                .map(|run| {
+                    (
+                        run.label.as_str(),
+                        run.pid,
+                        run.metrics.processes,
+                        run.metrics.memory / megabyte,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                seen,
+                vec![
+                    ("api", 4242, 2, 15),
+                    ("worker", 4300, 1, 20),
+                    ("site", 4400, 3, 81)
+                ],
+                "each run counts its own processes and memory, in the order the runs started"
+            );
+        });
+    }
+
+    /// A run that is gone from the list is forgotten with its history; one
+    /// whose process the machine no longer knows has no reading; and a machine
+    /// that says nothing leaves what was read as it was.
+    #[gpui::test]
+    async fn a_run_that_ends_is_forgotten_and_a_silent_machine_forgets_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let machine = [
+            named(4242, "the api", 8 << 20),
+            named(4300, "the worker", 8 << 20),
+        ];
+        let both = [context(4242, "api"), context(4300, "worker")];
+        let at = Instant::now();
+        item.update(&mut cx, |item, _| {
+            item.read_the_runs(&both, Some(&machine), at, None);
+            item.read_the_runs(&both, Some(&machine), at + Watcher::HOW_OFTEN, None);
+            assert_eq!(item.runs().len(), 2);
+            assert_eq!(item.runs()[0].series.len(), 2, "history is kept per run");
+
+            assert!(
+                !item.read_the_runs(&both, None, at + Watcher::HOW_OFTEN * 2, None),
+                "a machine that did not answer changes nothing"
+            );
+            assert_eq!(item.runs().len(), 2);
+
+            // The api's process is gone from the machine, and the worker's run
+            // is what the panel still holds.
+            let only_worker = [named(4300, "the worker", 8 << 20)];
+            assert!(item.read_the_runs(
+                &both,
+                Some(&only_worker),
+                at + Watcher::HOW_OFTEN * 3,
+                None
+            ));
+            let labels: Vec<_> = item.runs().iter().map(|run| run.label.clone()).collect();
+            assert_eq!(
+                labels,
+                ["worker"],
+                "a run the machine no longer knows has no reading"
+            );
+
+            // The api's terminal is closed altogether.
+            assert!(item.read_the_runs(
+                &[context(4300, "worker")],
+                Some(&only_worker),
+                at + Watcher::HOW_OFTEN * 4,
+                None
+            ));
+            assert_eq!(item.runs().len(), 1);
+            assert_eq!(
+                item.runs()[0].series.len(),
+                4,
+                "the worker's own history went on"
+            );
+        });
+    }
+
+    /// The plaque adds the runs up: memory, processes and (where there is a rate)
+    /// processor, and says how many runs there are.
+    #[test]
+    fn the_plaque_adds_every_run_up() {
+        let read = |pid: u32, processes: usize, cpu: Option<f32>, memory: u64| WatchedRun {
+            metrics: Some(Metrics {
+                pid,
+                processes,
+                cpu,
+                memory,
+                network: Err("no"),
+                video_memory: Err("no"),
+                threads: 1,
+                uptime: None,
+                tree: Vec::new(),
+            }),
+            ..WatchedRun::new(&context(pid, "a run"))
+        };
+        let runs = vec![
+            read(1, 2, Some(10.), 100),
+            read(2, 1, None, 50),
+            read(3, 3, Some(2.5), 25),
+            WatchedRun::new(&context(4, "not read yet")),
+        ];
+        let totals = totals_of(&runs).expect("three runs have a reading");
+        assert_eq!(totals.runs, 3, "a run with no reading yet is not counted");
+        assert_eq!(totals.processes, 6);
+        assert_eq!(totals.memory, 175);
+        assert_eq!(
+            totals.cpu,
+            Some(12.5),
+            "added over the runs that have a rate"
+        );
+
+        assert!(totals_of(&[WatchedRun::new(&context(4, "not read yet"))]).is_none());
+        let unrated = vec![read(1, 1, None, 1)];
+        assert_eq!(totals_of(&unrated).and_then(|totals| totals.cpu), None);
+    }
+
+    /// Several runs are one plaque, with the number of runs in it.
+    #[gpui::test]
+    async fn several_runs_are_one_plaque_that_says_how_many(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let machine = [
+            named(4242, "the api", 8 << 20),
+            named(4300, "the worker", 8 << 20),
+            named(4400, "the site", 8 << 20),
+        ];
+        let contexts = [
+            context(4242, "api"),
+            context(4300, "worker"),
+            context(4400, "site"),
+        ];
+        item.update(&mut cx, |item, _| {
+            item.read_the_runs(&contexts, Some(&machine), Instant::now(), None);
+        });
+        draw(&mut cx);
+        let with_three = cx
+            .debug_bounds("run-metrics-status")
+            .expect("the plaque is painted for three runs")
+            .size
+            .width;
+
+        item.update(&mut cx, |item, _| {
+            item.read_the_runs(&contexts[..1], Some(&machine), Instant::now(), None);
+        });
+        draw(&mut cx);
+        let with_one = cx
+            .debug_bounds("run-metrics-status")
+            .expect("the plaque is painted for one run")
+            .size
+            .width;
+        assert!(
+            with_three > with_one,
+            "the plaque of several runs carries their number as well: {with_three:?} against {with_one:?}"
+        );
+    }
+
+    /// The runs already known keep their places when others begin or end, so
+    /// the tabs of a window somebody is reading do not swap under the pointer,
+    /// whatever order the terminals are found in.
+    #[gpui::test]
+    async fn runs_keep_the_order_they_were_first_seen_in(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let machine = [
+            named(4242, "the api", 8 << 20),
+            named(4300, "the worker", 8 << 20),
+            named(4400, "the site", 8 << 20),
+        ];
+        let labels = |item: &RunMetricsStatusItem| -> Vec<String> {
+            item.runs().into_iter().map(|run| run.label).collect()
+        };
+        item.update(&mut cx, |item, _| {
+            item.read_the_runs(
+                &[context(4300, "worker")],
+                Some(&machine),
+                Instant::now(),
+                None,
+            );
+            // Two that are new, found in the opposite order to their numbers.
+            item.read_the_runs(
+                &[
+                    context(4400, "site"),
+                    context(4300, "worker"),
+                    context(4242, "api"),
+                ],
+                Some(&machine),
+                Instant::now(),
+                None,
+            );
+            assert_eq!(
+                labels(item),
+                ["worker", "api", "site"],
+                "the worker was there first; the two new ones follow in the order they began"
+            );
+        });
+    }
+
+    /// A task terminal placed in the centre of the window is a run like one in
+    /// the terminal panel; one whose task has ended is not a run any more.
+    #[gpui::test]
+    async fn every_running_task_terminal_is_a_run_and_an_ended_one_is_not(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.background_executor.allow_parking();
+        let workspace = item.read_with(&cx, |item, _| item.workspace.upgrade().expect("open"));
+        let project = workspace.read_with(&cx, |workspace, _| workspace.project().clone());
+
+        let mut terminals = Vec::new();
+        for (label, program, args) in [
+            ("server", "sleep", "60"),
+            ("worker", "sleep", "61"),
+            ("quick", "true", ""),
+        ] {
+            let template = task::TaskTemplate {
+                label: label.to_string(),
+                command: program.to_string(),
+                args: args.split_whitespace().map(|arg| arg.to_string()).collect(),
+                ..Default::default()
+            };
+            let mut spawned = template
+                .resolve_task("run configurations", &task::TaskContext::default())
+                .expect("the template resolves against an empty context")
+                .resolved;
+            spawned.cwd = Some(std::env::temp_dir());
+            let terminal = project
+                .update(&mut cx, |project, cx| {
+                    project.create_terminal_task(spawned, cx)
+                })
+                .await
+                .expect("the run starts");
+            let view = cx.update(|window, cx| {
+                cx.new(|cx| {
+                    terminal_view::TerminalView::new(
+                        terminal.clone(),
+                        workspace.downgrade(),
+                        None,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                })
+            });
+            let pane = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+            pane.update_in(&mut cx, |pane, window, cx| {
+                pane.add_item(Box::new(view), false, false, None, window, cx);
+            });
+            terminals.push(terminal);
+        }
+
+        let mut found = Vec::new();
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let ended = terminals[2].read_with(&cx, |terminal, _| {
+                terminal
+                    .task()
+                    .is_some_and(|task| task.status != terminal::TaskStatus::Running)
+            });
+            found = item.read_with(&cx, |item, cx| {
+                item.run_contexts(cx)
+                    .into_iter()
+                    .map(|context| context.label)
+                    .collect::<Vec<_>>()
+            });
+            if ended && found.len() >= 2 {
+                break;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            ["server", "worker"],
+            "both running tasks are runs, wherever they stand, and the one that ended is not"
+        );
+
+        for terminal in &terminals {
+            terminal.update(&mut cx, |terminal, _| terminal.kill_active_task());
+        }
     }
 }

@@ -6,13 +6,14 @@ use gpui::{
     Subscription, WeakEntity, Window, prelude::*,
 };
 use ui::{
-    Disclosure, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*,
+    ButtonLike, Disclosure, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk,
+    prelude::*,
 };
 use workspace::{ModalView, Workspace};
 
 use crate::goroutines::{GoroutineReading, GoroutineSource};
 use crate::process_metrics::{self, Metrics, ProcessReading, ThreadReading};
-use crate::run_metrics_status_item::{RunMetricsStatusItem, a_chart};
+use crate::run_metrics_status_item::{RunMetricsStatusItem, RunReading, a_chart};
 
 /// How far one step of the fork tree moves a row in from its parent. Wide enough
 /// that the step is visible at a glance, narrow enough that a tree eight deep
@@ -46,29 +47,33 @@ const CHART_ROW_HEIGHT: Pixels = px(80.);
 /// A window rather than the popover this replaces. A popover is as wide as it
 /// was written to be and goes away the moment anything else is pressed, which
 /// is the wrong shape for a reading somebody watches while a build runs: this
-/// one is carried, resized and left open beside the work. It is a single
-/// scrolled page rather than tabs, because a process one has to switch a tab to
-/// see is a process that reads as hidden.
+/// one is carried, resized and left open beside the work. Each run has a page
+/// of its own, with a tab to reach it -- but only runs get tabs: the processes
+/// of one run stay a single scrolled tree, because a process one has to switch
+/// a tab to see is a process that reads as hidden.
 pub struct RunMetricsModal {
     item: WeakEntity<RunMetricsStatusItem>,
     focus: FocusHandle,
     body_scroll: ScrollHandle,
+    /// The run whose page is shown, by its root process. A run that has ended
+    /// gives way to the newest one still going.
+    selected: Option<u32>,
     /// Which processes have their thread and goroutine detail shown. A pid
     /// stays in this set across readings, so a row a reader opened does not
     /// close itself the moment the numbers under it change.
     expanded: HashSet<u32>,
-    /// The root process the reading was last opened on, so that root can be
-    /// expanded by default exactly once and a reader who collapses it again is
-    /// not overridden on the next reading a second later.
-    default_expanded_for: Option<u32>,
+    /// The root processes already seen, so each root can be expanded by default
+    /// exactly once and a reader who collapses it again is not overridden on
+    /// the next reading a second later.
+    seen_roots: HashSet<u32>,
     /// Which threads have their statistics shown, by process and thread id.
     expanded_threads: HashSet<(u32, u32)>,
     /// The process the goroutines line goes under: the run's Go program when
     /// one is found in the tree, since a script or shell that starts it has
     /// no goroutines of its own; the root otherwise.
     goroutines_at: Option<u32>,
-    /// The Go program opened by default, once, the same way the root is.
-    default_expanded_go: Option<u32>,
+    /// The Go programs opened by default, once each, the same way the roots are.
+    seen_go_programs: HashSet<u32>,
     _observation: Option<Subscription>,
 }
 
@@ -81,11 +86,12 @@ impl RunMetricsModal {
             item,
             focus: cx.focus_handle(),
             body_scroll: ScrollHandle::new(),
+            selected: None,
             expanded: HashSet::new(),
-            default_expanded_for: None,
+            seen_roots: HashSet::new(),
             expanded_threads: HashSet::new(),
             goroutines_at: None,
-            default_expanded_go: None,
+            seen_go_programs: HashSet::new(),
             _observation: observation,
         }
     }
@@ -98,6 +104,12 @@ impl RunMetricsModal {
         cx: &mut Context<Workspace>,
     ) {
         workspace.toggle_modal(window, cx, move |_window, cx| Self::new(item, cx));
+    }
+
+    fn select_run(&mut self, pid: u32, cx: &mut Context<Self>) {
+        self.selected = Some(pid);
+        self.body_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
     }
 
     /// Shows or hides one process's thread and goroutine detail.
@@ -534,16 +546,13 @@ impl Render for RunMetricsModal {
         let Some(item) = self.item.upgrade() else {
             return shell;
         };
-        let (metrics, readings, goroutines, go_program) = {
-            let item = item.read(cx);
-            (
-                item.reading(),
-                item.series(),
-                item.goroutines(),
-                item.go_program(),
-            )
-        };
-        let Some(metrics) = metrics else {
+        let runs = item.read(cx).runs();
+        let Some(run) = self
+            .selected
+            .and_then(|pid| runs.iter().find(|run| run.pid == pid))
+            .or(runs.last())
+            .cloned()
+        else {
             return shell.child(
                 cyberpunk::dialog_body().child(
                     div().p(cyberpunk::SPACE_14).child(
@@ -554,23 +563,31 @@ impl Render for RunMetricsModal {
                 ),
             );
         };
+        self.selected = Some(run.pid);
+        let RunReading {
+            pid,
+            metrics,
+            series: readings,
+            goroutines,
+            go_program,
+            ..
+        } = run;
 
         // The root is expanded by default -- but only the first time this
-        // reading's root is seen, so a reader who collapses it again is not
+        // run's root is seen, so a reader who collapses it again is not
         // overridden a second later by the same run's next reading.
-        if self.default_expanded_for != Some(metrics.pid) {
-            self.expanded.insert(metrics.pid);
-            self.default_expanded_for = Some(metrics.pid);
+        if self.seen_roots.insert(pid) {
+            self.expanded.insert(pid);
         }
         if let Some(go_program) = go_program
-            && self.default_expanded_go != Some(go_program)
+            && self.seen_go_programs.insert(go_program)
         {
             self.expanded.insert(go_program);
-            self.default_expanded_go = Some(go_program);
         }
-        self.goroutines_at = Some(go_program.unwrap_or(metrics.pid));
+        self.goroutines_at = Some(go_program.unwrap_or(pid));
 
-        let body = self.body(&metrics, &readings, &goroutines, window, cx);
+        let tabs = (runs.len() > 1).then(|| self.tabs(&runs, pid, cx));
+        let body = self.body(&metrics, &readings, &goroutines, tabs, window, cx);
 
         shell.child(cyberpunk::dialog_body().child(body))
     }
@@ -582,6 +599,7 @@ impl RunMetricsModal {
         metrics: &Metrics,
         readings: &[(Option<f32>, u64)],
         goroutines: &Option<GoroutineReading>,
+        tabs: Option<gpui::Div>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -616,6 +634,7 @@ impl RunMetricsModal {
                     // surplus to give rather than leaving it blank.
                     .min_h_full()
                     .gap(cyberpunk::SPACE_18)
+                    .children(tabs)
                     .child(self.summary(metrics))
                     .child(Divider::horizontal())
                     .child(self.charts(metrics, processor, held, most_held))
@@ -629,6 +648,40 @@ impl RunMetricsModal {
                 window,
                 cx,
             )
+    }
+
+    /// One tab for each run, in the order they were started, the shown one
+    /// lit. Two runs of one name are told apart by their process number.
+    fn tabs(&self, runs: &[RunReading], shown: u32, cx: &mut Context<Self>) -> gpui::Div {
+        h_flex()
+            .w_full()
+            .flex_none()
+            .flex_wrap()
+            .gap_1()
+            .debug_selector(|| "RUN-METRICS-TABS".to_string())
+            .children(runs.iter().map(|run| {
+                let pid = run.pid;
+                let shared_name = runs.iter().filter(|other| other.label == run.label).count() > 1;
+                let name = match shared_name {
+                    true => format!("{} · {pid}", run.label),
+                    false => run.label.clone(),
+                };
+                div()
+                    .debug_selector(move || format!("RUN-METRICS-TAB-{pid}"))
+                    .child(
+                        ButtonLike::new(SharedString::from(format!("run-metrics-tab-{pid}")))
+                            .style(match pid == shown {
+                                true => cyberpunk::Rank::Accent.style(),
+                                false => cyberpunk::Rank::Quiet.style(),
+                            })
+                            .size(ButtonSize::Compact)
+                            .toggle_state(pid == shown)
+                            .child(Label::new(name).size(LabelSize::Default))
+                            .on_click(
+                                cx.listener(move |modal, _, _, cx| modal.select_run(pid, cx)),
+                            ),
+                    )
+            }))
     }
 
     /// The header row: the root process on the left, and everything the status
@@ -1368,6 +1421,181 @@ mod tests {
             modal.size.height >= px(760.) && modal.size.width >= px(1300.),
             "a reading opened on a 1400x900 editor fills most of it: {:?}",
             modal.size
+        );
+    }
+
+    /// A run of one process, named for its program, holding `megabytes`.
+    fn a_run_of_one(root_pid: u32, program: &str, megabytes: u64) -> Metrics {
+        let memory = megabytes * 1024 * 1024;
+        Metrics {
+            pid: root_pid,
+            processes: 1,
+            cpu: Some(1.5),
+            memory,
+            network: Err("needs rights this editor does not ask for"),
+            video_memory: Err("nothing is using it"),
+            threads: 1,
+            uptime: Some(Duration::from_secs(30)),
+            tree: vec![ProcessReading {
+                pid: root_pid,
+                parent: 1,
+                name: program.into(),
+                memory,
+                cpu: Some(1.5),
+                threads: 1,
+                state: 'S',
+                uptime: Some(Duration::from_secs(30)),
+                thread_readings: Vec::new(),
+            }],
+        }
+    }
+
+    fn three_runs() -> Vec<(String, Metrics, Vec<u64>)> {
+        vec![
+            (
+                "api".to_string(),
+                a_run_of_one(5001, "cmd-api", 40),
+                vec![40 << 20],
+            ),
+            (
+                "worker".to_string(),
+                a_run_of_one(5002, "cmd-worker", 20),
+                vec![20 << 20],
+            ),
+            (
+                "frontend".to_string(),
+                a_run_of_one(5003, "node", 90),
+                vec![90 << 20],
+            ),
+        ]
+    }
+
+    fn is_on_screen(pid: u32, cx: &mut VisualTestContext) -> bool {
+        cx.debug_bounds(format!("RUN-METRICS-PROCESS-{pid}").leak())
+            .is_some()
+    }
+
+    fn press_the_tab(pid: u32, cx: &mut VisualTestContext) {
+        let tab = cx
+            .debug_bounds(format!("RUN-METRICS-TAB-{pid}").leak())
+            .unwrap_or_else(|| panic!("run {pid} has a tab"));
+        cx.simulate_click(tab.center(), Modifiers::none());
+        settle(cx);
+    }
+
+    /// Every run going has a tab, and the page under the tabs is the page of
+    /// the run whose tab is lit -- the newest, until one is pressed.
+    #[gpui::test]
+    async fn every_run_has_a_tab_and_the_page_follows_the_tab(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        item.update(&mut cx, |item, cx| item.set_runs_for_test(three_runs(), cx));
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        for pid in [5001, 5002, 5003] {
+            assert!(
+                cx.debug_bounds(format!("RUN-METRICS-TAB-{pid}").leak())
+                    .is_some(),
+                "run {pid} has a tab"
+            );
+        }
+        assert!(
+            is_on_screen(5003, &mut cx)
+                && !is_on_screen(5001, &mut cx)
+                && !is_on_screen(5002, &mut cx),
+            "the newest run's page is the one shown to begin with"
+        );
+
+        press_the_tab(5001, &mut cx);
+        assert!(
+            is_on_screen(5001, &mut cx)
+                && !is_on_screen(5002, &mut cx)
+                && !is_on_screen(5003, &mut cx),
+            "pressing a tab shows that run's processes, and only those"
+        );
+
+        press_the_tab(5002, &mut cx);
+        assert!(
+            is_on_screen(5002, &mut cx)
+                && !is_on_screen(5001, &mut cx)
+                && !is_on_screen(5003, &mut cx),
+            "and another tab shows another run"
+        );
+    }
+
+    /// A run alone is not a row of one tab: the strip is for choosing.
+    #[gpui::test]
+    async fn a_run_alone_has_no_tabs(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        assert!(is_on_screen(root_pid, &mut cx));
+        assert!(cx.debug_bounds("RUN-METRICS-TABS").is_none());
+    }
+
+    /// The run being read ends: its page gives way to a run that is still
+    /// going rather than to an empty window.
+    #[gpui::test]
+    async fn a_shown_run_that_ends_gives_way_to_the_newest_one_left(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        item.update(&mut cx, |item, cx| item.set_runs_for_test(three_runs(), cx));
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+        press_the_tab(5001, &mut cx);
+        assert!(is_on_screen(5001, &mut cx));
+
+        item.update(&mut cx, |item, cx| {
+            let mut left = three_runs();
+            left.remove(0);
+            item.set_runs_for_test(left, cx);
+        });
+        settle(&mut cx);
+
+        assert!(
+            is_on_screen(5003, &mut cx) && !is_on_screen(5001, &mut cx),
+            "the newest run left is shown"
+        );
+        assert!(
+            cx.debug_bounds("RUN-METRICS-TAB-5001").is_none(),
+            "and the run that ended has no tab any more"
+        );
+    }
+
+    /// Two runs of one name are told apart by their process numbers, so the
+    /// tabs do not read as the same run twice.
+    #[gpui::test]
+    async fn two_runs_of_one_name_are_told_apart(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        item.update(&mut cx, |item, cx| {
+            item.set_runs_for_test(
+                vec![
+                    (
+                        "api".to_string(),
+                        a_run_of_one(5001, "cmd-api", 40),
+                        Vec::new(),
+                    ),
+                    (
+                        "api".to_string(),
+                        a_run_of_one(5002, "cmd-api", 41),
+                        Vec::new(),
+                    ),
+                ],
+                cx,
+            )
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+
+        let first = cx.debug_bounds("RUN-METRICS-TAB-5001").expect("first tab");
+        let second = cx.debug_bounds("RUN-METRICS-TAB-5002").expect("second tab");
+        assert!(
+            first.size.width > px(60.) && second.size.width > px(60.),
+            "each tab carries its number after the name: {first:?}, {second:?}"
         );
     }
 }
