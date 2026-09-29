@@ -2276,9 +2276,19 @@ mod tests {
     /// A focused terminal showing `output`, drawn, and where its first cell is.
     async fn a_drawn_terminal_showing(
         output: &str,
+        copy_on_select: Option<bool>,
         cx: &mut TestAppContext,
     ) -> (Entity<Terminal>, VisualTestContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        if copy_on_select.is_some() {
+            cx.update(|cx| {
+                settings::SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.terminal.get_or_insert_default().copy_on_select = copy_on_select;
+                    });
+                });
+            });
+        }
         let (_pane, terminal, _terminal_view) =
             add_display_only_terminal(&project, window_handle, true, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
@@ -2323,11 +2333,11 @@ mod tests {
     }
 
     /// Selecting with the mouse copies the selection as soon as the button is
-    /// released, the way kitty's `copy_on_select clipboard` does, with nothing
-    /// set in the settings.
+    /// released, the way kitty's `copy_on_select clipboard` does, when the
+    /// setting is on.
     #[gpui::test]
-    async fn dragging_over_text_copies_it_by_default(cx: &mut TestAppContext) {
-        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+    async fn dragging_over_text_copies_it_when_the_setting_is_on(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", Some(true), cx).await;
         // A selection starts at the side of the cell the press is nearer to,
         // so the drag begins at the left edge of the first letter.
         let cell_width = terminal.read_with(&cx, |terminal, _| {
@@ -2354,10 +2364,34 @@ mod tests {
         });
     }
 
+    /// Nothing is copied unless the reader turned the setting on.
+    #[gpui::test]
+    async fn selecting_text_copies_nothing_by_default(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", None, cx).await;
+        let cell_width = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.cell_width
+        });
+        let start = cell_center(&terminal, 0, &cx) - gpui::point(cell_width * 0.4, px(0.));
+        let end = cell_center(&terminal, 4, &cx);
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        terminal.read_with(&cx, |terminal, _| {
+            assert!(
+                terminal.last_content.selection.is_some(),
+                "the text is selected, so only the copying is being tested"
+            );
+        });
+        assert_eq!(clipboard_text(&mut cx).as_deref(), Some("before"));
+    }
+
     /// A double click selects a word and copies it too.
     #[gpui::test]
-    async fn double_clicking_a_word_copies_it_by_default(cx: &mut TestAppContext) {
-        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+    async fn double_clicking_a_word_copies_it_when_the_setting_is_on(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", Some(true), cx).await;
         let on_world = cell_center(&terminal, 8, &cx);
 
         for click_count in [1, 2] {
@@ -2383,7 +2417,7 @@ mod tests {
     /// A click that selects nothing must not wipe what is on the clipboard.
     #[gpui::test]
     async fn a_plain_click_leaves_the_clipboard_alone(cx: &mut TestAppContext) {
-        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", cx).await;
+        let (terminal, mut cx) = a_drawn_terminal_showing("hello world", Some(true), cx).await;
         let on_hello = cell_center(&terminal, 2, &cx);
 
         cx.simulate_mouse_down(on_hello, MouseButton::Left, gpui::Modifiers::none());

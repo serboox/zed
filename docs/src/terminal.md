@@ -209,12 +209,12 @@ Adjust scroll speed with:
 
 ### Copy on Select
 
-Selected text is copied to the clipboard as soon as the mouse button is released. To copy only on request:
+Copy selected text to the clipboard as soon as the mouse button is released:
 
 ```json [settings]
 {
   "terminal": {
-    "copy_on_select": false
+    "copy_on_select": true
   }
 }
 ```
