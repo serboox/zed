@@ -251,26 +251,63 @@ fn selected_windows(
     }
     if let Some(project) = &selector.project {
         let project = project.canonicalize().unwrap_or_else(|_| project.clone());
-        return windows
+        let holding: Vec<_> = windows
             .into_iter()
-            .find(|window| holds(&roots_of(window), &project))
-            .map(|window| vec![window])
-            .ok_or_else(|| {
-                format!(
-                    "No editor window has {} open. See `zedcli windows`.",
-                    project.display()
-                )
-            });
+            .filter(|window| holds(&roots_of(window), &project))
+            .collect();
+        if holding.is_empty() {
+            return Err(format!(
+                "No editor window has {} open. See `zedcli windows`.",
+                project.display()
+            ));
+        }
+        return the_one_of(holding, &project, cx);
     }
-    if let Some(cwd) = &selector.cwd
-        && let Some(window) = windows.iter().find(|window| holds(&roots_of(window), cwd))
-    {
-        return Ok(vec![*window]);
+    if let Some(cwd) = &selector.cwd {
+        let holding: Vec<_> = windows
+            .iter()
+            .filter(|window| holds(&roots_of(window), cwd))
+            .copied()
+            .collect();
+        if !holding.is_empty() {
+            return the_one_of(holding, cwd, cx);
+        }
     }
     let active = cx
         .active_window()
         .and_then(|window| window.downcast::<MultiWorkspace>());
     Ok(active.or(windows.first().copied()).into_iter().collect())
+}
+
+/// The one window to act on among those that hold `path`: the only one, or the
+/// focused one when it is among them. A choice between windows none of which
+/// the reader is looking at is theirs to make, so it is refused rather than
+/// made for them by whichever window happens to be listed first.
+fn the_one_of(
+    holding: Vec<WindowHandle<MultiWorkspace>>,
+    path: &Path,
+    cx: &App,
+) -> Result<Vec<WindowHandle<MultiWorkspace>>, String> {
+    if holding.len() == 1 {
+        return Ok(holding);
+    }
+    let focused = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>());
+    if let Some(focused) = focused.filter(|focused| holding.contains(focused)) {
+        return Ok(vec![focused]);
+    }
+    let ids = holding
+        .iter()
+        .map(|window| window.window_id().as_u64().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "{} editor windows have {} open (ids {ids}) and none of them has focus. Say which with \
+         --window. See `zedcli windows`.",
+        holding.len(),
+        path.display()
+    ))
 }
 
 pub fn list_windows(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
@@ -371,6 +408,8 @@ pub async fn list_runs(
                     };
                     sessions.push(DebugSessionInfo {
                         window: id,
+                        id: session.session_id().0,
+                        pid: session.debuggee_process_id(),
                         label: session
                             .label()
                             .map(|label| label.to_string())
@@ -499,9 +538,15 @@ pub async fn list_configurations(
         for (window, workspace, store) in &stores {
             for kind in [Kind::Task, Kind::Debug] {
                 for configuration in &store.read(cx).of_kind(kind).configurations {
-                    let running = configuration.task.as_ref().is_some_and(|task| {
-                        !run_instances::runs_of(workspace.read(cx), task, cx).is_empty()
-                    });
+                    let running = match (&configuration.task, &configuration.scenario) {
+                        (Some(task), _) => {
+                            !run_instances::runs_of(workspace.read(cx), task, cx).is_empty()
+                        }
+                        (None, Some(scenario)) => {
+                            !live_sessions_named(workspace.read(cx), &scenario.label, cx).is_empty()
+                        }
+                        (None, None) => false,
+                    };
                     items.push(ConfigurationInfo {
                         window: *window,
                         label: configuration.label.clone(),
@@ -537,6 +582,29 @@ pub async fn list_configurations(
 enum Found {
     Task(Entity<Workspace>, AnyWindowHandle, task::TaskTemplate),
     Debug(Entity<Workspace>, AnyWindowHandle, task::DebugScenario),
+}
+
+/// The debug sessions of the workspace that are still alive and carry `label`.
+fn live_sessions_named(
+    workspace: &Workspace,
+    label: &str,
+    cx: &App,
+) -> Vec<Entity<project::debugger::session::Session>> {
+    workspace
+        .project()
+        .read(cx)
+        .dap_store()
+        .read(cx)
+        .sessions()
+        .filter(|session| {
+            let session = session.read(cx);
+            !session.is_terminated()
+                && session
+                    .label()
+                    .is_some_and(|session_label| session_label.as_ref() == label)
+        })
+        .cloned()
+        .collect()
 }
 
 async fn act_on(
@@ -578,10 +646,20 @@ async fn act_on(
             }
         }
         Found::Debug(workspace, window, scenario) => {
+            if action == RunAction::Stop {
+                let stopping = workspace.update(cx, |workspace, cx| {
+                    live_sessions_named(workspace, &scenario.label, cx)
+                        .into_iter()
+                        .map(|session| session.update(cx, |session, cx| session.shutdown(cx)))
+                        .collect::<Vec<_>>()
+                });
+                futures::future::join_all(stopping).await;
+                return Ok(());
+            }
             if action != RunAction::Run {
                 return Err((
                     format!(
-                        "'{configuration}' is a debug configuration: stop or restart it from the \
+                        "'{configuration}' is a debug configuration: restart it from the \
                          debugger."
                     ),
                     exit_status::BAD_ARGUMENTS,
@@ -1355,6 +1433,235 @@ mod tests {
         assert!(!is_running(&run, cx), "Stop ends the run");
     }
 
+    fn windows_holding(cx: &mut TestAppContext, project: &str) -> Vec<u64> {
+        cx.update(|cx| {
+            editor_windows(cx)
+                .into_iter()
+                .filter(|window| {
+                    workspaces_of(window, cx).iter().any(|workspace| {
+                        project_roots(workspace, cx)
+                            .iter()
+                            .any(|root| root == Path::new(project))
+                    })
+                })
+                .map(|window| window.window_id().as_u64())
+                .collect()
+        })
+    }
+
+    fn said_on_stderr(responses: &[CliResponse]) -> String {
+        responses
+            .iter()
+            .filter_map(|response| match response {
+                CliResponse::Stderr { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Two windows over one project: a request that names the project, or is
+    /// sent from inside it, goes to the window that has focus when it is one
+    /// of them. When neither has focus the choice is the reader's, and it is
+    /// refused with the windows named, not made for them.
+    #[gpui::test]
+    async fn windows_of_one_project_are_told_apart_by_focus_and_never_by_order(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = two_projects(cx).await;
+        open(cx, &app_state, path!("/alpha"));
+        let both = windows_holding(cx, path!("/alpha"));
+        assert_eq!(both.len(), 2, "the project is open twice: {both:?}");
+        let focused = cx.update(|cx| {
+            cx.active_window()
+                .map(|window| window.window_id().as_u64())
+                .expect("a window has focus")
+        });
+        assert!(both.contains(&focused), "the newest window has focus");
+
+        let by_project = WindowSelector {
+            project: Some(PathBuf::from(path!("/alpha"))),
+            ..WindowSelector::default()
+        };
+        let by_directory = WindowSelector {
+            cwd: Some(PathBuf::from(path!("/alpha/src"))),
+            ..WindowSelector::default()
+        };
+        for selector in [by_project.clone(), by_directory.clone()] {
+            let reached = configurations(&configurations_of(cx, &app_state, selector));
+            assert!(!reached.is_empty());
+            assert!(
+                reached.iter().all(|item| item.window == focused),
+                "the window that has focus is the one asked: {reached:?}"
+            );
+        }
+
+        open(cx, &app_state, path!("/beta"));
+        for selector in [by_project, by_directory] {
+            let responses = ask(cx, &app_state, CliRequest::ListConfigurations { selector });
+            assert_eq!(
+                exit_of(&responses),
+                Some(exit_status::NOT_FOUND),
+                "{responses:?}"
+            );
+            let said = said_on_stderr(&responses);
+            assert!(said.contains("2 editor windows have"), "{said}");
+            assert!(said.contains("none of them has focus"), "{said}");
+            for window in &both {
+                assert!(
+                    said.contains(&window.to_string()),
+                    "the windows are named: {said}"
+                );
+            }
+        }
+        for window in both {
+            let reached = configurations(&configurations_of(cx, &app_state, selector_for(window)));
+            assert!(
+                !reached.is_empty() && reached.iter().all(|item| item.window == window),
+                "naming the window settles it"
+            );
+        }
+    }
+
+    const DEBUG_CONFIGURATIONS: &str = r#"[{
+        "label": "Debug API",
+        "adapter": "Delve",
+        "request": "launch",
+        "mode": "debug",
+        "program": "./cmd/api"
+    }]"#;
+
+    fn a_session_named(
+        cx: &mut TestAppContext,
+        workspace: &Entity<Workspace>,
+        label: &str,
+    ) -> Entity<project::debugger::session::Session> {
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        project.update(cx, |project, cx| {
+            project.dap_store().update(cx, |dap_store, cx| {
+                dap_store.new_session(
+                    Some(label.to_string().into()),
+                    dap::adapters::DebugAdapterName("Delve".into()),
+                    task::SharedTaskContext::default(),
+                    None,
+                    Default::default(),
+                    cx,
+                )
+            })
+        })
+    }
+
+    /// A debug configuration reads as running while a session of it is alive,
+    /// the sessions are listed with their numbers and processes, and Stop ends
+    /// every one of them; restarting one is left to the debugger.
+    #[gpui::test]
+    async fn a_debug_configuration_with_sessions_reads_as_running_and_stop_ends_them(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/gamma"),
+                json!({ ".zed": { "debug.json": DEBUG_CONFIGURATIONS }, "main.go": "" }),
+            )
+            .await;
+        open(cx, &app_state, path!("/gamma"));
+        let (gamma, workspace) = window_with(cx, path!("/gamma"));
+        let debug_item = |configured: &[ConfigurationInfo]| {
+            configured
+                .iter()
+                .find(|item| item.label == "Debug API")
+                .cloned()
+                .expect("the debug configuration is listed")
+        };
+
+        let before = configurations(&configurations_of(cx, &app_state, selector_for(gamma)));
+        assert_eq!(debug_item(&before).kind, "debug");
+        assert!(!debug_item(&before).running, "no session yet: {before:?}");
+
+        let first = a_session_named(cx, &workspace, "Debug API");
+        first.update(cx, |session, _| {
+            session.set_debuggee_process_id_for_test(Some(4242))
+        });
+        let second = a_session_named(cx, &workspace, "Debug API");
+        let other = a_session_named(cx, &workspace, "Something else");
+
+        let running = configurations(&configurations_of(cx, &app_state, selector_for(gamma)));
+        assert!(
+            debug_item(&running).running,
+            "a session is alive: {running:?}"
+        );
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ListRuns {
+                selector: selector_for(gamma),
+            },
+        );
+        let sessions = responses
+            .iter()
+            .find_map(|response| match response {
+                CliResponse::Runs { debug_sessions, .. } => Some(debug_sessions.clone()),
+                _ => None,
+            })
+            .expect("the sessions are answered");
+        let named: Vec<&DebugSessionInfo> = sessions
+            .iter()
+            .filter(|session| session.label == "Debug API")
+            .collect();
+        assert_eq!(named.len(), 2, "{sessions:?}");
+        assert_ne!(named[0].id, named[1].id, "the sessions are told apart");
+        assert_eq!(
+            named
+                .iter()
+                .filter_map(|session| session.pid)
+                .collect::<Vec<_>>(),
+            [4242],
+            "the one that named its process says which"
+        );
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(gamma),
+                configuration: "Debug API".into(),
+                action: RunAction::Restart,
+            },
+        );
+        assert_eq!(
+            exit_of(&responses),
+            Some(exit_status::BAD_ARGUMENTS),
+            "a session is restarted from the debugger: {responses:?}"
+        );
+        assert!(!first.read_with(cx, |session, _| session.is_terminated()));
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(gamma),
+                configuration: "Debug API".into(),
+                action: RunAction::Stop,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
+        assert!(first.read_with(cx, |session, _| session.is_terminated()));
+        assert!(second.read_with(cx, |session, _| session.is_terminated()));
+        assert!(
+            !other.read_with(cx, |session, _| session.is_terminated()),
+            "and no other session"
+        );
+        let after = configurations(&configurations_of(cx, &app_state, selector_for(gamma)));
+        assert!(
+            !debug_item(&after).running,
+            "nothing is running any more: {after:?}"
+        );
+    }
+
     #[gpui::test]
     async fn control_names_one_window_and_says_when_a_run_did_not_start(cx: &mut TestAppContext) {
         let app_state = two_projects(cx).await;
@@ -1444,8 +1751,11 @@ mod tests {
         assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
     }
 
+    /// A debug configuration is started and stopped from here, and restarted from
+    /// the debugger: a restart refused for the whole configuration, not stopped
+    /// half-way through.
     #[gpui::test]
-    async fn a_debug_configuration_is_only_started_from_here(cx: &mut TestAppContext) {
+    async fn a_debug_configuration_is_restarted_from_the_debugger(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         app_state
             .fs
@@ -1465,7 +1775,7 @@ mod tests {
             CliRequest::ControlRun {
                 selector: selector_for(gamma),
                 configuration: "api (Delve)".into(),
-                action: RunAction::Stop,
+                action: RunAction::Restart,
             },
         );
         assert_eq!(

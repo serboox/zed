@@ -31754,6 +31754,7 @@ dependencies = [
  "copilot_chat",
  "copilot_ui",
  "crashes",
+ "dap",
  "dap_adapters",
  "db",
  "db_client",

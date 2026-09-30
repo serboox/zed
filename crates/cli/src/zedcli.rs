@@ -627,7 +627,7 @@ fn control(
     connection: &Connection,
 ) -> Result<i32> {
     if running {
-        configurations = match running_configurations(&selector, connection)? {
+        configurations = match running_configurations(action, &selector, connection)? {
             Ok(configurations) => configurations,
             Err(status) => return Ok(status),
         };
@@ -656,10 +656,24 @@ fn control(
     Ok(status)
 }
 
+/// The configurations that have a run going on and that `action` can be done
+/// to. A debug session is stopped from here but restarted from the debugger, so
+/// restarting everything that runs leaves the debug configurations out rather
+/// than failing on each of them.
+fn names_running(items: Vec<ConfigurationInfo>, action: RunAction) -> Vec<String> {
+    items
+        .into_iter()
+        .filter(|item| item.running)
+        .filter(|item| action != RunAction::Restart || item.kind != "debug")
+        .map(|item| item.label)
+        .collect()
+}
+
 /// The names of the selected window's configurations that have a run going
 /// on, each once: the editor acts on every configuration of a name. An editor
 /// that answers with a failure gives its exit status instead.
 fn running_configurations(
+    action: RunAction,
     selector: &WindowSelector,
     connection: &Connection,
 ) -> Result<Result<Vec<String>, i32>> {
@@ -673,9 +687,9 @@ fn running_configurations(
     loop {
         match responses.recv_timeout(connection.timeout) {
             Ok(CliResponse::Configurations { items }) => {
-                for item in items.into_iter().filter(|item| item.running) {
-                    if !running.contains(&item.label) {
-                        running.push(item.label);
+                for label in names_running(items, action) {
+                    if !running.contains(&label) {
+                        running.push(label);
                     }
                 }
             }
@@ -1066,13 +1080,15 @@ fn runs_as(format: RowFormat, runs: &[RunInfo], sessions: &[DebugSessionInfo]) -
     if !sessions.is_empty() {
         text.push('\n');
         text.push_str(&table(
-            &["WINDOW", "DEBUG SESSION", "ADAPTER", "STATE"],
+            &["WINDOW", "DEBUG SESSION", "ID", "PID", "ADAPTER", "STATE"],
             sessions
                 .iter()
                 .map(|session| {
                     vec![
                         session.window.to_string(),
                         session.label.clone(),
+                        session.id.to_string(),
+                        session.pid.map(|pid| pid.to_string()).unwrap_or_default(),
                         session.adapter.clone(),
                         session.state.clone(),
                     ]
@@ -1263,6 +1279,31 @@ fn configurations_as(format: RowFormat, items: &[ConfigurationInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_configuration(label: &str, kind: &str, running: bool) -> ConfigurationInfo {
+        ConfigurationInfo {
+            window: 1,
+            label: label.to_string(),
+            kind: kind.to_string(),
+            command: String::new(),
+            running,
+        }
+    }
+
+    #[test]
+    fn stopping_what_runs_takes_the_debug_configurations_too_and_restarting_does_not() {
+        let items = vec![
+            a_configuration("api", "task", true),
+            a_configuration("Debug API", "debug", true),
+            a_configuration("tests", "task", false),
+            a_configuration("Debug tests", "debug", false),
+        ];
+        assert_eq!(
+            names_running(items.clone(), RunAction::Stop),
+            ["api", "Debug API"]
+        );
+        assert_eq!(names_running(items, RunAction::Restart), ["api"]);
+    }
 
     #[test]
     fn a_table_pads_every_column_to_its_widest_cell() {

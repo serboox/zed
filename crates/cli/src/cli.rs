@@ -333,7 +333,9 @@ pub struct ApiResponseInfo {
 }
 
 /// Which windows a request is about. With nothing set, the window whose project
-/// holds `cwd` is chosen, and the focused window when none does.
+/// holds `cwd` is chosen, and the focused window when none does. When several
+/// windows hold the path, the focused one is chosen if it is among them;
+/// otherwise the request is refused, saying which windows they are.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowSelector {
     pub window: Option<u64>,
@@ -401,9 +403,16 @@ pub struct ProcessInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DebugSessionInfo {
     pub window: u64,
+    /// The editor's number for the session, which tells two sessions of one
+    /// configuration apart.
+    #[serde(default)]
+    pub id: u32,
     pub label: String,
     pub adapter: String,
     pub state: String,
+    /// The program being debugged, once the adapter has said which process it is.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -529,5 +538,21 @@ pub trait CliResponseSink: Send + 'static {
 impl CliResponseSink for ipc::IpcSender<CliResponse> {
     fn send(&self, response: CliResponse) -> Result<()> {
         ipc::IpcSender::send(self, response).map_err(|error| anyhow::anyhow!("{error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An editor from before sessions carried a number and a process says neither
+    /// in its answer, and the answer still reads.
+    #[test]
+    fn a_debug_session_from_an_older_editor_still_reads() {
+        let older = r#"{"window":7,"label":"Debug API","adapter":"Delve","state":"running"}"#;
+        let session: DebugSessionInfo = serde_json::from_str(older).expect("it reads");
+        assert_eq!(session.id, 0);
+        assert_eq!(session.pid, None);
+        assert_eq!(session.label, "Debug API");
     }
 }
