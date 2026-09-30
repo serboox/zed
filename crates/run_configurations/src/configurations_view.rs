@@ -716,13 +716,16 @@ pub async fn run_a_task_on(
             }
             // One run of a configuration at a time, however it is started: a
             // second one beside the first fights it for its port and its files.
-            let stopping = workspace
-                .update(cx, |workspace, cx| {
-                    crate::run_instances::stop_every_run_of(workspace, &task, cx)
-                })
-                .ok();
-            if let Some(stopping) = stopping {
-                stopping.await;
+            // A configuration that says it may run several at once is left to.
+            if !task.allow_concurrent_runs {
+                let stopping = workspace
+                    .update(cx, |workspace, cx| {
+                        crate::run_instances::stop_every_run_of(workspace, &task, cx)
+                    })
+                    .ok();
+                if let Some(stopping) = stopping {
+                    stopping.await;
+                }
             }
             workspace
                 .update_in(cx, |workspace, window, cx| {

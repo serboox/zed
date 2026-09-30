@@ -583,29 +583,47 @@ impl ConfigurationsToolbar {
         Some((terminal, task_id))
     }
 
-    /// The debug session this configuration started, while it is still alive.
+    /// Every debug session this configuration started that is still alive.
     ///
     /// A run started through the debugger lives in the debugger, not in a
     /// terminal, so looking only there answers "nothing is running" about a
-    /// program the reader can plainly see running.
-    fn the_session_of(
+    /// program the reader can plainly see running. A session is told from its
+    /// configuration by its label, which is one of: the label of the debug
+    /// configuration itself; the label of the debug configuration a task is
+    /// paired with; the label of the task, for a session worked out from it.
+    /// Every session that carries one of them counts -- two can be going on
+    /// at once.
+    fn sessions_of(
         &self,
         pointing: &Pointing,
         cx: &App,
-    ) -> Option<Entity<project::debugger::session::Session>> {
-        let scenario = self.scenario_at(pointing, cx)?;
-        let project = self.workspace.upgrade()?.read(cx).project().clone();
+    ) -> Vec<Entity<project::debugger::session::Session>> {
+        let mut labels: Vec<SharedString> = Vec::new();
+        if let Some(scenario) = self.scenario_at(pointing, cx) {
+            labels.push(scenario.label);
+        }
+        if let Some(scenario) = self.matching_debug_scenario(pointing, cx) {
+            labels.push(scenario.label);
+        }
+        if let Some(task) = self.task_at(pointing, cx) {
+            labels.push(task.label.into());
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        let project = workspace.read(cx).project().clone();
         project
             .read(cx)
             .dap_store()
             .read(cx)
             .sessions()
-            .find(|session| {
+            .filter(|session| {
                 let session = session.read(cx);
                 !session.is_terminated()
-                    && session.label().is_some_and(|label| label == scenario.label)
+                    && session.label().is_some_and(|label| labels.contains(&label))
             })
             .cloned()
+            .collect()
     }
 
     /// Whether what this points at is running, by either way of starting it.
@@ -616,7 +634,7 @@ impl ConfigurationsToolbar {
     }
 
     pub(crate) fn is_running_of(&self, pointing: &Pointing, cx: &App) -> bool {
-        self.the_run_of(pointing, cx).is_some() || self.the_session_of(pointing, cx).is_some()
+        self.the_run_of(pointing, cx).is_some() || !self.sessions_of(pointing, cx).is_empty()
     }
 
     /// Every listed configuration that has a run going on.
@@ -647,9 +665,8 @@ impl ConfigurationsToolbar {
     pub(crate) fn stop_of(&mut self, pointing: &Pointing, cx: &mut Context<Self>) {
         if let Some(stopping) = self.stop_every_run_of(pointing, cx) {
             stopping.detach();
-            return;
         }
-        if let Some(session) = self.the_session_of(pointing, cx) {
+        for session in self.sessions_of(pointing, cx) {
             session
                 .update(cx, |session, cx| session.shutdown(cx))
                 .detach();
@@ -844,7 +861,7 @@ impl Render for ConfigurationsToolbar {
         // each reads as a fence. Two segments either way, so nothing on the bar
         // moves when a run starts or ends.
         let pair = pointing_at.as_ref().map(|_| match self.it_is_running(cx) {
-            true => self.stop_and_restart(cx),
+            true => self.stop_and_restart(self.the_run_it_points_at(cx).is_some(), cx),
             false => self.run_and_debug(cannot_be_debugged, cx),
         });
         let running = self.running_count(cx);
@@ -973,7 +990,33 @@ impl ConfigurationsToolbar {
     /// The pair while the run it points at is going on. The glyph changes along
     /// with the colour, so which state the pair is in survives a screen that
     /// shows no colour at all.
-    fn stop_and_restart(&self, cx: &Context<Self>) -> [AnyElement; 2] {
+    ///
+    /// A debug session is stopped from here and restarted from the debugger, so
+    /// for one the second segment is there but cannot be pressed, and says
+    /// where to go instead: a button that looks alive and does nothing is the
+    /// fault the other pair already had once.
+    fn stop_and_restart(&self, restartable: bool, cx: &Context<Self>) -> [AnyElement; 2] {
+        let restart = match restartable {
+            true => segment(
+                "run-configurations-restart",
+                IconName::Rerun,
+                Color::Accent,
+                "Stop the run and start it again",
+                cx.listener(|toolbar, _, window, cx| toolbar.restart(window, cx)),
+            ),
+            false => div()
+                .debug_selector(|| "run-configurations-restart-disabled".to_string())
+                .child(
+                    IconButton::new("run-configurations-restart", IconName::Rerun)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .disabled(true)
+                        .tooltip(Tooltip::text(
+                            "A debug session is restarted from the debugger",
+                        )),
+                )
+                .into_any_element(),
+        };
         [
             segment(
                 "run-configurations-stop",
@@ -982,13 +1025,7 @@ impl ConfigurationsToolbar {
                 "Stop the run",
                 cx.listener(|toolbar, _, _window, cx| toolbar.stop(cx)),
             ),
-            segment(
-                "run-configurations-restart",
-                IconName::Rerun,
-                Color::Accent,
-                "Stop the run and start it again",
-                cx.listener(|toolbar, _, window, cx| toolbar.restart(window, cx)),
-            ),
+            restart,
         ]
     }
 }
@@ -3428,6 +3465,214 @@ mod tests {
             wait_until_it_is_over(&their_run, &mut cx).await,
             "the other run this test started has to be left dead too"
         );
+    }
+
+    /// Starting a configuration stops the run of it that is going on, unless the
+    /// configuration says several may run at once: then the new run starts
+    /// beside the old one.
+    #[gpui::test]
+    async fn a_new_run_leaves_the_old_one_alone_only_when_several_may_run_at_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (over, mut cx) = a_plaque_over_runs(
+            r#"[
+              { "label": "api server", "command": "echo api", "allow_concurrent_runs": true },
+              { "label": "unit tests", "command": "echo tests" }
+            ]"#,
+            cx,
+        )
+        .await;
+        let several = the_kept_configuration(&over.toolbar, 0, &cx);
+        let one_only = the_kept_configuration(&over.toolbar, 1, &cx);
+        assert!(several.allow_concurrent_runs && !one_only.allow_concurrent_runs);
+        let first_of_several = a_run_of(&several, &over, &mut cx).await;
+        let first_of_one_only = a_run_of(&one_only, &over, &mut cx).await;
+
+        let pointing = Pointing::Kept {
+            kind: Kind::Task,
+            at: 0,
+        };
+        over.toolbar.update_in(&mut cx, |toolbar, window, cx| {
+            toolbar.run_of(&pointing, window, cx)
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if the_history_holds(&several, &over, &mut cx) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(
+            the_history_holds(&several, &over, &mut cx),
+            "the new run of the configuration was started"
+        );
+        assert!(
+            still_running(&first_of_several, &cx),
+            "a configuration that runs several at once leaves the old run alone"
+        );
+
+        let pointing = Pointing::Kept {
+            kind: Kind::Task,
+            at: 1,
+        };
+        over.toolbar.update_in(&mut cx, |toolbar, window, cx| {
+            toolbar.run_of(&pointing, window, cx)
+        });
+        assert!(
+            wait_until_it_is_over(&first_of_one_only, &mut cx).await,
+            "a configuration that runs one at a time stops its old run"
+        );
+        first_of_several.update(&mut cx, |terminal, _| terminal.kill_active_task());
+        assert!(wait_until_it_is_over(&first_of_several, &mut cx).await);
+    }
+
+    const API_TASK: &str = r#"[{ "label": "Run API", "command": "echo api" }]"#;
+    const API_DEBUG: &str = r#"[{
+        "label": "Debug API",
+        "adapter": "Delve",
+        "request": "launch",
+        "mode": "debug",
+        "program": "./cmd/api"
+    }]"#;
+
+    /// A debug session that is still starting: alive as far as the plaque can
+    /// tell, with no adapter behind it.
+    fn a_session_named(
+        label: &str,
+        toolbar: &Entity<ConfigurationsToolbar>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<project::debugger::session::Session> {
+        let project = toolbar.read_with(cx, |toolbar, cx| {
+            toolbar
+                .workspace
+                .upgrade()
+                .expect("the workspace is open")
+                .read(cx)
+                .project()
+                .clone()
+        });
+        project.update(cx, |project, cx| {
+            project.dap_store().update(cx, |dap_store, cx| {
+                dap_store.new_session(
+                    Some(label.to_string().into()),
+                    dap::adapters::DebugAdapterName("Delve".into()),
+                    task::SharedTaskContext::default(),
+                    None,
+                    Default::default(),
+                    cx,
+                )
+            })
+        })
+    }
+
+    fn is_alive(
+        session: &Entity<project::debugger::session::Session>,
+        cx: &VisualTestContext,
+    ) -> bool {
+        !session.read_with(cx, |session, _| session.is_terminated())
+    }
+
+    fn point_the_plaque_at(
+        pointing: Pointing,
+        toolbar: &Entity<ConfigurationsToolbar>,
+        cx: &mut VisualTestContext,
+    ) {
+        toolbar.update(cx, |toolbar, cx| toolbar.point_at(pointing, cx));
+        cx.run_until_parked();
+    }
+
+    /// Two sessions of one debug configuration are two runs of it: the plaque
+    /// offers Stop, Stop ends both, and the session's restart is left to the
+    /// debugger, so the plaque's own is there but cannot be pressed.
+    #[gpui::test]
+    async fn stop_ends_every_session_of_a_debug_configuration(cx: &mut TestAppContext) {
+        let (toolbar, bar, mut cx) =
+            a_bar_with_the_plaque_and_debug_file(API_TASK, API_DEBUG, cx).await;
+        let debug = Pointing::Kept {
+            kind: Kind::Debug,
+            at: 0,
+        };
+        point_the_plaque_at(debug.clone(), &toolbar, &mut cx);
+        draw_the_bar(bar, &mut cx);
+        assert!(cx.debug_bounds("run-configurations-run-button").is_some());
+
+        let first = a_session_named("Debug API", &toolbar, &mut cx);
+        let second = a_session_named("Debug API", &toolbar, &mut cx);
+        draw_the_bar(bar, &mut cx);
+        assert!(
+            cx.debug_bounds("run-configurations-stop-button").is_some(),
+            "a configuration with a session going is running"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-disabled")
+                .is_some(),
+            "a session is not restarted from the plaque"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-button")
+                .is_none()
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, cx| toolbar.running_count(cx)),
+            2
+        );
+
+        let restart = cx
+            .debug_bounds("run-configurations-restart-disabled")
+            .expect("painted");
+        cx.simulate_click(restart.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            is_alive(&first, &cx) && is_alive(&second, &cx),
+            "pressing it does nothing"
+        );
+
+        press("run-configurations-stop-button", bar, &mut cx);
+        assert!(!is_alive(&first, &cx), "the first session is ended");
+        assert!(!is_alive(&second, &cx), "and so is the second");
+        assert!(
+            cx.debug_bounds("run-configurations-run-button").is_some(),
+            "with nothing left running the plaque offers Run again"
+        );
+    }
+
+    /// Debug on a task starts a session that carries the task's own name, or the
+    /// name of the debug configuration the project keeps for it. The plaque
+    /// over the task has to see either one, and Stop has to end it.
+    #[gpui::test]
+    async fn a_session_started_by_debug_on_a_task_is_seen_and_stopped(cx: &mut TestAppContext) {
+        let (toolbar, bar, mut cx) =
+            a_bar_with_the_plaque_and_debug_file(API_TASK, API_DEBUG, cx).await;
+        let task = Pointing::Kept {
+            kind: Kind::Task,
+            at: 0,
+        };
+        point_the_plaque_at(task.clone(), &toolbar, &mut cx);
+        draw_the_bar(bar, &mut cx);
+        assert!(cx.debug_bounds("run-configurations-run-button").is_some());
+
+        let derived = a_session_named("Run API", &toolbar, &mut cx);
+        let paired = a_session_named("Debug API", &toolbar, &mut cx);
+        let stranger = a_session_named("Something else", &toolbar, &mut cx);
+        draw_the_bar(bar, &mut cx);
+        assert!(
+            toolbar.read_with(&cx, |toolbar, cx| toolbar.is_running_of(&task, cx)),
+            "a session started by Debug on this task is this task running"
+        );
+        assert!(cx.debug_bounds("run-configurations-stop-button").is_some());
+
+        press("run-configurations-stop-button", bar, &mut cx);
+        assert!(
+            !is_alive(&derived, &cx),
+            "the session worked out from the task"
+        );
+        assert!(
+            !is_alive(&paired, &cx),
+            "the session of the paired configuration"
+        );
+        assert!(is_alive(&stranger, &cx), "and nobody else's");
     }
 
     fn open_the_list(bar: gpui::WindowHandle<BarWithThePlaque>, cx: &mut VisualTestContext) {
