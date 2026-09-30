@@ -3106,6 +3106,12 @@ impl Terminal {
         Task::ready(None)
     }
 
+    /// The code the task's process ended with, once it has; none while it runs,
+    /// and none when it was ended by a signal rather than by exiting.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.child_exited.and_then(|status| status.code())
+    }
+
     fn register_task_finished(
         &mut self,
         exit_status: Option<ExitStatus>,
@@ -3148,6 +3154,7 @@ impl Terminal {
                 task.status.register_terminal_exit();
             }
         };
+        cx.notify();
 
         let (finished_successfully, task_line, command_line) = task_summary(task, exit_status);
         let mut lines_to_show = Vec::new();

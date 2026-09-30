@@ -967,6 +967,17 @@ impl TerminalPanel {
         })
     }
 
+    /// Whether the panel is on screen and is showing the terminal whose tab is
+    /// the item `item_id`.
+    pub fn is_showing(&self, item_id: gpui::EntityId, cx: &App) -> bool {
+        self.active
+            && self.center.panes().into_iter().any(|pane| {
+                pane.read(cx)
+                    .active_item()
+                    .is_some_and(|item| item.item_id() == item_id)
+            })
+    }
+
     /// Whether the terminal the panel is showing is a task that is still
     /// running, other than `except`: a run the reader may be reading.
     fn another_run_is_on_screen(&self, except: Option<&Entity<Terminal>>, cx: &App) -> bool {
@@ -3848,6 +3859,93 @@ mod tests {
             shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
             Some(on_screen_run.entity_id()),
             "and the run being read is still the one shown"
+        );
+        end_them_all(&over, cx);
+    }
+
+    fn a_task_that(label: &str, template: &str, script: &str) -> SpawnInTerminal {
+        SpawnInTerminal {
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            ..revealing(a_long_task(label, template, true, true))
+        }
+    }
+
+    async fn ended(terminal: &Entity<Terminal>, cx: &mut TestAppContext) {
+        terminal
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+        cx.run_until_parked();
+    }
+
+    fn what_was_said(over: &PanelOverTasks, cx: &mut TestAppContext) -> Vec<String> {
+        over.window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .notification_ids()
+                    .into_iter()
+                    .filter_map(|id| match id {
+                        workspace::notifications::NotificationId::Named(said) => {
+                            Some(said.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    /// A run that dies while another is on screen is told about; a run that
+    /// dies on screen, one that finishes well, and one the reader stopped are
+    /// not.
+    #[gpui::test]
+    async fn a_run_that_fails_out_of_sight_is_told_about_and_no_other_is(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+
+        let on_screen = spawn(&over, &a_task_that("lint", "lint", "sleep 0.5; exit 4"), cx).await;
+        ended(&on_screen, cx).await;
+        assert_eq!(
+            what_was_said(&over, cx),
+            Vec::<String>::new(),
+            "a run that dies where the reader can see it says so itself"
+        );
+
+        let watched = spawn(&over, &a_long_task("api server", "api", true, true), cx).await;
+        let watched = {
+            let revealed = revealing(a_long_task("api server", "api", true, true));
+            end_them_all(&over, cx);
+            ended(&watched, cx).await;
+            spawn(&over, &revealed, cx).await
+        };
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(watched.entity_id())
+        );
+
+        let failing = spawn(
+            &over,
+            &a_task_that("unit tests", "tests", "sleep 0.5; exit 3"),
+            cx,
+        )
+        .await;
+        let passing = spawn(
+            &over,
+            &a_task_that("formatting", "format", "sleep 0.5; exit 0"),
+            cx,
+        )
+        .await;
+        let stopped = spawn(&over, &a_long_task("watcher", "watch", true, true), cx).await;
+        stopped.update(cx, |terminal, _| terminal.kill_active_task());
+        for run in [&failing, &passing, &stopped] {
+            ended(run, cx).await;
+        }
+
+        assert_eq!(
+            what_was_said(&over, cx),
+            vec!["unit tests exited with code 3".to_string()],
+            "only the run that failed out of sight is told about"
         );
         end_them_all(&over, cx);
     }

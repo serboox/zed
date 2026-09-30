@@ -154,6 +154,9 @@ pub struct TerminalView {
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     self_handle: WeakEntity<Self>,
+    /// Whether the task in the terminal was seen running, so that the end of a
+    /// run is told from a task that had already ended when the tab was made.
+    task_was_running: bool,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -278,6 +281,8 @@ impl TerminalView {
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
 
+        let task_was_running = task_is_running(terminal.read(cx));
+
         Self {
             terminal,
             workspace: workspace_handle,
@@ -301,6 +306,7 @@ impl TerminalView {
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
+            task_was_running,
             rename_editor: None,
             rename_editor_subscription: None,
             _subscriptions: subscriptions,
@@ -673,6 +679,61 @@ impl TerminalView {
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.terminal.update(cx, |term, _| term.select_all());
         cx.notify();
+    }
+
+    /// A task that ends with a failing code while its tab is out of sight is told
+    /// to the reader in a notification: with several runs going, the one that
+    /// died would otherwise be found only by going through the tabs. A run
+    /// the reader ended, which ends by a signal and not by exiting, is not one.
+    fn watch_the_task_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terminal = self.terminal.read(cx);
+        let Some(task) = terminal.task() else {
+            return;
+        };
+        match task.status {
+            TaskStatus::Running => self.task_was_running = true,
+            TaskStatus::Completed { success: false } if self.task_was_running => {
+                self.task_was_running = false;
+                let Some(code) = terminal.exit_code() else {
+                    return;
+                };
+                let label = task.spawned_task.label.clone();
+                // Read the workspace once the update that brought the news is over.
+                cx.defer_in(window, move |terminal_view, _, cx| {
+                    terminal_view.tell_the_task_failed(&label, code, cx);
+                });
+            }
+            _ => self.task_was_running = false,
+        }
+    }
+
+    fn tell_the_task_failed(&mut self, label: &str, code: i32, cx: &mut Context<Self>) {
+        let item_id = cx.entity_id();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let workspace_ref = workspace.read(cx);
+        let in_the_centre = workspace_ref.panes().iter().any(|pane| {
+            pane.read(cx)
+                .active_item()
+                .is_some_and(|item| item.item_id() == item_id)
+        });
+        let in_the_panel = workspace_ref
+            .panel::<TerminalPanel>(cx)
+            .is_some_and(|panel| panel.read(cx).is_showing(item_id, cx));
+        if in_the_centre || in_the_panel {
+            return;
+        }
+        let said = format!("{label} exited with code {code}");
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                workspace::Toast::new(
+                    workspace::notifications::NotificationId::named(said.clone().into()),
+                    said,
+                ),
+                cx,
+            );
+        });
     }
 
     fn rerun_task(&mut self, _: &RerunTask, window: &mut Window, cx: &mut Context<Self>) {
@@ -1104,6 +1165,7 @@ impl TerminalView {
     ) {
         self._terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
+        self.task_was_running = task_is_running(terminal.read(cx));
         self.terminal = terminal;
     }
 
@@ -1150,6 +1212,12 @@ fn rerun_in(
     window.dispatch_action(Box::new(terminal_rerun_override(task_id)), cx);
 }
 
+fn task_is_running(terminal: &Terminal) -> bool {
+    terminal
+        .task()
+        .is_some_and(|task| task.status == TaskStatus::Running)
+}
+
 fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
     zed_actions::Rerun {
         task_id: Some(task.0.clone()),
@@ -1165,7 +1233,10 @@ fn subscribe_for_terminal_events(
     window: &mut Window,
     cx: &mut Context<TerminalView>,
 ) -> Vec<Subscription> {
-    let terminal_subscription = cx.observe(terminal, |_, _, cx| cx.notify());
+    let terminal_subscription = cx.observe_in(terminal, window, |terminal_view, _, window, cx| {
+        terminal_view.watch_the_task_end(window, cx);
+        cx.notify();
+    });
     let mut previous_cwd = None;
     let terminal_events_subscription = cx.subscribe_in(
         terminal,
