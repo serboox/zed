@@ -1084,6 +1084,15 @@ async fn test_realfs_renamed_directory_keeps_reporting_after_the_old_path_is_rel
     watcher.add(&old).unwrap();
 
     std::fs::rename(&old, &new).unwrap();
+    // The backend drops the old path's watch itself once it has handled the
+    // rename; adding the new path before that is a race of its own.
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == old || path == new
+        })
+        .await,
+        "the rename was reported"
+    );
     watcher.add(&new).unwrap();
     watcher.remove(&old).unwrap();
     let _ = watcher_delivered_event(&mut events, &executor, Duration::from_millis(300), &|_| {
