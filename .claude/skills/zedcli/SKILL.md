@@ -34,6 +34,7 @@ installed by the fork's `script/install-fast-shortcut` into `~/.local/bin`.
 | Restart / stop everything that runs | `zedcli restart --running` · `zedcli stop --running` |
 | List the database connections the user saved | `zedcli db connections` |
 | Run SQL on one of them | `zedcli db query -c LABEL "SQL"` |
+| Run one statement of a script, by line | `zedcli db query -c LABEL --file script.sql --line 12` |
 | List the HTTP requests saved in the API Client | `zedcli api list` |
 | List its collections / folders | `zedcli api collections` · `zedcli api folders` |
 | See one request in full | `zedcli api show "Collection/Folder/Name"` |
@@ -106,6 +107,11 @@ $ echo "SELECT COUNT(*) AS n FROM orders" | zedcli db query -c local-mysql --jso
 - `-c` takes the connection's label or id; `-d` the database (the connection's
   own when omitted).
 - SQL comes from the argument, `--file`, or stdin, in that order.
+- `--line N` (counted from 1) runs only the statement that line of the SQL stands
+  in, found the way the console finds it on Ctrl+Enter, so a statement with no
+  `;` after it is found too. `--column C` names a place in the line, and
+  `--innermost` runs the subquery there instead of the whole statement. Stderr says
+  which lines ran; a line the script does not have exits with status 2.
 - Output: a table (default), `--json` (`{columns, rows:[{column: value}], ...}`,
   NULL as `null`), `--csv`, `--tsv`. Every value arrives as a string.
 - Results are capped at 500 rows, silently: a query that matches more returns
