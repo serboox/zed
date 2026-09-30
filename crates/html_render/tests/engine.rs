@@ -116,6 +116,26 @@ fn wait_for_colour_at(page: &mut HtmlPage, x: usize, y: usize, want: [u8; 3], wh
     panic!("{what}: the pixel at {x},{y} never turned {want:?}, it stayed {last:?}");
 }
 
+/// Turns the engine over until `found` has something to say about the page,
+/// and returns it. Whatever was just done to the page -- a selection, a script
+/// -- reaches the screen a frame later, and a machine that is busy takes longer
+/// to paint that frame than a fixed number of turns allows for.
+fn wait_until<T>(
+    page: &mut HtmlPage,
+    what: &str,
+    mut found: impl FnMut(&HtmlPage) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        page.pump();
+        if let Some(answer) = found(page) {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    panic!("{what}: the page never showed it");
+}
+
 /// Turns the engine over for a while, so that whatever was just handed to it --
 /// an event, a script, a question -- is actually dealt with.
 fn pump_for(page: &mut HtmlPage, how_long: Duration) {
@@ -422,13 +442,15 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         // And the reader has to be able to see it: the highlight is painted over
         // the words, so the page is no longer plain white where they are.
-        let highlight = (0..40)
-            .flat_map(|x| (2..18).map(move |y| (x * 3, y)))
-            .filter_map(|(x, y)| colour_at(&selectable, x, y))
-            .find(|colour| colour[2] > colour[0].saturating_add(20));
-        assert!(
-            highlight.is_some(),
-            "the selected words should be painted over with the highlight"
+        wait_until(
+            &mut selectable,
+            "the selected words should be painted over with the highlight",
+            |page| {
+                (0..40)
+                    .flat_map(|x| (2..18).map(move |y| (x * 3, y)))
+                    .filter_map(|(x, y)| colour_at(page, x, y))
+                    .find(|colour| colour[2] > colour[0].saturating_add(20))
+            },
         );
         drop(selectable);
 
@@ -761,15 +783,12 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
         cx,
     )
     .expect("the engine started once already");
-    let deadline = Instant::now() + DEADLINE;
-    while Instant::now() < deadline && colour_at(&lent, 32, 8) != Some([255, 0, 0]) {
-        lent.pump();
-        std::thread::sleep(Duration::from_millis(8));
-    }
-    assert_eq!(
-        colour_at(&lent, 32, 8),
-        Some([255, 0, 0]),
-        "the copied frame should have the red half at the top"
+    wait_for_colour_at(
+        &mut lent,
+        32,
+        8,
+        [255, 0, 0],
+        "the copied frame should have the red half at the top",
     );
 
     let Some(frame) = lent.shared_frame() else {
@@ -1301,15 +1320,12 @@ fn the_page_lends_its_own_texture(cx: &mut gpui::App) {
         cx,
     )
     .expect("the engine started once already");
-    let deadline = Instant::now() + DEADLINE;
-    while Instant::now() < deadline && colour_at(&lent, 32, 8) != Some([255, 0, 0]) {
-        lent.pump();
-        std::thread::sleep(Duration::from_millis(8));
-    }
-    assert_eq!(
-        colour_at(&lent, 32, 8),
-        Some([255, 0, 0]),
-        "the copied frame should have the red half at the top"
+    wait_for_colour_at(
+        &mut lent,
+        32,
+        8,
+        [255, 0, 0],
+        "the copied frame should have the red half at the top",
     );
 
     let Some(frame) = lent.shared_frame() else {
