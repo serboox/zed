@@ -374,6 +374,28 @@ want=$'id,name\n1,Ada\n2,"Grace, ""the admiral"""\n3,'
 out=$(echo "SELECT COUNT(*) AS n FROM users" | zc db query -c e2e-mysql --json) || true
 echo "$out" | grep -q '"n": "3"' && pass "SQL is read from stdin and printed as JSON" || fail "SQL is read from stdin and printed as JSON" "$out"
 expect_status 1 "an SQL error is a failed request" -- db query -c e2e-mysql "SELECT nope FROM users"
+cat >"$ROOT/script.sql" <<'SQL'
+SELECT 'first' AS which;
+
+-- the second
+SELECT id, name
+FROM users
+WHERE id IN (
+    SELECT id FROM users WHERE id = 2
+);
+
+SELECT 'third' AS which
+SQL
+out=$(zc db query -c e2e-mysql --csv --file "$ROOT/script.sql" --line 5 2>/dev/null) || true
+want=$'id,name\n2,"Grace, ""the admiral"""'
+[ "$out" = "$want" ] && pass "a line of a script runs the statement it stands in, and only that" || fail "a line of a script runs the statement it stands in, and only that" "$out"
+out=$(zc db query -c e2e-mysql --csv --file "$ROOT/script.sql" --line 7 --column 14 --innermost 2>/dev/null) || true
+want=$'id\n2'
+[ "$out" = "$want" ] && pass "the innermost query at a position runs on its own" || fail "the innermost query at a position runs on its own" "$out"
+out=$(zc db query -c e2e-mysql --csv --file "$ROOT/script.sql" --line 10 2>/dev/null) || true
+want=$'which\nthird'
+[ "$out" = "$want" ] && pass "a last statement with no semicolon runs" || fail "a last statement with no semicolon runs" "$out"
+expect_status 2 "a line the script does not have is a bad argument" -- db query -c e2e-mysql --file "$ROOT/script.sql" --line 99
 
 echo "== only reads get through"
 mysql_count() { podman exec "$CONTAINER" mysql -uroot -pe2e-root shop -N -e "$1" 2>/dev/null; }

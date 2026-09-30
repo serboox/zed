@@ -694,8 +694,9 @@ pub async fn handle_cli_connection(
                 connection,
                 database,
                 sql,
+                at,
             } => {
-                handle_execute_query(connection, database, sql, responses.as_ref(), cx).await;
+                handle_execute_query(connection, database, sql, at, responses.as_ref(), cx).await;
             }
             CliRequest::ListConnections => {
                 handle_list_connections(responses.as_ref(), cx).await;
@@ -792,6 +793,7 @@ async fn handle_execute_query(
     connection: String,
     database: Option<String>,
     sql: String,
+    at: Option<cli::StatementPosition>,
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
 ) {
@@ -803,6 +805,46 @@ async fn handle_execute_query(
             .log_err();
         responses.send(CliResponse::Exit { status: 1 }).log_err();
         return;
+    };
+    let sql = match at {
+        Some(position) => {
+            let chosen = store.read_with(cx, |store, _| {
+                store.statement_for_cli(
+                    &connection,
+                    &sql,
+                    db_client_ui::PositionInText {
+                        line: position.line,
+                        column: position.column,
+                        innermost: position.innermost,
+                    },
+                )
+            });
+            match chosen {
+                Ok(chosen) => {
+                    responses
+                        .send(CliResponse::Stderr {
+                            message: format!(
+                                "Running lines {}-{}.",
+                                chosen.first_line, chosen.last_line
+                            ),
+                        })
+                        .log_err();
+                    chosen.sql
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let status = if message.starts_with("No database connection matching") {
+                        cli::exit_status::NOT_FOUND
+                    } else {
+                        cli::exit_status::BAD_ARGUMENTS
+                    };
+                    responses.send(CliResponse::Stderr { message }).log_err();
+                    responses.send(CliResponse::Exit { status }).log_err();
+                    return;
+                }
+            }
+        }
+        None => sql,
     };
 
     let task = store.update(cx, |store, cx| {

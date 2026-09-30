@@ -37,6 +37,7 @@ pub use panel::{
     toggle_inline_results,
 };
 pub use sql_exec::ExecStatusIndicator;
+pub use statement_chooser::{PositionInText, StatementAtPosition};
 pub use store::{CliQueryOutput, DatabaseStore, GlobalDatabaseStore};
 
 use gpui::App;

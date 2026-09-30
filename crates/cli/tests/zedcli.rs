@@ -511,8 +511,75 @@ fn sql_is_read_from_stdin_and_printed_as_csv() {
             connection: "local".into(),
             database: Some("shop".into()),
             sql: "SELECT id, name FROM users".into(),
+            at: None,
         }
     );
+}
+
+#[test]
+fn a_query_can_name_the_statement_at_a_position_of_its_script() {
+    let editor = FakeEditor::answering(|_| {
+        vec![
+            CliResponse::QueryResult {
+                columns: vec!["id".into()],
+                rows: vec![vec![Some("1".into())]],
+                rows_affected: 0,
+                execution_time_ms: 1,
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let script = "SELECT 1;\nSELECT * FROM a WHERE id IN (SELECT id FROM b);\n";
+    let output = zedcli(
+        editor.data_dir.path(),
+        &[
+            "db",
+            "query",
+            "-c",
+            "local",
+            "--line",
+            "2",
+            "--column",
+            "40",
+            "--innermost",
+            "--csv",
+        ],
+        Some(script),
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        editor.request(),
+        CliRequest::ExecuteQuery {
+            connection: "local".into(),
+            database: None,
+            sql: script.into(),
+            at: Some(cli::StatementPosition {
+                line: 2,
+                column: Some(40),
+                innermost: true,
+            }),
+        }
+    );
+}
+
+/// A column or the innermost query is a place in a line, and means nothing
+/// without the line.
+#[test]
+fn a_column_or_the_innermost_query_needs_a_line() {
+    let data_dir = TempDir::new().expect("a data directory");
+    for flags in [&["--column", "3"][..], &["--innermost"][..]] {
+        let mut arguments = vec!["db", "query", "-c", "local"];
+        arguments.extend_from_slice(flags);
+        arguments.push("SELECT 1");
+        let output = zedcli(data_dir.path(), &arguments, None, None);
+        assert_eq!(
+            output.status.code(),
+            Some(exit_status::BAD_ARGUMENTS),
+            "{flags:?}: {}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]

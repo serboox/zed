@@ -2523,7 +2523,7 @@ fn statement_bounds_at_offset(
 // below would put the boundary semicolon on the "before cursor" side and
 // hand back the following statement instead. `;` is ASCII, so stepping back
 // one byte can never land inside a multi-byte UTF-8 sequence.
-fn rewind_past_own_semicolon(text: &str, cursor: usize) -> usize {
+pub(crate) fn rewind_past_own_semicolon(text: &str, cursor: usize) -> usize {
     let cursor = cursor.min(text.len());
     if cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b';') {
         cursor - 1
@@ -2544,8 +2544,8 @@ fn statement_at_cursor(text: &str, cursor: usize, dialect: Option<&dyn Dialect>)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SqlStatementRun {
     pub(crate) sql: String,
-    start_row: u32,
-    end_row: u32,
+    pub(crate) start_row: u32,
+    pub(crate) end_row: u32,
 }
 
 fn row_for_byte_offset(text: &str, offset: usize) -> u32 {
@@ -2571,7 +2571,7 @@ fn trim_sql_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
     (trimmed_start < trimmed_end).then_some(trimmed_start..trimmed_end)
 }
 
-fn statement_range_at_cursor(
+pub(crate) fn statement_range_at_cursor(
     text: &str,
     cursor: usize,
     dialect: Option<&dyn Dialect>,

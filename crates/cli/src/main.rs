@@ -914,6 +914,7 @@ fn run_db_command(args: &[String]) -> Result<()> {
             connection,
             database,
             sql,
+            at: None,
         },
         DbCommand::ListConnections => CliRequest::ListConnections,
     };

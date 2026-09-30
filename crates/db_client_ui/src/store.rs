@@ -1272,6 +1272,24 @@ impl DatabaseStore {
         self.connections_loaded
     }
 
+    /// The statement a console of `connection` (an id or a label) runs with its
+    /// cursor at `position` in `text`, read with the dialect of its driver.
+    pub fn statement_for_cli(
+        &self,
+        connection: &str,
+        text: &str,
+        position: crate::statement_chooser::PositionInText,
+    ) -> Result<crate::statement_chooser::StatementAtPosition> {
+        let connection = self
+            .connections
+            .iter()
+            .find(|c| c.config.id.to_string() == connection || c.config.label == connection)
+            .with_context(|| format!("No database connection matching '{connection}'"))?;
+        let dialect = crate::sql_ast::dialect_for_driver(connection.config.driver);
+        crate::statement_chooser::statement_at_position(text, position, dialect.as_deref())
+            .map_err(anyhow::Error::msg)
+    }
+
     /// Saved connections as `(id, label, driver)` tuples, without credentials.
     /// Used by the CLI/agent surfaces that must never expose passwords.
     pub fn connection_summaries(&self) -> Vec<(String, String, String)> {

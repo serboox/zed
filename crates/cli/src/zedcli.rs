@@ -9,8 +9,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cli::{
     ApiData, ApiEnvironmentInfo, ApiHighlight, ApiOperation, ApiPair, ApiRequestChanges,
     ApiRequestDetail, ApiRequestInfo, ApiResponseInfo, CliRequest, CliResponse, ConfigurationInfo,
-    DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, WindowInfo, WindowSelector,
-    exit_status, ipc::IpcOneShotServer,
+    DebugSessionInfo, IpcHandshake, RunAction, RunInfo, RunState, StatementPosition, WindowInfo,
+    WindowSelector, exit_status, ipc::IpcOneShotServer,
 };
 use serde_json::json;
 
@@ -317,6 +317,17 @@ enum DbCommand {
         /// Print rows as tab-separated values.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
+        /// Run only the statement at this line (counted from 1) of the SQL, the
+        /// one a console would run with its cursor there.
+        #[arg(long)]
+        line: Option<u32>,
+        /// With --line: the column (counted from 1) of the position.
+        #[arg(long, requires = "line")]
+        column: Option<u32>,
+        /// With --line: run the innermost query at the position, not the whole
+        /// statement.
+        #[arg(long, requires = "line")]
+        innermost: bool,
         /// The SQL; read from stdin when neither this nor --file is given.
         sql: Option<String>,
     },
@@ -406,6 +417,9 @@ fn run(cli: ZedCli) -> Result<i32> {
                 file,
                 csv,
                 tsv,
+                line,
+                column,
+                innermost,
                 sql,
             } => {
                 if csv {
@@ -442,6 +456,11 @@ fn run(cli: ZedCli) -> Result<i32> {
                     connection,
                     database,
                     sql,
+                    at: line.map(|line| StatementPosition {
+                        line,
+                        column,
+                        innermost,
+                    }),
                 }
             }
         },

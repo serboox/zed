@@ -74,10 +74,14 @@ pub enum CliRequest {
     },
     /// Runs a SQL query against a saved database connection and returns the
     /// result. `connection` is matched against a connection id or its label.
+    /// With `at`, `sql` is a script and only the statement at that position
+    /// runs, the one a console would run with its cursor there.
     ExecuteQuery {
         connection: String,
         database: Option<String>,
         sql: String,
+        #[serde(default)]
+        at: Option<StatementPosition>,
     },
     /// Lists the saved database connections (no credentials).
     ListConnections,
@@ -332,6 +336,17 @@ pub struct ApiResponseInfo {
     pub tests: Vec<ApiTestInfo>,
 }
 
+/// A place in a SQL script that names the statement to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementPosition {
+    /// Counted from 1.
+    pub line: u32,
+    /// Counted from 1; the start of the line's text when absent.
+    pub column: Option<u32>,
+    /// The innermost query at the position instead of the whole statement.
+    pub innermost: bool,
+}
+
 /// Which windows a request is about. With nothing set, the window whose project
 /// holds `cwd` is chosen, and the focused window when none does. When several
 /// windows hold the path, the focused one is chosen if it is among them;
@@ -544,6 +559,23 @@ impl CliResponseSink for ipc::IpcSender<CliResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client from before a query could name a position asks without one, and
+    /// the editor still reads the question.
+    #[test]
+    fn a_query_from_an_older_client_has_no_position() {
+        let older = r#"{"ExecuteQuery":{"connection":"local","database":null,"sql":"SELECT 1"}}"#;
+        let request: CliRequest = serde_json::from_str(older).expect("it reads");
+        assert_eq!(
+            request,
+            CliRequest::ExecuteQuery {
+                connection: "local".into(),
+                database: None,
+                sql: "SELECT 1".into(),
+                at: None,
+            }
+        );
+    }
 
     /// An editor from before sessions carried a number and a process says neither
     /// in its answer, and the answer still reads.

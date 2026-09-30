@@ -14,7 +14,10 @@ use ui::{Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use crate::console_statements::{hash_starts_a_comment, nested_queries_at};
-use crate::panel::skip_leading_whitespace_and_comments;
+use crate::panel::{
+    rewind_past_own_semicolon, skip_leading_whitespace_and_comments, statement_range_at_cursor,
+    statement_runs_in_range,
+};
 
 const PREVIEW_CHARACTERS: usize = 80;
 const WHOLE_STATEMENT_LABEL: &str = "Whole statement";
@@ -35,6 +38,90 @@ impl Settings for DatabaseConsoleSettings {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// Where in a text a statement, or a part of one, is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionInText {
+    /// Counted from 1.
+    pub line: u32,
+    /// Counted from 1; the first character of the line's text when absent.
+    pub column: Option<u32>,
+    /// The innermost query at the position instead of the whole statement.
+    pub innermost: bool,
+}
+
+/// The SQL a console would send with its cursor at a [`PositionInText`], and
+/// the lines of the text it stands on, counted from 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatementAtPosition {
+    pub sql: String,
+    pub first_line: u32,
+    pub last_line: u32,
+}
+
+/// The statement a console runs with its cursor at `position`, or the part of it
+/// the cursor is inside when `position.innermost` asks for that. It is the very
+/// choice a run from the console makes, implicit boundaries and nested queries
+/// included.
+pub fn statement_at_position(
+    text: &str,
+    position: PositionInText,
+    dialect: Option<&dyn Dialect>,
+) -> Result<StatementAtPosition, String> {
+    let offset = offset_of_position(text, position.line, position.column)?;
+    let statement = statement_range_at_cursor(text, offset, dialect)
+        .ok_or_else(|| format!("there is no statement at line {}", position.line))?;
+    let range = match position.innermost {
+        true => {
+            let cursor = rewind_past_own_semicolon(text, offset);
+            choices_at_cursor(text, statement.clone(), cursor, dialect)
+                .into_iter()
+                .next()
+                .map_or(statement, |choice| choice.range)
+        }
+        false => statement,
+    };
+    let run = statement_runs_in_range(text, range, dialect)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("there is nothing to run at line {}", position.line))?;
+    let sql = run.sql.trim().trim_end_matches(';').trim().to_string();
+    if sql.is_empty() {
+        return Err(format!("there is nothing to run at line {}", position.line));
+    }
+    Ok(StatementAtPosition {
+        sql,
+        first_line: run.start_row + 1,
+        last_line: run.end_row + 1,
+    })
+}
+
+fn offset_of_position(text: &str, line: u32, column: Option<u32>) -> Result<usize, String> {
+    if line == 0 {
+        return Err("lines are counted from 1".to_string());
+    }
+    if column == Some(0) {
+        return Err("columns are counted from 1".to_string());
+    }
+    let mut line_start = 0;
+    for (index, content) in text.split('\n').enumerate() {
+        if index + 1 == line as usize {
+            let within = match column {
+                Some(column) => content
+                    .char_indices()
+                    .nth(column as usize - 1)
+                    .map_or(content.len(), |(at, _)| at),
+                None => content.len() - content.trim_start().len(),
+            };
+            return Ok(line_start + within);
+        }
+        line_start += content.len() + 1;
+    }
+    Err(format!(
+        "the text has {} lines, so there is no line {line}",
+        text.split('\n').count()
+    ))
 }
 
 /// One part of a statement that can be run or explained on its own.
@@ -408,5 +495,101 @@ mod tests {
         let found = choices(&text, "SELECT xx");
         assert_eq!(found[0].preview.chars().count(), PREVIEW_CHARACTERS + 1);
         assert!(found[0].preview.ends_with('…'));
+    }
+    fn at(
+        text: &str,
+        line: u32,
+        column: Option<u32>,
+        innermost: bool,
+    ) -> Result<StatementAtPosition, String> {
+        statement_at_position(
+            text,
+            PositionInText {
+                line,
+                column,
+                innermost,
+            },
+            Some(&MySqlDialect {}),
+        )
+    }
+
+    const SCRIPT: &str = "SELECT 1;\n\n-- the orders\nSELECT *\nFROM orders\nWHERE id IN (\n    SELECT order_id\n    FROM lines\n);\n\nSELECT 3\n";
+
+    /// Any line of a statement names the whole of it, with its own lines and
+    /// without the comment above it, the way a run from the console sends it.
+    #[test]
+    fn a_line_in_a_statement_names_the_whole_statement() {
+        for line in [4, 5, 6, 9] {
+            let found = at(SCRIPT, line, None, false).expect("a statement");
+            assert!(
+                found.sql.starts_with("SELECT *\nFROM orders"),
+                "{line}: {found:?}"
+            );
+            assert!(found.sql.ends_with(')'), "{line}: {found:?}");
+            assert_eq!((found.first_line, found.last_line), (4, 9), "line {line}");
+        }
+        let first = at(SCRIPT, 1, None, false).expect("a statement");
+        assert_eq!(first.sql, "SELECT 1");
+    }
+
+    /// A statement with no `;` after it ends where the text does, and the one
+    /// before it ends where this one begins.
+    #[test]
+    fn a_statement_without_a_semicolon_is_found_as_the_console_finds_it() {
+        let last = at(SCRIPT, 11, None, false).expect("a statement");
+        assert_eq!(last.sql, "SELECT 3");
+        assert_eq!((last.first_line, last.last_line), (11, 11));
+        let text = "SELECT id FROM a\nSELECT id FROM b\n";
+        assert_eq!(
+            at(text, 1, None, false).expect("first").sql,
+            "SELECT id FROM a"
+        );
+        assert_eq!(
+            at(text, 2, None, false).expect("second").sql,
+            "SELECT id FROM b"
+        );
+    }
+
+    /// With the innermost asked for, the part the position is inside is run on
+    /// its own; a position in no part smaller than the statement runs the
+    /// statement.
+    #[test]
+    fn the_innermost_query_at_a_position_is_found_on_its_own() {
+        let inside = at(SCRIPT, 7, Some(9), true).expect("a subquery");
+        assert_eq!(inside.sql, "SELECT order_id\n    FROM lines");
+        assert_eq!((inside.first_line, inside.last_line), (7, 8));
+        let outside = at(SCRIPT, 4, None, true).expect("the statement");
+        assert!(
+            outside.sql.starts_with("SELECT *\nFROM orders"),
+            "{outside:?}"
+        );
+    }
+
+    /// A column picks between two queries on one line.
+    #[test]
+    fn a_column_picks_between_the_queries_of_one_line() {
+        let text = "SELECT * FROM (SELECT a FROM x) p JOIN (SELECT b FROM y) q ON p.a = q.b";
+        let first = at(text, 1, Some(24), true).expect("the first subquery");
+        let second = at(text, 1, Some(50), true).expect("the second subquery");
+        assert_eq!(first.sql, "SELECT a FROM x");
+        assert_eq!(second.sql, "SELECT b FROM y");
+    }
+
+    /// What cannot be found is said, not guessed.
+    #[test]
+    fn a_position_that_names_nothing_is_said_so() {
+        assert!(at(SCRIPT, 0, None, false).unwrap_err().contains("from 1"));
+        assert!(
+            at(SCRIPT, 1, Some(0), false)
+                .unwrap_err()
+                .contains("from 1")
+        );
+        assert!(
+            at(SCRIPT, 99, None, false)
+                .unwrap_err()
+                .contains("no line 99")
+        );
+        assert!(at("  \n  \n", 1, None, false).is_err());
+        assert!(at("-- nothing but a comment\n", 1, None, false).is_err());
     }
 }
