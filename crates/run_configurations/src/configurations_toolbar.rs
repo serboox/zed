@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use fs::Fs;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle,
@@ -295,8 +295,100 @@ pub struct ConfigurationsToolbar {
     _subscriptions: Vec<Subscription>,
 }
 
+gpui::actions!(
+    run_configurations,
+    [
+        /// Starts what the plaque in the title bar points at.
+        RunSelected,
+        /// Stops what the plaque in the title bar points at, with everything it
+        /// started.
+        StopSelected,
+        /// Stops what the plaque in the title bar points at and starts it again,
+        /// or starts it when it is not running. With nothing for the plaque to
+        /// point at, reruns the last task.
+        RestartSelected,
+        /// Stops every run in the window, the ones the list does not know
+        /// included.
+        StopAllRunning
+    ]
+);
+
+/// The plaque of each workspace, so that a key pressed anywhere in the window
+/// reaches the one in its title bar.
+#[derive(Default)]
+struct Plaques(HashMap<gpui::EntityId, gpui::WeakEntity<ConfigurationsToolbar>>);
+
+impl gpui::Global for Plaques {}
+
+/// The plaque in `workspace`'s title bar, when it has one.
+fn plaque_of(workspace: &Workspace, cx: &App) -> Option<Entity<ConfigurationsToolbar>> {
+    cx.try_global::<Plaques>()?
+        .0
+        .get(&workspace.weak_handle().entity_id())?
+        .upgrade()
+}
+
+/// Lets `act` loose on the plaque of `workspace`, once the action that asked
+/// for it is over: the plaque reads and updates the workspace to find its runs,
+/// and the workspace is still being updated by the action. Says whether the
+/// workspace has a plaque.
+fn on_the_plaque(
+    workspace: &Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    act: impl FnOnce(&mut ConfigurationsToolbar, &mut Window, &mut Context<ConfigurationsToolbar>)
+    + 'static,
+) -> bool {
+    let Some(plaque) = plaque_of(workspace, cx) else {
+        return false;
+    };
+    window.defer(cx, move |window, cx| {
+        plaque.update(cx, |plaque, cx| act(plaque, window, cx));
+    });
+    true
+}
+
+/// Makes the keys do what the plaque's buttons do. A key with no plaque to act
+/// on goes on to whatever else is bound to it.
+pub(crate) fn register_the_keys(workspace: &mut Workspace) {
+    workspace.register_action(|workspace, _: &RunSelected, window, cx| {
+        if !on_the_plaque(workspace, window, cx, |plaque, window, cx| {
+            plaque.run(window, cx)
+        }) {
+            cx.propagate();
+        }
+    });
+    workspace.register_action(|workspace, _: &StopSelected, window, cx| {
+        if !on_the_plaque(workspace, window, cx, |plaque, _, cx| plaque.stop(cx)) {
+            cx.propagate();
+        }
+    });
+    workspace.register_action(|workspace, _: &StopAllRunning, window, cx| {
+        if !on_the_plaque(workspace, window, cx, |plaque, _, cx| plaque.stop_all(cx)) {
+            cx.propagate();
+        }
+    });
+    workspace.register_action(|workspace, _: &RestartSelected, window, cx| {
+        let points_at_something =
+            plaque_of(workspace, cx).is_some_and(|plaque| plaque.read(cx).pointing.is_some());
+        if points_at_something {
+            on_the_plaque(workspace, window, cx, |plaque, window, cx| {
+                plaque.restart_or_run(window, cx);
+            });
+        } else {
+            window.dispatch_action(Box::new(zed_actions::Rerun::default()), cx);
+        }
+    });
+}
+
 impl ConfigurationsToolbar {
     pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
+        let weak_self = cx.weak_entity();
+        let plaques = cx.default_global::<Plaques>();
+        plaques.0.retain(|_, plaque| plaque.upgrade().is_some());
+        plaques
+            .0
+            .insert(workspace.weak_handle().entity_id(), weak_self);
         let store = crate::configurations_store::store_for(workspace.project(), cx);
         let subscription = cx.observe(&store, |toolbar, _, cx| {
             toolbar.keep_pointing_at_something(cx);
@@ -740,6 +832,20 @@ impl ConfigurationsToolbar {
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pointing) = self.pointing.clone() {
             self.restart_of(&pointing, window, cx);
+        }
+    }
+
+    /// Restarts what the plaque points at when it runs in a terminal, starts it
+    /// when it is not running, and leaves a debug session to the debugger, where
+    /// it is restarted.
+    fn restart_or_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pointing) = self.pointing.clone() else {
+            return;
+        };
+        if self.the_run_of(&pointing, cx).is_some() {
+            self.restart_of(&pointing, window, cx);
+        } else if self.sessions_of(&pointing, cx).is_empty() {
+            self.run_of(&pointing, window, cx);
         }
     }
 
@@ -2167,6 +2273,160 @@ mod tests {
             },
             cx,
         )
+    }
+
+    /// The plaque over a project holding `tasks`, in a workspace that has the
+    /// shipped keymap, so that a key pressed in it reaches the plaque the way a
+    /// reader's does.
+    async fn a_plaque_under_the_keymap(
+        tasks: &str,
+        cx: &mut TestAppContext,
+    ) -> (APlaqueOverRuns, VisualTestContext, VisualTestContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let mut bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("the shipped keymap loads");
+            for binding in &mut bindings {
+                binding.set_meta(settings::KeybindSource::Default.meta());
+            }
+            cx.bind_keys(bindings);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".zed": { "tasks.json": tasks } }),
+        )
+        .await;
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let mut workspace_cx = VisualTestContext::from_window(window.into(), cx);
+        let (toolbar, gauge, panel) =
+            workspace.update_in(&mut workspace_cx, |workspace, window, cx| {
+                let toolbar = cx.new(|cx| ConfigurationsToolbar::new(workspace, cx));
+                let gauge = cx.new(|cx| AnsweringModeGauge::new(workspace, cx));
+                let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                workspace.add_panel(panel.clone(), window, cx);
+                let pane = workspace.active_pane().clone();
+                window.focus(&gpui::Focusable::focus_handle(&pane, cx), cx);
+                (toolbar, gauge, panel)
+            });
+        let bar = cx.add_window(|_window, cx| BarWithThePlaque {
+            toolbar: toolbar.clone(),
+            gauge,
+            focus_handle: cx.focus_handle(),
+        });
+        let bar_cx = VisualTestContext::from_window(bar.into(), cx);
+        workspace_cx.run_until_parked();
+        (
+            APlaqueOverRuns {
+                toolbar,
+                workspace,
+                panel,
+                bar,
+            },
+            bar_cx,
+            workspace_cx,
+        )
+    }
+
+    async fn wait_until_it_is_started(
+        template: &TaskTemplate,
+        over: &APlaqueOverRuns,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if the_history_holds(template, over, cx) {
+                return true;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        false
+    }
+
+    /// The keys that stand for the plaque's buttons do what the buttons do.
+    #[gpui::test]
+    async fn the_keys_do_what_the_buttons_of_the_plaque_do(cx: &mut TestAppContext) {
+        let (over, mut bar_cx, mut workspace_cx) = a_plaque_under_the_keymap(THREE_TASKS, cx).await;
+        let shown = what_it_would_run(&over.toolbar, &bar_cx);
+        let other = the_kept_configuration(&over.toolbar, 1, &bar_cx);
+
+        workspace_cx.simulate_keystrokes("alt-f5");
+        assert!(
+            wait_until_it_is_started(&shown, &over, &mut bar_cx).await,
+            "the key that stands for Run starts what the plaque shows"
+        );
+
+        let run = a_run_of(&shown, &over, &mut bar_cx).await;
+        let another = a_run_of(&other, &over, &mut bar_cx).await;
+        workspace_cx.simulate_keystrokes("alt-f6");
+        assert!(
+            wait_until_it_is_over(&run, &mut bar_cx).await,
+            "the key that stands for Stop ends the run the plaque shows"
+        );
+        assert!(
+            still_running(&another, &bar_cx),
+            "and no other run along with it"
+        );
+
+        let again = a_run_of(&shown, &over, &mut bar_cx).await;
+        workspace_cx.simulate_keystrokes("ctrl-alt-f6");
+        assert!(
+            wait_until_it_is_over(&again, &mut bar_cx).await,
+            "the key that stands for Stop all ends the run of the plaque"
+        );
+        assert!(
+            wait_until_it_is_over(&another, &mut bar_cx).await,
+            "and every other one"
+        );
+    }
+
+    /// The keys that used to rerun whatever ran last restart what the plaque
+    /// shows; with nothing on the plaque they still rerun the last task.
+    #[gpui::test]
+    async fn the_rerun_keys_follow_the_plaque(cx: &mut TestAppContext) {
+        let (over, mut bar_cx, mut workspace_cx) = a_plaque_under_the_keymap(THREE_TASKS, cx).await;
+        let shown = what_it_would_run(&over.toolbar, &bar_cx);
+        let run = a_run_of(&shown, &over, &mut bar_cx).await;
+
+        workspace_cx.simulate_keystrokes("ctrl-alt-r");
+
+        assert!(
+            wait_until_it_is_over(&run, &mut bar_cx).await,
+            "the rerun key restarts the run the plaque shows: the old one ends"
+        );
+        assert!(
+            wait_until_it_is_started(&shown, &over, &mut bar_cx).await,
+            "and the same configuration is started again"
+        );
+
+        let (over, _bar_cx, mut workspace_cx) = a_plaque_under_the_keymap("[]", cx).await;
+        let asked_for_the_last_task = std::rc::Rc::new(std::cell::Cell::new(0));
+        over.workspace.update(&mut workspace_cx, |workspace, _| {
+            let counted = asked_for_the_last_task.clone();
+            workspace.register_action(move |_, _: &zed_actions::Rerun, _, _| {
+                counted.set(counted.get() + 1);
+            });
+        });
+        workspace_cx.simulate_keystrokes("alt-t");
+        workspace_cx.run_until_parked();
+        assert_eq!(
+            asked_for_the_last_task.get(),
+            1,
+            "with nothing for the plaque to point at, the key reruns the last task"
+        );
     }
 
     /// Starts a run of `template` in the terminal panel, the way the workspace

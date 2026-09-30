@@ -757,7 +757,9 @@
       // All task parameters are captured and unchanged between reruns by default.
       // Use the `"reevaluate_context"` parameter to control this.
       "ctrl-shift-r": ["task::Rerun", { "reevaluate_context": false }],
-      "alt-t": "task::Rerun",
+      // Restarts what the plaque in the title bar points at; with nothing for it
+      // to point at, reruns the last task.
+      "alt-t": "run_configurations::RestartSelected",
       "shift-alt-t": "task::Spawn",
       "shift-alt-r": ["task::Spawn", { "reveal_target": "center" }],
       // also possible to spawn tasks by name:
@@ -1939,5 +1941,14 @@
       "ctrl-f5": "run_configurations::RunThisConfiguration",
       "ctrl-s": "run_configurations::SaveThisConfiguration"
     },
+  },
+  {
+    // The plaque in the title bar names what runs; these keys do what its buttons do.
+    "context": "Workspace",
+    "bindings": {
+      "alt-f5": "run_configurations::RunSelected",
+      "alt-f6": "run_configurations::StopSelected",
+      "ctrl-alt-f6": "run_configurations::StopAllRunning"
+    }
   },
 ]

@@ -868,7 +868,9 @@
       "cmd-shift-r": "task::Spawn",
       // All task parameters are captured and unchanged between reruns by default.
       // Use the `"reevaluate_context"` parameter to control this.
-      "cmd-alt-r": ["task::Rerun", { "reevaluate_context": false }],
+      // Restarts what the plaque in the title bar points at; with nothing for it
+      // to point at, reruns the last task.
+      "cmd-alt-r": "run_configurations::RestartSelected",
       "ctrl-alt-shift-r": ["task::Spawn", { "reveal_target": "center" }],
       // also possible to spawn tasks by name:
       // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
@@ -2032,6 +2034,15 @@
       "f5": "run_configurations::DebugThisConfiguration",
       "ctrl-f5": "run_configurations::RunThisConfiguration",
       "cmd-s": "run_configurations::SaveThisConfiguration"
+    }
+  },
+  {
+    // The plaque in the title bar names what runs; these keys do what its buttons do.
+    "context": "Workspace",
+    "bindings": {
+      "alt-f5": "run_configurations::RunSelected",
+      "alt-f6": "run_configurations::StopSelected",
+      "ctrl-alt-f6": "run_configurations::StopAllRunning"
     }
   },
 ]

@@ -121,7 +121,7 @@
       "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true }],
       "alt-shift-f10": "task::Spawn",
       "shift-f10": "task::Spawn",
-      "ctrl-f5": "task::Rerun",
+      "ctrl-f5": "run_configurations::RestartSelected",
       "ctrl-e": "file_finder::Toggle",
       "ctrl-k": "git_panel::ToggleFocus", // bug: This should also focus commit editor
       "ctrl-shift-n": "file_finder::Toggle",

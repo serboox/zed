@@ -2818,7 +2818,7 @@ mod tests {
 
     /// The actions this editor added to answer, with no language server
     /// running, what a language server would answer.
-    const THE_FORKS_OWN_ACTIONS: [&str; 26] = [
+    const THE_FORKS_OWN_ACTIONS: [&str; 30] = [
         "cargo_diagnostics::Check",
         "go_diagnostics::Check",
         "python_diagnostics::Lint",
@@ -2843,6 +2843,10 @@ mod tests {
         "run_configurations::RunThisConfiguration",
         "run_configurations::DebugThisConfiguration",
         "run_configurations::SaveThisConfiguration",
+        "run_configurations::RunSelected",
+        "run_configurations::StopSelected",
+        "run_configurations::RestartSelected",
+        "run_configurations::StopAllRunning",
         "log_lens::OpenLogLens",
         "browser_tools::ToggleFocus",
     ];
@@ -2959,9 +2963,9 @@ mod tests {
         }
     }
 
-    /// Twenty-six actions answered questions a language server would answer and
-    /// could be reached only by opening the command palette, which a reader who
-    /// never opens it cannot discover.
+    /// Thirty actions answered questions a language server would answer, or did
+    /// what a button of the title bar does, and could be reached only by opening
+    /// the command palette, which a reader who never opens it cannot discover.
     #[test]
     fn every_action_this_fork_added_is_bound_in_all_three_default_keymaps() {
         for (name, keymap) in DEFAULT_KEYMAPS {

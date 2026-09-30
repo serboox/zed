@@ -379,6 +379,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenRunConfigurations, _window, cx| {
             open_window(workspace.project().clone(), workspace.weak_handle(), cx);
         });
+        crate::configurations_toolbar::register_the_keys(workspace);
     })
     .detach();
 }
