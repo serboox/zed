@@ -3986,7 +3986,7 @@ mod tests {
             kind: Kind::Debug,
             at: 0,
         };
-        point_the_plaque_at(debug.clone(), &toolbar, &mut cx);
+        point_the_plaque_at(debug, &toolbar, &mut cx);
         draw_the_bar(bar, &mut cx);
         assert!(cx.debug_bounds("run-configurations-run-button").is_some());
 

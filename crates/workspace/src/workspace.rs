@@ -14355,7 +14355,7 @@ mod tests {
 
     struct StubRunningWork {
         names: Vec<&'static str>,
-        stopped: std::rc::Rc<std::cell::Cell<usize>>,
+        stopped: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RunningWorkProvider for StubRunningWork {
@@ -14367,7 +14367,8 @@ mod tests {
         }
 
         fn stop_all(&self, _: &Workspace, _: &mut App) -> Task<bool> {
-            self.stopped.set(self.stopped.get() + 1);
+            self.stopped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Task::ready(true)
         }
     }
@@ -14377,7 +14378,7 @@ mod tests {
     #[gpui::test]
     async fn test_closing_a_window_asks_about_what_runs_in_it(cx: &mut TestAppContext) {
         init_test(cx);
-        let stopped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         cx.update(|cx| {
             set_running_work_provider(
                 Arc::new(StubRunningWork {
@@ -14406,7 +14407,11 @@ mod tests {
         );
         cx.simulate_prompt_answer("Cancel");
         assert!(!task.await.unwrap(), "Cancel keeps the window open");
-        assert_eq!(stopped.get(), 0, "and ends nothing");
+        assert_eq!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and ends nothing"
+        );
 
         let task = workspace.update_in(cx, |w, window, cx| {
             w.prepare_to_close(CloseIntent::Quit, window, cx)
@@ -14416,7 +14421,7 @@ mod tests {
         cx.simulate_prompt_answer("Stop and quit");
         assert!(task.await.unwrap());
         assert_eq!(
-            stopped.get(),
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "what runs is ended before the editor goes"
         );
