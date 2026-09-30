@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// A machine to run something on, spelled the way `ssh` itself spells it.
 ///
@@ -96,6 +97,75 @@ pub fn run_over_ssh(
     cwd: Option<&str>,
     env: &[(String, String)],
 ) -> (String, Vec<String>) {
+    compose(machine, None, command, args, cwd, env)
+}
+
+/// Lets the editor find a run again on the far side: a token only its processes carry,
+/// and the path of the ssh connection that later questions reuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTag {
+    pub token: String,
+    pub control_path: PathBuf,
+}
+
+/// What a socket path may come to, with room to spare under the 104 bytes of the
+/// shortest limit a system has.
+const LONGEST_SOCKET_PATH: usize = 100;
+
+impl RunTag {
+    pub fn fresh() -> Self {
+        Self::in_one_of(
+            [
+                std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+                Some(std::env::temp_dir()),
+                Some(PathBuf::from("/tmp")),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
+
+    /// The first of `directories` the socket path fits in, for a runtime or
+    /// temporary directory of any length.
+    fn in_one_of(directories: impl IntoIterator<Item = PathBuf>) -> Self {
+        let token = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let name = format!("zed-ssh-{token}");
+        let directories: Vec<PathBuf> = directories.into_iter().collect();
+        let directory = directories
+            .iter()
+            .find(|directory| directory.join(&name).as_os_str().len() <= LONGEST_SOCKET_PATH)
+            .or(directories.last())
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        Self {
+            control_path: directory.join(name),
+            token,
+        }
+    }
+}
+
+const RUN_TOKEN_VARIABLE: &str = "ZED_REMOTE_RUN";
+
+/// [`run_over_ssh`] for a run the editor will measure on the far side.
+pub fn run_tagged_over_ssh(
+    machine: &Machine,
+    tag: &RunTag,
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> (String, Vec<String>) {
+    compose(machine, Some(tag), command, args, cwd, env)
+}
+
+fn compose(
+    machine: &Machine,
+    tag: Option<&RunTag>,
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> (String, Vec<String>) {
     let mut script = String::new();
     if let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
         script.push_str("cd ");
@@ -109,6 +179,10 @@ pub fn run_over_ssh(
         script.push_str(&quoted(value));
         script.push_str(" && ");
     }
+    // After the run's own variables, so none of them can take the token's place.
+    if let Some(tag) = tag {
+        script.push_str(&format!("export {RUN_TOKEN_VARIABLE}='{}' && ", tag.token));
+    }
     script.push_str(command);
     for arg in args {
         script.push(' ');
@@ -119,6 +193,17 @@ pub fn run_over_ssh(
     if let Some(port) = machine.port {
         ssh_args.push("-p".to_string());
         ssh_args.push(port.to_string());
+    }
+    if let Some(tag) = tag {
+        // The connection ends with the run, whatever the reader's configuration says.
+        for option in [
+            "ControlMaster=auto".to_string(),
+            format!("ControlPath={}", tag.control_path.display()),
+            "ControlPersist=no".to_string(),
+        ] {
+            ssh_args.push("-o".to_string());
+            ssh_args.push(option);
+        }
     }
     // The far side is asked for a terminal of its own, so a program that reads
     // input or paints progress behaves as it would if it were run there by
@@ -141,6 +226,51 @@ pub fn destination_of(command: Option<&str>, args: &[String]) -> Option<String> 
     }
     let separator = args.iter().position(|arg| arg == "--")?;
     args.get(separator.checked_sub(1)?).cloned()
+}
+
+/// A run sent over ssh, read back from its command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRun {
+    pub program: String,
+    pub destination: String,
+    pub port: Option<u16>,
+    pub control_path: PathBuf,
+    pub token: String,
+}
+
+/// The [`RemoteRun`] a command made by [`run_tagged_over_ssh`] describes. Any other
+/// run says nothing and is measured by its local client.
+pub fn remote_run_of(command: Option<&str>, args: &[String]) -> Option<RemoteRun> {
+    let program = command?;
+    let destination = destination_of(Some(program), args)?;
+    let separator = args.iter().position(|arg| arg == "--")?;
+    let port = args
+        .iter()
+        .take(separator)
+        .position(|arg| arg == "-p")
+        .and_then(|at| args.get(at + 1)?.parse().ok());
+    let control_path = args
+        .iter()
+        .take(separator)
+        .find_map(|arg| arg.strip_prefix("ControlPath="))?;
+    let script = args.get(separator + 1)?;
+    let marker = format!("export {RUN_TOKEN_VARIABLE}='");
+    let after = &script[script.find(&marker)? + marker.len()..];
+    let token = after[..after.find('\'')?].to_string();
+    if token.is_empty()
+        || !token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(RemoteRun {
+        program: program.to_string(),
+        destination,
+        port,
+        control_path: PathBuf::from(control_path),
+        token,
+    })
 }
 
 /// Rewrites a resolved run so it happens on `machine` instead of here.
@@ -174,7 +304,14 @@ pub fn send_to(
         .cwd
         .as_ref()
         .map(|cwd| cwd.to_string_lossy().into_owned());
-    let (program, args) = run_over_ssh(machine, &command, &resolved.args, cwd.as_deref(), &env);
+    let (program, args) = run_tagged_over_ssh(
+        machine,
+        &RunTag::fresh(),
+        &command,
+        &resolved.args,
+        cwd.as_deref(),
+        &env,
+    );
 
     // Named so a remote run is never mistaken for a local one, in the tab and
     // in the line the terminal prints above the output.
@@ -197,7 +334,7 @@ pub fn send_to(
 /// Single quotes take everything literally, which is what is wanted; the only
 /// character they cannot hold is a single quote itself, so each one is closed,
 /// escaped and reopened.
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
@@ -364,5 +501,122 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("uptime"));
         let (_, blank) = run_over_ssh(&machine, "uptime", &[], Some("   "), &[]);
         assert_eq!(blank.last().map(String::as_str), Some("uptime"));
+    }
+    fn a_tag() -> RunTag {
+        RunTag {
+            token: "abc123def456".into(),
+            control_path: PathBuf::from("/run/user/1000/zed-ssh-abc123def456"),
+        }
+    }
+
+    /// A tagged run can be found again from its command, and its script is unchanged.
+    #[test]
+    fn a_tagged_run_can_be_found_again_from_its_command() {
+        let machine = Machine::parse("deploy@build.example.com:2222").expect("a machine");
+        let (program, args) = run_tagged_over_ssh(
+            &machine,
+            &a_tag(),
+            "go",
+            &["run".to_string()],
+            Some("/srv/app"),
+            &[("PORT".to_string(), "8080".to_string())],
+        );
+        assert_eq!(
+            remote_run_of(Some(&program), &args),
+            Some(RemoteRun {
+                program: "ssh".into(),
+                destination: "deploy@build.example.com".into(),
+                port: Some(2222),
+                control_path: a_tag().control_path,
+                token: "abc123def456".into(),
+            })
+        );
+        let script = args.last().expect("a script");
+        assert_eq!(
+            script,
+            "cd '/srv/app' && export PORT='8080' && export ZED_REMOTE_RUN='abc123def456' && go 'run'"
+        );
+        for option in [
+            "ControlMaster=auto",
+            "ControlPath=/run/user/1000/zed-ssh-abc123def456",
+            "ControlPersist=no",
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-o" && pair[1] == option),
+                "{option} is asked of ssh: {args:?}"
+            );
+        }
+    }
+
+    /// A run the editor did not tag has nothing to ask about.
+    #[test]
+    fn a_run_with_no_tag_has_nothing_to_ask() {
+        let machine = Machine::parse("deploy@build.example.com").expect("a machine");
+        let (program, args) = run_over_ssh(&machine, "go", &[], None, &[]);
+        assert_eq!(remote_run_of(Some(&program), &args), None);
+        assert_eq!(
+            remote_run_of(Some("ssh"), &["host".to_string(), "uptime".to_string()]),
+            None
+        );
+        let (program, mut args) = run_tagged_over_ssh(&machine, &a_tag(), "go", &[], None, &[]);
+        let script = args.last_mut().expect("a script");
+        *script = script.replace("abc123def456", "a b");
+        assert_eq!(
+            remote_run_of(Some(&program), &args),
+            None,
+            "a token that is not plain letters and digits is not one the editor made"
+        );
+    }
+
+    /// A tag is short enough for a socket path, and no two runs share one.
+    #[test]
+    fn a_fresh_tag_is_short_and_not_shared() {
+        let (first, second) = (RunTag::fresh(), RunTag::fresh());
+        assert_ne!(first, second);
+        assert_eq!(first.token.len(), 12);
+        assert!(first.control_path.as_os_str().len() < 100);
+        assert!(
+            first
+                .control_path
+                .ends_with(format!("zed-ssh-{}", first.token))
+        );
+    }
+    /// A directory too long for a socket path is passed over for one that fits.
+    #[test]
+    fn a_directory_too_long_for_a_socket_is_passed_over() {
+        let too_long = PathBuf::from(format!("/run/user/1000/{}", "x".repeat(120)));
+        let tag = RunTag::in_one_of([too_long, PathBuf::from("/tmp")]);
+        assert_eq!(
+            tag.control_path.parent(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        let only_long = PathBuf::from(format!("/run/user/1000/{}", "y".repeat(120)));
+        assert!(
+            RunTag::in_one_of([only_long.clone()])
+                .control_path
+                .starts_with(&only_long),
+            "with nothing better the last directory is used as it is"
+        );
+    }
+
+    /// A run the editor sends over ssh is always tagged.
+    #[test]
+    fn a_run_sent_to_a_machine_can_be_asked_about() {
+        let machine = Machine::parse("deploy@build.example.com").expect("a machine");
+        let mut resolved = task::SpawnInTerminal {
+            label: "api".into(),
+            full_label: "api".into(),
+            command_label: "go run".into(),
+            command: Some("go".into()),
+            args: vec!["run".into()],
+            ..Default::default()
+        };
+        send_to(&machine, &mut resolved, HashMap::new());
+
+        let remote = remote_run_of(resolved.command.as_deref(), &resolved.args)
+            .expect("the run says how to ask about it");
+        assert_eq!(remote.destination, "deploy@build.example.com");
+        assert_eq!(resolved.label, "api on deploy@build.example.com");
     }
 }

@@ -571,6 +571,7 @@ impl Render for RunMetricsModal {
             goroutines,
             go_program,
             remote,
+            remote_measured,
             ..
         } = run;
 
@@ -588,6 +589,7 @@ impl Render for RunMetricsModal {
         self.goroutines_at = Some(go_program.unwrap_or(pid));
 
         let tabs = (runs.len() > 1).then(|| self.tabs(&runs, pid, cx));
+        let remote = remote.map(|machine| (machine, remote_measured));
         let body = self.body(&metrics, &readings, &goroutines, tabs, remote, window, cx);
 
         shell.child(cyberpunk::dialog_body().child(body))
@@ -601,7 +603,7 @@ impl RunMetricsModal {
         readings: &[(Option<f32>, u64)],
         goroutines: &Option<GoroutineReading>,
         tabs: Option<gpui::Div>,
-        remote: Option<String>,
+        remote: Option<(String, bool)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -637,19 +639,27 @@ impl RunMetricsModal {
                     .min_h_full()
                     .gap(cyberpunk::SPACE_18)
                     .children(tabs)
-                    .children(remote.map(|machine| {
+                    .children(remote.map(|(machine, measured)| {
+                        let (selector, words, color) = match measured {
+                            true => (
+                                "RUN-METRICS-REMOTE-MEASURED",
+                                format!("This run is on {machine}. These are its readings there."),
+                                Color::Muted,
+                            ),
+                            false => (
+                                "RUN-METRICS-REMOTE",
+                                format!(
+                                    "This run is on {machine}. These are the readings of the \
+                                     local ssh client, not of the program over there."
+                                ),
+                                Color::Warning,
+                            ),
+                        };
                         div()
                             .w_full()
                             .flex_none()
-                            .debug_selector(|| "RUN-METRICS-REMOTE".to_string())
-                            .child(
-                                Label::new(format!(
-                                    "This run is on {machine}. These are the readings of the local \
-                                     ssh client, not of the program over there."
-                                ))
-                                .size(LabelSize::Default)
-                                .color(Color::Warning),
-                            )
+                            .debug_selector(|| selector.to_string())
+                            .child(Label::new(words).size(LabelSize::Default).color(color))
                     }))
                     .child(self.summary(metrics))
                     .child(Divider::horizontal())
@@ -1296,6 +1306,20 @@ mod tests {
         assert!(
             cx.debug_bounds("RUN-METRICS-REMOTE").is_some(),
             "a run over ssh says that its numbers are the client's"
+        );
+        assert!(cx.debug_bounds("RUN-METRICS-REMOTE-MEASURED").is_none());
+
+        item.update(&mut cx, |item, cx| {
+            item.set_remote_measured_for_test(true, cx)
+        });
+        settle(&mut cx);
+        assert!(
+            cx.debug_bounds("RUN-METRICS-REMOTE-MEASURED").is_some(),
+            "a run whose far side answered says that its numbers are the program's"
+        );
+        assert!(
+            cx.debug_bounds("RUN-METRICS-REMOTE").is_none(),
+            "and no longer warns that they are the client's"
         );
     }
 

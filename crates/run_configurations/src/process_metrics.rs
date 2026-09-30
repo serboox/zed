@@ -154,7 +154,7 @@ pub struct ThreadSample {
 /// The ticks a second holds, as the machine itself says. Guessing it skews every
 /// percentage; the fallback is the value Linux has used for decades, for a machine
 /// that will not answer.
-fn ticks_a_second() -> f32 {
+pub(crate) fn ticks_a_second() -> f32 {
     #[cfg(unix)]
     {
         let answer = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
@@ -214,6 +214,11 @@ fn stat_fields(stat: &str) -> Option<StatFields> {
 
 /// Reads `/proc/<pid>/stat` and `/proc/<pid>/statm` into a sample.
 pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
+    sample_with_page_size(stat, statm, page_size())
+}
+
+/// [`sample_of`] for a machine whose page size is not this one's.
+pub fn sample_with_page_size(stat: &str, statm: &str, page_size: u64) -> Option<Sample> {
     let fields = stat_fields(stat)?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
     Some(Sample {
@@ -221,7 +226,7 @@ pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
         parent: fields.parent,
         name: fields.name,
         ticks: fields.ticks,
-        memory: pages.saturating_mul(page_size()),
+        memory: pages.saturating_mul(page_size),
         threads: fields.threads,
         state: fields.state,
         started: fields.started,

@@ -13,7 +13,9 @@ use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 use crate::configurations_file::{self, Kind};
 use crate::configurations_store;
 use crate::goroutines::{self, GoroutineReading, GoroutineSource, Goroutines};
+use crate::over_ssh::RemoteRun;
 use crate::process_metrics::{self, Metrics, Sample, Watcher};
+use crate::remote_metrics::{self, RemoteReading};
 use crate::run_configurations_settings::RunConfigurationsSettings;
 use crate::run_metrics_modal::RunMetricsModal;
 
@@ -47,6 +49,10 @@ pub struct RunMetricsStatusItem {
     /// for nothing, so it stops the moment focus leaves this window and starts
     /// again the moment focus comes back.
     window_active: bool,
+    /// What the far side said about each run sent over ssh that answered in the
+    /// last poll, by the pid of the run's local ssh client. A run missing here
+    /// is measured by that client.
+    remote_readings: HashMap<u32, RemoteReading>,
     _watching_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -59,9 +65,13 @@ struct WatchedRun {
     /// The label and command of the task that started it.
     label: String,
     command: Option<String>,
-    /// The machine the run was sent to, when it runs over ssh: the process
-    /// measured is then the local ssh client.
+    /// The machine the run was sent to, when it runs over ssh.
     remote: Option<String>,
+    /// Whether the numbers are those of the program on that machine, which is
+    /// so when it answered, and not those of the local ssh client.
+    remote_measured: bool,
+    /// Polls in a row the far side did not answer since it last did.
+    remote_misses: u8,
     metrics: Option<Metrics>,
     /// The last [`READINGS_KEPT`] readings, oldest first. The charts draw only
     /// these, so a run a few seconds old draws a few seconds.
@@ -91,6 +101,8 @@ impl WatchedRun {
             label: context.label.clone(),
             command: context.command.clone(),
             remote: context.remote.clone(),
+            remote_measured: false,
+            remote_misses: 0,
             metrics: None,
             readings: VecDeque::new(),
             watcher: Watcher::default(),
@@ -124,6 +136,36 @@ impl WatchedRun {
     }
 }
 
+/// Every process this machine has, read once for all the runs, and what the far
+/// side of each run sent over ssh says about it, each asked at the same time.
+async fn read_the_machines(
+    roots: Vec<u32>,
+    remote_runs: Vec<(u32, RemoteRun)>,
+    executor: gpui::BackgroundExecutor,
+) -> (
+    Option<Vec<Sample>>,
+    Option<std::time::Duration>,
+    HashMap<u32, RemoteReading>,
+) {
+    let mut everything = process_metrics::everything_running();
+    if let Some(everything) = everything.as_mut() {
+        process_metrics::read_threads_under(everything, &roots);
+    }
+    let remote = futures::future::join_all(remote_runs.iter().map(|(pid, run)| {
+        let executor = executor.clone();
+        async move { Some((*pid, remote_metrics::read(run, &executor).await?)) }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    (everything, process_metrics::machine_uptime(), remote)
+}
+
+/// How many polls in a row a run's far side may leave unanswered before the run
+/// is measured by its local client again.
+const REMOTE_POLLS_THAT_MAY_BE_MISSED: u8 = 3;
+
 /// What a window that draws one run in full needs of it.
 #[derive(Clone)]
 pub(crate) struct RunReading {
@@ -141,6 +183,9 @@ pub(crate) struct RunReading {
     pub go_program: Option<u32>,
     /// The machine the run was sent to, when it runs over ssh.
     pub remote: Option<String>,
+    /// Whether the numbers are those of the program over there rather than of
+    /// the local ssh client.
+    pub remote_measured: bool,
 }
 
 /// What is needed about a run to decide where its goroutines, if any, come
@@ -153,6 +198,8 @@ struct RunContext {
     command: Option<String>,
     /// The machine the run was sent to, when it runs over ssh.
     remote: Option<String>,
+    /// How to ask that machine about the run, when the run carries the means.
+    remote_run: Option<RemoteRun>,
 }
 
 /// One reading, kept only for what the charts draw.
@@ -179,6 +226,7 @@ impl RunMetricsStatusItem {
             workspace: workspace.weak_handle(),
             runs: Vec::new(),
             window_active: window.is_window_active(),
+            remote_readings: HashMap::new(),
             _watching_task: None,
             _subscriptions: subscriptions,
         };
@@ -214,23 +262,23 @@ impl RunMetricsStatusItem {
                     return;
                 };
                 let roots: Vec<u32> = contexts.iter().map(|context| context.pid).collect();
+                let remote_runs: Vec<(u32, RemoteRun)> = contexts
+                    .iter()
+                    .filter_map(|context| Some((context.pid, context.remote_run.clone()?)))
+                    .collect();
                 let read = match contexts.is_empty() {
                     false => {
-                        cx.background_spawn(async move {
-                            let mut everything = process_metrics::everything_running();
-                            if let Some(everything) = everything.as_mut() {
-                                process_metrics::read_threads_under(everything, &roots);
-                            }
-                            (everything, process_metrics::machine_uptime())
-                        })
-                        .await
+                        let executor = cx.background_executor().clone();
+                        cx.background_spawn(read_the_machines(roots, remote_runs, executor))
+                            .await
                     }
-                    true => (None, None),
+                    true => (None, None, HashMap::new()),
                 };
-                let (samples, machine_uptime) = read;
+                let (samples, machine_uptime, remote_readings) = read;
                 let now = Instant::now();
                 if item
                     .update(cx, |item, cx| {
+                        item.remote_readings = remote_readings;
                         let mut changed =
                             item.read_the_runs(&contexts, samples.as_deref(), now, machine_uptime);
                         if item.poll_goroutines(cx) {
@@ -297,9 +345,34 @@ impl RunMetricsStatusItem {
             return changed;
         };
         for run in &mut self.runs {
-            let read = run
-                .watcher
-                .metrics_of(run.pid, samples, now, machine_uptime);
+            let remote = self.remote_readings.get(&run.pid);
+            // One poll the far side missed says nothing about the run, and the
+            // numbers of another process in its place would only jump.
+            if remote.is_none()
+                && run.remote_measured
+                && run.remote_misses < REMOTE_POLLS_THAT_MAY_BE_MISSED
+            {
+                run.remote_misses += 1;
+                continue;
+            }
+            run.remote_misses = 0;
+            if run.remote_measured != remote.is_some() {
+                // The two are different processes, so what was learned of one
+                // says nothing about the other.
+                run.watcher.forget();
+                run.readings.clear();
+                run.remote_measured = remote.is_some();
+                changed = true;
+            }
+            let read = match remote {
+                Some(reading) => {
+                    run.watcher
+                        .metrics_of(reading.root, &reading.samples, now, reading.uptime)
+                }
+                None => run
+                    .watcher
+                    .metrics_of(run.pid, samples, now, machine_uptime),
+            };
             match &read {
                 Some(metrics) => {
                     if run.readings.len() >= READINGS_KEPT {
@@ -335,6 +408,7 @@ impl RunMetricsStatusItem {
                 label: "a run".to_string(),
                 command: None,
                 remote: None,
+                remote_run: None,
             })
             .into_iter()
             .collect();
@@ -371,9 +445,18 @@ impl RunMetricsStatusItem {
                     goroutines: run.goroutines.clone(),
                     go_program: run.go_program,
                     remote: run.remote.clone(),
+                    remote_measured: run.remote_measured,
                 })
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remote_measured_for_test(&mut self, measured: bool, cx: &mut Context<Self>) {
+        if let Some(run) = self.runs.last_mut() {
+            run.remote_measured = measured;
+        }
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -407,6 +490,7 @@ impl RunMetricsStatusItem {
                 label: "a run".to_string(),
                 command: None,
                 remote: None,
+                remote_run: None,
             });
             run.metrics = Some(metrics);
             run.goroutines = goroutines;
@@ -431,6 +515,7 @@ impl RunMetricsStatusItem {
                     label,
                     command: None,
                     remote: None,
+                    remote_run: None,
                 });
                 run.readings = memory
                     .into_iter()
@@ -472,6 +557,10 @@ impl RunMetricsStatusItem {
                     task.spawned_task.command.as_deref(),
                     &task.spawned_task.args,
                 ),
+                remote_run: crate::over_ssh::remote_run_of(
+                    task.spawned_task.command.as_deref(),
+                    &task.spawned_task.args,
+                ),
             });
         }
         // A program run through the debugger is a process like any other, but
@@ -492,6 +581,7 @@ impl RunMetricsStatusItem {
                     .unwrap_or_else(|| "debug session".to_string()),
                 command: None,
                 remote: None,
+                remote_run: None,
             });
         }
         contexts
@@ -1450,7 +1540,120 @@ mod tests {
             label: label.to_string(),
             command: None,
             remote: None,
+            remote_run: None,
         }
+    }
+
+    /// A run sent over ssh is measured by what its far side says when that
+    /// answers, and by its local client when it does not -- and the reading says
+    /// which, so the numbers are never taken for the other's.
+    #[gpui::test]
+    async fn a_run_over_ssh_is_measured_by_the_far_side_when_it_answers(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let megabyte = 1024 * 1024;
+        let local = [started_by(4242, 1, "ssh", megabyte)];
+        let far_side = RemoteReading {
+            root: 9000,
+            samples: vec![
+                started_by(1, 0, "init", megabyte),
+                started_by(9000, 1, "bash", 2 * megabyte),
+                started_by(9001, 9000, "api", 50 * megabyte),
+                started_by(9002, 9001, "worker", 7 * megabyte),
+            ],
+            uptime: None,
+        };
+        let mut over_ssh = context(4242, "api on deploy@build.example.com");
+        over_ssh.remote = Some("deploy@build.example.com".to_string());
+
+        item.update(&mut cx, |item, _| {
+            item.remote_readings.insert(4242, far_side);
+            assert!(item.read_the_runs(&[over_ssh.clone()], Some(&local), Instant::now(), None));
+            let runs = item.runs();
+            assert!(runs[0].remote_measured);
+            assert_eq!(
+                (runs[0].metrics.processes, runs[0].metrics.memory / megabyte),
+                (3, 59),
+                "the processes and memory over there, not the one local client"
+            );
+        });
+
+        item.update(&mut cx, |item, _| {
+            item.remote_readings.clear();
+            for silent_polls in 0..=REMOTE_POLLS_THAT_MAY_BE_MISSED {
+                item.read_the_runs(
+                    std::slice::from_ref(&over_ssh),
+                    Some(&local),
+                    Instant::now() + Watcher::HOW_OFTEN * (silent_polls as u32 + 1),
+                    None,
+                );
+            }
+            let runs = item.runs();
+            assert!(
+                !runs[0].remote_measured,
+                "a far side that stopped answering leaves the client's numbers, said to be so"
+            );
+            assert_eq!(
+                (runs[0].metrics.processes, runs[0].metrics.memory / megabyte),
+                (1, 1)
+            );
+            assert_eq!(
+                runs[0].series.len(),
+                1,
+                "the history of the other process is not drawn as this one's"
+            );
+        });
+    }
+
+    /// A far side that misses a poll or two keeps its run's numbers; one that
+    /// stays silent does not.
+    #[gpui::test]
+    async fn a_far_side_that_misses_a_poll_does_not_make_the_numbers_jump(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let megabyte = 1024 * 1024;
+        let local = [started_by(4242, 1, "ssh", megabyte)];
+        let far_side = RemoteReading {
+            root: 9000,
+            samples: vec![started_by(9000, 1, "api", 50 * megabyte)],
+            uptime: None,
+        };
+        let over_ssh = context(4242, "api");
+        let memory_of = |item: &RunMetricsStatusItem| item.runs()[0].metrics.memory / megabyte;
+
+        item.update(&mut cx, |item, _| {
+            item.remote_readings.insert(4242, far_side);
+            item.read_the_runs(
+                std::slice::from_ref(&over_ssh),
+                Some(&local),
+                Instant::now(),
+                None,
+            );
+            assert_eq!(memory_of(item), 50);
+            item.remote_readings.clear();
+            for missed in 1..=REMOTE_POLLS_THAT_MAY_BE_MISSED {
+                item.read_the_runs(
+                    std::slice::from_ref(&over_ssh),
+                    Some(&local),
+                    Instant::now(),
+                    None,
+                );
+                assert_eq!(
+                    memory_of(item),
+                    50,
+                    "{missed} polls missed: the last numbers of the far side stay"
+                );
+            }
+            item.read_the_runs(
+                std::slice::from_ref(&over_ssh),
+                Some(&local),
+                Instant::now(),
+                None,
+            );
+            assert_eq!(
+                memory_of(item),
+                1,
+                "a far side that stays silent leaves the client's numbers"
+            );
+        });
     }
 
     /// Three runs, and the machine's processes: each run is read from its own
@@ -1818,5 +2021,115 @@ mod tests {
         for terminal in &terminals {
             terminal.update(&mut cx, |terminal, _| terminal.kill_active_task());
         }
+    }
+    /// A run started as the editor starts one over ssh is found for what it is,
+    /// and its far side is asked for it the way the poll asks. The far side is
+    /// this machine, reached by a stand-in for `ssh`; everything else is real.
+    #[gpui::test]
+    async fn a_run_started_over_ssh_is_read_from_its_far_side(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        cx.background_executor.allow_parking();
+        let workspace = item.read_with(&cx, |item, _| item.workspace.upgrade().expect("open"));
+        let project = workspace.read_with(&cx, |workspace, _| workspace.project().clone());
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let stand_in = remote_metrics::a_stand_in_for_ssh(directory.path());
+        let tag = crate::over_ssh::RunTag {
+            token: "startedoverssh".into(),
+            control_path: directory.path().join("zed-ssh-startedoverssh"),
+        };
+        std::fs::write(&tag.control_path, "").expect("the connection is there");
+        let machine = crate::over_ssh::Machine::parse("deploy@build.example.com").expect("one");
+        let (_, args) = crate::over_ssh::run_tagged_over_ssh(
+            &machine,
+            &tag,
+            "sleep",
+            &["60".to_string()],
+            None,
+            &[],
+        );
+        let template = task::TaskTemplate {
+            label: "api".to_string(),
+            command: stand_in,
+            args,
+            ..Default::default()
+        };
+        let mut spawned = template
+            .resolve_task("run configurations", &task::TaskContext::default())
+            .expect("the template resolves against an empty context")
+            .resolved;
+        spawned.cwd = Some(std::env::temp_dir());
+        let terminal = project
+            .update(&mut cx, |project, cx| {
+                project.create_terminal_task(spawned, cx)
+            })
+            .await
+            .expect("the run starts");
+        let view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                terminal_view::TerminalView::new(
+                    terminal.clone(),
+                    workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let pane = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.add_item(Box::new(view), false, false, None, window, cx);
+        });
+
+        let mut contexts = Vec::new();
+        for _ in 0..300 {
+            cx.run_until_parked();
+            contexts = item.read_with(&cx, |item, cx| item.run_contexts(cx));
+            if !contexts.is_empty() {
+                break;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+        }
+        assert_eq!(contexts.len(), 1);
+        let run = contexts[0]
+            .remote_run
+            .clone()
+            .expect("a run over ssh says how to ask");
+        assert_eq!(run.token, "startedoverssh");
+        assert_eq!(
+            contexts[0].remote.as_deref(),
+            Some("deploy@build.example.com")
+        );
+
+        // The far side needs a moment to have started the program.
+        let mut reading = None;
+        for _ in 0..100 {
+            let read = smol::block_on(read_the_machines(
+                vec![contexts[0].pid],
+                vec![(contexts[0].pid, run.clone())],
+                cx.background_executor.clone(),
+            ));
+            if let Some(found) = read.2.get(&contexts[0].pid) {
+                reading = Some((read.0, found.clone()));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (local, far_side) = reading.expect("the far side answered");
+        item.update(&mut cx, |item, _| {
+            item.remote_readings = HashMap::from([(contexts[0].pid, far_side)]);
+            item.read_the_runs(&contexts, local.as_deref(), Instant::now(), None);
+            let runs = item.runs();
+            assert_eq!(runs.len(), 1);
+            assert!(
+                runs[0].remote_measured,
+                "the far side's numbers are the run's"
+            );
+        });
+
+        terminal.update(&mut cx, |terminal, _| terminal.kill_active_task());
     }
 }
