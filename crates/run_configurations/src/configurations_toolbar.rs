@@ -2642,6 +2642,52 @@ mod tests {
         );
     }
 
+    /// An `ssh` that is killed cannot remove the socket of its connection, so
+    /// ending the run does.
+    #[gpui::test]
+    async fn ending_a_run_over_ssh_takes_its_connection_socket_away(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (over, mut bar_cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        bar_cx.background_executor.allow_parking();
+        let template = what_it_would_run(&over.toolbar, &bar_cx);
+        let dir = std::env::temp_dir().join(format!("socket-over-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory for the stand-in");
+        let client = dir.join("ssh");
+        std::fs::write(&client, "#!/bin/sh\nsleep 60 &\nwait\n").expect("the stand-in is written");
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in can run");
+        let tag = crate::over_ssh::RunTag {
+            token: "socketclean1".into(),
+            control_path: dir.join("zed-ssh-socketclean1"),
+        };
+        std::fs::write(&tag.control_path, "").expect("the connection is there");
+        let machine = crate::over_ssh::Machine::parse("deploy@host").expect("a machine");
+        let (_, args) =
+            crate::over_ssh::run_tagged_over_ssh(&machine, &tag, "sleep", &[], None, &[]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = a_run_of_command(
+            &template,
+            client.to_str().expect("a path"),
+            &args,
+            &over,
+            &mut bar_cx,
+        )
+        .await;
+        for _ in 0..100 {
+            bar_cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let stopping =
+            bar_cx.update(|_window, cx| crate::run_instances::stop_all_for_good(vec![run], cx));
+        assert!(stopping.await);
+
+        let left = tag.control_path.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!left, "the socket of the ended run is gone");
+    }
+
     /// The keys that used to rerun whatever ran last restart what the plaque
     /// shows; with nothing on the plaque they still rerun the last task.
     #[gpui::test]

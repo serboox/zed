@@ -20924,6 +20924,7 @@ dependencies = [
  "libc",
  "log",
  "menu",
+ "parking_lot",
  "path",
  "paths",
  "platform_title_bar",

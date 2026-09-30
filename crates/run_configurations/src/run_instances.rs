@@ -177,6 +177,19 @@ pub fn stop_all_for_good(terminals: Vec<Entity<Terminal>>, cx: &mut App) -> Task
         .iter()
         .map(|terminal| roots_of(terminal.read(cx)))
         .collect();
+    let sockets: Vec<std::path::PathBuf> = terminals
+        .iter()
+        .filter_map(|terminal| {
+            let task = terminal.read(cx).task()?;
+            Some(
+                crate::over_ssh::remote_run_of(
+                    task.spawned_task.command.as_deref(),
+                    &task.spawned_task.args,
+                )?
+                .control_path,
+            )
+        })
+        .collect();
     let executor = cx.background_executor().clone();
     cx.spawn(async move |cx| {
         let caught = executor
@@ -191,10 +204,20 @@ pub fn stop_all_for_good(terminals: Vec<Entity<Terminal>>, cx: &mut App) -> Task
             });
             stopping.push(finish_stopping(caught, gone, executor.clone()));
         }
-        futures::future::join_all(stopping)
+        let all_ended = futures::future::join_all(stopping)
             .await
             .into_iter()
-            .all(|ended| ended)
+            .all(|ended| ended);
+        // An `ssh` that was killed cannot remove the socket of its connection.
+        for socket in sockets {
+            match std::fs::remove_file(&socket) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    log::warn!("could not remove {socket:?}: {error}");
+                }
+                _ => {}
+            }
+        }
+        all_ended
     })
 }
 

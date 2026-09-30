@@ -220,6 +220,10 @@ fn compose(
 /// run of anything else, or an `ssh` the reader wrote without the `--`, says
 /// nothing about where it goes.
 pub fn destination_of(command: Option<&str>, args: &[String]) -> Option<String> {
+    direct_destination_of(command, args).or_else(|| Some(sent_run_in(args)?.destination))
+}
+
+fn direct_destination_of(command: Option<&str>, args: &[String]) -> Option<String> {
     let program = std::path::Path::new(command?).file_name()?.to_str()?;
     if program != "ssh" {
         return None;
@@ -238,11 +242,55 @@ pub struct RemoteRun {
     pub token: String,
 }
 
-/// The [`RemoteRun`] a command made by [`run_tagged_over_ssh`] describes. Any other
-/// run says nothing and is measured by its local client.
+/// The runs [`send_to`] has sent, newest last. A terminal wraps what it runs in
+/// the reader's shell, so the command it ends up holding is `zsh -c '<the ssh
+/// line>'` and no longer reads as one; the token that only this run carries leads
+/// back to what was sent.
+static SENT_RUNS: parking_lot::Mutex<Vec<RemoteRun>> = parking_lot::Mutex::new(Vec::new());
+
+const SENT_RUNS_KEPT: usize = 64;
+const TOKEN_LENGTH: usize = 12;
+
+fn remember(run: RemoteRun) {
+    let mut sent = SENT_RUNS.lock();
+    sent.retain(|known| known.token != run.token);
+    sent.push(run);
+    if sent.len() > SENT_RUNS_KEPT {
+        sent.remove(0);
+    }
+}
+
+/// The run `args` carry the token of, however the command holding them was
+/// quoted or wrapped.
+fn sent_run_in(args: &[String]) -> Option<RemoteRun> {
+    const MARK: &str = "ZED_REMOTE_RUN=";
+    let token: String = args.iter().find_map(|arg| {
+        let after = &arg[arg.find(MARK)? + MARK.len()..];
+        let token: String = after
+            .chars()
+            .skip_while(|character| !character.is_ascii_alphanumeric())
+            .take_while(|character| character.is_ascii_alphanumeric())
+            .collect();
+        (token.len() == TOKEN_LENGTH).then_some(token)
+    })?;
+    SENT_RUNS
+        .lock()
+        .iter()
+        .find(|run| run.token == token)
+        .cloned()
+}
+
+/// The [`RemoteRun`] a command made by [`run_tagged_over_ssh`] describes, read
+/// from the `ssh` command itself or, once a shell has wrapped it, from the run
+/// it carries the token of. Any other run says nothing and is measured by its
+/// local client.
 pub fn remote_run_of(command: Option<&str>, args: &[String]) -> Option<RemoteRun> {
+    direct_remote_run_of(command, args).or_else(|| sent_run_in(args))
+}
+
+fn direct_remote_run_of(command: Option<&str>, args: &[String]) -> Option<RemoteRun> {
     let program = command?;
-    let destination = destination_of(Some(program), args)?;
+    let destination = direct_destination_of(Some(program), args)?;
     let separator = args.iter().position(|arg| arg == "--")?;
     let port = args
         .iter()
@@ -304,14 +352,22 @@ pub fn send_to(
         .cwd
         .as_ref()
         .map(|cwd| cwd.to_string_lossy().into_owned());
+    let tag = RunTag::fresh();
     let (program, args) = run_tagged_over_ssh(
         machine,
-        &RunTag::fresh(),
+        &tag,
         &command,
         &resolved.args,
         cwd.as_deref(),
         &env,
     );
+    remember(RemoteRun {
+        program: program.clone(),
+        destination: machine.destination(),
+        port: machine.port,
+        control_path: tag.control_path,
+        token: tag.token,
+    });
 
     // Named so a remote run is never mistaken for a local one, in the tab and
     // in the line the terminal prints above the output.
@@ -582,6 +638,41 @@ mod tests {
                 .ends_with(format!("zed-ssh-{}", first.token))
         );
     }
+    /// A terminal holds the command wrapped in the reader's shell, which no longer
+    /// reads as an ssh command; the token still leads back to the run.
+    #[test]
+    fn a_run_wrapped_in_a_shell_is_still_found() {
+        let machine = Machine::parse("deploy@wrapped.example.com:2200").expect("a machine");
+        let mut resolved = task::SpawnInTerminal {
+            command: Some("go".into()),
+            args: vec!["run".into()],
+            ..Default::default()
+        };
+        send_to(&machine, &mut resolved, HashMap::new());
+        let line = std::iter::once(resolved.command.clone().expect("a command"))
+            .chain(resolved.args.iter().cloned())
+            .map(|piece| quoted(&piece))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wrapped = vec!["-i".to_string(), "-c".to_string(), line];
+
+        let found = remote_run_of(Some("/bin/zsh"), &wrapped).expect("the run is found");
+        assert_eq!(found.destination, "deploy@wrapped.example.com");
+        assert_eq!(found.port, Some(2200));
+        assert_eq!(
+            destination_of(Some("/bin/zsh"), &wrapped).as_deref(),
+            Some("deploy@wrapped.example.com")
+        );
+
+        let never_sent = vec![
+            "-i".to_string(),
+            "-c".to_string(),
+            "ssh -t host -- 'export ZED_REMOTE_RUN=aaaaaaaaaaaa && go'".to_string(),
+        ];
+        assert_eq!(remote_run_of(Some("/bin/zsh"), &never_sent), None);
+        assert_eq!(destination_of(Some("/bin/zsh"), &never_sent), None);
+    }
+
     /// A directory too long for a socket path is passed over for one that fits.
     #[test]
     fn a_directory_too_long_for_a_socket_is_passed_over() {

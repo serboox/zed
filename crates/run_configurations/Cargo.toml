@@ -27,6 +27,7 @@ log.workspace = true
 menu.workspace = true
 path.workspace = true
 paths.workspace = true
+parking_lot.workspace = true
 platform_title_bar.workspace = true
 project.workspace = true
 release_channel.workspace = true
