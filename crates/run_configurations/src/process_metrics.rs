@@ -125,7 +125,9 @@ pub struct Sample {
     /// a fresh process may well have more processor time behind it than the one
     /// that had the number before.
     pub started: u64,
-    /// Every thread the process was running, read the same moment.
+    /// Every thread the process was running, read the same moment. Empty until
+    /// [`read_threads_under`] has read them: a reading of the machine does not
+    /// pay for the threads of processes nobody is watching.
     pub thread_samples: Vec<ThreadSample>,
 }
 
@@ -526,7 +528,14 @@ fn seconds(count: f32) -> Option<Duration> {
     }
 }
 
-/// Every process the machine will talk about, read from `/proc`.
+/// How many times the machine has been read, for a test that counts the looks
+/// a stop takes.
+#[cfg(test)]
+pub(crate) static MACHINE_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Every process the machine will talk about, read from `/proc`, without their
+/// threads.
 ///
 /// Anything that disappears while being read is skipped: processes come and go,
 /// and that is not an error worth reporting. Nothing at all comes back when the
@@ -534,6 +543,8 @@ fn seconds(count: f32) -> Option<Duration> {
 /// this editor is always among them -- so a reading that did not happen is never
 /// mistaken for a run that has ended.
 pub fn everything_running() -> Option<Vec<Sample>> {
+    #[cfg(test)]
+    MACHINE_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let Ok(entries) = fs::read_dir("/proc") else {
         return None;
     };
@@ -549,15 +560,33 @@ pub fn everything_running() -> Option<Vec<Sample>> {
         let stat = fs::read_to_string(entry.path().join("stat"));
         let statm = fs::read_to_string(entry.path().join("statm"));
         if let (Ok(stat), Ok(statm)) = (stat, statm)
-            && let Some(mut sample) = sample_of(&stat, &statm)
+            && let Some(sample) = sample_of(&stat, &statm)
         {
-            sample.thread_samples = threads_of(sample.pid);
             samples.push(sample);
         }
     }
     match samples.is_empty() {
         true => None,
         false => Some(samples),
+    }
+}
+
+/// Reads the threads of the processes in the trees under `roots`, and of no
+/// other process. A thread costs three files to read, and the machine holds
+/// several thousand of them against a few dozen that belong to runs, so
+/// reading them all would cost about nine times what the rest of a reading
+/// does, every second, for numbers nobody looks at.
+pub fn read_threads_under(everything: &mut [Sample], roots: &[u32]) {
+    let in_the_trees: std::collections::HashSet<u32> = roots
+        .iter()
+        .flat_map(|root| tree_of(*root, everything))
+        .map(|sample| sample.pid)
+        .collect();
+    for sample in everything
+        .iter_mut()
+        .filter(|sample| in_the_trees.contains(&sample.pid))
+    {
+        sample.thread_samples = threads_of(sample.pid);
     }
 }
 
@@ -612,6 +641,28 @@ pub fn processes_under(root: u32) -> Vec<Caught> {
         return Vec::new();
     };
     caught_in(root, &everything)
+}
+
+/// The processes under each of `groups`, all read from one look at the machine
+/// rather than one look for each.
+pub fn processes_under_each(groups: &[Vec<u32>]) -> Vec<Vec<Caught>> {
+    let Some(everything) = everything_running() else {
+        return groups.iter().map(|_| Vec::new()).collect();
+    };
+    groups
+        .iter()
+        .map(|roots| {
+            let mut caught: Vec<Caught> = Vec::new();
+            for root in roots {
+                for process in caught_in(*root, &everything) {
+                    if !caught.contains(&process) {
+                        caught.push(process);
+                    }
+                }
+            }
+            caught
+        })
+        .collect()
 }
 
 fn caught_in(root: u32, everything: &[Sample]) -> Vec<Caught> {
@@ -1420,6 +1471,54 @@ mod tests {
             vec![10, 20, 30],
             "no rate yet anywhere, so tid breaks every tie"
         );
+    }
+
+    #[test]
+    fn threads_are_read_for_the_trees_asked_for_and_for_no_other_process() {
+        let Some(mut everything) = everything_running() else {
+            return;
+        };
+        assert!(
+            everything
+                .iter()
+                .all(|sample| sample.thread_samples.is_empty()),
+            "a reading of the machine does not pay for any thread"
+        );
+        let this = std::process::id();
+        read_threads_under(&mut everything, &[this]);
+        let read: Vec<u32> = everything
+            .iter()
+            .filter(|sample| !sample.thread_samples.is_empty())
+            .map(|sample| sample.pid)
+            .collect();
+        assert!(read.contains(&this), "the tree asked for has its threads");
+        let in_the_tree: Vec<u32> = tree_of(this, &everything)
+            .into_iter()
+            .map(|sample| sample.pid)
+            .collect();
+        assert!(
+            read.iter().all(|pid| in_the_tree.contains(pid)),
+            "and nothing else does: {read:?} against {in_the_tree:?}"
+        );
+        assert!(
+            everything.len() > in_the_tree.len(),
+            "the machine holds processes besides this one's tree"
+        );
+    }
+
+    #[test]
+    fn processes_under_each_group_come_from_one_look_at_the_machine() {
+        let before = MACHINE_READS.load(std::sync::atomic::Ordering::SeqCst);
+        let this = std::process::id();
+        let groups = vec![vec![this], vec![this, 1], vec![]];
+        let caught = processes_under_each(&groups);
+        assert_eq!(
+            MACHINE_READS.load(std::sync::atomic::Ordering::SeqCst) - before,
+            1
+        );
+        assert_eq!(caught.len(), 3);
+        assert!(caught[0].iter().any(|one| one.pid == this));
+        assert!(caught[2].is_empty());
     }
 
     /// The reading is done against a real machine here, not a fixture: this

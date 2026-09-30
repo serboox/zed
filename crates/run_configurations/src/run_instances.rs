@@ -89,55 +89,86 @@ pub fn running_terminals(workspace: &Workspace, cx: &App) -> Vec<Entity<Terminal
 
 /// Stops a run and resolves only once nothing it started is left running,
 /// with whether that is so: false when a caught process outlived `SIGKILL`.
+pub fn stop_for_good(terminal: &Entity<Terminal>, cx: &mut App) -> Task<bool> {
+    stop_all_for_good(vec![terminal.clone()], cx)
+}
+
+/// Stops every one of `terminals` and resolves only once nothing any of them
+/// started is left running, with whether that is so.
 ///
 /// The terminal ends its foreground process group and its shell. Whatever the
 /// program put in a group or session of its own, or whatever takes its time
 /// over the signal, would otherwise keep running beside the next start, holding
-/// its port. So the whole tree is caught first, and what outlives the terminal
-/// is sent `SIGTERM`, then `SIGKILL`.
-pub fn stop_for_good(terminal: &Entity<Terminal>, cx: &mut App) -> Task<bool> {
-    let caught = caught_of(terminal.read(cx));
-    let gone = terminal.update(cx, |terminal, cx| {
-        terminal.kill_active_task();
-        terminal.wait_for_completed_task(cx)
-    });
+/// its port. So the whole trees are caught first, and what outlives the
+/// terminals is sent `SIGTERM`, then `SIGKILL`.
+///
+/// The machine is looked at once for all of them, off the drawing thread, and
+/// before any of them is ended: a process whose parent has just been ended is
+/// handed to another parent, and is no longer found under its run.
+pub fn stop_all_for_good(terminals: Vec<Entity<Terminal>>, cx: &mut App) -> Task<bool> {
+    let roots: Vec<Vec<u32>> = terminals
+        .iter()
+        .map(|terminal| roots_of(terminal.read(cx)))
+        .collect();
     let executor = cx.background_executor().clone();
-    executor.clone().spawn(async move {
-        if caught.is_empty() {
-            gone.await;
-            return true;
+    cx.spawn(async move |cx| {
+        let caught = executor
+            .spawn(async move { process_metrics::processes_under_each(&roots) })
+            .await;
+        let mut stopping = Vec::with_capacity(terminals.len());
+        for (terminal, caught) in terminals.iter().zip(caught) {
+            let gone = terminal.update(cx, |terminal, cx| {
+                terminal.kill_active_task();
+                terminal.wait_for_completed_task(cx)
+            });
+            stopping.push(finish_stopping(caught, gone, executor.clone()));
         }
-        smol::future::or(
-            async {
-                gone.await;
-            },
-            executor.timer(GIVEN_TO_END),
-        )
-        .await;
-        // Only a moment for the group the terminal has already sent `SIGKILL`
-        // to: whatever is left after that was out of its reach.
-        executor.timer(LOOKED_AT_EVERY).await;
-        let left = process_metrics::still_running(&caught);
-        if left.is_empty() {
-            return true;
-        }
-        #[cfg(unix)]
-        process_metrics::signal(&left, libc::SIGTERM);
-        let left = until_ended(left, &executor).await;
-        if left.is_empty() {
-            return true;
-        }
-        #[cfg(unix)]
-        process_metrics::signal(&left, libc::SIGKILL);
-        let left = until_ended(left, &executor).await;
-        if !left.is_empty() {
-            log::error!("processes of a stopped run are still running: {left:?}");
-        }
-        left.is_empty()
+        futures::future::join_all(stopping)
+            .await
+            .into_iter()
+            .all(|ended| ended)
     })
 }
 
-fn caught_of(terminal: &Terminal) -> Vec<Caught> {
+async fn finish_stopping(
+    caught: Vec<Caught>,
+    gone: Task<Option<std::process::ExitStatus>>,
+    executor: gpui::BackgroundExecutor,
+) -> bool {
+    if caught.is_empty() {
+        gone.await;
+        return true;
+    }
+    smol::future::or(
+        async {
+            gone.await;
+        },
+        executor.timer(GIVEN_TO_END),
+    )
+    .await;
+    // Only a moment for the group the terminal has already sent `SIGKILL`
+    // to: whatever is left after that was out of its reach.
+    executor.timer(LOOKED_AT_EVERY).await;
+    let left = process_metrics::still_running(&caught);
+    if left.is_empty() {
+        return true;
+    }
+    #[cfg(unix)]
+    process_metrics::signal(&left, libc::SIGTERM);
+    let left = until_ended(left, &executor).await;
+    if left.is_empty() {
+        return true;
+    }
+    #[cfg(unix)]
+    process_metrics::signal(&left, libc::SIGKILL);
+    let left = until_ended(left, &executor).await;
+    if !left.is_empty() {
+        log::error!("processes of a stopped run are still running: {left:?}");
+    }
+    left.is_empty()
+}
+
+fn roots_of(terminal: &Terminal) -> Vec<u32> {
     let mut roots = Vec::new();
     if let Some(getter) = terminal.pid_getter() {
         roots.push(getter.fallback_pid().as_u32());
@@ -145,15 +176,7 @@ fn caught_of(terminal: &Terminal) -> Vec<Caught> {
     if let Some(foreground) = terminal.pid() {
         roots.push(foreground.as_u32());
     }
-    let mut caught: Vec<Caught> = Vec::new();
-    for root in roots {
-        for process in process_metrics::processes_under(root) {
-            if !caught.contains(&process) {
-                caught.push(process);
-            }
-        }
-    }
-    caught
+    roots
 }
 
 /// Waits up to [`GIVEN_TO_END`] for the caught processes to end, and returns
@@ -172,12 +195,5 @@ async fn until_ended(caught: Vec<Caught>, executor: &gpui::BackgroundExecutor) -
 /// Stops every run of `task` in the workspace, and resolves once all of them
 /// are gone -- so whatever starts `task` next never runs beside an earlier one.
 pub fn stop_every_run_of(workspace: &Workspace, task: &TaskTemplate, cx: &mut App) -> Task<bool> {
-    let runs = runs_of(workspace, task, cx);
-    let stopping: Vec<Task<bool>> = runs.iter().map(|run| stop_for_good(run, cx)).collect();
-    cx.background_executor().spawn(async move {
-        futures::future::join_all(stopping)
-            .await
-            .into_iter()
-            .all(|ended| ended)
-    })
+    stop_all_for_good(runs_of(workspace, task, cx), cx)
 }

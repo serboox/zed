@@ -693,9 +693,8 @@ impl ConfigurationsToolbar {
     /// Stops every run at once, the ones the list does not know included.
     pub(crate) fn stop_all(&mut self, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
-            for terminal in crate::run_instances::running_terminals(workspace.read(cx), cx) {
-                crate::run_instances::stop_for_good(&terminal, cx).detach();
-            }
+            let runs = crate::run_instances::running_terminals(workspace.read(cx), cx);
+            crate::run_instances::stop_all_for_good(runs, cx).detach();
         }
         for session in self.live_sessions(cx) {
             session
@@ -3617,6 +3616,34 @@ mod tests {
             wait_until_it_is_over(&stranger_run, &mut cx).await,
             "and the one it does not"
         );
+    }
+
+    /// Stopping several runs at once looks at the machine once, not once for
+    /// each run, and every run is gone afterwards.
+    #[gpui::test]
+    async fn stop_all_looks_at_the_machine_once_for_all_the_runs(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let mut runs = Vec::new();
+        for index in 0..3 {
+            let template = the_kept_configuration(&over.toolbar, index, &cx);
+            runs.push(a_run_of(&template, &over, &mut cx).await);
+        }
+        let before =
+            crate::process_metrics::MACHINE_READS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let stopping =
+            cx.update(|_window, cx| crate::run_instances::stop_all_for_good(runs.clone(), cx));
+        assert!(stopping.await, "nothing the runs started is left");
+
+        assert_eq!(
+            crate::process_metrics::MACHINE_READS.load(std::sync::atomic::Ordering::SeqCst)
+                - before,
+            1,
+            "three runs, one look at the machine"
+        );
+        for run in &runs {
+            assert!(wait_until_it_is_over(run, &mut cx).await);
+        }
     }
 
     /// Several runs that cannot start each say why. One shared notification id

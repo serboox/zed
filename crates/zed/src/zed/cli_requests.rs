@@ -436,7 +436,13 @@ async fn trees_of(
         .iter()
         .map(|_| process_metrics::Watcher::default())
         .collect();
-    let first = process_metrics::everything_running().unwrap_or_default();
+    let live_roots: Vec<u32> = roots.iter().flatten().copied().collect();
+    let read_the_machine = || {
+        let mut everything = process_metrics::everything_running().unwrap_or_default();
+        process_metrics::read_threads_under(&mut everything, &live_roots);
+        everything
+    };
+    let first = read_the_machine();
     let first_at = Instant::now();
     for (watcher, root) in watchers.iter_mut().zip(roots) {
         if let Some(root) = root {
@@ -444,7 +450,7 @@ async fn trees_of(
         }
     }
     executor.timer(CPU_SAMPLED_OVER).await;
-    let second = process_metrics::everything_running().unwrap_or_default();
+    let second = read_the_machine();
     let second_at = Instant::now();
     watchers
         .iter_mut()

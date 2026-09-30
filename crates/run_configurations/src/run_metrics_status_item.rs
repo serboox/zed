@@ -205,13 +205,15 @@ impl RunMetricsStatusItem {
                 let Ok(contexts) = item.read_with(cx, |item, cx| item.run_contexts(cx)) else {
                     return;
                 };
+                let roots: Vec<u32> = contexts.iter().map(|context| context.pid).collect();
                 let read = match contexts.is_empty() {
                     false => {
                         cx.background_spawn(async move {
-                            (
-                                process_metrics::everything_running(),
-                                process_metrics::machine_uptime(),
-                            )
+                            let mut everything = process_metrics::everything_running();
+                            if let Some(everything) = everything.as_mut() {
+                                process_metrics::read_threads_under(everything, &roots);
+                            }
+                            (everything, process_metrics::machine_uptime())
                         })
                         .await
                     }
