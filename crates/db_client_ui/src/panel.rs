@@ -2653,9 +2653,13 @@ fn statement_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> 
 }
 
 // Finds the byte offset, relative to `s`, of the first byte that is not
-// leading whitespace or a leading comment (`-- ...` to end of line, or
-// `/* ... */`, including multi-line block comments). Returns `s.len()` if
-// `s` is nothing but whitespace/comments.
+// leading whitespace or a leading comment (`-- ...` or `# ...` to end of line,
+// or `/* ... */`, including multi-line block comments). Returns `s.len()` if
+// `s` is nothing but whitespace/comments. `#` is a comment here because
+// `unquoted_semicolon_offsets` already reads it as one: a `;` after it does not
+// end a statement, so the comment lands at the front of the next statement and
+// must be skipped like the others, or the statement is taken to start on the
+// comment's line.
 //
 // This only recognizes `--`/`/*` at a position where a new token is
 // expected (right after whitespace or a prior comment), so it deliberately
@@ -2668,7 +2672,7 @@ fn skip_leading_whitespace_and_comments(s: &str) -> usize {
     loop {
         let after_whitespace = s[offset..].len() - s[offset..].trim_start().len();
         offset += after_whitespace;
-        if bytes.get(offset..offset + 2) == Some(b"--") {
+        if bytes.get(offset..offset + 2) == Some(b"--") || bytes.get(offset) == Some(&b'#') {
             let line_end = s[offset..]
                 .find('\n')
                 .map(|i| offset + i + 1)
@@ -12483,6 +12487,46 @@ mod tests {
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 1 # note ; still comment\n+ 1");
         assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    // The shape of a real console: a statement, a commented-out line that still
+    // ends in `;`, blank lines, then the statement being worked on.
+    const COMMENTED_OUT_LINE_SQL: &str = "SELECT 1\nWHERE c.cc != '';\n#WHERE c.ci = sqlc.arg('country_id');\n\n\nSELECT * FROM ec_fmedia.countries;\n";
+
+    #[test]
+    fn a_hash_comment_before_a_statement_is_not_where_the_statement_starts() {
+        let runs =
+            super::statement_runs_in_range(COMMENTED_OUT_LINE_SQL, 0..COMMENTED_OUT_LINE_SQL.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[1].sql, "SELECT * FROM ec_fmedia.countries");
+        assert_eq!(
+            (runs[1].start_row, runs[1].end_row),
+            (5, 5),
+            "the marker, the range and the inline result belong on the statement's own \
+             line, not on the commented-out line above it"
+        );
+    }
+
+    #[test]
+    fn the_statement_under_the_cursor_starts_on_its_own_line_after_a_hash_comment() {
+        let text = COMMENTED_OUT_LINE_SQL;
+        let cursor = text.find("countries").expect("the statement") + 3;
+        let run = run_at_cursor(text, cursor).expect("a statement run");
+        assert_eq!(run.sql, "SELECT * FROM ec_fmedia.countries");
+        assert_eq!(run.start_row, 5);
+        // The caret on one of the blank lines above it picks the same statement.
+        let blank_line = text.find("\n\n\n").expect("the blank lines") + 2;
+        let run = run_at_cursor(text, blank_line).expect("a statement run");
+        assert_eq!(run.sql, "SELECT * FROM ec_fmedia.countries");
+        assert_eq!(run.start_row, 5);
+    }
+
+    #[test]
+    fn a_trailing_hash_comment_is_not_a_statement_to_run() {
+        let text = "SELECT 1;\n# just a note\n";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 1, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT 1");
     }
 
     #[test]
