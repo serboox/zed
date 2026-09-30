@@ -570,6 +570,7 @@ impl Render for RunMetricsModal {
             series: readings,
             goroutines,
             go_program,
+            remote,
             ..
         } = run;
 
@@ -587,7 +588,7 @@ impl Render for RunMetricsModal {
         self.goroutines_at = Some(go_program.unwrap_or(pid));
 
         let tabs = (runs.len() > 1).then(|| self.tabs(&runs, pid, cx));
-        let body = self.body(&metrics, &readings, &goroutines, tabs, window, cx);
+        let body = self.body(&metrics, &readings, &goroutines, tabs, remote, window, cx);
 
         shell.child(cyberpunk::dialog_body().child(body))
     }
@@ -600,6 +601,7 @@ impl RunMetricsModal {
         readings: &[(Option<f32>, u64)],
         goroutines: &Option<GoroutineReading>,
         tabs: Option<gpui::Div>,
+        remote: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -635,6 +637,20 @@ impl RunMetricsModal {
                     .min_h_full()
                     .gap(cyberpunk::SPACE_18)
                     .children(tabs)
+                    .children(remote.map(|machine| {
+                        div()
+                            .w_full()
+                            .flex_none()
+                            .debug_selector(|| "RUN-METRICS-REMOTE".to_string())
+                            .child(
+                                Label::new(format!(
+                                    "This run is on {machine}. These are the readings of the local \
+                                     ssh client, not of the program over there."
+                                ))
+                                .size(LabelSize::Default)
+                                .color(Color::Warning),
+                            )
+                    }))
                     .child(self.summary(metrics))
                     .child(Divider::horizontal())
                     .child(self.charts(metrics, processor, held, most_held))
@@ -1254,6 +1270,32 @@ mod tests {
         assert!(
             cx.debug_bounds("RUN-METRICS-GOROUTINES").is_some(),
             "and the line shows up the moment the status item has one"
+        );
+    }
+
+    /// A run over ssh says that its numbers are the local client's; a run here
+    /// says nothing of the kind.
+    #[gpui::test]
+    async fn a_run_over_ssh_says_whose_numbers_these_are(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let (_root_pid, _child_pid, metrics) = a_run();
+        item.update(&mut cx, |item, cx| {
+            item.set_reading_for_test(Some(metrics), None, cx);
+        });
+        draw(&mut cx);
+        press_the_plaque(&mut cx);
+        assert!(
+            cx.debug_bounds("RUN-METRICS-REMOTE").is_none(),
+            "a run on this machine has nothing to say about where it is"
+        );
+
+        item.update(&mut cx, |item, cx| {
+            item.set_remote_for_test(Some("deploy@build.example.com"), cx)
+        });
+        settle(&mut cx);
+        assert!(
+            cx.debug_bounds("RUN-METRICS-REMOTE").is_some(),
+            "a run over ssh says that its numbers are the client's"
         );
     }
 

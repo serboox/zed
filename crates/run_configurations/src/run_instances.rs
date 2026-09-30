@@ -16,6 +16,16 @@ use crate::process_metrics::{self, Caught};
 const GIVEN_TO_END: Duration = Duration::from_secs(3);
 const LOOKED_AT_EVERY: Duration = Duration::from_millis(50);
 
+/// What a program over ssh is given to end on its own after the interrupt, before
+/// its local client is ended: the far side's program is reached only through
+/// the pty, and once the client is gone it is left to the hangup.
+const REMOTE_GIVEN_TO_END: Duration = Duration::from_secs(2);
+
+/// The interrupt key, sent down the pty of a run over ssh: the client is in raw
+/// mode, so it carries the byte to the far side's terminal, which turns it into
+/// `SIGINT` for the program there.
+const INTERRUPT: &[u8] = b"\x03";
+
 /// Every terminal of this workspace still running `task`, wherever it was put:
 /// the terminal panel or the centre of the window.
 ///
@@ -172,6 +182,7 @@ pub fn stop_all_for_good(terminals: Vec<Entity<Terminal>>, cx: &mut App) -> Task
         let caught = executor
             .spawn(async move { process_metrics::processes_under_each(&roots) })
             .await;
+        interrupt_what_runs_over_ssh(&terminals, &executor, cx).await;
         let mut stopping = Vec::with_capacity(terminals.len());
         for (terminal, caught) in terminals.iter().zip(caught) {
             let gone = terminal.update(cx, |terminal, cx| {
@@ -185,6 +196,45 @@ pub fn stop_all_for_good(terminals: Vec<Entity<Terminal>>, cx: &mut App) -> Task
             .into_iter()
             .all(|ended| ended)
     })
+}
+
+/// Asks the programs that run over ssh to end, by the interrupt a reader would
+/// type, and gives them a moment. Killing the local client is all that is left
+/// to do to them afterwards, and that reaches the program over there only as a
+/// hangup, which a program may ignore, where the interrupt is what it expects.
+async fn interrupt_what_runs_over_ssh(
+    terminals: &[Entity<Terminal>],
+    executor: &gpui::BackgroundExecutor,
+    cx: &mut gpui::AsyncApp,
+) {
+    let mut waiting = Vec::new();
+    for terminal in terminals {
+        let gone = terminal.update(cx, |terminal, cx| {
+            let over_ssh = terminal.task().is_some_and(|task| {
+                task.status == TaskStatus::Running
+                    && crate::over_ssh::destination_of(
+                        task.spawned_task.command.as_deref(),
+                        &task.spawned_task.args,
+                    )
+                    .is_some()
+            });
+            over_ssh.then(|| {
+                terminal.input(INTERRUPT);
+                terminal.wait_for_completed_task(cx)
+            })
+        });
+        waiting.extend(gone);
+    }
+    if waiting.is_empty() {
+        return;
+    }
+    smol::future::or(
+        async {
+            futures::future::join_all(waiting).await;
+        },
+        executor.timer(REMOTE_GIVEN_TO_END),
+    )
+    .await;
 }
 
 async fn finish_stopping(

@@ -59,6 +59,9 @@ struct WatchedRun {
     /// The label and command of the task that started it.
     label: String,
     command: Option<String>,
+    /// The machine the run was sent to, when it runs over ssh: the process
+    /// measured is then the local ssh client.
+    remote: Option<String>,
     metrics: Option<Metrics>,
     /// The last [`READINGS_KEPT`] readings, oldest first. The charts draw only
     /// these, so a run a few seconds old draws a few seconds.
@@ -87,6 +90,7 @@ impl WatchedRun {
             pid: context.pid,
             label: context.label.clone(),
             command: context.command.clone(),
+            remote: context.remote.clone(),
             metrics: None,
             readings: VecDeque::new(),
             watcher: Watcher::default(),
@@ -135,6 +139,8 @@ pub(crate) struct RunReading {
     pub goroutines: Option<crate::goroutines::GoroutineReading>,
     /// The run's process that is a Go program, if one is.
     pub go_program: Option<u32>,
+    /// The machine the run was sent to, when it runs over ssh.
+    pub remote: Option<String>,
 }
 
 /// What is needed about a run to decide where its goroutines, if any, come
@@ -145,6 +151,8 @@ struct RunContext {
     pid: u32,
     label: String,
     command: Option<String>,
+    /// The machine the run was sent to, when it runs over ssh.
+    remote: Option<String>,
 }
 
 /// One reading, kept only for what the charts draw.
@@ -326,6 +334,7 @@ impl RunMetricsStatusItem {
                 pid,
                 label: "a run".to_string(),
                 command: None,
+                remote: None,
             })
             .into_iter()
             .collect();
@@ -361,9 +370,18 @@ impl RunMetricsStatusItem {
                         .collect(),
                     goroutines: run.goroutines.clone(),
                     go_program: run.go_program,
+                    remote: run.remote.clone(),
                 })
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remote_for_test(&mut self, machine: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(run) = self.runs.last_mut() {
+            run.remote = machine.map(str::to_string);
+        }
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -388,6 +406,7 @@ impl RunMetricsStatusItem {
                 pid: metrics.pid,
                 label: "a run".to_string(),
                 command: None,
+                remote: None,
             });
             run.metrics = Some(metrics);
             run.goroutines = goroutines;
@@ -411,6 +430,7 @@ impl RunMetricsStatusItem {
                     pid: metrics.pid,
                     label,
                     command: None,
+                    remote: None,
                 });
                 run.readings = memory
                     .into_iter()
@@ -448,6 +468,10 @@ impl RunMetricsStatusItem {
                 pid,
                 label: task.spawned_task.full_label.clone(),
                 command: task.spawned_task.command.clone(),
+                remote: crate::over_ssh::destination_of(
+                    task.spawned_task.command.as_deref(),
+                    &task.spawned_task.args,
+                ),
             });
         }
         // A program run through the debugger is a process like any other, but
@@ -467,6 +491,7 @@ impl RunMetricsStatusItem {
                     .map(|label| label.to_string())
                     .unwrap_or_else(|| "debug session".to_string()),
                 command: None,
+                remote: None,
             });
         }
         contexts
@@ -1424,6 +1449,7 @@ mod tests {
             pid,
             label: label.to_string(),
             command: None,
+            remote: None,
         }
     }
 

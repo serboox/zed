@@ -2408,14 +2408,12 @@ mod tests {
             .expect("the run has a process");
         let mut tree = Vec::new();
         for _ in 0..300 {
+            bar_cx.run_until_parked();
             tree = crate::process_metrics::processes_under(root);
             if tree.len() >= 2 {
                 break;
             }
-            bar_cx
-                .background_executor
-                .timer(Duration::from_millis(20))
-                .await;
+            std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
             tree.len() >= 2,
@@ -2452,6 +2450,78 @@ mod tests {
         assert!(
             crate::process_metrics::still_running(&tree).is_empty(),
             "nothing the run started is left, the program in its own session included"
+        );
+    }
+
+    /// A program that runs over ssh is ended the way a reader would end it, by
+    /// the interrupt down its terminal, before the local client is killed: the
+    /// client's death reaches the program over there only as a hangup. A run
+    /// that is not over ssh is not sent the interrupt.
+    #[gpui::test]
+    async fn a_run_over_ssh_is_interrupted_before_its_client_is_killed(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (over, mut bar_cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let template = what_it_would_run(&over.toolbar, &bar_cx);
+        let dir = std::env::temp_dir().join(format!("run-over-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory for the stand-in");
+        let script = "#!/bin/sh\nfor marker; do :; done\n\
+                      trap 'echo interrupted > \"$marker\"; exit 0' INT\n\
+                      sleep 60 &\nwait\n";
+        let mut clients = Vec::new();
+        for name in ["ssh", "not-ssh"] {
+            let path = dir.join(name);
+            std::fs::write(&path, script).expect("the stand-in is written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("the stand-in can run");
+            clients.push((path, dir.join(format!("{name}.marker"))));
+        }
+        let mut runs = Vec::new();
+        for (client, marker) in &clients {
+            let run = a_run_of_command(
+                &template,
+                client.to_str().expect("a path"),
+                &["-t", "deploy@host", "--", marker.to_str().expect("a path")],
+                &over,
+                &mut bar_cx,
+            )
+            .await;
+            runs.push(run);
+        }
+        // Each stand-in has put its trap in place once it has started its sleep.
+        for run in &runs {
+            let root = run
+                .read_with(&bar_cx, |terminal, _| {
+                    terminal
+                        .pid_getter()
+                        .map(|getter| getter.fallback_pid().as_u32())
+                })
+                .expect("the run has a process");
+            for _ in 0..300 {
+                bar_cx.run_until_parked();
+                if crate::process_metrics::processes_under(root).len() >= 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        let stopping =
+            bar_cx.update(|_window, cx| crate::run_instances::stop_all_for_good(runs.clone(), cx));
+        assert!(stopping.await);
+
+        let over_ssh = std::fs::read_to_string(&clients[0].1).unwrap_or_default();
+        let not_over_ssh = std::fs::read_to_string(&clients[1].1).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            over_ssh.trim(),
+            "interrupted",
+            "the program over ssh was interrupted, and so ended on its own terms"
+        );
+        assert_eq!(
+            not_over_ssh, "",
+            "a program that is not over ssh was not sent the interrupt"
         );
     }
 

@@ -130,6 +130,19 @@ pub fn run_over_ssh(
     ("ssh".to_string(), ssh_args)
 }
 
+/// The machine a run was sent to, read back out of the command that
+/// [`run_over_ssh`] made: `ssh`, then the options, then `--` and the script. A
+/// run of anything else, or an `ssh` the reader wrote without the `--`, says
+/// nothing about where it goes.
+pub fn destination_of(command: Option<&str>, args: &[String]) -> Option<String> {
+    let program = std::path::Path::new(command?).file_name()?.to_str()?;
+    if program != "ssh" {
+        return None;
+    }
+    let separator = args.iter().position(|arg| arg == "--")?;
+    args.get(separator.checked_sub(1)?).cloned()
+}
+
 /// Rewrites a resolved run so it happens on `machine` instead of here.
 ///
 /// `from_the_file` is whatever a named environment file held, read on this side
@@ -281,6 +294,30 @@ mod tests {
         assert_eq!(
             args[5],
             "cd '/srv/app' && export PORT='8080' && go 'run' './cmd/api'"
+        );
+    }
+
+    /// A run sent over ssh can be told from the command it became; a run of
+    /// anything else, and an `ssh` with no script to run, cannot.
+    #[test]
+    fn a_run_sent_over_ssh_says_where_it_was_sent() {
+        let machine = Machine::parse("deploy@build.example.com:2222").expect("a machine");
+        let (program, args) = run_over_ssh(&machine, "go", &[], None, &[]);
+        assert_eq!(
+            destination_of(Some(&program), &args),
+            Some("deploy@build.example.com".to_string())
+        );
+        assert_eq!(
+            destination_of(Some("/usr/bin/ssh"), &args),
+            Some("deploy@build.example.com".to_string()),
+            "the program may be spelled with a path"
+        );
+        assert_eq!(destination_of(Some("go"), &args), None);
+        assert_eq!(destination_of(None, &args), None);
+        assert_eq!(
+            destination_of(Some("ssh"), &["host".to_string(), "uptime".to_string()]),
+            None,
+            "an ssh written by hand has no `--` to read the destination from"
         );
     }
 
