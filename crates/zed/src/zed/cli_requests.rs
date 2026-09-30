@@ -580,7 +580,12 @@ pub async fn list_configurations(
 
 #[derive(Clone)]
 enum Found {
-    Task(Entity<Workspace>, AnyWindowHandle, task::TaskTemplate),
+    Task(
+        Entity<Workspace>,
+        AnyWindowHandle,
+        task::TaskTemplate,
+        Option<run_configurations::over_ssh::Machine>,
+    ),
     Debug(Entity<Workspace>, AnyWindowHandle, task::DebugScenario),
 }
 
@@ -614,7 +619,7 @@ async fn act_on(
     cx: &mut AsyncApp,
 ) -> Result<(), (String, i32)> {
     match found {
-        Found::Task(workspace, window, task) => {
+        Found::Task(workspace, window, task, machine) => {
             if matches!(action, RunAction::Stop | RunAction::Restart) {
                 let stopping = workspace.update(cx, |workspace, cx| {
                     run_instances::stop_every_run_of(workspace, &task, cx)
@@ -637,7 +642,7 @@ async fn act_on(
                     ));
                 };
                 let weak = workspace.downgrade();
-                if !configurations_view::run_a_task(&weak, task, &mut window_cx).await {
+                if !configurations_view::run_a_task_on(&weak, task, machine, &mut window_cx).await {
                     return Err((
                         format!("'{configuration}' could not be started; the editor says why."),
                         exit_status::FAILED,
@@ -725,7 +730,12 @@ pub async fn control_run(
                     .filter(|candidate| candidate.label == configuration)
                 {
                     if let Some(task) = &candidate.task {
-                        found.push(Found::Task(workspace.clone(), window.into(), task.clone()));
+                        found.push(Found::Task(
+                            workspace.clone(),
+                            window.into(),
+                            task.clone(),
+                            candidate.machine(),
+                        ));
                     } else if let Some(scenario) = &candidate.scenario {
                         found.push(Found::Debug(
                             workspace.clone(),
@@ -1431,6 +1441,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!is_running(&run, cx), "Stop ends the run");
+    }
+
+    /// A configuration that names a machine is run there from the command line
+    /// as well, not here.
+    #[gpui::test]
+    async fn a_configuration_that_names_a_machine_is_run_there(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/alpha"),
+                json!({ ".zed": { "tasks.json": r#"[
+                  { "label": "remote api", "command": "sleep", "args": ["60"], "on": "nobody@127.0.0.1:1" }
+                ]"# } }),
+            )
+            .await;
+        open(cx, &app_state, path!("/alpha"));
+        let (alpha, workspace) = window_with(cx, path!("/alpha"));
+
+        let responses = ask(
+            cx,
+            &app_state,
+            CliRequest::ControlRun {
+                selector: selector_for(alpha),
+                configuration: "remote api".into(),
+                action: RunAction::Run,
+            },
+        );
+        assert_eq!(exit_of(&responses), Some(0), "{responses:?}");
+
+        // The window of this test has no terminal provider, so nothing is
+        // spawned; what a start leaves behind is the task history.
+        let scheduled = workspace.read_with(cx, |workspace, cx| {
+            let inventory = workspace
+                .project()
+                .read(cx)
+                .task_store()
+                .read(cx)
+                .task_inventory()?;
+            let (_, task) = inventory.read(cx).last_scheduled_task(None)?;
+            Some((task.resolved.command, task.resolved.args))
+        });
+        let (command, args) = scheduled.expect("the run was scheduled");
+        assert!(
+            run_configurations::over_ssh::remote_run_of(command.as_deref(), &args).is_some(),
+            "the run was sent to its machine: {command:?} {args:?}"
+        );
     }
 
     fn windows_holding(cx: &mut TestAppContext, project: &str) -> Vec<u64> {

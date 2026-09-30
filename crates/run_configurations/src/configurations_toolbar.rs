@@ -478,6 +478,15 @@ impl ConfigurationsToolbar {
         }
     }
 
+    /// The machine the configuration this pointing would run says it runs on. A
+    /// temporary run names none.
+    fn machine_at(&self, pointing: &Pointing, cx: &App) -> Option<crate::over_ssh::Machine> {
+        match pointing {
+            Pointing::Kept { kind, at } => self.store.read(cx).get(*kind, *at)?.machine(),
+            Pointing::Remembered { .. } => None,
+        }
+    }
+
     /// The debug scenario this pointing would start, if it already is one. A
     /// temporary one is always a plain task, never a debug scenario.
     fn scenario_at(&self, pointing: &Pointing, cx: &App) -> Option<task::DebugScenario> {
@@ -600,9 +609,10 @@ impl ConfigurationsToolbar {
         let Some(task) = self.task_at(pointing, cx) else {
             return;
         };
+        let machine = self.machine_at(pointing, cx);
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            crate::configurations_view::run_a_task(&workspace, task, cx).await;
+            crate::configurations_view::run_a_task_on(&workspace, task, machine, cx).await;
         })
         .detach();
     }
@@ -850,13 +860,14 @@ impl ConfigurationsToolbar {
         let Some(task) = self.task_at(pointing, cx) else {
             return;
         };
+        let machine = self.machine_at(pointing, cx);
         let Some(gone) = self.stop_every_run_of(pointing, cx) else {
             return;
         };
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
             gone.await;
-            crate::configurations_view::run_a_task(&workspace, task, cx).await;
+            crate::configurations_view::run_a_task_on(&workspace, task, machine, cx).await;
         })
         .detach();
     }
@@ -2525,6 +2536,112 @@ mod tests {
         );
     }
 
+    /// A configuration that names a machine runs there when the plaque starts
+    /// it, and runs here when it names none.
+    #[gpui::test]
+    async fn a_configuration_that_names_a_machine_runs_there_from_the_plaque(
+        cx: &mut TestAppContext,
+    ) {
+        let (over, mut bar_cx) = a_plaque_over_runs(TASKS_ON_AND_OFF_A_MACHINE, cx).await;
+        bar_cx.background_executor.allow_parking();
+        for (at, over_ssh) in [(0, true), (1, false)] {
+            over.toolbar.update_in(&mut bar_cx, |toolbar, window, cx| {
+                let pointing = Pointing::Kept {
+                    kind: Kind::Task,
+                    at,
+                };
+                toolbar.run_of(&pointing, window, cx);
+            });
+            let prefix = if over_ssh { "remote" } else { "local" };
+            let mut started = None;
+            for _ in 0..300 {
+                bar_cx.run_until_parked();
+                started = over.workspace.read_with(&bar_cx, |workspace, cx| {
+                    let inventory = workspace
+                        .project()
+                        .read(cx)
+                        .task_store()
+                        .read(cx)
+                        .task_inventory()?;
+                    let (_, task) = inventory.read(cx).last_scheduled_task(None)?;
+                    task.resolved.label.starts_with(prefix).then(|| {
+                        (
+                            task.resolved.label.clone(),
+                            task.resolved.command.clone(),
+                            task.resolved.args.clone(),
+                        )
+                    })
+                });
+                if started.is_some() {
+                    break;
+                }
+                bar_cx
+                    .background_executor
+                    .timer(Duration::from_millis(20))
+                    .await;
+            }
+            let (_, command, args) = started.expect("the run started");
+            assert_eq!(
+                crate::over_ssh::remote_run_of(command.as_deref(), &args).is_some(),
+                over_ssh,
+                "a run that names a machine is sent there, one that names none is not: \
+                 {command:?} {args:?}"
+            );
+        }
+    }
+
+    /// Restarting a configuration that names a machine starts it there again.
+    #[gpui::test]
+    async fn a_restart_sends_a_configuration_to_its_machine(cx: &mut TestAppContext) {
+        let (over, mut bar_cx) = a_plaque_over_runs(TASKS_ON_AND_OFF_A_MACHINE, cx).await;
+        let pointing = Pointing::Kept {
+            kind: Kind::Task,
+            at: 0,
+        };
+        let template = over
+            .toolbar
+            .read_with(&bar_cx, |toolbar, cx| toolbar.task_at(&pointing, cx))
+            .expect("the configuration is there");
+        let run = a_run_of(&template, &over, &mut bar_cx).await;
+
+        over.toolbar.update_in(&mut bar_cx, |toolbar, window, cx| {
+            toolbar.restart_of(&pointing, window, cx);
+        });
+
+        assert!(wait_until_it_is_over(&run, &mut bar_cx).await);
+        // A run sent to a machine is labelled with it, so what the restart left
+        // in the history is found by the start of its label.
+        let mut scheduled = None;
+        for _ in 0..300 {
+            bar_cx.run_until_parked();
+            scheduled = over.workspace.read_with(&bar_cx, |workspace, cx| {
+                let inventory = workspace
+                    .project()
+                    .read(cx)
+                    .task_store()
+                    .read(cx)
+                    .task_inventory()?;
+                let (_, task) = inventory.read(cx).last_scheduled_task(None)?;
+                task.resolved
+                    .label
+                    .starts_with("remote api")
+                    .then(|| (task.resolved.command.clone(), task.resolved.args.clone()))
+            });
+            if scheduled.is_some() {
+                break;
+            }
+            bar_cx
+                .background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let (command, args) = scheduled.expect("the restart was scheduled");
+        assert!(
+            crate::over_ssh::remote_run_of(command.as_deref(), &args).is_some(),
+            "the restart went to the machine: {command:?} {args:?}"
+        );
+    }
+
     /// The keys that used to rerun whatever ran last restart what the plaque
     /// shows; with nothing on the plaque they still rerun the last task.
     #[gpui::test]
@@ -2669,6 +2786,11 @@ mod tests {
             let _ = window.draw(cx);
         });
     }
+
+    const TASKS_ON_AND_OFF_A_MACHINE: &str = r#"[
+      { "label": "remote api", "command": "sleep", "args": ["60"], "on": "nobody@127.0.0.1:1" },
+      { "label": "local api", "command": "sleep", "args": ["61"] }
+    ]"#;
 
     const THREE_TASKS: &str = r#"[
       { "label": "api server", "command": "go run ./cmd/api" },

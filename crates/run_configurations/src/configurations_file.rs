@@ -63,6 +63,11 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    /// The machine this configuration says it runs on, if it names one.
+    pub fn machine(&self) -> Option<crate::over_ssh::Machine> {
+        machine_of(&self.as_written).and_then(|said| crate::over_ssh::Machine::parse(&said))
+    }
+
     /// What to show when there is no label worth showing.
     pub fn shown_label(&self) -> String {
         match self.label.trim().is_empty() {
