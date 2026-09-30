@@ -254,6 +254,33 @@ impl Watcher for FsWatcher {
         }
         Ok(())
     }
+
+    fn describe(&self, path: &std::path::Path) -> String {
+        let sanitized = SanitizedPath::new(path);
+        let registrations = self.registrations.lock();
+        let registration = registrations
+            .get(&WatchKey::exact(sanitized))
+            .or_else(|| registrations.get(&WatchKey::folded(sanitized)));
+        if let Some(registration) = registration {
+            return format!(
+                "registered with the {:?} watcher",
+                registration.os_watcher.kind()
+            );
+        }
+        if path_covered_by_recursive_registration(&registrations, sanitized) {
+            return "covered by a recursive watch above it".to_string();
+        }
+        drop(registrations);
+        if self.pending_registrations.lock().contains_key(path) {
+            return "waiting to be registered".to_string();
+        }
+        "not watched".to_string()
+    }
+
+    fn rewatch(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.remove(path)?;
+        self.add(path)
+    }
 }
 
 /// Whether a recursive registration on a strict ancestor of `path` already covers
@@ -955,6 +982,10 @@ impl OsWatcher {
 
     pub(crate) fn is_recursive(&self) -> bool {
         self.recursive
+    }
+
+    pub(crate) fn kind(&self) -> OsWatcherKind {
+        self.kind
     }
 
     #[must_use]

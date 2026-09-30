@@ -72,6 +72,16 @@ use std::ffi::OsStr;
 pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
     fn remove(&self, path: &Path) -> Result<()>;
+
+    /// Says in a few words how `path` is watched, or "unknown".
+    fn describe(&self, _path: &Path) -> String {
+        "unknown".to_string()
+    }
+
+    /// Puts the watch on `path` in place again.
+    fn rewatch(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]

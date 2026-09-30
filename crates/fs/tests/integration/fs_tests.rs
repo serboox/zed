@@ -1064,6 +1064,101 @@ async fn test_realfs_watcher_diagnostics(executor: BackgroundExecutor, cx: &mut 
     drop(watcher);
 }
 
+/// The operating system keeps one watch per inode, so letting go of a renamed
+/// directory's old path must not take the watch of its new path with it.
+#[cfg(target_os = "linux")]
+#[gpui::test]
+async fn test_realfs_renamed_directory_keeps_reporting_after_the_old_path_is_released(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor.clone());
+    let directory = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let old = root.join("old");
+    let new = root.join("new");
+    std::fs::create_dir(&old).unwrap();
+
+    let (mut events, watcher) = fs.watch(&root, Duration::from_millis(10)).await;
+    watcher.add(&old).unwrap();
+
+    std::fs::rename(&old, &new).unwrap();
+    watcher.add(&new).unwrap();
+    watcher.remove(&old).unwrap();
+    let _ = watcher_delivered_event(&mut events, &executor, Duration::from_millis(300), &|_| {
+        false
+    })
+    .await;
+
+    let file = new.join("arrived.txt");
+    fs.write(&file, b"hello").await.unwrap();
+    // A rescan would find the file anyway, so the event has to name the file.
+    let timeout = executor.timer(Duration::from_secs(5)).fuse();
+    futures::pin_mut!(timeout);
+    let reported = loop {
+        futures::select_biased! {
+            batch = events.next().fuse() => {
+                let Some(batch) = batch else { break false };
+                if batch.iter().any(|event| event.path == file) {
+                    break true;
+                }
+            }
+            _ = timeout => break false,
+        }
+    };
+    assert!(
+        reported,
+        "a file put into the renamed directory was never reported"
+    );
+    drop(events);
+    drop(watcher);
+}
+
+/// After a rewatch the path goes on reporting.
+#[gpui::test]
+async fn test_realfs_watcher_describes_a_path_and_rewatches_it(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor.clone());
+    let directory = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let watched = root.join("watched");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&watched).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+
+    let (mut events, watcher) = fs.watch(&root, Duration::from_millis(10)).await;
+    watcher.add(&watched).unwrap();
+
+    assert!(
+        watcher.describe(&watched).starts_with("registered"),
+        "{}",
+        watcher.describe(&watched)
+    );
+    assert!(
+        !watcher.describe(&elsewhere).starts_with("registered"),
+        "{}",
+        watcher.describe(&elsewhere)
+    );
+
+    watcher.rewatch(&watched).unwrap();
+    assert!(watcher.describe(&watched).starts_with("registered"));
+    let file = watched.join("after.txt");
+    fs.write(&file, b"hello").await.unwrap();
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == file
+        })
+        .await,
+        "the directory went quiet after its watch was put in place again"
+    );
+    drop(events);
+    drop(watcher);
+}
+
 /// Exercises a spread of real watchers whose registered watch path is spelled
 /// differently from the path the OS reports events under. Each scenario watches
 /// some directory and then mutates the on-disk file; a correct watcher must

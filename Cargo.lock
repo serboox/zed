@@ -18804,6 +18804,7 @@ dependencies = [
  "markdown_preview",
  "menu",
  "notifications",
+ "postage",
  "pretty_assertions",
  "project",
  "rayon",

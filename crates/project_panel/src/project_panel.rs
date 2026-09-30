@@ -32,6 +32,7 @@ use language::DiagnosticSeverity;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::StatusToast;
+use postage::prelude::Stream as _;
 use project::{
     Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
     ProjectPath, Worktree, WorktreeId,
@@ -95,6 +96,9 @@ const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
 /// Quiet window used to debounce background-driven tree rebuilds in the
 /// `balanced`/`snapshot` tree performance modes.
 const BACKGROUND_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How often the directories shown in the tree are compared with the disk.
+const UNREPORTED_CHANGES_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -205,6 +209,7 @@ pub struct ProjectPanel {
     // panel's subtree, so nothing else repaints it once the scan ends without
     // changing any entry.
     initial_scan_notify: Task<()>,
+    unreported_changes_check: Task<()>,
     #[cfg(test)]
     update_visible_entries_run_count: usize,
 }
@@ -785,6 +790,13 @@ impl ProjectPanel {
             let focus_handle = cx.focus_handle();
             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
 
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.look_for_unreported_changes(cx);
+                }
+            })
+            .detach();
+
             cx.subscribe_in(
                 &git_store,
                 window,
@@ -1019,11 +1031,13 @@ impl ProjectPanel {
                 refresh_debounce_task: None,
                 last_tree_input_signature: None,
                 initial_scan_notify: Task::ready(()),
+                unreported_changes_check: Task::ready(()),
                 #[cfg(test)]
                 update_visible_entries_run_count: 0,
             };
             this.update_visible_entries(None, false, false, window, cx);
             this.notify_when_initial_scan_completes(cx);
+            this.check_for_unreported_changes_periodically(window, cx);
 
             this
         });
@@ -1200,6 +1214,7 @@ impl ProjectPanel {
         if !self.focus_handle.contains_focused(window, cx) {
             cx.emit(Event::Focus);
         }
+        self.look_for_unreported_changes(cx);
     }
 
     /// Whether keyboard focus is within the panel, including a deployed context menu.
@@ -1412,6 +1427,7 @@ impl ProjectPanel {
                                 menu.separator()
                                     .action("Expand All", Box::new(ExpandAllEntries))
                                     .action("Collapse All", Box::new(CollapseAllEntries))
+                                    .action("Refresh", Box::new(RefreshTree))
                             })
                     }
                 })
@@ -1785,8 +1801,71 @@ impl ProjectPanel {
     }
 
     fn refresh_tree(&mut self, _: &RefreshTree, window: &mut Window, cx: &mut Context<Self>) {
+        let mut disk_reads: Vec<_> = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .filter_map(|worktree| Some(worktree.read(cx).as_local()?.refresh_loaded_directories()))
+            .collect();
         self.update_visible_entries(None, false, false, window, cx);
         cx.notify();
+        // The frozen `snapshot` mode ignores the events of these reads, so the
+        // tree is rebuilt once more when they are all in.
+        cx.spawn_in(window, async move |this, cx| {
+            for disk_read in &mut disk_reads {
+                disk_read.recv().await;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.update_visible_entries(None, false, false, window, cx);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Compares the shown directories with the disk: one `stat` each when nothing changed.
+    fn look_for_unreported_changes(&self, cx: &App) {
+        for worktree in self.project.read(cx).visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let Some(local_worktree) = worktree.as_local() else {
+                continue;
+            };
+            let expanded_directories = self
+                .state
+                .expanded_dir_ids
+                .get(&worktree.id())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry_id| worktree.entry_for_id(*entry_id))
+                .map(|entry| entry.path.clone());
+            let directories = std::iter::once(RelPath::empty_arc())
+                .chain(expanded_directories)
+                .collect();
+            drop(local_worktree.refresh_directories_if_changed(directories));
+        }
+    }
+
+    fn check_for_unreported_changes_periodically(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unreported_changes_check = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(UNREPORTED_CHANGES_CHECK_INTERVAL)
+                    .await;
+                let still_alive = this.update_in(cx, |this, window, cx| {
+                    if window.is_window_active() {
+                        this.look_for_unreported_changes(cx);
+                    }
+                });
+                if still_alive.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     fn expand_all_for_entry_and_refresh(

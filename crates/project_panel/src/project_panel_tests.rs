@@ -8176,6 +8176,156 @@ async fn test_selection_fallback_to_next_highest_worktree(cx: &mut gpui::TestApp
     );
 }
 
+/// Holds back file system events, like a quiet watcher, and adds files the tree is never told of.
+async fn add_files_nothing_reports(fs: &FakeFs, touch_directories: bool) {
+    fs.pause_events();
+    fs.insert_file(path!("/root/dir1/added_in_dir.txt"), Vec::new())
+        .await;
+    fs.insert_file(path!("/root/added_in_root.txt"), Vec::new())
+        .await;
+    if touch_directories {
+        fs.touch_path(path!("/root/dir1")).await;
+        fs.touch_path(path!("/root")).await;
+    }
+}
+
+async fn panel_over_unreported_changes(
+    cx: &mut gpui::TestAppContext,
+) -> (Entity<ProjectPanel>, Arc<FakeFs>, VisualTestContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "dir1": { "file1.txt": "" }, "file2.txt": "" }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+    let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut visual_cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
+    visual_cx.run_until_parked();
+    toggle_expand_dir(&panel, "root/dir1", &mut visual_cx);
+    (panel, fs, visual_cx)
+}
+
+fn shows_unreported_files(
+    panel: &Entity<ProjectPanel>,
+    cx: &mut VisualTestContext,
+) -> (bool, bool) {
+    let shown = visible_entries_as_strings(panel, 0..20, cx).join("\n");
+    (
+        shown.contains("added_in_dir.txt"),
+        shown.contains("added_in_root.txt"),
+    )
+}
+
+#[gpui::test]
+async fn test_a_change_nothing_reported_shows_when_the_window_is_activated(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (panel, fs, mut cx) = panel_over_unreported_changes(cx).await;
+    add_files_nothing_reports(&fs, true).await;
+    cx.run_until_parked();
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (false, false),
+        "nothing told the tree, so it does not show the files"
+    );
+
+    // Focus coming back to the panel looks on its own, so the editor area has it.
+    cx.update(|window, cx| {
+        let workspace = panel.read(cx).workspace.upgrade().unwrap();
+        let pane = workspace.read(cx).active_pane().clone();
+        window.focus(&pane.focus_handle(cx), cx);
+    });
+    cx.deactivate_window();
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (true, true),
+        "coming back to the window showed both the expanded directory's file and the root's"
+    );
+}
+
+#[gpui::test]
+async fn test_a_change_nothing_reported_shows_within_the_check_interval(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (panel, fs, mut cx) = panel_over_unreported_changes(cx).await;
+    assert!(
+        cx.update(|window, _| window.is_window_active()),
+        "the periodic check only looks while the window is the one in use"
+    );
+    add_files_nothing_reports(&fs, true).await;
+    cx.run_until_parked();
+    assert_eq!(shows_unreported_files(&panel, &mut cx), (false, false));
+
+    cx.executor()
+        .advance_clock(UNREPORTED_CHANGES_CHECK_INTERVAL + Duration::from_secs(1));
+    cx.run_until_parked();
+
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (true, true),
+        "the periodic check found both files"
+    );
+}
+
+#[gpui::test]
+async fn test_the_periodic_check_leaves_a_window_out_of_use_alone(cx: &mut gpui::TestAppContext) {
+    let (panel, fs, mut cx) = panel_over_unreported_changes(cx).await;
+    add_files_nothing_reports(&fs, true).await;
+    cx.deactivate_window();
+
+    cx.executor()
+        .advance_clock(UNREPORTED_CHANGES_CHECK_INTERVAL * 3);
+    cx.run_until_parked();
+
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (false, false),
+        "a window nobody looks at is not read from the disk"
+    );
+}
+
+#[gpui::test]
+async fn test_refresh_reads_the_directories_again_even_when_their_time_did_not_move(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (panel, fs, mut cx) = panel_over_unreported_changes(cx).await;
+    add_files_nothing_reports(&fs, false).await;
+    cx.run_until_parked();
+    cx.deactivate_window();
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (false, false),
+        "the looks at the modification times found nothing, as no time moved"
+    );
+
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.focus_handle(cx).focus(window, cx);
+    });
+    cx.dispatch_action(RefreshTree);
+    cx.run_until_parked();
+
+    assert_eq!(
+        shows_unreported_files(&panel, &mut cx),
+        (true, true),
+        "the refresh action read every loaded directory from the disk"
+    );
+}
+
 pub(crate) fn toggle_expand_dir(
     panel: &Entity<ProjectPanel>,
     path: &str,

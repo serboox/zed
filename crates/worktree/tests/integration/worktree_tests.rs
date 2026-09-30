@@ -34,6 +34,275 @@ use util::{
     test::TempTree,
 };
 
+async fn a_worktree_over(fs: &Arc<FakeFs>, cx: &mut TestAppContext) -> Entity<Worktree> {
+    let tree = Worktree::local(
+        Path::new(path!("/root")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree
+}
+
+fn paths_of(tree: &Entity<Worktree>, cx: &TestAppContext) -> Vec<String> {
+    tree.read_with(cx, |tree, _| {
+        tree.entries(true, 0)
+            .map(|entry| entry.path.as_unix_str().to_string())
+            .collect()
+    })
+}
+
+/// A change the file watcher never reported is found by looking at the
+/// directory: its modification time is not the one the tree has.
+#[gpui::test]
+async fn test_a_change_the_watcher_never_reported_is_found_by_looking(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "a": { "f1": "" }, "b": { "g1": "" } }),
+    )
+    .await;
+    let tree = a_worktree_over(&fs, cx).await;
+
+    // Held-back events look like a watcher that went quiet. The directory's
+    // time moves too, as it does on a real file system.
+    fs.pause_events();
+    fs.insert_file(path!("/root/a/f2"), Vec::new()).await;
+    fs.touch_path(path!("/root/a")).await;
+    cx.executor().run_until_parked();
+    assert!(
+        !paths_of(&tree, cx).contains(&"a/f2".to_string()),
+        "the tree does not know the file: nothing told it"
+    );
+
+    let mut looked = tree.update(cx, |tree, _| {
+        tree.as_local()
+            .unwrap()
+            .refresh_directories_if_changed(vec![rel_path("a").into()])
+    });
+    looked.recv().await;
+    cx.executor().run_until_parked();
+
+    assert!(
+        paths_of(&tree, cx).contains(&"a/f2".to_string()),
+        "looking at the directory found the file: {:?}",
+        paths_of(&tree, cx)
+    );
+}
+
+/// A directory that has not changed costs a look and nothing else: it is not
+/// scanned again.
+#[gpui::test]
+async fn test_a_directory_that_has_not_changed_is_not_rescanned(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "a": { "f1": "" } }))
+        .await;
+    let tree = a_worktree_over(&fs, cx).await;
+    let scans_before = tree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot().scan_id());
+    let reads_before = fs.read_dir_call_count();
+
+    let mut looked = tree.update(cx, |tree, _| {
+        tree.as_local()
+            .unwrap()
+            .refresh_directories_if_changed(vec![rel_path("a").into(), rel_path("").into()])
+    });
+    looked.recv().await;
+    cx.executor().run_until_parked();
+
+    let scans_after = tree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot().scan_id());
+    assert_eq!(
+        scans_before, scans_after,
+        "nothing had changed, so nothing was scanned"
+    );
+    assert_eq!(
+        reads_before,
+        fs.read_dir_call_count(),
+        "an unchanged directory was not even listed"
+    );
+}
+
+#[gpui::test]
+async fn test_a_file_removed_without_a_word_is_found_gone_by_looking(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "a": { "f1": "", "f2": "" } }))
+        .await;
+    let tree = a_worktree_over(&fs, cx).await;
+
+    fs.pause_events();
+    fs.remove_file(Path::new(path!("/root/a/f1")), Default::default())
+        .await
+        .unwrap();
+    fs.touch_path(path!("/root/a")).await;
+    cx.executor().run_until_parked();
+    assert!(paths_of(&tree, cx).contains(&"a/f1".to_string()));
+
+    let mut looked = tree.update(cx, |tree, _| {
+        tree.as_local()
+            .unwrap()
+            .refresh_directories_if_changed(vec![rel_path("a").into()])
+    });
+    looked.recv().await;
+    cx.executor().run_until_parked();
+
+    let known = paths_of(&tree, cx);
+    assert!(!known.contains(&"a/f1".to_string()), "{known:?}");
+    assert!(known.contains(&"a/f2".to_string()), "{known:?}");
+}
+
+#[gpui::test]
+async fn test_a_directory_removed_without_a_word_is_found_gone_by_looking(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "a": { "f1": "" }, "b": { "g1": "" } }),
+    )
+    .await;
+    let tree = a_worktree_over(&fs, cx).await;
+
+    fs.pause_events();
+    fs.remove_dir(
+        Path::new(path!("/root/a")),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    let mut looked = tree.update(cx, |tree, _| {
+        tree.as_local()
+            .unwrap()
+            .refresh_directories_if_changed(vec![rel_path("a").into()])
+    });
+    looked.recv().await;
+    cx.executor().run_until_parked();
+
+    let known = paths_of(&tree, cx);
+    assert!(!known.iter().any(|path| path.starts_with("a")), "{known:?}");
+    assert!(known.contains(&"b/g1".to_string()), "{known:?}");
+}
+
+/// A watcher does not report a directory's own time, so a time that moved with
+/// nothing added or removed is no change and must not scan anything.
+#[gpui::test]
+async fn test_a_moved_directory_time_with_the_same_entries_is_not_a_change(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "a": { "f1": "" } }))
+        .await;
+    let tree = a_worktree_over(&fs, cx).await;
+    let scans_before = tree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot().scan_id());
+
+    fs.pause_events();
+    fs.touch_path(path!("/root/a")).await;
+    let reads_before = fs.read_dir_call_count();
+    let mut reads_after_each_look = Vec::new();
+    for _ in 0..2 {
+        let mut looked = tree.update(cx, |tree, _| {
+            tree.as_local()
+                .unwrap()
+                .refresh_directories_if_changed(vec![rel_path("a").into()])
+        });
+        looked.recv().await;
+        cx.executor().run_until_parked();
+        reads_after_each_look.push(fs.read_dir_call_count());
+    }
+
+    let scans_after = tree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot().scan_id());
+    assert_eq!(scans_before, scans_after);
+    assert!(
+        reads_after_each_look[0] > reads_before,
+        "the first look listed the directory whose time was not the tree's"
+    );
+    assert_eq!(
+        reads_after_each_look[0], reads_after_each_look[1],
+        "the second look found a time it had already looked at, and listed nothing"
+    );
+}
+
+#[gpui::test]
+async fn test_refreshing_the_loaded_directories_updates_a_file_that_was_modified(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "a": { "f1": "" } }))
+        .await;
+    let tree = a_worktree_over(&fs, cx).await;
+    let mtime_of_entry = |tree: &Entity<Worktree>, cx: &TestAppContext| {
+        tree.read_with(cx, |tree, _| {
+            tree.entry_for_path(rel_path("a/f1")).unwrap().mtime
+        })
+    };
+    let mtime_before = mtime_of_entry(&tree, cx);
+
+    fs.pause_events();
+    fs.touch_path(path!("/root/a/f1")).await;
+    let mtime_on_disk = fs
+        .metadata(Path::new(path!("/root/a/f1")))
+        .await
+        .unwrap()
+        .unwrap()
+        .mtime;
+    assert_ne!(Some(mtime_on_disk), mtime_before);
+
+    let mut refreshed = tree.update(cx, |tree, _| {
+        tree.as_local().unwrap().refresh_loaded_directories()
+    });
+    refreshed.recv().await;
+    cx.executor().run_until_parked();
+
+    assert_eq!(mtime_of_entry(&tree, cx), Some(mtime_on_disk));
+}
+
+/// "Refresh" looks at everything that was read, changed or not: a file the
+/// watcher never reported is found even in a directory whose time did not move.
+#[gpui::test]
+async fn test_refreshing_the_loaded_directories_finds_what_nothing_reported(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "a": { "f1": "" }, "b": { "g1": "" } }),
+    )
+    .await;
+    let tree = a_worktree_over(&fs, cx).await;
+
+    fs.pause_events();
+    fs.insert_file(path!("/root/a/f2"), Vec::new()).await;
+    fs.insert_file(path!("/root/b/g2"), Vec::new()).await;
+    cx.executor().run_until_parked();
+    let known = paths_of(&tree, cx);
+    assert!(!known.contains(&"a/f2".to_string()) && !known.contains(&"b/g2".to_string()));
+
+    let mut refreshed = tree.update(cx, |tree, _| {
+        tree.as_local().unwrap().refresh_loaded_directories()
+    });
+    refreshed.recv().await;
+    cx.executor().run_until_parked();
+
+    let known = paths_of(&tree, cx);
+    assert!(
+        known.contains(&"a/f2".to_string()) && known.contains(&"b/g2".to_string()),
+        "every directory was read again: {known:?}"
+    );
+}
+
 #[gpui::test]
 async fn test_traversal(cx: &mut TestAppContext) {
     init_test(cx);

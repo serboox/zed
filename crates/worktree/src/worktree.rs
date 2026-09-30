@@ -140,6 +140,7 @@ impl fmt::Debug for LoadedBinaryFile {
 pub struct LocalWorktree {
     snapshot: LocalSnapshot,
     scan_requests_tx: async_channel::Sender<ScanRequest>,
+    directory_scans_tx: async_channel::Sender<DirectoryScanRequest>,
     path_prefixes_to_scan_tx: async_channel::Sender<PathPrefixScanRequest>,
     is_scanning: (watch::Sender<bool>, watch::Receiver<bool>),
     snapshot_subscriptions: VecDeque<(usize, oneshot::Sender<()>)>,
@@ -164,6 +165,24 @@ struct ScanRequest {
     relative_paths: Vec<Arc<RelPath>>,
     done: SmallVec<[barrier::Sender; 1]>,
 }
+
+/// Compares directories with the disk and announces the difference as a watcher would.
+struct DirectoryScanRequest {
+    directories: Vec<Arc<RelPath>>,
+    which: DirectoriesToLookAt,
+    done: SmallVec<[barrier::Sender; 1]>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoriesToLookAt {
+    /// Directories whose modification time differs from the snapshot's.
+    OnlyChanged,
+    /// Every directory, and the modification time of each file in it.
+    All,
+}
+
+/// A directory modified more recently than this may still have its event on the way.
+const WATCHER_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 pub struct RemoteWorktree {
     snapshot: Snapshot,
@@ -593,6 +612,7 @@ impl Worktree {
             }
 
             let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
+            let (directory_scans_tx, directory_scans_rx) = async_channel::unbounded();
             let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = async_channel::unbounded();
             let mut worktree = LocalWorktree {
                 share_private_files,
@@ -602,6 +622,7 @@ impl Worktree {
                 snapshot_subscriptions: Default::default(),
                 update_observer: None,
                 scan_requests_tx,
+                directory_scans_tx,
                 path_prefixes_to_scan_tx,
                 _background_scanner_tasks: Vec::new(),
                 fs,
@@ -611,7 +632,12 @@ impl Worktree {
                 scanning_enabled,
                 force_defer_watch: false,
             };
-            worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
+            worktree.start_background_scanner(
+                scan_requests_rx,
+                directory_scans_rx,
+                path_prefixes_to_scan_rx,
+                cx,
+            );
             Worktree::Local(worktree)
         }))
     }
@@ -1321,11 +1347,18 @@ impl LocalWorktree {
 
     fn restart_background_scanners(&mut self, cx: &Context<Worktree>) {
         let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
+        let (directory_scans_tx, directory_scans_rx) = async_channel::unbounded();
         let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = async_channel::unbounded();
         self.scan_requests_tx = scan_requests_tx;
+        self.directory_scans_tx = directory_scans_tx;
         self.path_prefixes_to_scan_tx = path_prefixes_to_scan_tx;
 
-        self.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
+        self.start_background_scanner(
+            scan_requests_rx,
+            directory_scans_rx,
+            path_prefixes_to_scan_rx,
+            cx,
+        );
         let always_included_entries = self
             .snapshot
             .entries(true, 0)
@@ -1345,6 +1378,7 @@ impl LocalWorktree {
     fn start_background_scanner(
         &mut self,
         scan_requests_rx: async_channel::Receiver<ScanRequest>,
+        directory_scans_rx: async_channel::Receiver<DirectoryScanRequest>,
         path_prefixes_to_scan_rx: async_channel::Receiver<PathPrefixScanRequest>,
         cx: &Context<Worktree>,
     ) {
@@ -1378,6 +1412,8 @@ impl LocalWorktree {
                     status_updates_tx: scan_states_tx,
                     executor: background,
                     scan_requests_rx,
+                    directory_scans_rx,
+                    directories_looked_at: Default::default(),
                     path_prefixes_to_scan_rx,
                     next_entry_id,
                     state: async_lock::Mutex::new(BackgroundScannerState {
@@ -2139,6 +2175,36 @@ impl LocalWorktree {
         self.scan_requests_tx
             .try_send(ScanRequest {
                 relative_paths: paths,
+                done: smallvec![tx],
+            })
+            .ok();
+        rx
+    }
+
+    /// Announces what differs on disk in `directories` from the snapshot, as a
+    /// watcher would have. A directory whose modification time matches costs one `stat`.
+    pub fn refresh_directories_if_changed(
+        &self,
+        directories: Vec<Arc<RelPath>>,
+    ) -> barrier::Receiver {
+        self.look_at_directories(directories, DirectoriesToLookAt::OnlyChanged)
+    }
+
+    /// The same for every loaded directory, changed or not.
+    pub fn refresh_loaded_directories(&self) -> barrier::Receiver {
+        self.look_at_directories(Vec::new(), DirectoriesToLookAt::All)
+    }
+
+    fn look_at_directories(
+        &self,
+        directories: Vec<Arc<RelPath>>,
+        which: DirectoriesToLookAt,
+    ) -> barrier::Receiver {
+        let (tx, rx) = barrier::channel();
+        self.directory_scans_tx
+            .try_send(DirectoryScanRequest {
+                directories,
+                which,
                 done: smallvec![tx],
             })
             .ok();
@@ -4361,6 +4427,8 @@ struct BackgroundScanner {
     status_updates_tx: UnboundedSender<ScanState>,
     executor: BackgroundExecutor,
     scan_requests_rx: async_channel::Receiver<ScanRequest>,
+    directory_scans_rx: async_channel::Receiver<DirectoryScanRequest>,
+    directories_looked_at: Mutex<HashMap<Arc<RelPath>, MTime>>,
     path_prefixes_to_scan_rx: async_channel::Receiver<PathPrefixScanRequest>,
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
@@ -4597,6 +4665,11 @@ impl BackgroundScanner {
                     }
                 }
 
+                directory_scan = self.directory_scans_rx.recv().fuse() => {
+                    let Ok(request) = directory_scan else { break };
+                    self.process_directory_scan(request).await;
+                }
+
                 path_prefix_request = self.path_prefixes_to_scan_rx.recv().fuse() => {
                     let Ok(request) = path_prefix_request else { break };
 
@@ -4656,6 +4729,145 @@ impl BackgroundScanner {
                 }
             }
         }
+    }
+
+    /// The events a watcher would have sent for what differs on disk in `directory`.
+    async fn unannounced_changes_in(
+        &self,
+        root_canonical_path: &Path,
+        directory: &Arc<RelPath>,
+        which: DirectoriesToLookAt,
+    ) -> Vec<PathEvent> {
+        let (known_mtime, known_children) = {
+            let state = self.state.lock().await;
+            let Some(entry) = state.snapshot.entry_for_path(directory) else {
+                return Vec::new();
+            };
+            let children = state
+                .snapshot
+                .child_entries(directory)
+                .map(|child| (child.path.clone(), child.mtime, child.is_file()))
+                .collect::<Vec<_>>();
+            (entry.mtime, children)
+        };
+        let abs_directory = root_canonical_path.join(directory.as_std_path());
+        let on_disk = match self.fs.metadata(&abs_directory).await {
+            Ok(Some(on_disk)) => on_disk,
+            Ok(None) => {
+                return vec![PathEvent {
+                    path: abs_directory,
+                    kind: Some(PathEventKind::Removed),
+                }];
+            }
+            Err(error) => {
+                log::warn!("could not look at {abs_directory:?}: {error}");
+                return Vec::new();
+            }
+        };
+
+        // A watcher does not report the change of a directory's own time, so the
+        // snapshot's copy of it goes stale and a look is remembered separately.
+        let looked_at_before = self.directories_looked_at.lock().get(directory).copied();
+        if which == DirectoriesToLookAt::OnlyChanged
+            && (known_mtime == Some(on_disk.mtime) || looked_at_before == Some(on_disk.mtime))
+        {
+            return Vec::new();
+        }
+
+        let Ok(mut listing) = self.fs.read_dir(&abs_directory).await else {
+            return Vec::new();
+        };
+        let mut children_on_disk = HashSet::<Arc<RelPath>>::default();
+        while let Some(child) = listing.next().await {
+            let child_path = child.ok().and_then(|child| {
+                let name = child.file_name()?.to_str()?.to_owned();
+                Some(directory.join(RelPath::from_unix_str(&name).ok()?))
+            });
+            if let Some(child_path) = child_path
+                && !self.settings.is_path_excluded(&child_path)
+            {
+                children_on_disk.insert(child_path.into());
+            }
+        }
+
+        let abs_path_of =
+            |child: &RelPath| abs_directory.join(child.file_name().unwrap_or_default());
+        let mut events = Vec::new();
+        for (child, known_child_mtime, is_file) in &known_children {
+            if !children_on_disk.remove(child) {
+                events.push(PathEvent {
+                    path: abs_path_of(child),
+                    kind: Some(PathEventKind::Removed),
+                });
+            } else if which == DirectoriesToLookAt::All && *is_file {
+                let mtime_on_disk = self
+                    .fs
+                    .metadata(&abs_path_of(child))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|metadata| metadata.mtime);
+                if mtime_on_disk != *known_child_mtime {
+                    events.push(PathEvent {
+                        path: abs_path_of(child),
+                        kind: Some(PathEventKind::Changed),
+                    });
+                }
+            }
+        }
+        events.extend(children_on_disk.into_iter().map(|child| PathEvent {
+            path: abs_path_of(&child),
+            kind: Some(PathEventKind::Created),
+        }));
+
+        self.directories_looked_at
+            .lock()
+            .insert(directory.clone(), on_disk.mtime);
+        let modified_ago = on_disk.mtime.timestamp_for_user().elapsed().ok();
+        if which == DirectoriesToLookAt::OnlyChanged
+            && !events.is_empty()
+            && modified_ago.is_none_or(|modified_ago| modified_ago > WATCHER_GRACE_PERIOD)
+        {
+            log::warn!(
+                "{abs_directory:?} changed on disk without the file watcher reporting it; watch: {}",
+                self.watcher.describe(&abs_directory),
+            );
+            self.watcher.rewatch(&abs_directory).log_err();
+        }
+        events
+    }
+
+    async fn process_directory_scan(&self, request: DirectoryScanRequest) {
+        let root_path = self.state.lock().await.snapshot.abs_path.clone();
+        if let Ok(root_canonical_path) = self.fs.canonicalize(root_path.as_path()).await {
+            let directories = match request.which {
+                DirectoriesToLookAt::OnlyChanged => request.directories,
+                DirectoriesToLookAt::All => self
+                    .state
+                    .lock()
+                    .await
+                    .snapshot
+                    .entries(true, 0)
+                    .filter(|entry| entry.kind == EntryKind::Dir)
+                    .map(|entry| entry.path.clone())
+                    .collect(),
+            };
+            let mut events = Vec::new();
+            for directory in &directories {
+                events.extend(
+                    self.unannounced_changes_in(&root_canonical_path, directory, request.which)
+                        .await,
+                );
+            }
+            if !events.is_empty() {
+                self.process_events(events).await;
+            }
+            let state = self.state.lock().await;
+            self.directories_looked_at
+                .lock()
+                .retain(|directory, _| state.snapshot.entry_for_path(directory).is_some());
+        }
+        self.send_status_update(false, request.done, &[]).await;
     }
 
     async fn process_scan_request(&self, mut request: ScanRequest, scanning: bool) -> bool {
