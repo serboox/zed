@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Writes a draft of .github/release-changes/<tag>.md from the commits between
+# this fork's previous release and <tag>, for someone to put into words.
+#
+# The bundle workflow already puts the commit subjects into a release's own
+# description when it is published. This makes the same list the start of the
+# file that later rewrites that description, so the words are an edit of a draft
+# rather than a page started from nothing.
+#
+# Usage: script/draft-release-changes [--tag TAG] [--previous TAG] [--to REV] [--stdout]
+#
+#   --tag       the release to describe; the newest fork-* tag by default
+#   --previous  the release before it; the fork-* tag before --tag by default
+#   --to        where the release was built from; --tag itself by default
+#   --stdout    print the draft instead of writing the file
+#
+# A file that exists is never replaced.
+set -euo pipefail
+
+tag=""
+previous=""
+to=""
+to_stdout=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tag) tag="$2"; shift 2 ;;
+    --previous) previous="$2"; shift 2 ;;
+    --to) to="$2"; shift 2 ;;
+    --stdout) to_stdout=true; shift ;;
+    -h | --help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+repo_root="$(git rev-parse --show-toplevel)"
+forks() { git tag --list 'fork-*' --sort=creatordate; }
+
+[ -n "$tag" ] || tag="$(forks | tail -n 1)"
+if [ -z "$tag" ]; then
+  echo "there is no fork release to describe" >&2
+  exit 1
+fi
+if [ -z "$previous" ]; then
+  # The tag before this one in the order they were made, not merely the newest
+  # other tag: describing an old release must not compare it with a later one.
+  previous="$(forks | awk -v tag="$tag" '$0 == tag { print last; exit } { last = $0 }')"
+fi
+[ -n "$to" ] || to="$tag"
+
+if [ -z "$previous" ]; then
+  echo "$tag is the first release; describe it against upstream by hand" >&2
+  exit 1
+fi
+
+draft() {
+  echo "<!-- A draft from the commit subjects. Put it into words that say what a reader of the editor will notice, leave out what they will not, and delete this line. -->"
+  echo "## What changed since \`$previous\`"
+  echo
+  # This branch's own commits: an upstream merge is one line, not the thousands
+  # of upstream commits it brought in.
+  git log --first-parent --pretty='- %s' -n 50 "$previous..$to"
+}
+
+if $to_stdout; then
+  draft
+  exit 0
+fi
+
+file="$repo_root/.github/release-changes/$tag.md"
+if [ -e "$file" ]; then
+  echo "$file exists; not replaced" >&2
+  exit 0
+fi
+mkdir -p "$(dirname "$file")"
+draft > "$file"
+echo "wrote $file"

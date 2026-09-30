@@ -694,3 +694,38 @@ jobs:
           gh release edit "$tag" --draft=false --latest
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # The words of a release live in .github/release-changes/<tag>.md, which
+      # cannot exist before the release does, since the tag carries the commit
+      # it was built from. So the draft of it is handed over here, the moment
+      # the release is out: in the summary, and as a file to drop in.
+      - name: Offer a draft of the words
+        if: steps.changed.outputs.commits != '0'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.name.outputs.tag }}"
+          previous="${{ steps.changed.outputs.previous }}"
+          if [ -z "$previous" ]; then
+            echo "This is the first release; it is described against upstream by hand." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          script/draft-release-changes --tag "$tag" --previous "$previous" --to "$GITHUB_SHA" --stdout \
+            > "draft-$tag.md"
+          {
+            echo "## Draft for \`.github/release-changes/$tag.md\`"
+            echo
+            echo "Put it into words and commit it; the description of the release is rewritten from that file."
+            echo
+            echo '```markdown'
+            cat "draft-$tag.md"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.commits != '0' && steps.changed.outputs.previous != ''
+        with:
+          name: release-changes-draft
+          path: draft-*.md

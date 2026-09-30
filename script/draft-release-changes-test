@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Checks script/draft-release-changes against a repository made for the purpose.
+set -euo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/draft-release-changes"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+git init -q .
+git config user.name tester
+git config user.email tester@example.com
+git config commit.gpgsign false
+
+commit() { git commit -q --allow-empty -m "$1"; }
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+commit "Start the fork"
+git tag fork-2026.01.01-aaaaaaa
+commit "Stop several runs from one look at the machine"
+commit "Keep a run being read on screen when another run starts"
+git tag fork-2026.01.08-bbbbbbb
+commit "Name the running tasks when several tabs are closed at once"
+git tag fork-2026.01.15-ccccccc
+commit "Commit after the last release"
+
+# The newest release against the one before it.
+draft="$("$script" --stdout)"
+# shellcheck disable=SC2016
+echo "$draft" | grep -q 'What changed since `fork-2026.01.08-bbbbbbb`' || fail "the heading names the previous release: $draft"
+echo "$draft" | grep -qx -- '- Name the running tasks when several tabs are closed at once' || fail "the release's own commit is listed: $draft"
+echo "$draft" | grep -q 'Commit after the last release' && fail "a commit after the release is not part of it: $draft"
+echo "$draft" | grep -q 'Stop several runs' && fail "a commit of an earlier release is not part of this one: $draft"
+
+# An older release is compared with the one before it, not with a later one.
+older="$("$script" --tag fork-2026.01.08-bbbbbbb --stdout)"
+# shellcheck disable=SC2016
+echo "$older" | grep -q 'What changed since `fork-2026.01.01-aaaaaaa`' || fail "an old release names its own previous: $older"
+[ "$(echo "$older" | grep -c '^- ')" = 2 ] || fail "two commits went into the second release: $older"
+
+# A release the workflow has just made is not a tag in the checkout yet.
+built="$("$script" --tag fork-2026.01.22-ddddddd --previous fork-2026.01.15-ccccccc --to HEAD --stdout)"
+echo "$built" | grep -q 'Commit after the last release' || fail "the range is read up to --to: $built"
+
+# The file is written once, and never replaced.
+"$script" --tag fork-2026.01.15-ccccccc > /dev/null
+file=".github/release-changes/fork-2026.01.15-ccccccc.md"
+[ -f "$file" ] || fail "the draft is written to $file"
+echo "my own words" > "$file"
+"$script" --tag fork-2026.01.15-ccccccc 2>/dev/null
+[ "$(cat "$file")" = "my own words" ] || fail "a file that exists is left as it is"
+
+# The first release has nothing before it to be compared with.
+if "$script" --tag fork-2026.01.01-aaaaaaa --stdout 2>/dev/null; then
+  fail "the first release is refused"
+fi
+echo "draft-release-changes: ok"
