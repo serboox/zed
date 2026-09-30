@@ -96,6 +96,26 @@ fn wait_for_colour(page: &mut HtmlPage, want: [u8; 3], what: &str) {
     panic!("{what}: the page never turned {want:?}, it stayed {last:?}");
 }
 
+/// Waits for the pixel at (`x`, `y`) to turn `want`, which is what a question about
+/// where something was laid out does not wait for: the page answers for its
+/// layout before the frame showing it is painted, so a colour read straight
+/// after the answer can still be the page's empty background.
+fn wait_for_colour_at(page: &mut HtmlPage, x: usize, y: usize, want: [u8; 3], what: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    let mut last = None;
+    while Instant::now() < deadline {
+        page.pump();
+        if let Some(colour) = colour_at(page, x, y) {
+            if close_to(colour, want) {
+                return;
+            }
+            last = Some(colour);
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    panic!("{what}: the pixel at {x},{y} never turned {want:?}, it stayed {last:?}");
+}
+
 /// Turns the engine over for a while, so that whatever was just handed to it --
 /// an event, a script, a question -- is actually dealt with.
 fn pump_for(page: &mut HtmlPage, how_long: Duration) {
@@ -1132,6 +1152,8 @@ fn the_page_is_laid_out_the_way_it_asks_to_be(cx: &mut gpui::App) {
     );
 
     // And the pixels agree: red on the left half, blue on the right.
+    wait_for_colour_at(&mut page, 100, 20, [255, 0, 0], "the first column");
+    wait_for_colour_at(&mut page, 300, 20, [0, 0, 255], "the second column");
     assert_eq!(
         colour_at(&page, 100, 20),
         Some([255, 0, 0]),
