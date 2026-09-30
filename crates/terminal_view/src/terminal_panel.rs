@@ -85,6 +85,9 @@ pub struct TerminalPanel {
     restoring: bool,
     _restoration: Task<()>,
     deferred_tasks: HashMap<TaskId, Task<()>>,
+    /// The terminal whose rerun button was pressed, for the next task to be
+    /// spawned: with several terminals of one task, it is the one to replace.
+    rerun_of: Option<WeakEntity<Terminal>>,
     assistant_enabled: bool,
     active: bool,
 }
@@ -105,6 +108,7 @@ impl TerminalPanel {
             restoring: false,
             _restoration: Task::ready(()),
             deferred_tasks: HashMap::default(),
+            rerun_of: None,
             assistant_enabled: false,
             active: false,
         };
@@ -625,6 +629,12 @@ impl TerminalPanel {
             .detach_and_log_err(cx);
     }
 
+    /// Says which terminal the task about to be spawned is a rerun of, so that
+    /// it replaces that one and not another terminal of the same task.
+    pub fn note_rerun_of(&mut self, terminal: &Entity<Terminal>) {
+        self.rerun_of = Some(terminal.downgrade());
+    }
+
     pub fn spawn_task(
         &mut self,
         task: &SpawnInTerminal,
@@ -661,7 +671,8 @@ impl TerminalPanel {
             return self.spawn_in_new_terminal(task, window, cx);
         }
 
-        let mut terminals_for_task = self.terminals_for_task(&task.full_label, cx);
+        let rerun_of = self.rerun_of.take().and_then(|terminal| terminal.upgrade());
+        let mut terminals_for_task = self.terminals_for_task(&task, rerun_of.as_ref(), cx);
         let Some(existing) = terminals_for_task.pop() else {
             return self.spawn_in_new_terminal(task, window, cx);
         };
@@ -773,9 +784,16 @@ impl TerminalPanel {
             .detach_and_log_err(cx);
     }
 
+    /// The terminals that ran this task, the one to replace last: the one
+    /// `rerun_of` names when it is among them, otherwise the newest.
+    ///
+    /// A terminal belongs to the task when it has the same label and was
+    /// resolved from the same template: two configurations that happen to be
+    /// named alike are two tasks, and one must not replace the other's run.
     fn terminals_for_task(
         &self,
-        label: &str,
+        task: &SpawnInTerminal,
+        rerun_of: Option<&Entity<Terminal>>,
         cx: &mut App,
     ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
         let Some(workspace) = self.workspace.upgrade() else {
@@ -789,7 +807,10 @@ impl TerminalPanel {
                 .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
                 .filter_map(|(index, terminal_view)| {
                     let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
-                    if &task_state.spawned_task.full_label == label {
+                    let spawned = &task_state.spawned_task;
+                    if spawned.full_label == task.full_label
+                        && from_the_same_template(&spawned.id, &task.id)
+                    {
                         Some((index, terminal_view))
                     } else {
                         None
@@ -811,7 +832,12 @@ impl TerminalPanel {
                     .cloned()
                     .flat_map(pane_terminal_views),
             )
-            .sorted_by_key(|(_, _, terminal_view)| terminal_view.entity_id())
+            .sorted_by_key(|(_, _, terminal_view)| {
+                let is_the_rerun = rerun_of.is_some_and(|terminal| {
+                    terminal.entity_id() == terminal_view.read(cx).terminal().entity_id()
+                });
+                (is_the_rerun, terminal_view.entity_id())
+            })
             .collect()
     }
 
@@ -1386,6 +1412,27 @@ pub fn new_terminal_pane(
     cx.observe(&pane, |_, _, cx| cx.notify()).detach();
 
     pane
+}
+
+/// The hash of the template a task was resolved from, which a `TaskId` of a
+/// resolved template carries between where it came from and the context it was
+/// resolved in: `{source}_{template}_{context}`.
+fn template_hash(id: &TaskId) -> Option<&str> {
+    let mut parts = id.0.rsplitn(3, '_');
+    parts.next()?;
+    let template = parts.next()?;
+    parts.next()?;
+    Some(template)
+}
+
+/// Whether two ids come from one template. An id that does not carry a
+/// template hash, such as one made for a command that was never a template,
+/// says nothing against it.
+fn from_the_same_template(left: &TaskId, right: &TaskId) -> bool {
+    match (template_hash(left), template_hash(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 async fn wait_for_terminals_tasks(
@@ -3472,6 +3519,197 @@ mod tests {
             center_items_after, center_items_before,
             "Center pane should not gain a new terminal when panel is focused"
         );
+    }
+
+    struct PanelOverTasks {
+        window: gpui::WindowHandle<MultiWorkspace>,
+        panel: Entity<TerminalPanel>,
+    }
+
+    async fn a_panel_over_tasks(cx: &mut TestAppContext) -> PanelOverTasks {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let panel = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                })
+            })
+            .unwrap();
+        PanelOverTasks { window, panel }
+    }
+
+    fn a_long_task(
+        label: &str,
+        template: &str,
+        several: bool,
+        new_terminal: bool,
+    ) -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId(format!("test_{template}_context")),
+            full_label: label.to_string(),
+            label: label.to_string(),
+            command: Some("sleep".to_string()),
+            args: vec!["60".to_string()],
+            cwd: Some(std::env::temp_dir()),
+            allow_concurrent_runs: several,
+            use_new_terminal: new_terminal,
+            reveal: RevealStrategy::Never,
+            ..SpawnInTerminal::default()
+        }
+    }
+
+    async fn spawn(
+        over: &PanelOverTasks,
+        task: &SpawnInTerminal,
+        cx: &mut TestAppContext,
+    ) -> Entity<Terminal> {
+        let spawning = over
+            .window
+            .update(cx, |_, window, cx| {
+                over.panel
+                    .update(cx, |panel, cx| panel.spawn_task(task, window, cx))
+            })
+            .unwrap();
+        spawning
+            .await
+            .expect("the task starts")
+            .upgrade()
+            .expect("the terminal is alive")
+    }
+
+    fn the_terminals(over: &PanelOverTasks, cx: &mut TestAppContext) -> Vec<Entity<Terminal>> {
+        over.panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|view| view.read(cx).terminal().clone())
+                .collect()
+        })
+    }
+
+    fn end_them_all(over: &PanelOverTasks, cx: &mut TestAppContext) {
+        for terminal in the_terminals(over, cx) {
+            terminal.update(cx, |terminal, _| terminal.kill_active_task());
+        }
+    }
+
+    /// The rerun key on a terminal's tab replaces that terminal, not whichever
+    /// terminal of the same task happens to be newest.
+    #[gpui::test]
+    async fn a_rerun_replaces_the_terminal_it_was_pressed_in_and_no_other(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+        let severally = a_long_task("api server", "api", true, true);
+        for _ in 0..3 {
+            spawn(&over, &severally, cx).await;
+        }
+        let before = the_terminals(&over, cx);
+        assert_eq!(before.len(), 3);
+
+        let pressed_in = before[1].clone();
+        let rerun = a_long_task("api server", "api", true, false);
+        let mut visual = VisualTestContext::from_window(over.window.into(), cx);
+        let view = over.panel.read_with(&visual, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .find(|view| view.read(cx).terminal().entity_id() == pressed_in.entity_id())
+                .expect("the terminal has a tab")
+        });
+        let workspace = over
+            .window
+            .read_with(&visual, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(&mut visual, |workspace, _| {
+            let panel = over.panel.clone();
+            workspace.register_action(move |_, _: &zed_actions::Rerun, window, cx| {
+                let rerun = rerun.clone();
+                let panel = panel.clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    panel
+                        .update_in(cx, |panel, window, cx| {
+                            panel.spawn_task(&rerun, window, cx).detach()
+                        })
+                        .ok();
+                })
+                .detach();
+            });
+        });
+        let pane = over
+            .panel
+            .read_with(&visual, |panel, _| panel.active_pane.clone());
+        workspace.update_in(&mut visual, |workspace, window, cx| {
+            workspace.open_panel::<TerminalPanel>(window, cx);
+            pane.update(cx, |pane, cx| pane.activate_item(1, true, true, window, cx));
+        });
+        visual.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        visual.run_until_parked();
+        visual.dispatch_action(crate::RerunTask);
+        visual.run_until_parked();
+
+        let after = the_terminals(&over, cx);
+        assert_eq!(after.len(), 3, "a rerun replaces a terminal, it adds none");
+        assert_eq!(after[0].entity_id(), before[0].entity_id());
+        assert_ne!(
+            after[1].entity_id(),
+            before[1].entity_id(),
+            "the terminal it was pressed in is the one replaced"
+        );
+        assert_eq!(after[2].entity_id(), before[2].entity_id());
+        end_them_all(&over, cx);
+    }
+
+    /// Two configurations that are named alike are two tasks: starting one does
+    /// not wait for, or replace, the other's run.
+    #[gpui::test]
+    async fn a_task_named_like_another_does_not_take_its_terminal(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+        let first = a_long_task("api server", "first", false, false);
+        let second = a_long_task("api server", "second", false, false);
+        let first_run = spawn(&over, &first, cx).await;
+
+        let second_run = spawn(&over, &second, cx).await;
+
+        let terminals = the_terminals(&over, cx);
+        assert_eq!(
+            terminals.len(),
+            2,
+            "each configuration has a terminal of its own"
+        );
+        assert_ne!(first_run.entity_id(), second_run.entity_id());
+        assert!(
+            first_run.read_with(cx, |terminal, _| terminal
+                .task()
+                .is_some_and(|task| task.status == terminal::TaskStatus::Running)),
+            "and the first is still running"
+        );
+        end_them_all(&over, cx);
+    }
+
+    /// The same configuration started again still takes its own terminal over.
+    #[gpui::test]
+    async fn the_same_task_started_again_takes_its_own_terminal_over(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+        let task = a_long_task("api server", "api", true, false);
+        let first_run = spawn(&over, &task, cx).await;
+
+        let second_run = spawn(&over, &task, cx).await;
+
+        let terminals = the_terminals(&over, cx);
+        assert_eq!(terminals.len(), 1, "the terminal was reused");
+        assert_ne!(first_run.entity_id(), second_run.entity_id());
+        end_them_all(&over, cx);
     }
 
     fn set_max_tabs(cx: &mut TestAppContext, value: Option<usize>) {

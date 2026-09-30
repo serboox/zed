@@ -676,13 +676,16 @@ impl TerminalView {
     }
 
     fn rerun_task(&mut self, _: &RerunTask, window: &mut Window, cx: &mut Context<Self>) {
-        let task = self
+        let Some(task_id) = self
             .terminal
             .read(cx)
             .task()
-            .map(|task| terminal_rerun_override(&task.spawned_task.id))
-            .unwrap_or_default();
-        window.dispatch_action(Box::new(task), cx);
+            .map(|task| task.spawned_task.id.clone())
+        else {
+            window.dispatch_action(Box::new(zed_actions::Rerun::default()), cx);
+            return;
+        };
+        rerun_in(&self.terminal, &task_id, &self.workspace, window, cx);
     }
 
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
@@ -1104,7 +1107,11 @@ impl TerminalView {
         self.terminal = terminal;
     }
 
-    fn rerun_button(task: &TaskState) -> Option<IconButton> {
+    fn rerun_button(
+        task: &TaskState,
+        terminal: Entity<Terminal>,
+        workspace: WeakEntity<Workspace>,
+    ) -> Option<IconButton> {
         if !task.spawned_task.show_rerun {
             return None;
         }
@@ -1118,10 +1125,29 @@ impl TerminalView {
                 .shape(ui::IconButtonShape::Square)
                 .tooltip(move |_window, cx| Tooltip::for_action("Rerun task", &RerunTask, cx))
                 .on_click(move |_, window, cx| {
-                    window.dispatch_action(Box::new(terminal_rerun_override(&task_id)), cx);
+                    rerun_in(&terminal, &task_id, &workspace, window, cx);
                 }),
         )
     }
+}
+
+/// Reruns a task in the terminal it ran in: the terminal panel is told which
+/// terminal it is, so that the run replaces this one and not another terminal
+/// of the same task.
+fn rerun_in(
+    terminal: &Entity<Terminal>,
+    task_id: &TaskId,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(panel) = workspace
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
+    {
+        panel.update(cx, |panel, _| panel.note_rerun_of(terminal));
+    }
+    window.dispatch_action(Box::new(terminal_rerun_override(task_id)), cx);
 }
 
 fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
@@ -1502,15 +1528,27 @@ impl Item for TerminalView {
                 TaskStatus::Running => (
                     IconName::PlayFilled,
                     Color::Disabled,
-                    TerminalView::rerun_button(terminal_task),
+                    TerminalView::rerun_button(
+                        terminal_task,
+                        self.terminal.clone(),
+                        self.workspace.clone(),
+                    ),
                 ),
                 TaskStatus::Unknown => (
                     IconName::Warning,
                     Color::Warning,
-                    TerminalView::rerun_button(terminal_task),
+                    TerminalView::rerun_button(
+                        terminal_task,
+                        self.terminal.clone(),
+                        self.workspace.clone(),
+                    ),
                 ),
                 TaskStatus::Completed { success } => {
-                    let rerun_button = TerminalView::rerun_button(terminal_task);
+                    let rerun_button = TerminalView::rerun_button(
+                        terminal_task,
+                        self.terminal.clone(),
+                        self.workspace.clone(),
+                    );
 
                     if *success {
                         (IconName::Check, Color::Success, rerun_button)
