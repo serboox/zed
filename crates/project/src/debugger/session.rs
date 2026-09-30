@@ -703,6 +703,9 @@ pub struct Session {
     output: Box<circular_buffer::CircularBuffer<MAX_TRACKED_OUTPUT_EVENTS, dap::OutputEvent>>,
     watchers: HashMap<SharedString, Watcher>,
     is_session_terminated: bool,
+    /// The operating system's number for the program being debugged, once the
+    /// adapter has said which process it is, and only for one on this machine.
+    debuggee_process_id: Option<u32>,
     requests: TypeIdHashMap<HashMap<RequestSlot, Shared<Task<Option<()>>>>>,
     pub(crate) breakpoint_store: Entity<BreakpointStore>,
     ignore_breakpoints: bool,
@@ -879,6 +882,7 @@ impl Session {
                 background_tasks: Vec::default(),
                 restart_task: None,
                 is_session_terminated: false,
+                debuggee_process_id: None,
                 ignore_breakpoints: false,
                 breakpoint_store,
                 data_breakpoints: Default::default(),
@@ -1079,6 +1083,17 @@ impl Session {
 
     pub fn is_terminated(&self) -> bool {
         self.is_session_terminated
+    }
+
+    /// The operating system's number for the program being debugged, when the
+    /// adapter has said which process it is and it runs on this machine.
+    pub fn debuggee_process_id(&self) -> Option<u32> {
+        self.debuggee_process_id
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_debuggee_process_id_for_test(&mut self, process_id: Option<u32>) {
+        self.debuggee_process_id = process_id;
     }
 
     pub fn console_output(&mut self, cx: &mut Context<Self>) -> mpsc::UnboundedSender<String> {
@@ -1635,7 +1650,13 @@ impl Session {
                 cx.notify();
             }
             Events::Memory(_) => {}
-            Events::Process(_) => {}
+            Events::Process(event) => {
+                if event.is_local_process != Some(false) {
+                    self.debuggee_process_id = event
+                        .system_process_id
+                        .and_then(|process_id| u32::try_from(process_id).ok());
+                }
+            }
             Events::ProgressEnd(_) => {}
             Events::ProgressStart(_) => {}
             Events::ProgressUpdate(_) => {}

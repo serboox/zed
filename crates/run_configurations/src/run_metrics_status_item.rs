@@ -450,6 +450,25 @@ impl RunMetricsStatusItem {
                 command: task.spawned_task.command.clone(),
             });
         }
+        // A program run through the debugger is a process like any other, but
+        // its output goes to the debugger and no terminal of a task holds it.
+        for session in crate::run_instances::live_sessions(workspace.read(cx), cx) {
+            let session = session.read(cx);
+            let Some(pid) = session.debuggee_process_id() else {
+                continue;
+            };
+            if contexts.iter().any(|context| context.pid == pid) {
+                continue;
+            }
+            contexts.push(RunContext {
+                pid,
+                label: session
+                    .label()
+                    .map(|label| label.to_string())
+                    .unwrap_or_else(|| "debug session".to_string()),
+                command: None,
+            });
+        }
         contexts
     }
 
@@ -1626,6 +1645,68 @@ mod tests {
                 ["worker", "api", "site"],
                 "the worker was there first; the two new ones follow in the order they began"
             );
+        });
+    }
+
+    /// A program run through the debugger is a run of its own: the debugger says
+    /// which process it is, and its numbers are read like any other run's. A
+    /// session that has not said yet, or has ended, is not one.
+    #[gpui::test]
+    async fn a_debug_session_with_a_process_is_a_run(cx: &mut TestAppContext) {
+        let (item, mut cx) = an_item_of_its_own(cx).await;
+        let project = item.read_with(&cx, |item, cx| {
+            item.workspace
+                .upgrade()
+                .expect("open")
+                .read(cx)
+                .project()
+                .clone()
+        });
+        let new_session = |label: &str, cx: &mut VisualTestContext| {
+            project.update(cx, |project, cx| {
+                project.dap_store().update(cx, |dap_store, cx| {
+                    dap_store.new_session(
+                        Some(label.to_string().into()),
+                        dap::adapters::DebugAdapterName("Delve".into()),
+                        task::SharedTaskContext::default(),
+                        None,
+                        Default::default(),
+                        cx,
+                    )
+                })
+            })
+        };
+        let this_process = std::process::id();
+        let running = new_session("Debug API", &mut cx);
+        running.update(&mut cx, |session, _| {
+            session.set_debuggee_process_id_for_test(Some(this_process))
+        });
+        let _not_said_yet = new_session("Debug worker", &mut cx);
+        let ended = new_session("Debug site", &mut cx);
+        ended.update(&mut cx, |session, cx| {
+            session.set_debuggee_process_id_for_test(Some(this_process + 1));
+            session.shutdown(cx).detach();
+        });
+
+        let contexts = item.read_with(&cx, |item, cx| item.run_contexts(cx));
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|context| (context.label.as_str(), context.pid))
+                .collect::<Vec<_>>(),
+            [("Debug API", this_process)],
+            "only the session that named its process, and is alive, is a run"
+        );
+
+        let Some(machine) = crate::process_metrics::everything_running() else {
+            return;
+        };
+        item.update(&mut cx, |item, _| {
+            item.read_the_runs(&contexts, Some(&machine), Instant::now(), None);
+            let runs = item.runs();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].label, "Debug API");
+            assert!(runs[0].pid == this_process);
         });
     }
 
