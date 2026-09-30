@@ -3950,6 +3950,51 @@ mod tests {
         end_them_all(&over, cx);
     }
 
+    /// A terminal that holds a task is not saved with the window, and a plain
+    /// shell is.
+    #[gpui::test]
+    async fn a_terminal_that_holds_a_task_is_not_restorable_and_a_shell_is(
+        cx: &mut TestAppContext,
+    ) {
+        use workspace::item::ItemHandle as _;
+
+        let over = a_panel_over_tasks(cx).await;
+        let run = spawn(&over, &a_long_task("api server", "api", true, true), cx).await;
+        let shell = over
+            .window
+            .update(cx, |_, window, cx| {
+                over.panel.update(cx, |panel, cx| {
+                    panel.add_terminal_shell(false, None, RevealStrategy::Never, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .expect("a shell starts")
+            .upgrade()
+            .expect("the shell is alive");
+        cx.run_until_parked();
+
+        let restorable = |terminal: &Entity<Terminal>, cx: &mut TestAppContext| {
+            over.panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_pane
+                    .read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>())
+                    .find(|view| view.read(cx).terminal().entity_id() == terminal.entity_id())
+                    .and_then(|view| view.to_serializable_item_handle(cx))
+                    .map(|handle| handle.is_restorable(cx))
+            })
+        };
+        assert_eq!(
+            restorable(&run, cx),
+            Some(false),
+            "a run has nothing to come back as"
+        );
+        assert_eq!(restorable(&shell, cx), Some(true));
+        end_them_all(&over, cx);
+    }
+
     fn the_views(over: &PanelOverTasks, cx: &App) -> Vec<Entity<TerminalView>> {
         over.panel
             .read(cx)

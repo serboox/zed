@@ -2042,6 +2042,12 @@ impl SerializableItem for TerminalView {
         self.needs_serialize
     }
 
+    /// A terminal that holds a task has nothing to come back as: only a shell
+    /// is saved, and the window would be given an empty one in its place.
+    fn is_restorable(&self, cx: &App) -> bool {
+        self.terminal.read(cx).task().is_none()
+    }
+
     fn deserialize(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,

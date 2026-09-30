@@ -11460,7 +11460,10 @@ fn serialize_pane_handle(
             .items()
             .enumerate()
             .filter_map(|(index, handle)| {
-                let Some(handle) = handle.to_serializable_item_handle(cx) else {
+                let handle = handle
+                    .to_serializable_item_handle(cx)
+                    .filter(|handle| handle.is_restorable(cx));
+                let Some(handle) = handle else {
                     if pinned_region.contains(&index) {
                         pinned_count -= 1;
                     }
@@ -19348,6 +19351,48 @@ mod tests {
         assert_eq!(
             pane.pinned_count, 2,
             "an unpinned tab that is not serialized should not unpin anything"
+        );
+    }
+
+    /// A tab that holds a run is not saved with the window: a tab for it would be
+    /// brought back as an empty shell where the run was.
+    #[gpui::test]
+    async fn test_a_tab_that_holds_a_run_is_not_saved_with_the_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            register_serializable_item::<TestItem>(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let pane = workspace.update_in(cx, |workspace, window, cx| {
+            let pane = workspace.add_pane(window, cx);
+            pane.update(cx, |pane, cx| {
+                for running in [None, Some("api server"), Some("unit tests"), None] {
+                    let item = cx.new(|cx| {
+                        let item = TestItem::new(cx);
+                        match running {
+                            Some(task) => item.with_running_task(task),
+                            None => item,
+                        }
+                    });
+                    pane.add_item(Box::new(item), false, false, None, window, cx);
+                }
+                pane.set_pinned_count(3);
+            });
+            serialize_pane_handle(&pane, window, cx)
+        });
+
+        assert_eq!(
+            pane.children.len(),
+            2,
+            "only the tabs that hold no run are saved"
+        );
+        assert_eq!(
+            pane.pinned_count, 1,
+            "the two pinned tabs that hold runs take their places in the pinned count with them"
         );
     }
 

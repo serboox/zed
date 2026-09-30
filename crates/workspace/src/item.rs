@@ -458,10 +458,18 @@ pub trait SerializableItem: Item {
     ) -> Option<Task<Result<()>>>;
 
     fn should_serialize(&self, event: &Self::Event) -> bool;
+
+    /// Whether the item can be brought back when the window is restored. One
+    /// that cannot, such as a terminal that holds a run, is left out of the
+    /// saved window altogether: a tab for it would come back as something else.
+    fn is_restorable(&self, _cx: &App) -> bool {
+        true
+    }
 }
 
 pub trait SerializableItemHandle: ItemHandle {
     fn serialized_item_kind(&self) -> &'static str;
+    fn is_restorable(&self, cx: &App) -> bool;
     fn serialize(
         &self,
         workspace: &mut Workspace,
@@ -494,6 +502,10 @@ where
         event
             .downcast_ref::<T::Event>()
             .is_some_and(|event| self.read(cx).should_serialize(event))
+    }
+
+    fn is_restorable(&self, cx: &App) -> bool {
+        self.read(cx).is_restorable(cx)
     }
 }
 
@@ -1920,6 +1932,10 @@ pub mod test {
             _cx: &mut App,
         ) -> Task<anyhow::Result<()>> {
             Task::ready(Ok(()))
+        }
+
+        fn is_restorable(&self, _cx: &App) -> bool {
+            self.running_task.is_none()
         }
 
         fn serialize(
