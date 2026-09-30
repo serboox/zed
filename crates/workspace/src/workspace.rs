@@ -335,6 +335,30 @@ static ZED_WINDOW_POSITION: LazyLock<Option<Point<Pixels>>> = LazyLock::new(|| {
         .and_then(parse_pixel_position_env_var)
 });
 
+/// What would end with a workspace when it goes away: the runs in its
+/// terminals and the debug sessions of its project. Registered once for the
+/// application, by whichever crate knows how a run is told from any other
+/// terminal.
+pub trait RunningWorkProvider {
+    /// The names of what is running in `workspace`.
+    fn names_of_running(&self, workspace: &Workspace, cx: &App) -> Vec<SharedString>;
+
+    /// Ends all of it, with everything it started, and resolves once nothing is
+    /// left, with whether that is so.
+    fn stop_all(&self, workspace: &Workspace, cx: &mut App) -> Task<bool>;
+}
+
+struct GlobalRunningWorkProvider(Arc<dyn RunningWorkProvider>);
+
+impl Global for GlobalRunningWorkProvider {}
+
+pub fn set_running_work_provider(provider: Arc<dyn RunningWorkProvider>, cx: &mut App) {
+    cx.set_global(GlobalRunningWorkProvider(provider));
+}
+
+/// The most names shown when asking whether to stop what is running.
+const MOST_NAMES_OF_RUNNING_SHOWN: usize = 6;
+
 pub trait TerminalProvider {
     fn spawn(
         &self,
@@ -4003,6 +4027,10 @@ impl Workspace {
                 }
             }
 
+            if !Self::the_running_work_may_end(&this, close_intent, cx).await? {
+                return anyhow::Ok(false);
+            }
+
             // Hot-exit silently writes dirty buffers to the DB; only allow it
             // if the workspace will be reachable again, either via session
             // restore or by reopening its folder paths. Otherwise prompt, so
@@ -4042,6 +4070,64 @@ impl Workspace {
 
             save_result
         })
+    }
+
+    /// Asks whether what runs in the workspace may be ended along with it, and
+    /// ends it when it may. Everything that runs here would end anyway, but
+    /// only the shell of each terminal would be told, and what the program
+    /// started in a group of its own would be left running, holding its port.
+    async fn the_running_work_may_end(
+        this: &WeakEntity<Self>,
+        close_intent: CloseIntent,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<bool> {
+        let Some(provider) = cx.update(|_window, cx| {
+            cx.try_global::<GlobalRunningWorkProvider>()
+                .map(|global| global.0.clone())
+        })?
+        else {
+            return Ok(true);
+        };
+        let names = this.read_with(cx, |this, cx| provider.names_of_running(this, cx))?;
+        if names.is_empty() {
+            return Ok(true);
+        }
+        this.update(cx, |_, cx| cx.emit(Event::Activate))?;
+        let title = match names.len() {
+            1 => "1 app is still running".to_string(),
+            count => format!("{count} apps are still running"),
+        };
+        let mut detail = names
+            .iter()
+            .take(MOST_NAMES_OF_RUNNING_SHOWN)
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if names.len() > MOST_NAMES_OF_RUNNING_SHOWN {
+            detail.push_str(&format!(
+                "\n.. and {} more",
+                names.len() - MOST_NAMES_OF_RUNNING_SHOWN
+            ));
+        }
+        let stop = match close_intent {
+            CloseIntent::Quit => "Stop and quit",
+            CloseIntent::CloseWindow | CloseIntent::ReplaceWindow => "Stop and close",
+        };
+        let answer = cx.update(|window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                &title,
+                Some(&detail),
+                &[stop, "Cancel"],
+                cx,
+            )
+        })?;
+        if answer.await.log_err() != Some(0) {
+            return Ok(false);
+        }
+        let stopping = this.update(cx, |this, cx| provider.stop_all(this, cx))?;
+        stopping.await;
+        Ok(true)
     }
 
     fn save_all(&mut self, action: &SaveAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -14261,6 +14347,101 @@ mod tests {
             "quitting should hot-exit silently; the session restore on next \
              launch will bring the dirty buffer back"
         );
+        assert!(task.await.unwrap());
+    }
+
+    struct StubRunningWork {
+        names: Vec<&'static str>,
+        stopped: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl RunningWorkProvider for StubRunningWork {
+        fn names_of_running(&self, _: &Workspace, _: &App) -> Vec<SharedString> {
+            self.names
+                .iter()
+                .map(|name| SharedString::from(*name))
+                .collect()
+        }
+
+        fn stop_all(&self, _: &Workspace, _: &mut App) -> Task<bool> {
+            self.stopped.set(self.stopped.get() + 1);
+            Task::ready(true)
+        }
+    }
+
+    /// Closing a window, or quitting, asks once about what runs in it, names it,
+    /// and ends it only when the reader says so.
+    #[gpui::test]
+    async fn test_closing_a_window_asks_about_what_runs_in_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let stopped = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|cx| {
+            set_running_work_provider(
+                Arc::new(StubRunningWork {
+                    names: vec!["api server", "unit tests"],
+                    stopped: stopped.clone(),
+                }),
+                cx,
+            );
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task = workspace.update_in(cx, |w, window, cx| {
+            w.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "2 apps are still running".to_string(),
+                "api server\nunit tests".to_string()
+            )),
+            "the window names what runs in it"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!task.await.unwrap(), "Cancel keeps the window open");
+        assert_eq!(stopped.get(), 0, "and ends nothing");
+
+        let task = workspace.update_in(cx, |w, window, cx| {
+            w.prepare_to_close(CloseIntent::Quit, window, cx)
+        });
+        cx.executor().run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Stop and quit");
+        assert!(task.await.unwrap());
+        assert_eq!(
+            stopped.get(),
+            1,
+            "what runs is ended before the editor goes"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_closing_a_window_with_nothing_running_does_not_ask(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            set_running_work_provider(
+                Arc::new(StubRunningWork {
+                    names: Vec::new(),
+                    stopped: Default::default(),
+                }),
+                cx,
+            );
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task = workspace.update_in(cx, |w, window, cx| {
+            w.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
         assert!(task.await.unwrap());
     }
 

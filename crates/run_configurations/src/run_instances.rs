@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use gpui::{App, Entity, Task};
+use std::sync::Arc;
+
+use gpui::{App, Entity, SharedString, Task};
+use project::debugger::session::Session;
 use task::TaskTemplate;
 use terminal::{TaskStatus, Terminal};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
@@ -85,6 +88,60 @@ pub fn running_terminals(workspace: &Workspace, cx: &App) -> Vec<Entity<Terminal
                 .is_some_and(|task| task.status == TaskStatus::Running)
         })
         .collect()
+}
+
+/// The debug sessions of the workspace's project that are still alive and were
+/// started by the reader, not by another session of the program being debugged.
+pub fn live_sessions(workspace: &Workspace, cx: &App) -> Vec<Entity<Session>> {
+    workspace
+        .project()
+        .read(cx)
+        .dap_store()
+        .read(cx)
+        .sessions()
+        .filter(|session| {
+            let session = session.read(cx);
+            !session.is_terminated() && session.parent_id(cx).is_none()
+        })
+        .cloned()
+        .collect()
+}
+
+/// What is running in a workspace that would end with it, asked about when the
+/// window is closed or the editor quits.
+struct WhatRunsInAWorkspace;
+
+impl workspace::RunningWorkProvider for WhatRunsInAWorkspace {
+    fn names_of_running(&self, workspace: &Workspace, cx: &App) -> Vec<SharedString> {
+        let runs = running_terminals(workspace, cx)
+            .into_iter()
+            .filter_map(|terminal| {
+                let label = terminal.read(cx).task()?.spawned_task.label.clone();
+                Some(SharedString::from(label))
+            });
+        let sessions = live_sessions(workspace, cx).into_iter().map(|session| {
+            session
+                .read(cx)
+                .label()
+                .unwrap_or_else(|| "a debug session".into())
+        });
+        runs.chain(sessions).collect()
+    }
+
+    fn stop_all(&self, workspace: &Workspace, cx: &mut App) -> Task<bool> {
+        let stopping = stop_all_for_good(running_terminals(workspace, cx), cx);
+        for session in live_sessions(workspace, cx) {
+            session
+                .update(cx, |session, cx| session.shutdown(cx))
+                .detach();
+        }
+        stopping
+    }
+}
+
+/// Has the window and the editor ask before they end what is running.
+pub fn ask_before_ending_what_runs(cx: &mut App) {
+    workspace::set_running_work_provider(Arc::new(WhatRunsInAWorkspace), cx);
 }
 
 /// Stops a run and resolves only once nothing it started is left running,

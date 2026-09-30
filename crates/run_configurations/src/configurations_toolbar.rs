@@ -768,21 +768,10 @@ impl ConfigurationsToolbar {
     /// The debug sessions still alive that were started by the reader, not by
     /// another session of the program being debugged.
     fn live_sessions(&self, cx: &App) -> Vec<Entity<project::debugger::session::Session>> {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return Vec::new();
-        };
-        let project = workspace.read(cx).project().clone();
-        project
-            .read(cx)
-            .dap_store()
-            .read(cx)
-            .sessions()
-            .filter(|session| {
-                let session = session.read(cx);
-                !session.is_terminated() && session.parent_id(cx).is_none()
-            })
-            .cloned()
-            .collect()
+        match self.workspace.upgrade() {
+            Some(workspace) => crate::run_instances::live_sessions(workspace.read(cx), cx),
+            None => Vec::new(),
+        }
     }
 
     /// How many runs are going on in the window: every task that is still
@@ -2390,6 +2379,79 @@ mod tests {
         assert!(
             wait_until_it_is_over(&another, &mut bar_cx).await,
             "and every other one"
+        );
+    }
+
+    /// Closing the window with runs going asks about them, by name; "Cancel"
+    /// leaves them alone, and the other answer ends them with everything they
+    /// started, even what a program put in a session of its own.
+    #[gpui::test]
+    async fn closing_the_window_asks_about_the_runs_and_ends_their_trees(cx: &mut TestAppContext) {
+        let (over, mut bar_cx, mut workspace_cx) = a_plaque_under_the_keymap(THREE_TASKS, cx).await;
+        let api = the_kept_configuration(&over.toolbar, 0, &bar_cx);
+        let tests = the_kept_configuration(&over.toolbar, 1, &bar_cx);
+        let with_a_child = a_run_of_command(
+            &api,
+            "sh",
+            &["-c", "setsid sleep 120 & wait"],
+            &over,
+            &mut bar_cx,
+        )
+        .await;
+        let plain = a_run_of(&tests, &over, &mut bar_cx).await;
+        let root = with_a_child
+            .read_with(&bar_cx, |terminal, _| {
+                terminal
+                    .pid_getter()
+                    .map(|getter| getter.fallback_pid().as_u32())
+            })
+            .expect("the run has a process");
+        let mut tree = Vec::new();
+        for _ in 0..300 {
+            tree = crate::process_metrics::processes_under(root);
+            if tree.len() >= 2 {
+                break;
+            }
+            bar_cx
+                .background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(
+            tree.len() >= 2,
+            "the program started something of its own: {tree:?}"
+        );
+
+        let closing = over
+            .workspace
+            .update_in(&mut workspace_cx, |workspace, window, cx| {
+                workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
+            });
+        workspace_cx.run_until_parked();
+        let (said, names) = workspace_cx
+            .pending_prompt()
+            .expect("the window asks before it ends the runs");
+        let mut names: Vec<&str> = names.lines().collect();
+        names.sort();
+        assert_eq!(said, "2 apps are still running");
+        assert_eq!(names, ["api server", "unit tests"]);
+        workspace_cx.simulate_prompt_answer("Cancel");
+        assert!(!closing.await.unwrap(), "Cancel keeps the window");
+        assert!(still_running(&with_a_child, &bar_cx) && still_running(&plain, &bar_cx));
+
+        let closing = over
+            .workspace
+            .update_in(&mut workspace_cx, |workspace, window, cx| {
+                workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
+            });
+        workspace_cx.run_until_parked();
+        workspace_cx.simulate_prompt_answer("Stop and close");
+        assert!(closing.await.unwrap());
+        assert!(wait_until_it_is_over(&with_a_child, &mut bar_cx).await);
+        assert!(wait_until_it_is_over(&plain, &mut bar_cx).await);
+        assert!(
+            crate::process_metrics::still_running(&tree).is_empty(),
+            "nothing the run started is left, the program in its own session included"
         );
     }
 

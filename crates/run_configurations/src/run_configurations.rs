@@ -24,4 +24,5 @@ pub use zed_actions::run_configurations::{
 
 pub fn init(cx: &mut App) {
     configurations_view::init(cx);
+    run_instances::ask_before_ending_what_runs(cx);
 }
