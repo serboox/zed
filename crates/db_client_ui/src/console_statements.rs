@@ -1,11 +1,12 @@
-use std::ops::Range;
+use std::collections::{HashMap, HashSet};
+use std::ops::{ControlFlow, Range};
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Query, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor};
 use sqlparser::dialect::{
     BigQueryDialect, ClickHouseDialect, Dialect, HiveDialect, MySqlDialect, SnowflakeDialect,
 };
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Token, Tokenizer};
+use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 
 use crate::sql_binder::offset_for_location;
 
@@ -69,6 +70,311 @@ pub(crate) fn hash_starts_a_comment(dialect: Option<&dyn Dialect>) -> bool {
             || dialect.is::<BigQueryDialect>()
             || dialect.is::<HiveDialect>()
     })
+}
+
+/// A piece of a statement that can run on its own: a subquery, a CTE, a branch
+/// of a `UNION`, the `SELECT` of an `INSERT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NestedQuery {
+    /// Where it is in the text it was read from.
+    pub(crate) range: Range<usize>,
+    pub(crate) label: String,
+    /// It refers to a table of the query around it, so on its own the server
+    /// would not know the name.
+    pub(crate) correlated: bool,
+}
+
+/// The pieces of the statement `text` that hold `cursor`, the innermost first,
+/// the whole statement left out. Empty when the cursor is in none of them, when
+/// the text is not one statement that the grammar reads, and when there is no
+/// grammar.
+pub(crate) fn nested_queries_at(
+    text: &str,
+    cursor: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Vec<NestedQuery> {
+    let Some(dialect) = dialect else {
+        return Vec::new();
+    };
+    read_nested_queries(text, dialect)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|nested| nested.range.start <= cursor && cursor <= nested.range.end)
+        .collect()
+}
+
+fn read_nested_queries(text: &str, dialect: &dyn Dialect) -> Option<Vec<NestedQuery>> {
+    let tokens = Tokenizer::new(dialect, text)
+        .tokenize_with_location()
+        .ok()?;
+    let index = LocationIndex::new(text);
+    let code: Vec<(Token, Range<usize>)> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .filter_map(|token| {
+            let range = index.offset(token.span.start)?..index.offset(token.span.end)?;
+            Some((token.token.clone(), range))
+        })
+        .collect();
+    let whole = code.first()?.1.start..code.last()?.1.end;
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
+    let statement = parser.parse_statement().ok()?;
+    if parser.peek_token().token != Token::EOF {
+        return None;
+    }
+    let mut collector = NestedQueryCollector::default();
+    let _ = statement.visit(&mut collector);
+
+    let mut found: Vec<(Span, String, bool, u8)> = Vec::new();
+    for query in &collector.queries {
+        let label = collector
+            .names
+            .get(&query.span)
+            .cloned()
+            .unwrap_or_else(|| "Subquery".to_string());
+        let priority = if collector.names.contains_key(&query.span) {
+            2
+        } else {
+            0
+        };
+        found.push((query.span, label, query.correlated, priority));
+    }
+    for branch in &collector.branches {
+        let correlated = collector
+            .queries
+            .get(branch.owner)
+            .is_some_and(|owner| owner.correlated);
+        let label = format!("Branch {} of UNION", branch.position);
+        found.push((branch.span, label, correlated, 1));
+    }
+    found.sort_by_key(|(_, _, _, priority)| std::cmp::Reverse(*priority));
+
+    let mut nested: Vec<NestedQuery> = Vec::new();
+    for (span, label, correlated, _) in found {
+        let (Some(start), Some(end)) = (index.offset(span.start), index.offset(span.end)) else {
+            continue;
+        };
+        let range = start..with_its_closing_parentheses(&code, start, end);
+        if range.is_empty()
+            || range == whole
+            || nested.iter().any(|existing| existing.range == range)
+        {
+            continue;
+        }
+        nested.push(NestedQuery {
+            range,
+            label,
+            correlated,
+        });
+    }
+    nested.sort_by_key(|nested| (nested.range.len(), std::cmp::Reverse(nested.range.start)));
+    Some(nested)
+}
+
+/// `end` moved forward over the `)` that close the `(` the range opened. The
+/// span the parser reports for a query stops before the `)` of a subquery it
+/// ends with, which would hand the server a query with an open parenthesis.
+fn with_its_closing_parentheses(code: &[(Token, Range<usize>)], start: usize, end: usize) -> usize {
+    let mut end = end;
+    let mut open = 0isize;
+    for (token, range) in code {
+        if range.start < start {
+            continue;
+        }
+        if range.end > end && open <= 0 {
+            break;
+        }
+        match token {
+            Token::LParen => open += 1,
+            Token::RParen => open -= 1,
+            _ => {}
+        }
+        end = end.max(range.end);
+    }
+    end
+}
+
+/// Turns the line and column the parser reports into a byte offset, without
+/// reading the text from the top each time.
+struct LocationIndex<'a> {
+    text: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> LocationIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+            .collect();
+        Self { text, line_starts }
+    }
+
+    fn offset(&self, location: Location) -> Option<usize> {
+        let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
+        let start = *self.line_starts.get(line)?;
+        let rest = self.text.get(start..)?;
+        let line_text = &rest[..rest.find('\n').unwrap_or(rest.len())];
+        let column = usize::try_from(location.column).ok()?.saturating_sub(1);
+        Some(
+            line_text
+                .char_indices()
+                .nth(column)
+                .map_or(start + line_text.len(), |(index, _)| start + index),
+        )
+    }
+}
+
+#[derive(Default)]
+struct QueryFrame {
+    index: usize,
+    defined: HashSet<String>,
+    used: HashSet<String>,
+    free_below: HashSet<String>,
+}
+
+struct QueryFound {
+    span: Span,
+    correlated: bool,
+}
+
+struct UnionBranch {
+    span: Span,
+    owner: usize,
+    position: usize,
+}
+
+/// Walks a statement and records every query in it, with what it is called and
+/// whether it needs a table that only the query around it has. A qualifier such
+/// as the `a` of `a.id` is free in a query when no `FROM` of that query or of
+/// the ones inside it names it; a query with a free qualifier is correlated.
+#[derive(Default)]
+struct NestedQueryCollector {
+    frames: Vec<QueryFrame>,
+    queries: Vec<QueryFound>,
+    names: HashMap<Span, String>,
+    branches: Vec<UnionBranch>,
+}
+
+fn collect_union_leaves<'a>(body: &'a SetExpr, leaves: &mut Vec<&'a SetExpr>) {
+    match body {
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_union_leaves(left, leaves);
+            collect_union_leaves(right, leaves);
+        }
+        leaf => leaves.push(leaf),
+    }
+}
+
+impl Visitor for NestedQueryCollector {
+    type Break = ();
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        let source = match statement {
+            Statement::Insert(insert) => insert
+                .source
+                .as_deref()
+                .map(|query| (query, "SELECT of INSERT")),
+            Statement::CreateTable(create) => create
+                .query
+                .as_deref()
+                .map(|query| (query, "SELECT of CREATE TABLE")),
+            Statement::CreateView(create) => Some((&*create.query, "SELECT of CREATE VIEW")),
+            _ => None,
+        };
+        if let Some((query, label)) = source {
+            self.names.insert(query.span(), label.to_string());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        let defined = match factor {
+            TableFactor::Table { name, alias, .. } => alias
+                .as_ref()
+                .map(|alias| alias.name.value.clone())
+                .or_else(|| {
+                    name.0
+                        .last()
+                        .and_then(|part| part.as_ident())
+                        .map(|ident| ident.value.clone())
+                }),
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let label = match alias {
+                    Some(alias) => format!("Derived table `{}`", alias.name.value),
+                    None => "Derived table".to_string(),
+                };
+                self.names.insert(subquery.span(), label);
+                alias.as_ref().map(|alias| alias.name.value.clone())
+            }
+            _ => None,
+        };
+        if let (Some(defined), Some(frame)) = (defined, self.frames.last_mut()) {
+            frame.defined.insert(defined.to_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let (Expr::CompoundIdentifier(parts), Some(frame)) = (expr, self.frames.last_mut())
+            && let Some(qualifier) = parts.len().checked_sub(2).and_then(|at| parts.get(at))
+        {
+            frame.used.insert(qualifier.value.to_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        let index = self.queries.len();
+        let mut frame = QueryFrame {
+            index,
+            ..QueryFrame::default()
+        };
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                frame.defined.insert(cte.alias.name.value.to_lowercase());
+                self.names
+                    .insert(cte.query.span(), format!("CTE `{}`", cte.alias.name.value));
+            }
+        }
+        let mut leaves = Vec::new();
+        collect_union_leaves(&query.body, &mut leaves);
+        if leaves.len() > 1 {
+            for (position, leaf) in leaves.into_iter().enumerate() {
+                self.branches.push(UnionBranch {
+                    span: leaf.span(),
+                    owner: index,
+                    position: position + 1,
+                });
+            }
+        }
+        self.queries.push(QueryFound {
+            span: query.span(),
+            correlated: false,
+        });
+        self.frames.push(frame);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        let Some(frame) = self.frames.pop() else {
+            return ControlFlow::Continue(());
+        };
+        let free: HashSet<String> = frame
+            .used
+            .union(&frame.free_below)
+            .filter(|qualifier| !frame.defined.contains(*qualifier))
+            .cloned()
+            .collect();
+        if let Some(found) = self.queries.get_mut(frame.index) {
+            found.correlated = !free.is_empty();
+        }
+        if let Some(parent) = self.frames.last_mut() {
+            parent.free_below.extend(free);
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// The offsets, within `segment`, of the lines that start a statement of their
@@ -749,6 +1055,178 @@ mod tests {
         assert_eq!(texts, ["SELECT 1", "SELECT 2", "SELECT 3"]);
         let spans = statement_spans(text, None);
         assert_eq!(spans.len(), 2, "no grammar, only what is written counts");
+    }
+
+    fn nested(text: &str, cursor_at: &str) -> Vec<(String, String, bool)> {
+        let cursor = text
+            .find(cursor_at)
+            .expect("the cursor marker is in the text");
+        nested_queries_at(text, cursor, Some(&MySqlDialect {}))
+            .into_iter()
+            .map(|nested| {
+                (
+                    nested.label,
+                    text[nested.range].to_string(),
+                    nested.correlated,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_subquery_under_the_cursor_is_offered_and_the_rest_of_the_statement_is_not() {
+        let text = "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE x = 1)";
+        assert_eq!(
+            nested(text, "id FROM b"),
+            [(
+                "Subquery".to_string(),
+                "SELECT id FROM b WHERE x = 1".to_string(),
+                false
+            )]
+        );
+        assert!(nested(text, "a WHERE").is_empty());
+        assert!(nested(text, "* FROM").is_empty());
+    }
+
+    #[test]
+    fn the_innermost_query_comes_first() {
+        let text = "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE k IN (SELECT k FROM c))";
+        let found = nested(text, "k FROM c");
+        let queries: Vec<&str> = found.iter().map(|(_, query, _)| query.as_str()).collect();
+        assert_eq!(
+            queries,
+            [
+                "SELECT k FROM c",
+                "SELECT id FROM b WHERE k IN (SELECT k FROM c)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cte_a_derived_table_and_a_union_branch_are_named() {
+        let cte = "WITH totals AS (SELECT a, SUM(b) AS s FROM t GROUP BY a) SELECT * FROM totals";
+        assert_eq!(
+            nested(cte, "SUM(b)")[0].0,
+            "CTE `totals`",
+            "{:?}",
+            nested(cte, "SUM(b)")
+        );
+        let derived = "SELECT * FROM (SELECT a FROM t) q WHERE q.a > 1";
+        assert_eq!(nested(derived, "a FROM t")[0].0, "Derived table `q`");
+        let union = "SELECT a FROM t1 UNION ALL SELECT a FROM t2";
+        assert_eq!(
+            nested(union, "t2"),
+            [(
+                "Branch 2 of UNION".to_string(),
+                "SELECT a FROM t2".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn the_select_of_an_insert_or_a_view_is_offered() {
+        let insert = "INSERT INTO t (a) SELECT a FROM u WHERE a > 1";
+        assert_eq!(
+            nested(insert, "a FROM u"),
+            [(
+                "SELECT of INSERT".to_string(),
+                "SELECT a FROM u WHERE a > 1".to_string(),
+                false
+            )]
+        );
+        assert!(nested(insert, "(a)").is_empty());
+        let view = "CREATE VIEW v AS SELECT a FROM u";
+        assert_eq!(nested(view, "a FROM u")[0].0, "SELECT of CREATE VIEW");
+    }
+
+    #[test]
+    fn a_subquery_that_uses_a_table_of_the_query_around_it_is_marked() {
+        let text = "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)";
+        assert!(nested(text, "1 FROM b")[0].2, "it needs `a`");
+        let alone = "SELECT * FROM a WHERE id IN (SELECT b.id FROM b WHERE b.ok = 1)";
+        assert!(!nested(alone, "b.id")[0].2, "it needs nothing of `a`");
+        let aliased = "SELECT * FROM a x WHERE EXISTS (SELECT 1 FROM b y WHERE y.a_id = x.id)";
+        assert!(nested(aliased, "1 FROM b")[0].2);
+    }
+
+    #[test]
+    fn a_reference_two_levels_out_marks_every_query_in_between() {
+        let text = "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.x IN (SELECT c.x FROM c WHERE c.a_id = a.id))";
+        let found = nested(text, "c.x FROM c");
+        assert_eq!(found.len(), 2);
+        assert!(found[0].2, "the inner one needs `a`");
+        assert!(found[1].2, "so the one around it cannot run alone either");
+    }
+
+    #[test]
+    fn a_name_the_subquery_defines_for_itself_is_not_a_free_reference() {
+        let text = "SELECT * FROM a WHERE id IN (SELECT t.id FROM (SELECT id FROM b) t)";
+        assert!(!nested(text, "t.id")[0].2);
+        let cte = "WITH c AS (SELECT 1 AS n) SELECT * FROM c WHERE c.n IN (SELECT c.n FROM c)";
+        assert!(!nested(cte, "c.n FROM")[0].2);
+    }
+
+    #[test]
+    fn every_piece_offered_reads_as_a_statement_of_its_own() {
+        let dialect = MySqlDialect {};
+        for (text, marker) in [
+            (
+                "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE k IN (SELECT k FROM c))",
+                "k FROM c",
+            ),
+            (
+                "WITH x AS (SELECT a FROM t WHERE a IN (SELECT 1)) SELECT * FROM x",
+                "SELECT 1",
+            ),
+            (
+                "SELECT * FROM (SELECT a FROM (SELECT a FROM t) u) v",
+                "a FROM t",
+            ),
+            (
+                "INSERT INTO t (a) SELECT a FROM u WHERE a IN (SELECT 1 UNION SELECT 2)",
+                "SELECT 2",
+            ),
+            (
+                "SELECT a FROM t WHERE a IN (SELECT 1) UNION SELECT a FROM u",
+                "SELECT a FROM t",
+            ),
+        ] {
+            let cursor = text.rfind(marker).expect("marker");
+            let pieces = nested_queries_at(text, cursor, Some(&dialect));
+            assert!(!pieces.is_empty(), "{text:?} at {marker:?}");
+            for piece in pieces {
+                let sql = &text[piece.range.clone()];
+                let tokens = Tokenizer::new(&dialect, sql)
+                    .tokenize_with_location()
+                    .expect("tokens");
+                let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
+                parser
+                    .parse_statement()
+                    .unwrap_or_else(|error| panic!("{sql:?} from {text:?}: {error}"));
+                assert_eq!(
+                    parser.peek_token().token,
+                    Token::EOF,
+                    "{sql:?} is one statement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comments_around_the_statement_do_not_make_it_a_nested_query_of_itself() {
+        let text = "-- a note\nSELECT a FROM t -- trailing\n";
+        assert!(nested(text, "a FROM").is_empty());
+    }
+
+    #[test]
+    fn nothing_is_offered_for_text_the_grammar_does_not_read() {
+        assert!(nested("SELECT * FROM a WHERE id IN (SELECT id FROM", "id FROM").is_empty());
+        assert!(
+            nested_queries_at("SELECT 1 UNION SELECT 2", 20, None).is_empty(),
+            "no grammar, no pieces"
+        );
+        assert!(nested("SELECT 1; SELECT 2", "SELECT 2").is_empty());
     }
 
     #[test]

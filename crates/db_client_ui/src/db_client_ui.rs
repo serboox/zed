@@ -25,6 +25,7 @@ mod sql_completion_provider;
 pub mod sql_exec;
 mod sql_highlight;
 mod sql_validator;
+mod statement_chooser;
 mod store;
 mod table_copy;
 mod widgets;

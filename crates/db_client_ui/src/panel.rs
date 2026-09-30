@@ -22,6 +22,9 @@ use crate::native_dump::{
 };
 use crate::result_view::{ResultView, format_query_error};
 use crate::sql_completion_provider::install_on_editor;
+use crate::statement_chooser::{
+    DatabaseConsoleSettings, OnChoose, StatementChoice, StatementChooser, choices_at_cursor,
+};
 use crate::store::{
     ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RelativePosition,
     RunConfiguration, SchemaCacheStatus, TreeItemRef,
@@ -52,6 +55,7 @@ use project::{
     lsp_store::{BufferSemanticTokens, CacheInlayHints},
 };
 use serde::{Deserialize, Serialize};
+use settings::{Settings as _, SubqueryChoice};
 use sqlparser::dialect::Dialect;
 use std::cell::RefCell;
 use std::ops::Range;
@@ -2590,7 +2594,7 @@ fn statement_range_at_cursor(
 // does not special-case `--`/`/*` appearing inside a string literal at the
 // very start of a statement -- a statement essentially never begins with a
 // string literal, so a full SQL tokenizer would be overkill here.
-fn skip_leading_whitespace_and_comments(s: &str, hash_comments: bool) -> usize {
+pub(crate) fn skip_leading_whitespace_and_comments(s: &str, hash_comments: bool) -> usize {
     let bytes = s.as_bytes();
     let mut offset = 0;
     loop {
@@ -3652,7 +3656,7 @@ pub fn run_current_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    run_sql_from_editor(workspace, window, cx, |sql| sql);
+    run_sql_from_editor(workspace, window, cx, None);
 }
 
 pub fn format_current_sql_query(
@@ -4010,13 +4014,51 @@ pub fn toggle_inline_results(
     controller.update(cx, |controller, cx| controller.toggle(cx));
 }
 
+fn subquery_choice(cx: &App) -> SubqueryChoice {
+    DatabaseConsoleSettings::get_global(cx).subquery_choice
+}
+
+// The parts of the statement under the cursor that can run on their own, the
+// smallest first and the whole statement last. Empty when there is a selection
+// (it runs as it is) or when the cursor is in no part smaller than the statement.
+fn choices_under_cursor(
+    editor: &Entity<Editor>,
+    dialect: Option<&dyn Dialect>,
+    cx: &mut App,
+) -> Vec<StatementChoice> {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        if selection.start.to_offset(&snapshot).0 != selection.end.to_offset(&snapshot).0 {
+            return Vec::new();
+        }
+        let cursor = selection.head().to_offset(&snapshot).0;
+        let full = editor.text(cx);
+        let Some(statement) = statement_range_at_cursor(&full, cursor, dialect) else {
+            return Vec::new();
+        };
+        let cursor = rewind_past_own_semicolon(&full, cursor);
+        choices_at_cursor(&full, statement, cursor, dialect)
+    })
+}
+
+#[derive(Clone, Default)]
+struct ExplainRequest {
+    analyze: bool,
+    explicit_range: Option<Range<usize>>,
+}
+
 enum ExplainTarget {
-    /// The focused item is not a SQL console — the keybinding should
-    /// propagate to whatever default handler would otherwise run.
+    /// The focused item is not a SQL console, or its driver cannot explain the
+    /// way asked -- the keybinding should propagate to whatever default
+    /// handler would otherwise run.
     NotApplicable,
     /// A console is focused but there is no statement to explain (empty
     /// cursor line, or no resolvable connection) — do nothing, silently.
     Empty,
+    /// The cursor is inside a part of the statement that can be explained on
+    /// its own, and the reader is to say which part.
+    Choose(Entity<Editor>, Vec<StatementChoice>),
     Ready(
         Entity<DatabasePanel>,
         ConnectionId,
@@ -4026,7 +4068,11 @@ enum ExplainTarget {
     ),
 }
 
-fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>) -> ExplainTarget {
+fn resolve_explain_target(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+    request: &ExplainRequest,
+) -> ExplainTarget {
     let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
         return ExplainTarget::NotApplicable;
     };
@@ -4038,33 +4084,6 @@ fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>
     let Some(connection_id) = console_connection_for_editor(&editor, &store, cx) else {
         return ExplainTarget::NotApplicable;
     };
-
-    let dialect = connection_dialect(&store.downgrade(), connection_id, cx);
-    let statement = editor.update(cx, |editor, cx| {
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let selection = editor.selections.newest_anchor();
-        let start = selection.start.to_offset(&snapshot).0;
-        let end = selection.end.to_offset(&snapshot).0;
-        let full = editor.text(cx);
-        let range = if start != end {
-            (start.min(end), start.max(end))
-        } else {
-            let cursor = selection.head().to_offset(&snapshot).0;
-            match statement_range_at_cursor(&full, cursor, dialect.as_deref()) {
-                Some(range) => (range.start, range.end),
-                None => return String::new(),
-            }
-        };
-        statement_runs_in_range(&full, range.0..range.1, dialect.as_deref())
-            .into_iter()
-            .next()
-            .map(|run| run.sql)
-            .unwrap_or_default()
-    });
-    let sql = statement.trim().trim_end_matches(';').trim().to_string();
-    if sql.is_empty() {
-        return ExplainTarget::Empty;
-    }
 
     let resolved = {
         let store_ref = store.read(cx);
@@ -4084,6 +4103,54 @@ fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>
     let Some((id, database, driver)) = resolved else {
         return ExplainTarget::Empty;
     };
+    let supported = if request.analyze {
+        supports_explain_analyze(driver)
+    } else {
+        supports_explain_plan(driver)
+    };
+    if !supported {
+        return ExplainTarget::NotApplicable;
+    }
+
+    let dialect = connection_dialect(&store.downgrade(), connection_id, cx);
+    let mut explicit_range = request.explicit_range.clone();
+    if explicit_range.is_none() {
+        let choices = choices_under_cursor(&editor, dialect.as_deref(), cx);
+        match (choices.is_empty(), subquery_choice(cx)) {
+            (true, _) | (false, SubqueryChoice::Whole) => {}
+            (false, SubqueryChoice::Innermost) => {
+                explicit_range = choices.first().map(|choice| choice.range.clone());
+            }
+            (false, SubqueryChoice::Ask) => return ExplainTarget::Choose(editor, choices),
+        }
+    }
+    let statement = editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let start = selection.start.to_offset(&snapshot).0;
+        let end = selection.end.to_offset(&snapshot).0;
+        let full = editor.text(cx);
+        let range = if let Some(range) = explicit_range {
+            (range.start, range.end)
+        } else if start != end {
+            (start.min(end), start.max(end))
+        } else {
+            let cursor = selection.head().to_offset(&snapshot).0;
+            match statement_range_at_cursor(&full, cursor, dialect.as_deref()) {
+                Some(range) => (range.start, range.end),
+                None => return String::new(),
+            }
+        };
+        statement_runs_in_range(&full, range.0..range.1, dialect.as_deref())
+            .into_iter()
+            .next()
+            .map(|run| run.sql)
+            .unwrap_or_default()
+    });
+    let sql = statement.trim().trim_end_matches(';').trim().to_string();
+    if sql.is_empty() {
+        return ExplainTarget::Empty;
+    }
     ExplainTarget::Ready(panel, id, database, driver, sql)
 }
 
@@ -4092,23 +4159,7 @@ pub fn explain_current_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let (panel, id, database, driver, sql) = match resolve_explain_target(workspace, cx) {
-        ExplainTarget::NotApplicable => {
-            cx.propagate();
-            return;
-        }
-        ExplainTarget::Empty => return,
-        ExplainTarget::Ready(panel, id, database, driver, sql) => {
-            (panel, id, database, driver, sql)
-        }
-    };
-    if !supports_explain_plan(driver) {
-        cx.propagate();
-        return;
-    }
-    panel.update(cx, |panel, cx| {
-        panel.open_explain_plan(id, database, driver, sql, false, window, cx);
-    });
+    explain_statement(workspace, window, cx, ExplainRequest::default());
 }
 
 pub fn explain_analyze_current_sql_query(
@@ -4116,30 +4167,67 @@ pub fn explain_analyze_current_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let (panel, id, database, driver, sql) = match resolve_explain_target(workspace, cx) {
+    explain_statement(
+        workspace,
+        window,
+        cx,
+        ExplainRequest {
+            analyze: true,
+            explicit_range: None,
+        },
+    );
+}
+
+fn explain_statement(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    request: ExplainRequest,
+) {
+    let (panel, id, database, driver, sql) = match resolve_explain_target(workspace, cx, &request) {
         ExplainTarget::NotApplicable => {
             cx.propagate();
             return;
         }
         ExplainTarget::Empty => return,
+        ExplainTarget::Choose(editor, choices) => {
+            let workspace_handle = workspace.weak_handle();
+            let analyze = request.analyze;
+            let on_choose: OnChoose = Rc::new(move |range, window, cx| {
+                if let Some(workspace) = workspace_handle.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        let request = ExplainRequest {
+                            analyze,
+                            explicit_range: Some(range),
+                        };
+                        explain_statement(workspace, window, cx, request);
+                    });
+                }
+            });
+            let title = if analyze {
+                "Explain analyze which part of the statement?"
+            } else {
+                "Explain which part of the statement?"
+            };
+            StatementChooser::open(workspace, title, &editor, choices, on_choose, window, cx);
+            return;
+        }
         ExplainTarget::Ready(panel, id, database, driver, sql) => {
             (panel, id, database, driver, sql)
         }
     };
-    if !supports_explain_analyze(driver) {
-        cx.propagate();
-        return;
-    }
     panel.update(cx, |panel, cx| {
-        panel.open_explain_plan(id, database, driver, sql, true, window, cx);
+        panel.open_explain_plan(id, database, driver, sql, request.analyze, window, cx);
     });
 }
 
+// `explicit_range` is the part of the statement to run, picked from the list of
+// parts under the cursor; `None` runs what the cursor or the selection says.
 fn run_sql_from_editor(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-    transform: impl Fn(String) -> String,
+    explicit_range: Option<Range<usize>>,
 ) {
     let panel = workspace.panel::<DatabasePanel>(cx);
     let panel = match panel {
@@ -4176,13 +4264,45 @@ fn run_sql_from_editor(
     };
 
     let dialect = connection_dialect(&store.downgrade(), bound_connection_id, cx);
+    let mut explicit_range = explicit_range;
+    if explicit_range.is_none() {
+        let choices = choices_under_cursor(&editor, dialect.as_deref(), cx);
+        match (choices.is_empty(), subquery_choice(cx)) {
+            (true, _) | (false, SubqueryChoice::Whole) => {}
+            (false, SubqueryChoice::Innermost) => {
+                explicit_range = choices.first().map(|choice| choice.range.clone());
+            }
+            (false, SubqueryChoice::Ask) => {
+                let workspace_handle = workspace.weak_handle();
+                let on_choose: OnChoose = Rc::new(move |range, window, cx| {
+                    if let Some(workspace) = workspace_handle.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            run_sql_from_editor(workspace, window, cx, Some(range));
+                        });
+                    }
+                });
+                StatementChooser::open(
+                    workspace,
+                    "Run which part of the statement?",
+                    &editor,
+                    choices,
+                    on_choose,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+    }
     let mut statements = editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let selection = editor.selections.newest_anchor();
         let start = selection.start.to_offset(&snapshot).0;
         let end = selection.end.to_offset(&snapshot).0;
         let full = editor.text(cx);
-        if start != end {
+        if let Some(range) = explicit_range.clone() {
+            statement_runs_in_range(&full, range, dialect.as_deref())
+        } else if start != end {
             let (lo, hi) = (start.min(end), start.max(end));
             statement_runs_in_range(&full, lo..hi, dialect.as_deref())
         } else {
@@ -4198,8 +4318,12 @@ fn run_sql_from_editor(
     statements = statements
         .into_iter()
         .filter_map(|statement| {
-            let sql = transform(statement.sql);
-            let sql = sql.trim().trim_end_matches(';').trim().to_string();
+            let sql = statement
+                .sql
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
             (!sql.is_empty()).then_some(SqlStatementRun {
                 sql,
                 start_row: statement.start_row,
@@ -21047,5 +21171,413 @@ mod tests {
             center_result_tabs, 1,
             "with no dock to put it in, the result table must fall back to the center pane"
         );
+    }
+
+    struct ChooserConsole {
+        workspace: Entity<Workspace>,
+        editor: Entity<Editor>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        cx: VisualTestContext,
+    }
+
+    impl ChooserConsole {
+        async fn open(test_cx: &mut TestAppContext, sql: &str, cursor: Range<usize>) -> Self {
+            let config = db_client::ConnectionConfig {
+                label: "chooser".to_string(),
+                auto_connect: false,
+                ..Default::default()
+            };
+            let connection_id = config.id;
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+            init_test(test_cx);
+            test_cx.update(|cx| {
+                let mut default_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                    "keymaps/default-linux.json",
+                    cx,
+                )
+                .expect("load default-linux keymap");
+                for binding in &mut default_bindings {
+                    binding.set_meta(settings::KeybindSource::Default.meta());
+                }
+                cx.bind_keys(default_bindings);
+                let mut base_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                    "keymaps/linux/jetbrains.json",
+                    cx,
+                )
+                .expect("load jetbrains keymap");
+                for binding in &mut base_bindings {
+                    binding.set_meta(settings::KeybindSource::Base.meta());
+                }
+                cx.bind_keys(base_bindings);
+            });
+            let fs = FakeFs::new(test_cx.executor());
+            let project = Project::test(fs.clone(), [], test_cx).await;
+            let window = test_cx
+                .add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let workspace = window
+                .read_with(test_cx, |mw, _| mw.workspace().clone())
+                .unwrap();
+            let mut visual = VisualTestContext::from_window(window.into(), test_cx);
+            let cx = &mut visual;
+
+            workspace.update_in(cx, |workspace, _window, _cx| {
+                workspace.register_action(
+                    |workspace, _: &zed_actions::database_panel::RunQuery, window, cx| {
+                        run_current_sql_query(workspace, window, cx);
+                    },
+                );
+                workspace.register_action(
+                    |workspace, _: &zed_actions::database_panel::ExplainQuery, window, cx| {
+                        explain_current_sql_query(workspace, window, cx);
+                    },
+                );
+            });
+            let store = workspace.update_in(cx, |workspace, window, cx| {
+                let store = cx.new(DatabaseStore::new);
+                let focus_handle = cx.focus_handle();
+                let workspace_handle = workspace.weak_handle();
+                let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+                let panel = cx.new(|cx| {
+                    let sub = cx.subscribe(
+                        &store,
+                        |_: &mut DatabasePanel,
+                         _: Entity<DatabaseStore>,
+                         _: &DatabaseStoreEvent,
+                         cx: &mut Context<DatabasePanel>| {
+                            cx.notify();
+                        },
+                    );
+                    DatabasePanel {
+                        focus_handle,
+                        store: store.clone(),
+                        workspace: workspace_handle,
+                        history_expanded: false,
+                        table_filter_editor,
+                        collapsed_folders: HashSet::default(),
+                        collapsed_connections: HashSet::default(),
+                        editing_folder: None,
+                        drag_target: None,
+                        views_expanded: HashSet::default(),
+                        procedures_expanded: HashSet::default(),
+                        sequences_expanded: HashSet::default(),
+                        events_expanded: HashSet::default(),
+                        table_indexes_expanded: HashSet::default(),
+                        table_fks_expanded: HashSet::default(),
+                        table_triggers_expanded: HashSet::default(),
+                        server_objects_expanded: HashSet::default(),
+                        server_users: HashMap::default(),
+                        table_filter_is_regex: false,
+                        selected_tree_node: None,
+                        selected_entity: None,
+                        initial_collapse_pending: false,
+                        pending_tree_state_serialization: Task::ready(None),
+                        position: DockPosition::Left,
+                        dump: DumpUiState::default(),
+                        export: ExportUiState::default(),
+                        context_menu: None,
+                        tree_scroll_handle: UniformListScrollHandle::new(),
+                        _subscriptions: vec![sub],
+                    }
+                });
+                workspace.add_panel(panel, window, cx);
+                store
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                workspace.add_panel(panel, window, cx);
+            });
+            store.update(cx, |store, cx| {
+                store.add_connected_for_test(
+                    config,
+                    std::sync::Arc::new(RecordingMockProvider {
+                        calls: calls.clone(),
+                    }),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+
+            let sql = sql.to_string();
+            let editor = workspace.update_in(cx, |workspace, window, cx| {
+                let buffer = cx.new(|cx| language::Buffer::local(sql, cx));
+                let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                    editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                    editor.set_show_runnables(true, cx);
+                    editor
+                });
+                workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+                editor
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                    s.select_ranges([editor::MultiBufferOffset(cursor.start)
+                        ..editor::MultiBufferOffset(cursor.end)]);
+                });
+                let handle = editor.focus_handle(cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+            Self {
+                workspace,
+                editor,
+                calls,
+                cx: visual,
+            }
+        }
+
+        fn focus_editor(&mut self) {
+            self.editor.update_in(&mut self.cx, |editor, window, cx| {
+                let handle = editor.focus_handle(cx);
+                window.focus(&handle, cx);
+            });
+            self.cx.run_until_parked();
+        }
+
+        fn press(&mut self, keystrokes: &str) {
+            self.cx.simulate_keystrokes(keystrokes);
+            self.cx.run_until_parked();
+        }
+
+        fn chooser(&mut self) -> Option<Entity<StatementChooser>> {
+            self.workspace.read_with(&self.cx, |workspace, cx| {
+                workspace.active_modal::<StatementChooser>(cx)
+            })
+        }
+
+        fn chooser_labels(&mut self) -> Vec<String> {
+            let chooser = self.chooser().expect("the chooser is open");
+            chooser.read_with(&self.cx, |chooser, cx| {
+                chooser
+                    .choices(cx)
+                    .into_iter()
+                    .map(|choice| choice.label)
+                    .collect()
+            })
+        }
+
+        fn selected_label(&mut self) -> String {
+            let chooser = self.chooser().expect("the chooser is open");
+            chooser
+                .read_with(&self.cx, |chooser, cx| chooser.selected_choice(cx))
+                .expect("a part is selected")
+                .label
+        }
+
+        fn highlighted_columns(&mut self) -> Vec<Range<u32>> {
+            self.editor.update_in(&mut self.cx, |editor, window, cx| {
+                editor
+                    .all_text_background_highlights(window, cx)
+                    .into_iter()
+                    .map(|(range, _)| range.start.column()..range.end.column())
+                    .collect()
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .clone()
+        }
+
+        fn set_subquery_choice(&mut self, choice: SubqueryChoice) {
+            self.cx.update(|_window, cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        content.database_console = Some(settings::DatabaseConsoleSettingsContent {
+                            subquery_choice: Some(choice),
+                        });
+                    });
+                });
+            });
+        }
+    }
+
+    const SUBQUERY_SQL: &str = "SELECT * FROM a WHERE id IN (SELECT id FROM b)";
+
+    fn inside_the_subquery() -> Range<usize> {
+        let at = SUBQUERY_SQL.find("id FROM b").expect("marker");
+        at..at
+    }
+
+    #[gpui::test]
+    async fn ctrl_enter_inside_a_subquery_offers_the_parts_and_runs_the_one_picked(
+        cx: &mut TestAppContext,
+    ) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        console.press("ctrl-enter");
+
+        assert_eq!(
+            console.chooser_labels(),
+            ["Subquery", "Whole statement"],
+            "the smallest part first"
+        );
+        assert_eq!(console.selected_label(), "Subquery");
+        assert!(console.calls().is_empty(), "nothing runs before the pick");
+        let subquery_start = SUBQUERY_SQL.find("SELECT id").expect("marker") as u32;
+        assert!(
+            console
+                .highlighted_columns()
+                .contains(&(subquery_start..SUBQUERY_SQL.len() as u32 - 1)),
+            "the selected part is painted in the editor: {:?}",
+            console.highlighted_columns()
+        );
+
+        console.press("down");
+        assert_eq!(console.selected_label(), "Whole statement");
+        assert!(
+            console
+                .highlighted_columns()
+                .contains(&(0..SUBQUERY_SQL.len() as u32)),
+            "the highlight follows the list: {:?}",
+            console.highlighted_columns()
+        );
+        console.press("up");
+        assert_eq!(console.selected_label(), "Subquery");
+        console.press("down");
+
+        console.press("enter");
+        assert!(console.chooser().is_none(), "the list closes on Enter");
+        assert_eq!(console.calls(), [SUBQUERY_SQL.to_string()]);
+        assert!(
+            console.highlighted_columns().is_empty(),
+            "the highlight is gone: {:?}",
+            console.highlighted_columns()
+        );
+    }
+
+    #[gpui::test]
+    async fn enter_on_the_first_part_runs_only_the_subquery(cx: &mut TestAppContext) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        console.press("ctrl-enter");
+        console.press("enter");
+        assert_eq!(console.calls(), ["SELECT id FROM b".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn escape_closes_the_list_and_runs_nothing(cx: &mut TestAppContext) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        console.press("ctrl-enter");
+        assert!(console.chooser().is_some());
+        console.press("escape");
+        assert!(console.chooser().is_none());
+        assert!(console.calls().is_empty());
+        assert!(
+            console.highlighted_columns().is_empty(),
+            "the highlight is gone: {:?}",
+            console.highlighted_columns()
+        );
+    }
+
+    #[gpui::test]
+    async fn a_cursor_outside_every_subquery_runs_at_once(cx: &mut TestAppContext) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, 3..3).await;
+        console.press("ctrl-enter");
+        assert!(console.chooser().is_none());
+        assert_eq!(console.calls(), [SUBQUERY_SQL.to_string()]);
+    }
+
+    #[gpui::test]
+    async fn a_selection_runs_as_it_is_without_asking(cx: &mut TestAppContext) {
+        let at = SUBQUERY_SQL.find("SELECT id").expect("marker");
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, at..SUBQUERY_SQL.len() - 1).await;
+        console.press("ctrl-enter");
+        assert!(console.chooser().is_none());
+        assert_eq!(console.calls(), ["SELECT id FROM b".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn the_setting_can_take_the_whole_statement_or_the_innermost_part_without_asking(
+        cx: &mut TestAppContext,
+    ) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        console.set_subquery_choice(SubqueryChoice::Whole);
+        console.press("ctrl-enter");
+        assert!(console.chooser().is_none());
+        assert_eq!(console.calls(), [SUBQUERY_SQL.to_string()]);
+
+        console.set_subquery_choice(SubqueryChoice::Innermost);
+        console.focus_editor();
+        console.press("ctrl-enter");
+        assert!(console.chooser().is_none());
+        assert_eq!(
+            console.calls(),
+            [SUBQUERY_SQL.to_string(), "SELECT id FROM b".to_string()]
+        );
+    }
+
+    fn explained_sql(console: &mut ChooserConsole, request: &ExplainRequest) -> Option<String> {
+        console
+            .workspace
+            .update_in(
+                &mut console.cx,
+                |workspace, _window, cx| match resolve_explain_target(workspace, cx, request) {
+                    ExplainTarget::Ready(_, _, _, _, sql) => Some(sql),
+                    ExplainTarget::Choose(..) => None,
+                    ExplainTarget::Empty | ExplainTarget::NotApplicable => {
+                        panic!(
+                            "a console with a statement under the cursor has something to explain"
+                        )
+                    }
+                },
+            )
+    }
+
+    #[gpui::test]
+    async fn explain_offers_the_same_parts_and_escape_explains_nothing(cx: &mut TestAppContext) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        console.press("ctrl-shift-e");
+        assert_eq!(console.chooser_labels(), ["Subquery", "Whole statement"]);
+        assert!(console.calls().is_empty());
+        assert_eq!(
+            explained_sql(&mut console, &ExplainRequest::default()),
+            None,
+            "asking is what explain does first"
+        );
+        console.press("escape");
+        assert!(console.chooser().is_none());
+        assert!(console.calls().is_empty());
+    }
+
+    #[gpui::test]
+    async fn explain_takes_the_part_the_reader_picked_or_the_setting_names(
+        cx: &mut TestAppContext,
+    ) {
+        let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, inside_the_subquery()).await;
+        let subquery_start = SUBQUERY_SQL.find("SELECT id").expect("marker");
+        let picked = ExplainRequest {
+            analyze: false,
+            explicit_range: Some(subquery_start..SUBQUERY_SQL.len() - 1),
+        };
+        assert_eq!(
+            explained_sql(&mut console, &picked).as_deref(),
+            Some("SELECT id FROM b")
+        );
+
+        console.set_subquery_choice(SubqueryChoice::Innermost);
+        assert_eq!(
+            explained_sql(&mut console, &ExplainRequest::default()).as_deref(),
+            Some("SELECT id FROM b")
+        );
+        console.set_subquery_choice(SubqueryChoice::Whole);
+        assert_eq!(
+            explained_sql(&mut console, &ExplainRequest::default()).as_deref(),
+            Some(SUBQUERY_SQL)
+        );
+    }
+
+    #[gpui::test]
+    async fn a_correlated_subquery_is_marked_in_the_list(cx: &mut TestAppContext) {
+        let sql = "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)";
+        let at = sql.find("1 FROM b").expect("marker");
+        let mut console = ChooserConsole::open(cx, sql, at..at).await;
+        console.press("ctrl-enter");
+        let chooser = console.chooser().expect("the chooser is open");
+        let choices = chooser.read_with(&console.cx, |chooser, cx| chooser.choices(cx));
+        assert!(choices[0].correlated, "{choices:?}");
+        assert!(!choices[1].correlated);
     }
 }

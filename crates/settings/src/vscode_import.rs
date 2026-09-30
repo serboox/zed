@@ -188,6 +188,7 @@ impl VsCodeSettings {
             auto_update: None,
             open_in_preview: None,
             run_configurations: None,
+            database_console: None,
             zedcli: None,
             typo_diagnostics: None,
             prose_diagnostics: None,

@@ -218,6 +218,9 @@ pub struct SettingsContent {
     /// Configuration of the run configurations.
     pub run_configurations: Option<RunConfigurationsSettingsContent>,
 
+    /// Configuration of the database query consoles.
+    pub database_console: Option<DatabaseConsoleSettingsContent>,
+
     /// Configuration of zedcli, the command line that talks to this editor.
     pub zedcli: Option<ZedcliSettingsContent>,
 
@@ -431,7 +434,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation, html_preview, run_configurations, zedcli, typo_diagnostics, prose_diagnostics,
+        instrumentation, html_preview, run_configurations, database_console, zedcli, typo_diagnostics,
+        prose_diagnostics,
         open_in_preview,
     },
     defaults: {},
@@ -622,6 +626,35 @@ pub struct RunConfigurationsSettingsContent {
     ///
     /// Default: true
     pub show_process_metrics: Option<bool>,
+}
+
+/// Configuration of the database query consoles.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct DatabaseConsoleSettingsContent {
+    /// What runs, and what is explained, when the cursor is inside a subquery,
+    /// a CTE, a branch of a UNION or the SELECT of an INSERT: `ask` offers the
+    /// choice in a list, `whole` always takes the whole statement, `innermost`
+    /// always takes the smallest piece under the cursor.
+    ///
+    /// Default: ask
+    pub subquery_choice: Option<SubqueryChoice>,
+}
+
+/// Which part of a statement a console runs when the cursor is inside a
+/// piece that can run on its own.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubqueryChoice {
+    /// A list of the pieces under the cursor opens, and the one picked runs.
+    #[default]
+    Ask,
+    /// The whole statement, as if there were no pieces.
+    Whole,
+    /// The smallest piece under the cursor.
+    Innermost,
 }
 
 /// Configuration of zedcli.
