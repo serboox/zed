@@ -20,7 +20,7 @@ use project::{Fs, Project};
 
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
+use terminal::{TaskStatus, Terminal, terminal_settings::TerminalSettings};
 use ui::{
     ButtonLike, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu,
     SplitButton, Toggleable, Tooltip, prelude::*,
@@ -916,8 +916,13 @@ impl TerminalPanel {
             let terminal = project
                 .update(cx, |project, cx| project.create_terminal_task(task, cx))
                 .await?;
-            let pane = terminal_panel
-                .read_with(cx, |terminal_panel, _| terminal_panel.active_pane.clone())?;
+            let (pane, behind_another_run) =
+                terminal_panel.read_with(cx, |terminal_panel, cx| {
+                    (
+                        terminal_panel.active_pane.clone(),
+                        terminal_panel.another_run_is_on_screen(None, cx),
+                    )
+                })?;
             workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = Box::new(cx.new(|cx| {
                     TerminalView::new(
@@ -930,25 +935,58 @@ impl TerminalPanel {
                     )
                 }));
 
+                // A run that starts while another is on screen is added behind
+                // it: the tab appears, and the log being read stays where it is.
                 let take_focus = reveal_strategy == RevealStrategy::Always
+                    && !behind_another_run
                     && !workspace.has_active_modal(window, cx);
                 match reveal_strategy {
                     RevealStrategy::Always if take_focus => {
                         workspace.focus_panel::<Self>(window, cx);
                     }
-                    RevealStrategy::Always | RevealStrategy::NoFocus => {
+                    RevealStrategy::Always | RevealStrategy::NoFocus if !behind_another_run => {
                         workspace.open_panel::<Self>(window, cx);
                     }
-                    RevealStrategy::Never => {}
+                    RevealStrategy::Always | RevealStrategy::NoFocus | RevealStrategy::Never => {}
                 }
 
                 pane.update(cx, |pane, cx| {
-                    pane.add_item(terminal_view, true, take_focus, None, window, cx);
+                    pane.add_item_inner(
+                        terminal_view,
+                        !behind_another_run,
+                        take_focus,
+                        !behind_another_run,
+                        None,
+                        window,
+                        cx,
+                    );
                 });
 
                 terminal.downgrade()
             })
         })
+    }
+
+    /// Whether the terminal the panel is showing is a task that is still
+    /// running, other than `except`: a run the reader may be reading.
+    fn another_run_is_on_screen(&self, except: Option<&Entity<Terminal>>, cx: &App) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Some(shown) = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+        else {
+            return false;
+        };
+        let shown = shown.read(cx).terminal();
+        except.is_none_or(|except| except.entity_id() != shown.entity_id())
+            && shown
+                .read(cx)
+                .task()
+                .is_some_and(|task| task.status == TaskStatus::Running)
     }
 
     fn add_terminal_shell(
@@ -1136,6 +1174,14 @@ impl TerminalPanel {
                     project.create_terminal_task(spawn_task, cx)
                 })
                 .await?;
+            let replaced = terminal_to_replace.read_with(cx, |view, _| view.terminal().clone());
+            let behind_another_run = terminal_panel.read_with(cx, |panel, cx| {
+                panel.another_run_is_on_screen(Some(&replaced), cx)
+            })?;
+            let reveal = match behind_another_run {
+                true => RevealStrategy::Never,
+                false => reveal,
+            };
             terminal_to_replace.update_in(cx, |terminal_to_replace, window, cx| {
                 terminal_to_replace.set_terminal(new_terminal.clone(), window, cx);
             })?;
@@ -3695,6 +3741,125 @@ mod tests {
             "and the first is still running"
         );
         end_them_all(&over, cx);
+    }
+
+    fn shown_terminal(over: &PanelOverTasks, cx: &mut TestAppContext) -> Option<Entity<Terminal>> {
+        over.panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .map(|view| view.read(cx).terminal().clone())
+        })
+    }
+
+    fn revealing(task: SpawnInTerminal) -> SpawnInTerminal {
+        SpawnInTerminal {
+            reveal: RevealStrategy::Always,
+            ..task
+        }
+    }
+
+    /// The first run is shown. A second that starts while the first is on
+    /// screen is added behind it, so the log being read is not taken away. Once
+    /// the first has ended nothing is being read, and the next run is shown.
+    #[gpui::test]
+    async fn a_run_started_behind_another_leaves_it_on_screen(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+        let first = revealing(a_long_task("api server", "api", true, true));
+        let second = revealing(a_long_task("unit tests", "tests", true, true));
+        let third = revealing(a_long_task("lint", "lint", true, true));
+
+        let first_run = spawn(&over, &first, cx).await;
+        cx.run_until_parked();
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(first_run.entity_id()),
+            "with nothing else on screen the run is shown"
+        );
+
+        let second_run = spawn(&over, &second, cx).await;
+        cx.run_until_parked();
+        assert_eq!(the_terminals(&over, cx).len(), 2, "its tab is there");
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(first_run.entity_id()),
+            "but the first run is still the one on screen"
+        );
+        let second_has_focus = over
+            .window
+            .update(cx, |_, window, cx| {
+                the_views(&over, cx)
+                    .into_iter()
+                    .find(|view| view.read(cx).terminal().entity_id() == second_run.entity_id())
+                    .is_some_and(|view| view.focus_handle(cx).is_focused(window))
+            })
+            .unwrap();
+        assert!(!second_has_focus, "and the new run did not take the focus");
+
+        first_run.update(cx, |terminal, _| terminal.kill_active_task());
+        first_run
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+        second_run.update(cx, |terminal, _| terminal.kill_active_task());
+        second_run
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+        cx.run_until_parked();
+
+        let third_run = spawn(&over, &third, cx).await;
+        cx.run_until_parked();
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(third_run.entity_id()),
+            "with only finished runs on screen the next run is shown"
+        );
+        end_them_all(&over, cx);
+    }
+
+    /// A rerun in place of a terminal that is not on screen does not bring it to
+    /// the front while another run is being read.
+    #[gpui::test]
+    async fn a_rerun_in_a_hidden_tab_leaves_the_run_on_screen_alone(cx: &mut TestAppContext) {
+        let over = a_panel_over_tasks(cx).await;
+        let hidden = revealing(a_long_task("unit tests", "tests", true, false));
+        let on_screen = revealing(a_long_task("api server", "api", true, true));
+
+        let hidden_run = spawn(&over, &hidden, cx).await;
+        hidden_run.update(cx, |terminal, _| terminal.kill_active_task());
+        hidden_run
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+        cx.run_until_parked();
+        let on_screen_run = spawn(&over, &on_screen, cx).await;
+        cx.run_until_parked();
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(on_screen_run.entity_id())
+        );
+
+        let again = spawn(&over, &hidden, cx).await;
+        cx.run_until_parked();
+
+        assert_ne!(again.entity_id(), hidden_run.entity_id(), "it was rerun");
+        assert_eq!(the_terminals(&over, cx).len(), 2, "in the same tab");
+        assert_eq!(
+            shown_terminal(&over, cx).map(|terminal| terminal.entity_id()),
+            Some(on_screen_run.entity_id()),
+            "and the run being read is still the one shown"
+        );
+        end_them_all(&over, cx);
+    }
+
+    fn the_views(over: &PanelOverTasks, cx: &App) -> Vec<Entity<TerminalView>> {
+        over.panel
+            .read(cx)
+            .active_pane
+            .read(cx)
+            .items()
+            .filter_map(|item| item.downcast::<TerminalView>())
+            .collect()
     }
 
     /// The same configuration started again still takes its own terminal over.
