@@ -1,6 +1,7 @@
 use crate::aerospike_view::AerospikeView;
 use crate::compare_data::CompareDataView;
 use crate::connection_view;
+use crate::console_statements::{hash_starts_a_comment, statement_separators};
 use crate::data_import::ImportDataView;
 use crate::db_migration::{
     BUNDLE_VERSION, ConsoleFile, EncryptedSecrets, ExportBundle, decrypt_secrets, encrypt_secrets,
@@ -51,6 +52,7 @@ use project::{
     lsp_store::{BufferSemanticTokens, CacheInlayHints},
 };
 use serde::{Deserialize, Serialize};
+use sqlparser::dialect::Dialect;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -1196,13 +1198,17 @@ fn show_create_table_reference(sql: &str) -> Option<SqlTableReference> {
     table_reference_after(bytes, sql, index + b"table".len())
 }
 
-fn statement_table_reference_at_offset(text: &str, offset: usize) -> Option<SqlTableReference> {
+fn statement_table_reference_at_offset(
+    text: &str,
+    offset: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Option<SqlTableReference> {
     let lexical_reference = lexical_table_reference_at_offset(text, offset)?;
     let cursor = offset.min(text.len());
     let Range {
         start: statement_start,
         end: statement_end,
-    } = statement_bounds_at_offset(text, cursor);
+    } = statement_bounds_at_offset(text, cursor, dialect);
     let statement = &text[statement_start..statement_end];
     let mut statement_reference =
         show_create_table_reference(statement).or_else(|| select_table_reference(statement))?;
@@ -1263,12 +1269,16 @@ fn show_create_database_reference(sql: &str) -> Option<SqlDatabaseReference> {
 // `SHOW CREATE DATABASE <name>` statement, or the database part of a qualified
 // `database.table` reference (cursor before the dot). Returns None when the
 // cursor is on the table part, so the table path keeps its existing behavior.
-fn database_reference_at_offset(text: &str, offset: usize) -> Option<SqlDatabaseReference> {
+fn database_reference_at_offset(
+    text: &str,
+    offset: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Option<SqlDatabaseReference> {
     let cursor = offset.min(text.len());
     let Range {
         start: statement_start,
         end: statement_end,
-    } = statement_bounds_at_offset(text, cursor);
+    } = statement_bounds_at_offset(text, cursor, dialect);
     let statement = &text[statement_start..statement_end];
 
     if let Some(mut reference) = show_create_database_reference(statement) {
@@ -1301,7 +1311,7 @@ fn database_reference_at_offset(text: &str, offset: usize) -> Option<SqlDatabase
     if database.is_empty() {
         return None;
     }
-    let table_reference = statement_table_reference_at_offset(text, dot_offset + 1)?;
+    let table_reference = statement_table_reference_at_offset(text, dot_offset + 1, dialect)?;
     if table_reference.database.as_deref() != Some(database) {
         return None;
     }
@@ -1475,12 +1485,13 @@ fn innermost_scope_end(text: &str, scope_start: usize) -> usize {
 fn from_tables_at_offset(
     text: &str,
     offset: usize,
+    dialect: Option<&dyn Dialect>,
 ) -> Vec<crate::sql_completion_provider::TableRef> {
     let cursor = offset.min(text.len());
     let Range {
         start: statement_start,
         end: statement_end,
-    } = statement_bounds_at_offset(text, cursor);
+    } = statement_bounds_at_offset(text, cursor, dialect);
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
     let scope_start =
@@ -1548,12 +1559,16 @@ fn find_on_duplicate_key_update(statement: &str) -> Option<usize> {
 // so a column in the `INSERT INTO table (col, col, ...)` list or in an `ON
 // DUPLICATE KEY UPDATE col = VALUES(col)` clause resolves against the INSERT
 // target table instead of the trailing SELECT's FROM tables.
-fn insert_column_context_at_offset(text: &str, offset: usize) -> Option<InsertColumnContext> {
+fn insert_column_context_at_offset(
+    text: &str,
+    offset: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Option<InsertColumnContext> {
     let cursor = offset.min(text.len());
     let Range {
         start: statement_start,
         end: statement_end,
-    } = statement_bounds_at_offset(text, cursor);
+    } = statement_bounds_at_offset(text, cursor, dialect);
     let statement = &text[statement_start..statement_end];
     let target = insert_into_target(statement)?;
     let bytes = statement.as_bytes();
@@ -1607,12 +1622,16 @@ struct DerivedTableRef {
 // Derived-table aliases (`FROM (SELECT ...) alias`) visible from `offset`,
 // scoped the same way as `from_tables_at_offset` so a click on `q1.col` in an
 // outer query resolves through the derived table to its real source column.
-fn derived_tables_at_offset(text: &str, offset: usize) -> Vec<DerivedTableRef> {
+fn derived_tables_at_offset(
+    text: &str,
+    offset: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Vec<DerivedTableRef> {
     let cursor = offset.min(text.len());
     let Range {
         start: statement_start,
         end: statement_end,
-    } = statement_bounds_at_offset(text, cursor);
+    } = statement_bounds_at_offset(text, cursor, dialect);
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
     let scope_start =
@@ -1951,6 +1970,7 @@ impl SemanticsProvider for DbSemanticsProvider {
         let snapshot = buffer.read(cx).snapshot();
         let offset = snapshot.offset_for_anchor(&position);
         let text = snapshot.text();
+        let dialect = connection_dialect(&self.store, self.connection_id, cx);
 
         // Try a real AST-based resolution first: it parses the statement
         // under the cursor with `sqlparser` and walks a scope-stack binder,
@@ -1999,7 +2019,9 @@ impl SemanticsProvider for DbSemanticsProvider {
             }
         }
 
-        if let Some(table_reference) = statement_table_reference_at_offset(&text, offset) {
+        if let Some(table_reference) =
+            statement_table_reference_at_offset(&text, offset, dialect.as_deref())
+        {
             let database_opt = table_reference.database;
             let table_name = table_reference.table;
 
@@ -2027,7 +2049,9 @@ impl SemanticsProvider for DbSemanticsProvider {
             ));
         }
 
-        if let Some(database_reference) = database_reference_at_offset(&text, offset) {
+        if let Some(database_reference) =
+            database_reference_at_offset(&text, offset, dialect.as_deref())
+        {
             let database = database_reference.database;
             let word_start = snapshot.anchor_before(database_reference.start);
             let word_end = snapshot.anchor_after(database_reference.end);
@@ -2045,7 +2069,9 @@ impl SemanticsProvider for DbSemanticsProvider {
         // column always belongs to the INSERT target table, never to the
         // trailing SELECT's FROM tables, so this runs ahead of the generic
         // column resolution below.
-        if let Some(insert_context) = insert_column_context_at_offset(&text, offset) {
+        if let Some(insert_context) =
+            insert_column_context_at_offset(&text, offset, dialect.as_deref())
+        {
             let in_column_list = insert_context
                 .column_list
                 .is_some_and(|(start, end)| offset >= start && offset <= end);
@@ -2094,7 +2120,7 @@ impl SemanticsProvider for DbSemanticsProvider {
 
         if let Some(column_reference) = column_reference_at_offset(&text, offset) {
             if let Some(qualifier) = &column_reference.qualifier {
-                let derived_tables = derived_tables_at_offset(&text, offset);
+                let derived_tables = derived_tables_at_offset(&text, offset, dialect.as_deref());
                 if let Some(derived) = derived_tables
                     .iter()
                     .find(|derived| derived.alias.eq_ignore_ascii_case(qualifier))
@@ -2133,7 +2159,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                 }
             }
 
-            let from_tables = from_tables_at_offset(&text, offset);
+            let from_tables = from_tables_at_offset(&text, offset, dialect.as_deref());
             let candidates: Vec<(Option<String>, String)> = match &column_reference.qualifier {
                 Some(qualifier) => {
                     match crate::sql_completion_provider::resolve_table_ref(qualifier, &from_tables)
@@ -2390,10 +2416,13 @@ impl DbSemanticsProvider {
             return Some(range);
         }
 
-        if let Some(reference) = statement_table_reference_at_offset(text, offset) {
+        let dialect = connection_dialect(&self.store, self.connection_id, cx);
+        if let Some(reference) =
+            statement_table_reference_at_offset(text, offset, dialect.as_deref())
+        {
             return Some(reference.start..reference.end);
         }
-        if let Some(reference) = database_reference_at_offset(text, offset) {
+        if let Some(reference) = database_reference_at_offset(text, offset, dialect.as_deref()) {
             return Some(reference.start..reference.end);
         }
         if let Some(reference) = column_reference_at_offset(text, offset) {
@@ -2455,130 +2484,21 @@ impl DbSemanticsProvider {
     }
 }
 
-// Byte offsets of every top-level `;` in `text` -- i.e. semicolons that are
-// NOT inside a string literal, a quoted identifier, or a comment. This is a
-// small SQL tokenizer (not a parser): it walks the text tracking which
-// construct it is inside so a `;` that is part of a value, an identifier, or a
-// comment is never mistaken for a statement boundary. Recognized constructs:
-//   * `'...'` / `"..."` string literals, honoring both the SQL doubled-quote
-//     escape (`''`/`""`) and a backslash escape (`\'`), so a `;` embedded in a
-//     value (e.g. a PHP-serialized string like `a:9:{i:60;i:1;...}`) does not
-//     split.
-//   * `` `...` `` quoted identifiers, honoring the doubled-backtick escape
-//     (`` `` ``); there is no backslash escape inside backtick identifiers.
-//   * `--` and `#` line comments (skipped to end of line) and `/* ... */`
-//     block comments (skipped to the matching `*/`). MySQL block comments do
-//     not nest, and `/*! ... */` conditional comments share the same
-//     delimiters, so both skip identically here.
-// The `--` case follows MySQL's rule that the second dash must be followed by
-// whitespace, a control char, or end-of-input, so an operator like `5--3`
-// stays an expression. This is deliberately stricter than
-// `skip_leading_whitespace_and_comments`, which treats a leading `--`
-// unconditionally; that helper only runs at the very start of a statement,
-// where a `--` can never be a subtraction operator.
-// Operating on bytes is safe: every delimiter checked (`'`, `"`, `;`, `` ` ``,
-// `\`, `-`, `#`, `/`, `*`, `\n`) is ASCII, so it can never appear as part of a
-// multi-byte UTF-8 continuation sequence.
-fn unquoted_semicolon_offsets(text: &str) -> Vec<usize> {
-    enum State {
-        Normal,
-        // Inside a `'`- or `"`-quoted string; holds the closing quote byte.
-        String(u8),
-        Identifier,
-        LineComment,
-        BlockComment,
-    }
-    let bytes = text.as_bytes();
-    let mut offsets = Vec::new();
-    let mut state = State::Normal;
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match state {
-            State::Normal => match byte {
-                b'\'' | b'"' => {
-                    state = State::String(byte);
-                    index += 1;
-                }
-                b'`' => {
-                    state = State::Identifier;
-                    index += 1;
-                }
-                b'#' => {
-                    state = State::LineComment;
-                    index += 1;
-                }
-                b'-' if bytes.get(index + 1) == Some(&b'-')
-                    && bytes.get(index + 2).is_none_or(|&b| b <= b' ') =>
-                {
-                    state = State::LineComment;
-                    index += 2;
-                }
-                b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                    state = State::BlockComment;
-                    index += 2;
-                }
-                b';' => {
-                    offsets.push(index);
-                    index += 1;
-                }
-                _ => index += 1,
-            },
-            State::String(quote) => {
-                if byte == b'\\' && index + 1 < bytes.len() {
-                    index += 2;
-                } else if byte == quote {
-                    if bytes.get(index + 1) == Some(&quote) {
-                        index += 2;
-                    } else {
-                        state = State::Normal;
-                        index += 1;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            State::Identifier => {
-                if byte == b'`' {
-                    if bytes.get(index + 1) == Some(&b'`') {
-                        index += 2;
-                    } else {
-                        state = State::Normal;
-                        index += 1;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            State::LineComment => {
-                if byte == b'\n' {
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::BlockComment => {
-                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    state = State::Normal;
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-        }
-    }
-    offsets
-}
-
-// The `;`-delimited statement bounds containing byte offset `cursor`, aware
-// of string-literal-quoted semicolons via `unquoted_semicolon_offsets`. This
+// The statement bounds containing byte offset `cursor`, aware of
+// string-literal-quoted semicolons and of the statements that have no `;`, via
+// `statement_separators`. This
 // is the single shared implementation for every "which statement is the
 // cursor in" resolution (run-at-cursor, FK/table/database reference
 // look-up, completion scoping, INSERT column context) -- do not reintroduce
 // a local `rfind(';')`/`find(';')` pair, which silently breaks on any value
 // containing a semicolon.
-fn statement_bounds_at_offset(text: &str, cursor: usize) -> Range<usize> {
+fn statement_bounds_at_offset(
+    text: &str,
+    cursor: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Range<usize> {
     let cursor = cursor.min(text.len());
-    let offsets = unquoted_semicolon_offsets(text);
+    let offsets = statement_separators(text, dialect);
     let start = offsets
         .iter()
         .rev()
@@ -2611,9 +2531,9 @@ fn rewind_past_own_semicolon(text: &str, cursor: usize) -> usize {
 // Returns the `;`-delimited SQL statement that contains the byte offset
 // `cursor`, trimmed. `;` is ASCII so byte scanning stays on char boundaries.
 #[cfg(test)]
-fn statement_at_cursor(text: &str, cursor: usize) -> String {
+fn statement_at_cursor(text: &str, cursor: usize, dialect: Option<&dyn Dialect>) -> String {
     let cursor = rewind_past_own_semicolon(text, cursor);
-    let bounds = statement_bounds_at_offset(text, cursor);
+    let bounds = statement_bounds_at_offset(text, cursor, dialect);
     text[bounds].trim().to_string()
 }
 
@@ -2647,32 +2567,38 @@ fn trim_sql_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
     (trimmed_start < trimmed_end).then_some(trimmed_start..trimmed_end)
 }
 
-fn statement_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
+fn statement_range_at_cursor(
+    text: &str,
+    cursor: usize,
+    dialect: Option<&dyn Dialect>,
+) -> Option<Range<usize>> {
     let cursor = rewind_past_own_semicolon(text, cursor);
-    trim_sql_range(text, statement_bounds_at_offset(text, cursor))
+    trim_sql_range(text, statement_bounds_at_offset(text, cursor, dialect))
 }
 
 // Finds the byte offset, relative to `s`, of the first byte that is not
 // leading whitespace or a leading comment (`-- ...` or `# ...` to end of line,
 // or `/* ... */`, including multi-line block comments). Returns `s.len()` if
-// `s` is nothing but whitespace/comments. `#` is a comment here because
-// `unquoted_semicolon_offsets` already reads it as one: a `;` after it does not
-// end a statement, so the comment lands at the front of the next statement and
-// must be skipped like the others, or the statement is taken to start on the
-// comment's line.
+// `s` is nothing but whitespace/comments. `#` is a comment when `hash_comments`
+// is set, which is where the statement scanner reads it as one: a `;` after it
+// does not end a statement, so the comment lands at the front of the next
+// statement and must be skipped like the others, or the statement is taken to
+// start on the comment's line.
 //
 // This only recognizes `--`/`/*` at a position where a new token is
 // expected (right after whitespace or a prior comment), so it deliberately
 // does not special-case `--`/`/*` appearing inside a string literal at the
 // very start of a statement -- a statement essentially never begins with a
 // string literal, so a full SQL tokenizer would be overkill here.
-fn skip_leading_whitespace_and_comments(s: &str) -> usize {
+fn skip_leading_whitespace_and_comments(s: &str, hash_comments: bool) -> usize {
     let bytes = s.as_bytes();
     let mut offset = 0;
     loop {
         let after_whitespace = s[offset..].len() - s[offset..].trim_start().len();
         offset += after_whitespace;
-        if bytes.get(offset..offset + 2) == Some(b"--") || bytes.get(offset) == Some(&b'#') {
+        if bytes.get(offset..offset + 2) == Some(b"--")
+            || (hash_comments && bytes.get(offset) == Some(&b'#'))
+        {
             let line_end = s[offset..]
                 .find('\n')
                 .map(|i| offset + i + 1)
@@ -2693,17 +2619,23 @@ fn skip_leading_whitespace_and_comments(s: &str) -> usize {
     offset
 }
 
-pub(crate) fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementRun> {
+pub(crate) fn statement_runs_in_range(
+    text: &str,
+    range: Range<usize>,
+    dialect: Option<&dyn Dialect>,
+) -> Vec<SqlStatementRun> {
     let Some(range) = trim_sql_range(text, range) else {
         return Vec::new();
     };
+    let hash_comments = hash_starts_a_comment(dialect);
     let mut statements = Vec::new();
     let mut start = range.start;
     let push_statement = |statements: &mut Vec<SqlStatementRun>, trimmed: Range<usize>| {
         let Some(segment) = text.get(trimmed.clone()) else {
             return;
         };
-        let content_offset = trimmed.start + skip_leading_whitespace_and_comments(segment);
+        let content_offset =
+            trimmed.start + skip_leading_whitespace_and_comments(segment, hash_comments);
         if content_offset >= trimmed.end {
             // The whole interval is comments/whitespace -- nothing to run.
             return;
@@ -2717,7 +2649,7 @@ pub(crate) fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<Sq
             end_row: row_for_byte_offset(text, trimmed.end),
         });
     };
-    for semicolon in unquoted_semicolon_offsets(text) {
+    for semicolon in statement_separators(text, dialect) {
         if semicolon < range.start {
             continue;
         }
@@ -3101,6 +3033,16 @@ fn connection_driver(
             .find(|c| c.config.id == connection_id)
             .map(|c| c.config.driver)
     })
+}
+
+/// The SQL dialect of a console's connection; `None` when the connection is
+/// gone or its driver has no SQL grammar.
+fn connection_dialect(
+    store: &WeakEntity<DatabaseStore>,
+    connection_id: ConnectionId,
+    cx: &App,
+) -> Option<Box<dyn Dialect>> {
+    connection_driver(store, connection_id, cx).and_then(crate::sql_ast::dialect_for_driver)
 }
 
 /// When true, SQL-dialect consoles are colored by our own resilient
@@ -3787,6 +3729,7 @@ pub fn execute_current_sql_query_to_file(
         return;
     };
 
+    let dialect = connection_dialect(&store.downgrade(), bound_connection_id, cx);
     let sql = editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let selection = editor.selections.newest_anchor();
@@ -3798,8 +3741,8 @@ pub fn execute_current_sql_query_to_file(
             full.get(lo..hi).map(str::to_string)
         } else {
             let cursor = selection.head().to_offset(&snapshot).0;
-            statement_range_at_cursor(&full, cursor)
-                .map(|range| statement_runs_in_range(&full, range))
+            statement_range_at_cursor(&full, cursor, dialect.as_deref())
+                .map(|range| statement_runs_in_range(&full, range, dialect.as_deref()))
                 .and_then(|runs| runs.into_iter().next())
                 .map(|run| run.sql)
         }
@@ -4096,6 +4039,7 @@ fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>
         return ExplainTarget::NotApplicable;
     };
 
+    let dialect = connection_dialect(&store.downgrade(), connection_id, cx);
     let statement = editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let selection = editor.selections.newest_anchor();
@@ -4106,12 +4050,12 @@ fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>
             (start.min(end), start.max(end))
         } else {
             let cursor = selection.head().to_offset(&snapshot).0;
-            match statement_range_at_cursor(&full, cursor) {
+            match statement_range_at_cursor(&full, cursor, dialect.as_deref()) {
                 Some(range) => (range.start, range.end),
                 None => return String::new(),
             }
         };
-        statement_runs_in_range(&full, range.0..range.1)
+        statement_runs_in_range(&full, range.0..range.1, dialect.as_deref())
             .into_iter()
             .next()
             .map(|run| run.sql)
@@ -4231,6 +4175,7 @@ fn run_sql_from_editor(
         }
     };
 
+    let dialect = connection_dialect(&store.downgrade(), bound_connection_id, cx);
     let mut statements = editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let selection = editor.selections.newest_anchor();
@@ -4239,11 +4184,11 @@ fn run_sql_from_editor(
         let full = editor.text(cx);
         if start != end {
             let (lo, hi) = (start.min(end), start.max(end));
-            statement_runs_in_range(&full, lo..hi)
+            statement_runs_in_range(&full, lo..hi, dialect.as_deref())
         } else {
             let cursor = selection.head().to_offset(&snapshot).0;
-            statement_range_at_cursor(&full, cursor)
-                .map(|range| statement_runs_in_range(&full, range))
+            statement_range_at_cursor(&full, cursor, dialect.as_deref())
+                .map(|range| statement_runs_in_range(&full, range, dialect.as_deref()))
                 .unwrap_or_default()
         }
     });
@@ -12224,19 +12169,22 @@ mod tests {
     fn statement_at_cursor_picks_only_the_statement_under_the_cursor() {
         let text = "SELECT 1;\nSELECT 2;\nSELECT 3;";
         // cursor inside the second statement (after the first ';')
-        assert_eq!(super::statement_at_cursor(text, 12), "SELECT 2");
+        assert_eq!(super::statement_at_cursor(text, 12, None), "SELECT 2");
         // cursor in the first statement
-        assert_eq!(super::statement_at_cursor(text, 3), "SELECT 1");
+        assert_eq!(super::statement_at_cursor(text, 3, None), "SELECT 1");
         // cursor in the last statement (no trailing ';')
-        assert_eq!(super::statement_at_cursor(text, 26), "SELECT 3");
+        assert_eq!(super::statement_at_cursor(text, 26, None), "SELECT 3");
         // single statement, no semicolons
-        assert_eq!(super::statement_at_cursor("SELECT 42", 4), "SELECT 42");
+        assert_eq!(
+            super::statement_at_cursor("SELECT 42", 4, None),
+            "SELECT 42"
+        );
     }
 
     #[test]
     fn statement_runs_in_range_split_sql_and_track_first_rows() {
         let text = "SELECT 1;\n\nSELECT *\nFROM schema.table;\n  SHOW CREATE TABLE schema.table;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
 
         assert_eq!(
             runs,
@@ -12269,14 +12217,14 @@ mod tests {
     fn statement_at_cursor_does_not_split_on_a_semicolon_inside_a_string_literal() {
         let text = "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;s:4:\"week\";i:1;}');\nSELECT 1;";
         assert_eq!(
-            super::statement_at_cursor(text, 10),
+            super::statement_at_cursor(text, 10, None),
             "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;s:4:\"week\";i:1;}')"
         );
         // The cursor in the second, unrelated statement must still resolve to
         // just that statement, not accidentally swallow the first one too.
         let second_start = text.rfind("SELECT 1").expect("SELECT 1 present");
         assert_eq!(
-            super::statement_at_cursor(text, second_start + 3),
+            super::statement_at_cursor(text, second_start + 3, None),
             "SELECT 1"
         );
     }
@@ -12284,7 +12232,7 @@ mod tests {
     #[test]
     fn statement_runs_in_range_does_not_split_a_multi_row_insert_on_embedded_semicolons() {
         let text = "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;}'), ('b;c');\nSELECT 1;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
 
         assert_eq!(
             runs,
@@ -12310,7 +12258,7 @@ mod tests {
     fn statement_runs_in_range_splits_a_multi_command_mongo_shell_script() {
         let text =
             "db.users.find({name: \"a;b\"});\ndb.orders.insertOne({total: 10, note: 'x;y'});";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
 
         assert_eq!(
             runs,
@@ -12339,7 +12287,7 @@ mod tests {
     #[test]
     fn statement_runs_in_range_splits_a_multi_command_redis_script() {
         let text = "SET greeting \"hi;there\";\nHSET user:1 name \"a;b\"";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
 
         assert_eq!(
             runs,
@@ -12360,7 +12308,9 @@ mod tests {
 
     #[test]
     fn skip_leading_whitespace_and_comments_handles_all_cases() {
-        use super::skip_leading_whitespace_and_comments as skip;
+        fn skip(text: &str) -> usize {
+            super::skip_leading_whitespace_and_comments(text, true)
+        }
 
         assert_eq!(skip(""), 0);
         assert_eq!(skip("   \n\t "), 6);
@@ -12386,9 +12336,76 @@ mod tests {
     const CURSOR_BUG_REPORT_SQL: &str = "SELECT COUNT(*) FROM instruments.financials_values; -- 228475\nSELECT * FROM instruments.financials_values;\n\nSELECT COUNT(*) FROM instruments.financials_indicators; -- 233\n";
 
     fn run_at_cursor(text: &str, cursor: usize) -> Option<super::SqlStatementRun> {
-        super::statement_range_at_cursor(text, cursor)
-            .map(|range| super::statement_runs_in_range(text, range))
+        super::statement_range_at_cursor(text, cursor, None)
+            .map(|range| super::statement_runs_in_range(text, range, None))
             .and_then(|runs| runs.into_iter().next())
+    }
+
+    fn run_at_cursor_in(
+        text: &str,
+        cursor: usize,
+        dialect: &dyn sqlparser::dialect::Dialect,
+    ) -> Option<super::SqlStatementRun> {
+        super::statement_range_at_cursor(text, cursor, Some(dialect))
+            .map(|range| super::statement_runs_in_range(text, range, Some(dialect)))
+            .and_then(|runs| runs.into_iter().next())
+    }
+
+    #[test]
+    fn a_statement_without_a_semicolon_runs_alone_under_the_cursor() {
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let text = "SELECT * FROM a\nSELECT * FROM b\n\nSELECT * FROM c";
+        for (needle, expected_sql, expected_row) in [
+            ("FROM a", "SELECT * FROM a", 0),
+            ("FROM b", "SELECT * FROM b", 1),
+            ("FROM c", "SELECT * FROM c", 3),
+        ] {
+            let cursor = text.find(needle).expect("needle") + 2;
+            let run = run_at_cursor_in(text, cursor, &dialect)
+                .unwrap_or_else(|| panic!("a run at cursor {cursor}"));
+            assert_eq!(run.sql, expected_sql, "cursor at {needle}");
+            assert_eq!(run.start_row, expected_row, "cursor at {needle}");
+            assert_eq!(run.end_row, expected_row, "cursor at {needle}");
+        }
+        let cursor = text.find("FROM b").expect("needle");
+        let glued = run_at_cursor(text, cursor).expect("a run without a grammar");
+        assert_eq!(
+            glued.sql.lines().count(),
+            4,
+            "without a grammar nothing tells the statements apart: {:?}",
+            glued.sql
+        );
+    }
+
+    #[test]
+    fn a_selection_over_statements_without_semicolons_runs_each_of_them() {
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let text = "SELECT 1\nSELECT 2\nDELETE FROM t WHERE a = 1";
+        let runs = super::statement_runs_in_range(text, 0..text.len(), Some(&dialect));
+        let sqls: Vec<&str> = runs.iter().map(|run| run.sql.as_str()).collect();
+        assert_eq!(sqls, ["SELECT 1", "SELECT 2", "DELETE FROM t WHERE a = 1"]);
+    }
+
+    #[test]
+    fn the_comment_above_a_statement_without_a_semicolon_does_not_lend_it_its_row() {
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let text = "SELECT * FROM a WHERE x = ''\n#WHERE c.ci = 1\nSELECT * FROM countries";
+        let cursor = text.find("countries").expect("needle");
+        let run = run_at_cursor_in(text, cursor, &dialect).expect("a run");
+        assert_eq!(run.sql, "SELECT * FROM countries");
+        assert_eq!(run.start_row, 2, "the marker stands on the query line");
+        let first = run_at_cursor_in(text, 3, &dialect).expect("the first run");
+        assert_eq!(first.sql, "SELECT * FROM a WHERE x = ''");
+    }
+
+    #[test]
+    fn a_hash_operator_in_postgresql_does_not_hide_the_semicolon_after_it() {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let text = "SELECT data #> '{a}' FROM t;\nSELECT 2;";
+        let first = run_at_cursor_in(text, 3, &dialect).expect("the first run");
+        assert_eq!(first.sql, "SELECT data #> '{a}' FROM t");
+        let second = run_at_cursor_in(text, text.len() - 3, &dialect).expect("the second run");
+        assert_eq!(second.sql, "SELECT 2");
     }
 
     #[test]
@@ -12483,7 +12500,7 @@ mod tests {
     #[test]
     fn hash_line_comment_semicolon_does_not_split() {
         let text = "SELECT 1 # note ; still comment\n+ 1;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 1 # note ; still comment\n+ 1");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12495,8 +12512,11 @@ mod tests {
 
     #[test]
     fn a_hash_comment_before_a_statement_is_not_where_the_statement_starts() {
-        let runs =
-            super::statement_runs_in_range(COMMENTED_OUT_LINE_SQL, 0..COMMENTED_OUT_LINE_SQL.len());
+        let runs = super::statement_runs_in_range(
+            COMMENTED_OUT_LINE_SQL,
+            0..COMMENTED_OUT_LINE_SQL.len(),
+            None,
+        );
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[1].sql, "SELECT * FROM ec_fmedia.countries");
         assert_eq!(
@@ -12524,7 +12544,7 @@ mod tests {
     #[test]
     fn a_trailing_hash_comment_is_not_a_statement_to_run() {
         let text = "SELECT 1;\n# just a note\n";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 1, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 1");
     }
@@ -12532,7 +12552,7 @@ mod tests {
     #[test]
     fn block_comment_semicolon_does_not_split() {
         let text = "SELECT 1 /* a ; b ; c */ + 1;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 1 /* a ; b ; c */ + 1");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12541,7 +12561,7 @@ mod tests {
     #[test]
     fn semicolon_inside_backtick_identifier_does_not_split() {
         let text = "CREATE TABLE `weird;name` (id INT);\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "CREATE TABLE `weird;name` (id INT)");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12550,7 +12570,7 @@ mod tests {
     #[test]
     fn semicolon_inside_backslash_escaped_single_quote_does_not_split() {
         let text = "SELECT '\\';' AS a;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT '\\';' AS a");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12560,7 +12580,7 @@ mod tests {
     #[test]
     fn php_style_escaped_quote_pattern_splits_correctly() {
         let text = "SELECT x FROM t WHERE x = '\\'' AND y = 'z';\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT x FROM t WHERE x = '\\'' AND y = 'z'");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12569,7 +12589,7 @@ mod tests {
     #[test]
     fn doubled_quote_string_escape_protects_embedded_semicolons() {
         let text = "SELECT 'a;b''c;d';\nSELECT \"e;f\"\"g;h\";";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 'a;b''c;d'");
         assert_eq!(runs[1].sql, "SELECT \"e;f\"\"g;h\"");
@@ -12578,7 +12598,7 @@ mod tests {
     #[test]
     fn doubled_backtick_identifier_escape_protects_embedded_semicolon() {
         let text = "SELECT * FROM `we``ird;name`;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT * FROM `we``ird;name`");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12587,7 +12607,7 @@ mod tests {
     #[test]
     fn comment_introducers_inside_a_string_are_literal() {
         let text = "SELECT '-- x; /* y ; */ z';\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT '-- x; /* y ; */ z'");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12599,11 +12619,12 @@ mod tests {
         // expose the semicolons it swallows as false statement boundaries.
         let unterminated_string = "SELECT 'oops ; no close\nSELECT 2";
         let runs =
-            super::statement_runs_in_range(unterminated_string, 0..unterminated_string.len());
+            super::statement_runs_in_range(unterminated_string, 0..unterminated_string.len(), None);
         assert_eq!(runs.len(), 1, "runs: {runs:?}");
 
         let unterminated_block = "SELECT 1 /* oops ; no close\nSELECT 2";
-        let runs = super::statement_runs_in_range(unterminated_block, 0..unterminated_block.len());
+        let runs =
+            super::statement_runs_in_range(unterminated_block, 0..unterminated_block.len(), None);
         assert_eq!(runs.len(), 1, "runs: {runs:?}");
     }
 
@@ -12613,7 +12634,7 @@ mod tests {
     #[test]
     fn leading_pmm_name_comment_is_skipped_and_statement_runs() {
         let text = "-- name: CountRows :one\nSELECT COUNT(*) FROM t;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT COUNT(*) FROM t");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12628,7 +12649,7 @@ mod tests {
     #[test]
     fn double_dash_without_trailing_space_is_not_a_comment() {
         let text = "SELECT 5--3;\nSELECT 2;";
-        let runs = super::statement_runs_in_range(text, 0..text.len());
+        let runs = super::statement_runs_in_range(text, 0..text.len(), None);
         assert_eq!(runs.len(), 2, "runs: {runs:?}");
         assert_eq!(runs[0].sql, "SELECT 5--3");
         assert_eq!(runs[1].sql, "SELECT 2");
@@ -12665,7 +12686,7 @@ mod tests {
         let offset = database_start + 2;
 
         assert_eq!(
-            super::database_reference_at_offset(text, offset),
+            super::database_reference_at_offset(text, offset, None),
             Some(super::SqlDatabaseReference {
                 database: "instruments".to_string(),
                 start: database_start,
@@ -12679,7 +12700,10 @@ mod tests {
         let text = "SELECT * FROM instruments.splits;";
         let offset = text.find("splits").expect("table in sql") + 1;
 
-        assert_eq!(super::database_reference_at_offset(text, offset), None);
+        assert_eq!(
+            super::database_reference_at_offset(text, offset, None),
+            None
+        );
     }
 
     #[test]
@@ -12689,7 +12713,7 @@ mod tests {
         let offset = database_start + 3;
 
         assert_eq!(
-            super::database_reference_at_offset(text, offset),
+            super::database_reference_at_offset(text, offset, None),
             Some(super::SqlDatabaseReference {
                 database: "instruments".to_string(),
                 start: database_start,
@@ -12705,7 +12729,7 @@ mod tests {
         let offset = database_start + 1;
 
         assert_eq!(
-            super::database_reference_at_offset(text, offset),
+            super::database_reference_at_offset(text, offset, None),
             Some(super::SqlDatabaseReference {
                 database: "public".to_string(),
                 start: database_start,
@@ -12719,7 +12743,10 @@ mod tests {
         let text = "SET a.b = 1";
         let offset = text.find("a.b").expect("qualified word in sql");
 
-        assert_eq!(super::database_reference_at_offset(text, offset), None);
+        assert_eq!(
+            super::database_reference_at_offset(text, offset, None),
+            None
+        );
     }
 
     #[test]
@@ -12768,7 +12795,7 @@ mod tests {
     fn from_tables_at_offset_resolves_alias_to_table() {
         let text = "SELECT * FROM instruments.splits AS s WHERE s.operation;";
         let offset = text.rfind("operation").expect("column in sql");
-        let tables = super::from_tables_at_offset(text, offset);
+        let tables = super::from_tables_at_offset(text, offset, None);
 
         let resolved = crate::sql_completion_provider::resolve_table_ref("s", &tables)
             .expect("alias resolves");
@@ -12780,7 +12807,7 @@ mod tests {
     fn from_tables_at_offset_resolves_alias_before_from_in_select_list() {
         let text = "SELECT s.opera FROM instruments.splits AS s WHERE s.operation;";
         let offset = text.find("opera").expect("column in sql");
-        let tables = super::from_tables_at_offset(text, offset);
+        let tables = super::from_tables_at_offset(text, offset, None);
 
         let resolved = crate::sql_completion_provider::resolve_table_ref("s", &tables)
             .expect("alias resolves from a SELECT-list offset before FROM is parsed");
@@ -12795,7 +12822,7 @@ mod tests {
         let inner_offset = text
             .rfind("inner_s.operation")
             .expect("inner column in sql");
-        let inner_tables = super::from_tables_at_offset(text, inner_offset);
+        let inner_tables = super::from_tables_at_offset(text, inner_offset, None);
         let inner_resolved =
             crate::sql_completion_provider::resolve_table_ref("inner_s", &inner_tables)
                 .expect("subquery alias resolves");
@@ -12806,7 +12833,7 @@ mod tests {
         );
 
         let outer_offset = text.find("outer_s.name").expect("outer column in sql");
-        let outer_tables = super::from_tables_at_offset(text, outer_offset);
+        let outer_tables = super::from_tables_at_offset(text, outer_offset, None);
         let outer_resolved =
             crate::sql_completion_provider::resolve_table_ref("outer_s", &outer_tables)
                 .expect("outer alias resolves");
@@ -12819,7 +12846,7 @@ mod tests {
             (SELECT id FROM t2 WHERE id IN \
             (SELECT id FROM t3 WHERE t3.flag = 1))";
         let offset = text.rfind("t3.flag").expect("column in sql");
-        let tables = super::from_tables_at_offset(text, offset);
+        let tables = super::from_tables_at_offset(text, offset, None);
 
         let resolved = crate::sql_completion_provider::resolve_table_ref("t3", &tables)
             .expect("innermost table resolves three levels deep");
@@ -12834,7 +12861,8 @@ mod tests {
     fn insert_column_context_resolves_column_list_to_target_table() {
         let text = "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname) SELECT 1, 2, 3;";
         let offset = text.find("shortname").expect("column in sql") + 2;
-        let context = super::insert_column_context_at_offset(text, offset).expect("insert context");
+        let context =
+            super::insert_column_context_at_offset(text, offset, None).expect("insert context");
         assert_eq!(context.database.as_deref(), Some("ec_fmedia"));
         assert_eq!(context.table, "quotes_pair_translate");
         let (start, end) = context.column_list.expect("column list span");
@@ -12845,7 +12873,8 @@ mod tests {
     #[test]
     fn insert_column_context_finds_on_duplicate_key_update_span() {
         let text = "INSERT INTO t (a, b) SELECT 1, 2 ON DUPLICATE KEY UPDATE a = VALUES(a), b = VALUES(b);";
-        let context = super::insert_column_context_at_offset(text, 0).expect("insert context");
+        let context =
+            super::insert_column_context_at_offset(text, 0, None).expect("insert context");
         assert_eq!(context.table, "t");
         let clause_start = context.on_duplicate_key_update.expect("clause span");
         assert_eq!(&text[clause_start..clause_start + 1], "a");
@@ -12905,7 +12934,7 @@ mod tests {
             JOIN (SELECT qdt.currency_ID FROM ec_fmedia.quotes_currency_dat_trans qdt) q2 \
             ON q1.lang_id = q2.currency_ID;";
         let offset = text.find("q1.lang_id").expect("outer column reference");
-        let derived_tables = super::derived_tables_at_offset(text, offset);
+        let derived_tables = super::derived_tables_at_offset(text, offset, None);
 
         let q1 = derived_tables
             .iter()
@@ -13150,7 +13179,7 @@ mod tests {
         let offset = text.find("splits").expect("splits in sql") + 2;
 
         assert_eq!(
-            super::statement_table_reference_at_offset(text, offset),
+            super::statement_table_reference_at_offset(text, offset, None),
             Some(super::SqlTableReference {
                 database: Some("instruments".to_string()),
                 table: "splits".to_string(),
@@ -13166,7 +13195,7 @@ mod tests {
         let offset = text.find("instruments").expect("schema in sql") + 2;
 
         assert_eq!(
-            super::statement_table_reference_at_offset(text, offset),
+            super::statement_table_reference_at_offset(text, offset, None),
             None
         );
     }

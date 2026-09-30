@@ -9,6 +9,8 @@ use sqlparser::dialect::{
 };
 use sqlparser::parser::Parser;
 
+use crate::console_statements::statement_spans;
+
 /// Returns the sqlparser dialect matching a connection's driver.
 ///
 /// `GenericDialect` is used as a placeholder for any future driver that gains
@@ -32,116 +34,6 @@ pub(crate) fn dialect_for_driver(driver: DatabaseDriver) -> Option<Box<dyn Diale
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ScanState {
-    Normal,
-    SingleQuoted,
-    DoubleQuoted,
-    Backtick,
-    LineComment,
-    BlockComment,
-}
-
-/// Splits SQL text into top-level statement byte-ranges, split on `;`.
-///
-/// Unlike a naive `str::find(';')`, this tracks quoting/comment state so a
-/// semicolon inside a string literal, a quoted identifier, or a comment does
-/// not end the statement early. Doubled quotes (`''`, `""`, `` `` ``) and
-/// backslash escapes inside a quoted section are treated as part of the
-/// quoted content, not as closing it.
-pub(crate) fn statement_spans(text: &str) -> Vec<Range<usize>> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut state = ScanState::Normal;
-    let mut start = 0usize;
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match state {
-            ScanState::Normal => match byte {
-                b'\'' => state = ScanState::SingleQuoted,
-                b'"' => state = ScanState::DoubleQuoted,
-                b'`' => state = ScanState::Backtick,
-                b'#' => state = ScanState::LineComment,
-                b'-' if bytes.get(index + 1) == Some(&b'-')
-                    && bytes.get(index + 2).is_none_or(|&b| b <= b' ') =>
-                {
-                    state = ScanState::LineComment;
-                    index += 1;
-                }
-                b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                    state = ScanState::BlockComment;
-                    index += 1;
-                }
-                b';' => {
-                    spans.push(start..index);
-                    start = index + 1;
-                }
-                _ => {}
-            },
-            ScanState::SingleQuoted | ScanState::DoubleQuoted | ScanState::Backtick => {
-                let quote = match state {
-                    ScanState::SingleQuoted => b'\'',
-                    ScanState::DoubleQuoted => b'"',
-                    _ => b'`',
-                };
-                if byte == b'\\' && state != ScanState::Backtick {
-                    // Backslash-escapes the next byte in MySQL-style strings; skip it
-                    // so an escaped quote character is not mistaken for the closer.
-                    index += 1;
-                } else if byte == quote {
-                    if bytes.get(index + 1) == Some(&quote) {
-                        // Doubled quote is an escaped literal quote, not a closer.
-                        index += 1;
-                    } else {
-                        state = ScanState::Normal;
-                    }
-                }
-            }
-            ScanState::LineComment => {
-                if byte == b'\n' {
-                    state = ScanState::Normal;
-                }
-            }
-            ScanState::BlockComment => {
-                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    state = ScanState::Normal;
-                    index += 1;
-                }
-            }
-        }
-        index += 1;
-    }
-
-    if start < bytes.len() {
-        if matches!(
-            state,
-            ScanState::SingleQuoted | ScanState::DoubleQuoted | ScanState::Backtick
-        ) {
-            // Unterminated quote: the scanner never returned to Normal, so any
-            // ';' it swallowed after `start` may really be a statement
-            // boundary. Re-split the tail on ';' so one malformed statement
-            // cannot merge every following statement into a single blob.
-            let mut sub_start = start;
-            let mut sub_index = start;
-            while sub_index < bytes.len() {
-                if bytes[sub_index] == b';' {
-                    spans.push(sub_start..sub_index);
-                    sub_start = sub_index + 1;
-                }
-                sub_index += 1;
-            }
-            if sub_start < bytes.len() {
-                spans.push(sub_start..bytes.len());
-            }
-        } else {
-            spans.push(start..bytes.len());
-        }
-    }
-    spans
-}
-
 /// Pretty-prints every statement in `text` (keyword case, indentation, line
 /// breaks), preserving statement boundaries. Returns `None` — leaving the
 /// buffer untouched — if the driver has no SQL dialect, `text` has no
@@ -162,7 +54,7 @@ pub(crate) fn format_sql(text: &str, driver: DatabaseDriver) -> Option<String> {
     };
 
     let mut formatted_statements = Vec::new();
-    for span in statement_spans(text) {
+    for span in statement_spans(text, Some(dialect.as_ref())) {
         let trimmed = text[span].trim();
         if trimmed.is_empty() {
             continue;
@@ -182,9 +74,13 @@ pub(crate) fn format_sql(text: &str, driver: DatabaseDriver) -> Option<String> {
 }
 
 /// Finds the byte-range of the statement containing `offset`, per [`statement_spans`].
-pub(crate) fn statement_span_at(text: &str, offset: usize) -> Option<Range<usize>> {
+pub(crate) fn statement_span_at(
+    text: &str,
+    offset: usize,
+    dialect: &dyn Dialect,
+) -> Option<Range<usize>> {
     let offset = offset.min(text.len());
-    statement_spans(text)
+    statement_spans(text, Some(dialect))
         .into_iter()
         .find(|span| span.contains(&offset) || span.end == offset)
 }
@@ -212,7 +108,7 @@ pub(crate) fn try_parse_statement_at_with_span(
     cursor_offset: usize,
 ) -> Option<(Statement, Range<usize>)> {
     let dialect = dialect_for_driver(driver)?;
-    let span = statement_span_at(text, cursor_offset)?;
+    let span = statement_span_at(text, cursor_offset, dialect.as_ref())?;
     let raw = text.get(span.clone())?;
     let leading = raw.len() - raw.trim_start().len();
     let statement_text = raw.trim();
@@ -248,81 +144,6 @@ mod tests {
     #[test]
     fn dialect_for_driver_returns_none_for_redis() {
         assert!(dialect_for_driver(DatabaseDriver::Redis).is_none());
-    }
-
-    #[test]
-    fn statement_spans_splits_multiple_statements_on_semicolon() {
-        let text = "SELECT 1; SELECT 2;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(&text[spans[0].clone()], "SELECT 1");
-        assert_eq!(&text[spans[1].clone()], " SELECT 2");
-    }
-
-    #[test]
-    fn statement_spans_ignores_semicolon_inside_string_literal() {
-        let text = "SELECT 'a;b' FROM t;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&text[spans[0].clone()], "SELECT 'a;b' FROM t");
-    }
-
-    #[test]
-    fn statement_spans_ignores_semicolon_inside_backtick_identifier() {
-        let text = "SELECT `weird;name` FROM t;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&text[spans[0].clone()], "SELECT `weird;name` FROM t");
-    }
-
-    #[test]
-    fn statement_spans_ignores_semicolon_inside_double_quoted_identifier() {
-        let text = "SELECT \"weird;name\" FROM t;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&text[spans[0].clone()], "SELECT \"weird;name\" FROM t");
-    }
-
-    #[test]
-    fn statement_spans_ignores_semicolon_inside_line_comment() {
-        let text = "SELECT 1 -- trailing ; comment\nFROM t;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 1);
-    }
-
-    #[test]
-    fn statement_spans_keeps_trailing_statement_without_terminator() {
-        let text = "SELECT 1; SELECT 2";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(&text[spans[1].clone()], " SELECT 2");
-    }
-
-    #[test]
-    fn statement_spans_ignores_semicolon_inside_hash_line_comment() {
-        let text = "SELECT 1 # trailing ; comment\nFROM t;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 1);
-    }
-
-    #[test]
-    fn statement_spans_double_dash_without_trailing_space_is_not_a_comment() {
-        // MySQL requires whitespace after `--`; `1--2` is arithmetic, not a
-        // comment, so the following ';' still terminates the statement.
-        let text = "SELECT 1--2; SELECT 3;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 2);
-    }
-
-    #[test]
-    fn statement_spans_recovers_boundary_after_unterminated_quote() {
-        // An unterminated single quote must not swallow every following
-        // statement into one blob; a trailing well-formed statement keeps its
-        // own span. (Fails pre-recovery: yields a single span.)
-        let text = "SELECT 'oops; SELECT 1;";
-        let spans = statement_spans(text);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(&text[spans[1].clone()], " SELECT 1");
     }
 
     #[test]

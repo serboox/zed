@@ -1,3 +1,5 @@
+use crate::console_statements::statement_separators;
+use crate::sql_ast::dialect_for_driver;
 use crate::sql_binder::{self, ScopeBinding};
 use crate::store::DatabaseStore;
 use db_client::schema::TableKind;
@@ -7,6 +9,7 @@ use gpui::{App, Context, Entity, Hsla, Task, WeakEntity, Window};
 use language::{Anchor, Buffer, CodeLabel, ToOffset};
 use project::lsp_store::CompletionDocumentation;
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
+use sqlparser::dialect::Dialect;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -327,6 +330,15 @@ fn current_statement(text_before: &str) -> &str {
     }
 }
 
+/// Text of the SQL statement under the cursor: everything after the last
+/// separator, written or implied by where the grammar ends the statement above.
+fn current_sql_statement<'a>(text_before: &'a str, dialect: Option<&dyn Dialect>) -> &'a str {
+    match statement_separators(text_before, dialect).last() {
+        Some(index) => &text_before[index + 1..],
+        None => text_before,
+    }
+}
+
 /// Identifier that sits immediately before a trailing `.` (after stripping the
 /// word currently being typed). `from instruments.spl` -> `instruments`.
 fn extract_qualifier(text_before: &str) -> Option<String> {
@@ -524,8 +536,8 @@ fn parse_cte_names(statement: &str) -> Vec<String> {
     names
 }
 
-fn parse_context(text_before: &str) -> ParsedContext {
-    let statement = current_statement(text_before);
+fn parse_context(text_before: &str, dialect: Option<&dyn Dialect>) -> ParsedContext {
+    let statement = current_sql_statement(text_before, dialect);
     let scope = &statement[innermost_scope_start(statement)..];
     ParsedContext {
         qualifier: extract_qualifier(text_before),
@@ -1089,7 +1101,8 @@ impl CompletionProvider for SqlCompletionProvider {
         // not a fallback bolted on as an afterthought.
         let full_text: String = buffer.read(cx).snapshot().text();
         let cursor_offset = text_before.len();
-        let heuristic_context = parse_context(&text_before);
+        let dialect = dialect_for_driver(driver);
+        let heuristic_context = parse_context(&text_before, dialect.as_deref());
         let (context, extra_columns) = match ast_tables_in_scope(&full_text, driver, cursor_offset)
         {
             Some((tables_in_scope, extra_columns)) => (
@@ -1233,7 +1246,25 @@ mod tests {
     use super::*;
 
     fn ctx(text_before: &str) -> ParsedContext {
-        parse_context(text_before)
+        parse_context(text_before, None)
+    }
+
+    #[test]
+    fn a_statement_without_a_semicolon_is_scoped_to_its_own_tables() {
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let text = "SELECT * FROM orders o\nSELECT * FROM users u WHERE u.";
+        let context = parse_context(text, Some(&dialect));
+        let aliases: Vec<_> = context
+            .tables_in_scope
+            .iter()
+            .map(|table| table.alias.as_deref())
+            .collect();
+        assert_eq!(aliases, [Some("u")], "the statement above is not in scope");
+        let glued = parse_context(text, None);
+        assert!(
+            glued.tables_in_scope.len() > 1,
+            "without a grammar the two statements are one"
+        );
     }
 
     #[test]
@@ -1715,7 +1746,7 @@ mod tests {
         assert!(ast_tables_in_scope(text, DatabaseDriver::MySQL, text.len()).is_none());
         // The pre-existing heuristic path is completely unaffected: it still
         // resolves the same in-scope table from the same (incomplete) text.
-        let context = parse_context(text);
+        let context = parse_context(text, None);
         assert_eq!(context.tables_in_scope[0].alias.as_deref(), Some("o"));
     }
 

@@ -9,7 +9,8 @@ use sqlparser::ast::{
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Span};
 
-use crate::sql_ast::{dialect_for_driver, statement_spans};
+use crate::console_statements::statement_spans;
+use crate::sql_ast::dialect_for_driver;
 use crate::sql_binder::{
     BindCtx, NavigationTarget, SchemaLookup, database_and_table, offset_for_location,
     resolve_navigation,
@@ -51,7 +52,7 @@ pub(crate) fn validate(
         return Vec::new();
     };
     let mut diagnostics = Vec::new();
-    for span in statement_spans(text) {
+    for span in statement_spans(text, Some(dialect.as_ref())) {
         let Some(statement_text) = text.get(span.clone()) else {
             continue;
         };
@@ -104,7 +105,7 @@ pub(crate) fn validate(
 /// entirely rather than misparsing shell calls as SQL.
 fn validate_mongo_shell(text: &str) -> Vec<SqlDiagnostic> {
     let mut diagnostics = Vec::new();
-    for span in statement_spans(text) {
+    for span in statement_spans(text, None) {
         let Some(statement_text) = text.get(span.clone()) else {
             continue;
         };

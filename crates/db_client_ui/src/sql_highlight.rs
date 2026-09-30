@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 
 use db_client::DatabaseDriver;
 
-use crate::sql_ast::{dialect_for_driver, statement_spans};
+use crate::console_statements::statement_spans;
+use crate::sql_ast::dialect_for_driver;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SqlTokenKind {
@@ -34,11 +35,11 @@ pub(crate) struct SqlHighlightToken {
 /// This is the resilience the console needs, because tree-sitter would instead
 /// paint the whole rest of the buffer as one string once a quote goes unclosed.
 pub(crate) fn highlight_tokens(text: &str, driver: DatabaseDriver) -> Vec<SqlHighlightToken> {
-    if dialect_for_driver(driver).is_none() {
+    let Some(dialect) = dialect_for_driver(driver) else {
         return Vec::new();
-    }
+    };
     let mut tokens = Vec::new();
-    for span in statement_spans(text) {
+    for span in statement_spans(text, Some(dialect.as_ref())) {
         tokenize_statement(&text[span.clone()], span.start, &mut tokens);
     }
     tokens

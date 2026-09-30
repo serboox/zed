@@ -1,6 +1,7 @@
 mod aerospike_view;
 mod compare_data;
 mod connection_view;
+mod console_statements;
 mod data_import;
 mod db_agent_tools;
 mod db_migration;

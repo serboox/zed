@@ -12,13 +12,16 @@ use ui::{
 use util::ResultExt;
 use workspace::{ModalView, StatusItemView, item::ItemHandle};
 
+use sqlparser::dialect::Dialect;
+
+use crate::sql_ast::dialect_for_driver;
 use crate::store::{DatabaseStore, DatabaseStoreEvent};
 
 /// Splits `text` into individual SQL statements using the same quote/comment
 /// aware boundary detection as the query console's statement-at-cursor
 /// resolution, so a heavy multi-statement script is never split mid-string.
-pub(crate) fn split_sql_statements(text: &str) -> Vec<String> {
-    crate::panel::statement_runs_in_range(text, 0..text.len())
+pub(crate) fn split_sql_statements(text: &str, dialect: Option<&dyn Dialect>) -> Vec<String> {
+    crate::panel::statement_runs_in_range(text, 0..text.len(), dialect)
         .into_iter()
         .map(|run| run.sql)
         .collect()
@@ -70,7 +73,12 @@ impl DatabaseStore {
         sql_text: String,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let statements = split_sql_statements(&sql_text);
+        let dialect = self
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .and_then(|connection| dialect_for_driver(connection.config.driver));
+        let statements = split_sql_statements(&sql_text, dialect.as_deref());
         if statements.is_empty() {
             return None;
         }
@@ -486,7 +494,7 @@ mod tests {
     #[test]
     fn split_sql_statements_separates_a_multi_statement_script() {
         let text = "INSERT INTO t VALUES (1);\nUPDATE t SET a = 1 WHERE id = 1;\n";
-        let statements = split_sql_statements(text);
+        let statements = split_sql_statements(text, None);
         assert_eq!(
             statements,
             vec![
@@ -499,7 +507,7 @@ mod tests {
     #[test]
     fn split_sql_statements_ignores_semicolons_inside_string_literals() {
         let text = "INSERT INTO t (name) VALUES ('a;b');\nSELECT 1;";
-        let statements = split_sql_statements(text);
+        let statements = split_sql_statements(text, None);
         assert_eq!(
             statements,
             vec![
@@ -511,7 +519,7 @@ mod tests {
 
     #[test]
     fn split_sql_statements_is_empty_for_blank_input() {
-        assert!(split_sql_statements("   \n\t  ").is_empty());
+        assert!(split_sql_statements("   \n\t  ", None).is_empty());
     }
 
     #[gpui::test]
