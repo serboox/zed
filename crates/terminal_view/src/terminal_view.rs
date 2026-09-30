@@ -1921,6 +1921,14 @@ impl Item for TerminalView {
         }
     }
 
+    fn running_task_name(&self, cx: &App) -> Option<SharedString> {
+        self.terminal
+            .read(cx)
+            .task()
+            .filter(|task| task.status == TaskStatus::Running)
+            .map(|task| task.spawned_task.label.clone().into())
+    }
+
     fn has_conflict(&self, _cx: &App) -> bool {
         false
     }

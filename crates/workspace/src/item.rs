@@ -306,6 +306,13 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         false
     }
 
+    /// The name of the task this item is running, while it runs. Closing an
+    /// item that runs one ends the task, which is what the reader is asked
+    /// about, rather than about saving anything.
+    fn running_task_name(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
     fn save(
         &mut self,
         _options: SaveOptions,
@@ -550,6 +557,7 @@ pub trait ItemHandle: 'static + Send {
     fn has_conflict(&self, cx: &App) -> bool;
     fn can_save(&self, cx: &App) -> bool;
     fn can_save_as(&self, cx: &App) -> bool;
+    fn running_task_name(&self, cx: &App) -> Option<SharedString>;
     fn save(
         &self,
         options: SaveOptions,
@@ -1088,6 +1096,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).can_save_as(cx)
     }
 
+    fn running_task_name(&self, cx: &App) -> Option<SharedString> {
+        self.read(cx).running_task_name(cx)
+    }
+
     fn save(
         &self,
         options: SaveOptions,
@@ -1481,6 +1493,7 @@ pub mod test {
         pub save_as_count: usize,
         pub reload_count: usize,
         pub is_dirty: bool,
+        pub running_task: Option<String>,
         pub save_error: Option<String>,
         pub buffer_kind: ItemBufferKind,
         pub has_conflict: bool,
@@ -1574,6 +1587,7 @@ pub mod test {
                 save_as_count: 0,
                 reload_count: 0,
                 is_dirty: false,
+                running_task: None,
                 save_error: None,
                 has_conflict: false,
                 has_deleted_file: false,
@@ -1612,6 +1626,14 @@ pub mod test {
 
         pub fn with_dirty(mut self, dirty: bool) -> Self {
             self.is_dirty = dirty;
+            self
+        }
+
+        /// Makes the item one that runs the task `name`, which counts as unsaved
+        /// for as long as it runs, the way a terminal's does.
+        pub fn with_running_task(mut self, name: &str) -> Self {
+            self.running_task = Some(name.to_string());
+            self.is_dirty = true;
             self
         }
 
@@ -1774,6 +1796,7 @@ pub mod test {
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
                     is_dirty: self.is_dirty,
+                    running_task: self.running_task.clone(),
                     save_error: self.save_error.clone(),
                     buffer_kind: self.buffer_kind,
                     has_conflict: self.has_conflict,
@@ -1817,6 +1840,10 @@ pub mod test {
 
         fn can_save_as(&self, _cx: &App) -> bool {
             self.buffer_kind == ItemBufferKind::Singleton
+        }
+
+        fn running_task_name(&self, _cx: &App) -> Option<SharedString> {
+            self.running_task.clone().map(SharedString::from)
         }
 
         fn capability(&self, _: &App) -> Capability {

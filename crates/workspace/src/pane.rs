@@ -1943,6 +1943,9 @@ impl Pane {
                     .and_then(|path| path.path.file_name().map(ToOwned::to_owned));
                 file_names.insert(filename.unwrap_or("untitled".to_string()));
             });
+            if let Some(task_name) = item.running_task_name(cx) {
+                file_names.insert(format!("{task_name} (running)"));
+            }
         }
         if file_names.len() > 6 {
             format!(
@@ -1998,21 +2001,47 @@ impl Pane {
             })?;
 
             if save_intent == SaveIntent::Close && dirty_items.len() > 1 {
-                let answer = pane.update_in(cx, |_, window, cx| {
-                    let detail = Self::file_names_for_prompt(&mut dirty_items.iter(), cx);
-                    window.prompt(
-                        PromptLevel::Warning,
-                        "Do you want to save changes to the following files?",
-                        Some(&detail),
-                        &["Save all", "Discard all", "Cancel"],
-                        cx,
-                    )
+                let only_running_tasks = pane.update(cx, |_, cx| {
+                    dirty_items
+                        .iter()
+                        .all(|item| item.running_task_name(cx).is_some())
                 })?;
-                match answer.await {
-                    Ok(0) => save_intent = SaveIntent::SaveAll,
-                    Ok(1) => save_intent = SaveIntent::Skip,
-                    Ok(2) => return Ok(()),
-                    _ => {}
+                if only_running_tasks {
+                    // Nothing to save: what closing costs is the tasks that end.
+                    let answer = pane.update_in(cx, |_, window, cx| {
+                        let names = dirty_items
+                            .iter()
+                            .filter_map(|item| item.running_task_name(cx))
+                            .join("\n");
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &format!("{} tasks are still running", dirty_items.len()),
+                            Some(&names),
+                            &["Stop them", "Cancel"],
+                            cx,
+                        )
+                    })?;
+                    match answer.await {
+                        Ok(0) => save_intent = SaveIntent::Skip,
+                        _ => return Ok(()),
+                    }
+                } else {
+                    let answer = pane.update_in(cx, |_, window, cx| {
+                        let detail = Self::file_names_for_prompt(&mut dirty_items.iter(), cx);
+                        window.prompt(
+                            PromptLevel::Warning,
+                            "Do you want to save changes to the following files?",
+                            Some(&detail),
+                            &["Save all", "Discard all", "Cancel"],
+                            cx,
+                        )
+                    })?;
+                    match answer.await {
+                        Ok(0) => save_intent = SaveIntent::SaveAll,
+                        Ok(1) => save_intent = SaveIntent::Skip,
+                        Ok(2) => return Ok(()),
+                        _ => {}
+                    }
                 }
             }
 
@@ -8369,6 +8398,95 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         close_task.await.unwrap();
         assert_item_labels(&pane, ["Dirty*^"], cx);
+    }
+
+    fn add_running_item(
+        pane: &Entity<Pane>,
+        label: &str,
+        task: &str,
+        cx: &mut VisualTestContext,
+    ) -> Box<Entity<TestItem>> {
+        pane.update_in(cx, |pane, window, cx| {
+            let item =
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label).with_running_task(task)));
+            pane.add_item(item.clone(), false, false, None, window, cx);
+            item
+        })
+    }
+
+    fn close_all_with_prompt(pane: &Entity<Pane>, cx: &mut VisualTestContext) -> Task<Result<()>> {
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_all_items(
+                &CloseAllItems {
+                    save_intent: None,
+                    close_pinned: false,
+                },
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Closing several tabs that only run tasks asks about the tasks, by name,
+    /// and not about saving files there are none of.
+    #[gpui::test]
+    async fn test_closing_several_running_tasks_names_them(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        add_running_item(&pane, "A", "api server", cx);
+        add_running_item(&pane, "B", "unit tests", cx);
+
+        let closing = close_all_with_prompt(&pane, cx);
+        cx.executor().run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "2 tasks are still running".to_string(),
+                "api server\nunit tests".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        closing.await.unwrap();
+        assert_item_labels(&pane, ["A^", "B*^"], cx);
+
+        let closing = close_all_with_prompt(&pane, cx);
+        cx.executor().run_until_parked();
+        cx.simulate_prompt_answer("Stop them");
+        closing.await.unwrap();
+        assert_item_labels(&pane, [], cx);
+    }
+
+    /// With a file among the tabs the question is still about saving, and the
+    /// task is listed beside the file, marked as running.
+    #[gpui::test]
+    async fn test_closing_a_running_task_beside_a_file_lists_both(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        add_running_item(&pane, "A", "api server", cx);
+        add_labeled_item(&pane, "B", true, cx).update(cx, |item, cx| {
+            item.project_items
+                .push(TestProjectItem::new_dirty(2, "B.txt", cx))
+        });
+
+        let closing = close_all_with_prompt(&pane, cx);
+        cx.executor().run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Do you want to save changes to the following files?".to_string(),
+                "B.txt\napi server (running)".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        closing.await.unwrap();
     }
 
     #[gpui::test]
