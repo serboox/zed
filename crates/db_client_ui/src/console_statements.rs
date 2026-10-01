@@ -96,14 +96,23 @@ pub(crate) fn nested_queries_at(
     let Some(dialect) = dialect else {
         return Vec::new();
     };
-    read_nested_queries(text, dialect)
+    read_nested_queries(text, cursor, dialect, MOST_BYTES_READ_BACK)
         .unwrap_or_default()
         .into_iter()
         .filter(|nested| nested.range.start <= cursor && cursor <= nested.range.end)
         .collect()
 }
 
-fn read_nested_queries(text: &str, dialect: &dyn Dialect) -> Option<Vec<NestedQuery>> {
+/// How many bytes of pieces are read back to check them, for one statement. A
+/// piece past that is not offered, rather than offered unchecked.
+const MOST_BYTES_READ_BACK: usize = 256 * 1024;
+
+fn read_nested_queries(
+    text: &str,
+    cursor: usize,
+    dialect: &dyn Dialect,
+    mut budget: usize,
+) -> Option<Vec<NestedQuery>> {
     let tokens = Tokenizer::new(dialect, text)
         .tokenize_with_location()
         .ok()?;
@@ -125,8 +134,12 @@ fn read_nested_queries(text: &str, dialect: &dyn Dialect) -> Option<Vec<NestedQu
     let mut collector = NestedQueryCollector::default();
     let _ = statement.visit(&mut collector);
 
-    let mut found: Vec<(Span, String, bool, u8)> = Vec::new();
-    for query in &collector.queries {
+    let mut found: Vec<(Span, String, bool, u8, Expected)> = Vec::new();
+    for query in collector
+        .queries
+        .iter()
+        .filter(|query| !query.is_the_statement)
+    {
         let label = collector
             .names
             .get(&query.span)
@@ -137,7 +150,13 @@ fn read_nested_queries(text: &str, dialect: &dyn Dialect) -> Option<Vec<NestedQu
         } else {
             0
         };
-        found.push((query.span, label, query.correlated, priority));
+        found.push((
+            query.span,
+            label,
+            query.correlated,
+            priority,
+            Expected::Query(query.node.clone()),
+        ));
     }
     for branch in &collector.branches {
         let correlated = collector
@@ -145,16 +164,41 @@ fn read_nested_queries(text: &str, dialect: &dyn Dialect) -> Option<Vec<NestedQu
             .get(branch.owner)
             .is_some_and(|owner| owner.correlated);
         let label = format!("Branch {} of UNION", branch.position);
-        found.push((branch.span, label, correlated, 1));
+        found.push((
+            branch.span,
+            label,
+            correlated,
+            1,
+            Expected::Branch(branch.leaf.clone()),
+        ));
     }
-    found.sort_by_key(|(_, _, _, priority)| std::cmp::Reverse(*priority));
+    found.sort_by_key(|(_, _, _, priority, _)| std::cmp::Reverse(*priority));
 
+    let reading = Reading {
+        text,
+        dialect,
+        code: &code,
+        statement_end: whole.end,
+    };
     let mut nested: Vec<NestedQuery> = Vec::new();
-    for (span, label, correlated, _) in found {
+    for (span, label, correlated, _, expected) in found {
         let (Some(start), Some(end)) = (index.offset(span.start), index.offset(span.end)) else {
             continue;
         };
-        let range = start..with_its_closing_parentheses(&code, start, end);
+        let enclosure = reading.enclosure_of(start);
+        if cursor < start || cursor > enclosure.limit {
+            continue;
+        }
+        let end = with_its_closing_parentheses(&code, start, end);
+        // The span the parser reports leaves out what ends some clauses, the `DESC` of
+        // an `ORDER BY` among them. Text that does not read back as the query it was
+        // taken for would run a different query than the one shown, so it is mended
+        // from the tokens that follow, or not offered at all.
+        let Some(end) = reading.end_that_reads_as(start, end, &enclosure, &expected, &mut budget)
+        else {
+            continue;
+        };
+        let range = start..end;
         if range.is_empty()
             || range == whole
             || nested.iter().any(|existing| existing.range == range)
@@ -192,6 +236,139 @@ fn with_its_closing_parentheses(code: &[(Token, Range<usize>)], start: usize, en
         end = end.max(range.end);
     }
     end
+}
+
+/// How many tokens after the reported end are tried when mending a piece that
+/// no `(` encloses.
+const MOST_TOKENS_A_SPAN_MAY_LEAVE_OUT: usize = 24;
+
+/// The group a query sits in.
+struct Enclosure {
+    /// Where the query ends when a `(` opens it: right before the `)` closing
+    /// that `(`, however many tokens the parser left out of its span.
+    exact_end: Option<usize>,
+    /// The furthest the query can reach: the `)` closing its group, or the end
+    /// of the statement when no `(` opens it.
+    limit: usize,
+}
+
+/// The text of one statement and its tokens, which a piece is read back from.
+struct Reading<'a> {
+    text: &'a str,
+    dialect: &'a dyn Dialect,
+    /// Every token that is not whitespace or a comment, with where it is.
+    code: &'a [(Token, Range<usize>)],
+    statement_end: usize,
+}
+
+impl Reading<'_> {
+    fn enclosure_of(&self, start: usize) -> Enclosure {
+        let outside = Enclosure {
+            exact_end: None,
+            limit: self.statement_end,
+        };
+        let Ok(first) = self
+            .code
+            .binary_search_by_key(&start, |(_, range)| range.start)
+        else {
+            return outside;
+        };
+        if !first
+            .checked_sub(1)
+            .and_then(|before| self.code.get(before))
+            .is_some_and(|(token, _)| *token == Token::LParen)
+        {
+            return outside;
+        }
+        let mut depth = 1isize;
+        for (at, (token, range)) in self.code.iter().enumerate().skip(first) {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return Enclosure {
+                    exact_end: at
+                        .checked_sub(1)
+                        .and_then(|before| self.code.get(before))
+                        .map(|(_, range)| range.end),
+                    limit: range.start,
+                };
+            }
+        }
+        outside
+    }
+
+    /// The end, at or after `end`, at which the text from `start` reads as exactly
+    /// `expected`; nothing when no end does, or when `budget` bytes of reading back
+    /// are spent.
+    fn end_that_reads_as(
+        &self,
+        start: usize,
+        end: usize,
+        enclosure: &Enclosure,
+        expected: &Expected,
+        budget: &mut usize,
+    ) -> Option<usize> {
+        let mut reads_as_expected = |end: usize| {
+            let Some(piece) = self.text.get(start..end) else {
+                return false;
+            };
+            if piece.len() > *budget {
+                return false;
+            }
+            *budget -= piece.len();
+            reads_as(piece, self.dialect, expected)
+        };
+        if reads_as_expected(end) {
+            return Some(end);
+        }
+        if let Some(exact_end) = enclosure.exact_end.filter(|exact_end| *exact_end > end) {
+            return reads_as_expected(exact_end).then_some(exact_end);
+        }
+        let mut depth = 0isize;
+        for (token, range) in self
+            .code
+            .iter()
+            .filter(|(_, range)| range.end > end && range.end <= enclosure.limit)
+            .take(MOST_TOKENS_A_SPAN_MAY_LEAVE_OUT)
+        {
+            match token {
+                Token::SemiColon => break,
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                break;
+            }
+            if depth == 0 && reads_as_expected(range.end) {
+                return Some(range.end);
+            }
+        }
+        None
+    }
+}
+
+/// Whether `piece` is one statement that the grammar reads as `expected`.
+fn reads_as(piece: &str, dialect: &dyn Dialect, expected: &Expected) -> bool {
+    let Ok(tokens) = Tokenizer::new(dialect, piece).tokenize_with_location() else {
+        return false;
+    };
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
+    let Ok(Statement::Query(read)) = parser.parse_statement() else {
+        return false;
+    };
+    if parser.peek_token().token != Token::EOF {
+        return false;
+    }
+    match expected {
+        Expected::Query(query) => *read == *query,
+        Expected::Branch(leaf) => {
+            read.with.is_none() && read.order_by.is_none() && *read.body == *leaf
+        }
+    }
 }
 
 /// Turns the line and column the parser reports into a byte offset, without
@@ -235,12 +412,23 @@ struct QueryFrame {
 struct QueryFound {
     span: Span,
     correlated: bool,
+    node: Query,
+    /// The query that is the whole statement, which is never a piece of itself.
+    is_the_statement: bool,
 }
 
 struct UnionBranch {
     span: Span,
     owner: usize,
     position: usize,
+    leaf: SetExpr,
+}
+
+/// What the text of a piece must read back as: the query or branch the grammar
+/// found it as.
+enum Expected {
+    Query(Query),
+    Branch(SetExpr),
 }
 
 /// Walks a statement and records every query in it, with what it is called and
@@ -253,6 +441,7 @@ struct NestedQueryCollector {
     queries: Vec<QueryFound>,
     names: HashMap<Span, String>,
     branches: Vec<UnionBranch>,
+    statement_is_a_query: bool,
 }
 
 fn collect_union_leaves<'a>(body: &'a SetExpr, leaves: &mut Vec<&'a SetExpr>) {
@@ -269,6 +458,7 @@ impl Visitor for NestedQueryCollector {
     type Break = ();
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        self.statement_is_a_query = matches!(statement, Statement::Query(_));
         let source = match statement {
             Statement::Insert(insert) => insert
                 .source
@@ -346,12 +536,15 @@ impl Visitor for NestedQueryCollector {
                     span: leaf.span(),
                     owner: index,
                     position: position + 1,
+                    leaf: leaf.clone(),
                 });
             }
         }
         self.queries.push(QueryFound {
             span: query.span(),
             correlated: false,
+            node: query.clone(),
+            is_the_statement: self.statement_is_a_query && self.queries.is_empty(),
         });
         self.frames.push(frame);
         ControlFlow::Continue(())
@@ -1217,6 +1410,206 @@ mod tests {
     fn comments_around_the_statement_do_not_make_it_a_nested_query_of_itself() {
         let text = "-- a note\nSELECT a FROM t -- trailing\n";
         assert!(nested(text, "a FROM").is_empty());
+    }
+
+    /// Every top-level query the console may be handed, with the clauses that
+    /// end a query: the parser leaves some of them out of the span it reports.
+    const WHOLE_QUERIES: &[&str] = &[
+        "SELECT *\nFROM ec_userdata.opened_positions POS\nWHERE POS.portfolio_id = 59424004\nORDER BY POS.portfolio_id, POS.row_id DESC",
+        "SELECT a FROM t ORDER BY a DESC",
+        "SELECT a FROM t ORDER BY a ASC",
+        "SELECT a FROM t ORDER BY a DESC, b ASC",
+        "SELECT a FROM t ORDER BY a DESC LIMIT 10",
+        "SELECT a FROM t ORDER BY a DESC LIMIT 10 OFFSET 5",
+        "SELECT a FROM t ORDER BY a LIMIT 5, 10",
+        "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY a DESC",
+        "SELECT a FROM t WHERE a > 1 FOR UPDATE",
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY a DESC",
+        "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1 DESC LIMIT 3",
+        "WITH x AS (SELECT a FROM t) SELECT * FROM x ORDER BY a DESC",
+        "SELECT a FROM t WHERE a IN (1, 2, 3) ORDER BY a DESC",
+        "SELECT COUNT(*) FROM t",
+        "SELECT a, SUM(b) OVER (PARTITION BY a ORDER BY c DESC) FROM t ORDER BY a DESC",
+        "-- a note\nSELECT a FROM t ORDER BY a DESC -- trailing\n",
+        "/* first */ SELECT a FROM t ORDER BY a DESC /* last */",
+        "# a note\nSELECT a FROM t ORDER BY a DESC",
+    ];
+
+    fn dialects() -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(MySqlDialect {}), Box::new(PostgreSqlDialect {})]
+    }
+
+    #[test]
+    fn a_statement_that_ends_in_desc_is_not_offered_as_a_piece_of_itself() {
+        let text = "/* getOpenPositionsForPortfolio */\nSELECT *\nFROM ec_userdata.opened_positions POS\nWHERE POS.portfolio_id = 59424004\nORDER BY POS.portfolio_id, POS.row_id DESC";
+        for marker in [
+            "SELECT *",
+            "FROM ec_userdata",
+            "POS.portfolio_id = ",
+            "POS.row_id DESC",
+            "DESC",
+        ] {
+            assert!(
+                nested(text, marker).is_empty(),
+                "offered at {marker:?}: {:?}",
+                nested(text, marker)
+            );
+        }
+    }
+
+    #[test]
+    fn a_piece_in_parentheses_keeps_the_clauses_that_end_it() {
+        for (text, marker, expected) in [
+            (
+                "SELECT * FROM a WHERE id IN (SELECT id FROM b ORDER BY id DESC)",
+                "id FROM b",
+                "SELECT id FROM b ORDER BY id DESC",
+            ),
+            (
+                "SELECT * FROM a WHERE id = (SELECT id FROM b ORDER BY id DESC LIMIT 1)",
+                "id FROM b",
+                "SELECT id FROM b ORDER BY id DESC LIMIT 1",
+            ),
+            (
+                "SELECT * FROM (SELECT a FROM t ORDER BY a DESC LIMIT 5) q",
+                "a FROM t",
+                "SELECT a FROM t ORDER BY a DESC LIMIT 5",
+            ),
+            (
+                "WITH x AS (SELECT a FROM t ORDER BY a DESC LIMIT 2) SELECT * FROM x",
+                "a FROM t",
+                "SELECT a FROM t ORDER BY a DESC LIMIT 2",
+            ),
+            (
+                "INSERT INTO t (a) SELECT a FROM u ORDER BY a DESC",
+                "a FROM u",
+                "SELECT a FROM u ORDER BY a DESC",
+            ),
+        ] {
+            let found = nested(text, marker);
+            assert_eq!(
+                found.first().map(|(_, query, _)| query.as_str()),
+                Some(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Every query and union branch of a statement, as the grammar reads them.
+    #[derive(Default)]
+    struct EveryQuery {
+        queries: Vec<Query>,
+    }
+
+    impl Visitor for EveryQuery {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            self.queries.push(query.clone());
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn is_a_branch_of(query: &Query, branch: &SetExpr) -> bool {
+        let mut leaves = Vec::new();
+        collect_union_leaves(&query.body, &mut leaves);
+        leaves.len() > 1 && leaves.into_iter().any(|leaf| leaf == branch)
+    }
+
+    fn statement_of(text: &str, dialect: &dyn Dialect) -> Option<Statement> {
+        let tokens = Tokenizer::new(dialect, text)
+            .tokenize_with_location()
+            .ok()?;
+        let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
+        let statement = parser.parse_statement().ok()?;
+        (parser.peek_token().token == Token::EOF).then_some(statement)
+    }
+
+    #[test]
+    fn every_piece_offered_runs_the_query_it_names_and_no_other() {
+        let mut texts: Vec<&str> = WHOLE_QUERIES.to_vec();
+        texts.extend([
+            "SELECT * FROM a WHERE id IN (SELECT id FROM b ORDER BY id DESC)",
+            "SELECT * FROM a WHERE id = (SELECT id FROM b ORDER BY id DESC LIMIT 1)",
+            "SELECT * FROM (SELECT a FROM t ORDER BY a DESC LIMIT 5) q WHERE q.a > 1",
+            "WITH x AS (SELECT a FROM t ORDER BY a DESC LIMIT 2) SELECT * FROM x",
+            "INSERT INTO t (a) SELECT a FROM u ORDER BY a DESC",
+            "CREATE VIEW v AS SELECT a FROM u ORDER BY a DESC",
+            "SELECT a FROM t1 UNION ALL SELECT a FROM t2 UNION SELECT a FROM t3",
+            "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id ORDER BY b.id DESC)",
+            "SELECT a FROM t WHERE a IN (SELECT 1 UNION SELECT 2 ORDER BY 1 DESC) ORDER BY a DESC",
+        ]);
+        for dialect in dialects() {
+            let Some(Statement::Query(plain)) = statement_of("SELECT 1", dialect.as_ref()) else {
+                panic!("a plain query reads");
+            };
+            for text in texts.iter().copied() {
+                let Some(statement) = statement_of(text, dialect.as_ref()) else {
+                    continue;
+                };
+                let mut every = EveryQuery::default();
+                let _ = statement.visit(&mut every);
+                for cursor in 0..=text.len() {
+                    if !text.is_char_boundary(cursor) {
+                        continue;
+                    }
+                    for piece in nested_queries_at(text, cursor, Some(dialect.as_ref())) {
+                        let offered = &text[piece.range.clone()];
+                        let Some(Statement::Query(read)) = statement_of(offered, dialect.as_ref())
+                        else {
+                            panic!("{text:?} at {cursor}: {offered:?} is not one query");
+                        };
+                        let as_a_branch = Query {
+                            body: read.body.clone(),
+                            ..(*plain).clone()
+                        };
+                        assert!(
+                            every.queries.iter().any(|query| *query == *read
+                                || (as_a_branch == *read && is_a_branch_of(query, &read.body))),
+                            "{text:?} at {cursor}: {offered:?} is not a query of the statement"
+                        );
+                        assert!(
+                            Statement::Query(read.clone()) != statement,
+                            "{text:?} at {cursor}: the statement is offered as a piece of itself"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_clause_the_parser_leaves_out_may_be_long() {
+        let settings = (1..=12)
+            .map(|number| format!("k{number} = {number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = format!("SELECT * FROM (SELECT * FROM t SETTINGS {settings}) q");
+        let cursor = text.find("* FROM t").expect("marker");
+        let found = nested_queries_at(&text, cursor, Some(&ClickHouseDialect {}));
+        assert_eq!(
+            found.first().map(|piece| &text[piece.range.clone()]),
+            Some(format!("SELECT * FROM t SETTINGS {settings}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_piece_that_cannot_be_read_back_within_the_budget_is_not_offered() {
+        let text = "SELECT * FROM a WHERE id IN (SELECT id FROM b)";
+        let cursor = text.find("id FROM b").expect("marker");
+        let dialect = MySqlDialect {};
+        assert_eq!(
+            read_nested_queries(text, cursor, &dialect, MOST_BYTES_READ_BACK)
+                .expect("the statement reads")
+                .len(),
+            1
+        );
+        assert!(
+            read_nested_queries(text, cursor, &dialect, 4)
+                .expect("the statement reads")
+                .is_empty(),
+            "a piece nothing was left to check it with is left out"
+        );
     }
 
     #[test]

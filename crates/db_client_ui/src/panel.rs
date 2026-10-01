@@ -21481,6 +21481,34 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_statement_ending_in_desc_runs_at_once_wherever_the_cursor_is(
+        cx: &mut TestAppContext,
+    ) {
+        let statement = "SELECT *\nFROM ec_userdata.opened_positions POS\nWHERE POS.portfolio_id = 59424004\nORDER BY POS.portfolio_id, POS.row_id DESC";
+        let sql = format!("-- open positions\n/* getOpenPositionsForPortfolio */\n{statement};\n");
+        for marker in [
+            "SELECT *",
+            "FROM ec_userdata",
+            "portfolio_id = ",
+            "row_id DESC",
+        ] {
+            let at = sql.find(marker).expect("marker");
+            let mut console = ChooserConsole::open(cx, &sql, at..at).await;
+            console.press("ctrl-enter");
+            assert!(
+                console.chooser().is_none(),
+                "the list of parts opened at {marker:?}"
+            );
+            assert_eq!(console.calls().len(), 1, "it runs at once at {marker:?}");
+            assert!(
+                console.calls()[0].trim_end_matches(';').ends_with("DESC"),
+                "the statement is sent whole, with its DESC: {:?}",
+                console.calls()
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn a_selection_runs_as_it_is_without_asking(cx: &mut TestAppContext) {
         let at = SUBQUERY_SQL.find("SELECT id").expect("marker");
         let mut console = ChooserConsole::open(cx, SUBQUERY_SQL, at..SUBQUERY_SQL.len() - 1).await;
