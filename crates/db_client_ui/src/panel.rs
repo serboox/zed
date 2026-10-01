@@ -449,6 +449,8 @@ enum QueryExecutionStatus {
     Running,
     Success,
     Error,
+    /// Stopped on request: neither done nor failed.
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -515,7 +517,20 @@ impl editor::Addon for DbQueryEditorAddon {
             _ => return None,
         }
 
-        Some(render_query_status_indicator(row, marker.status).into_any_element())
+        Some(
+            render_query_status_indicator(row, marker.status, self.connection_id, cx)
+                .into_any_element(),
+        )
+    }
+
+    /// Says to the keymap that this console's connection has a statement
+    /// running, so that a key which must not act otherwise, Escape, can stop it.
+    fn extend_key_context(&self, context: &mut gpui::KeyContext, cx: &App) {
+        if DatabaseStore::global(cx)
+            .is_some_and(|store| store.read(cx).has_running_queries(self.connection_id))
+        {
+            context.add("db_query_running");
+        }
     }
 
     fn to_any(&self) -> &dyn std::any::Any {
@@ -656,8 +671,15 @@ impl DbQueryEditorAddon {
     }
 }
 
-fn render_query_status_indicator(row: u32, status: QueryExecutionStatus) -> impl IntoElement {
+fn render_query_status_indicator(
+    row: u32,
+    status: QueryExecutionStatus,
+    connection: ConnectionId,
+    cx: &App,
+) -> impl IntoElement {
     let id = ElementId::from(SharedString::from(format!("sql-query-status-{row}")));
+    let running = status == QueryExecutionStatus::Running;
+    let hover_background = cx.theme().status().error_background;
     div()
         .id(id.clone())
         .debug_selector(move || format!("SQL_QUERY_STATUS-{row}"))
@@ -665,11 +687,56 @@ fn render_query_status_indicator(row: u32, status: QueryExecutionStatus) -> impl
         .flex()
         .items_center()
         .justify_center()
+        .relative()
+        .when(running, |indicator| {
+            // A statement that is running is the one place a stop makes sense,
+            // so the spinner carries the way to stop it: a red square inside
+            // the ring, which is what every progress ring that can be stopped
+            // looks like.
+            indicator
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover_background))
+                .tooltip(Tooltip::text(crate::query_stop::STOP_TOOLTIP))
+                .on_click(move |_, window, cx| {
+                    crate::query_stop::stop_and_tell(
+                        connection,
+                        Workspace::for_window(window, cx).map(|workspace| workspace.downgrade()),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                })
+        })
         .child(match status {
-            QueryExecutionStatus::Running => Icon::new(IconName::ArrowCircle)
+            QueryExecutionStatus::Running => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Hint)
+                        .with_keyed_rotate_animation(id, 1),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .debug_selector(move || format!("SQL_QUERY_STOP-{row}"))
+                        .child(
+                            Icon::new(IconName::Stop)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        ),
+                )
+                .into_any_element(),
+            QueryExecutionStatus::Cancelled => Icon::new(IconName::SquareMinus)
                 .size(IconSize::Small)
-                .color(Color::Hint)
-                .with_keyed_rotate_animation(id, 1)
+                .color(Color::Muted)
                 .into_any_element(),
             QueryExecutionStatus::Success => Icon::new(IconName::Check)
                 .size(IconSize::Small)
@@ -4427,9 +4494,23 @@ fn run_sql_from_editor(
     });
     workspace.open_panel::<TerminalPanel>(window, cx);
 
-    cx.spawn_in(window, async move |_workspace, cx| {
+    cx.spawn_in(window, async move |workspace_handle, cx| {
         let mut connected = connected;
-        for statement in statements {
+        let stops_before = store.read_with(cx, |store, _| store.stop_requests(conn_id));
+        let total = statements.len();
+        for (index, statement) in statements.into_iter().enumerate() {
+            // A stop that came between two statements ends the script here: the
+            // rest of it is not run. What the statements before it answered stays
+            // on the screen, so the reader is told in a toast instead.
+            if store.read_with(cx, |store, _| store.stop_requests(conn_id)) != stops_before {
+                let message = format!("Cancelled before statement {} of {total}.", index + 1);
+                if index == 0 {
+                    result_view.update(cx, |view, cx| view.set_cancelled(message, cx));
+                } else {
+                    show_db_toast(&workspace_handle, "db-script-stopped", &message, cx);
+                }
+                return anyhow::Ok(());
+            }
             let (controller, marker_id) = editor.update(cx, |editor, cx| {
                 let controller = editor
                     .addon::<DbQueryEditorAddon>()
@@ -4581,6 +4662,25 @@ fn run_sql_from_editor(
                         }
                     })?;
                 }
+                Err(err) if crate::query_runs::is_cancelled(&err) => {
+                    let message = say_how_the_stop_ended(&store, conn_id, cx).await;
+                    editor.update(cx, |editor, cx| {
+                        if let Some((id, addon)) =
+                            marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
+                        {
+                            addon.set_query_status(id, QueryExecutionStatus::Cancelled, None);
+                            cx.notify();
+                        }
+                    });
+                    if !is_current {
+                        return anyhow::Ok(());
+                    }
+                    if let Some(inline_view) = &inline_view {
+                        inline_view.update(cx, |view, cx| view.set_cancelled(message.clone(), cx));
+                    }
+                    result_view.update(cx, |view, cx| view.set_cancelled(message, cx));
+                    return anyhow::Ok(());
+                }
                 Err(err) => {
                     editor.update(cx, |editor, cx| {
                         if let Some((id, addon)) =
@@ -4605,6 +4705,51 @@ fn run_sql_from_editor(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+/// What to tell the reader about a statement that was stopped: how the stop
+/// ended, once it has settled.
+async fn say_how_the_stop_ended(
+    store: &Entity<DatabaseStore>,
+    connection: ConnectionId,
+    cx: &mut gpui::AsyncWindowContext,
+) -> String {
+    let in_progress = store.read_with(cx, |store, _| store.stop_in_progress(connection));
+    if let Some(in_progress) = in_progress
+        && let Ok(report) = in_progress.await
+    {
+        return report.describe();
+    }
+    store
+        .read_with(cx, |store, _| store.last_stop(connection))
+        .map_or_else(|| "Cancelled.".to_string(), |report| report.describe())
+}
+
+/// Stops the statements the console in front is running, or every statement of
+/// every connection when the thing in front is not a console, and rolls back
+/// what they had open.
+pub fn cancel_running_queries(
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let weak_workspace = cx.entity().downgrade();
+    let console_connection = workspace
+        .active_item_as::<Editor>(cx)
+        .and_then(|editor| {
+            editor
+                .read(cx)
+                .addon::<DbQueryEditorAddon>()
+                .map(|addon| addon.connection_id)
+        })
+        .filter(|connection| {
+            DatabaseStore::global(cx)
+                .is_some_and(|store| store.read(cx).has_running_queries(*connection))
+        });
+    match console_connection {
+        Some(connection) => crate::query_stop::stop_and_tell(connection, Some(weak_workspace), cx),
+        None => crate::query_stop::stop_everything_and_tell(Some(weak_workspace), cx),
+    }
 }
 
 pub struct DatabasePanel {
@@ -21175,6 +21320,7 @@ mod tests {
 
     struct ChooserConsole {
         workspace: Entity<Workspace>,
+        store: Entity<DatabaseStore>,
         editor: Entity<Editor>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         cx: VisualTestContext,
@@ -21182,6 +21328,17 @@ mod tests {
 
     impl ChooserConsole {
         async fn open(test_cx: &mut TestAppContext, sql: &str, cursor: Range<usize>) -> Self {
+            Self::open_on(test_cx, sql, cursor, None).await
+        }
+
+        /// The same console, over `provider` instead of the one that writes
+        /// down what it is asked.
+        async fn open_on(
+            test_cx: &mut TestAppContext,
+            sql: &str,
+            cursor: Range<usize>,
+            provider: Option<std::sync::Arc<dyn db_client::DbProvider>>,
+        ) -> Self {
             let config = db_client::ConnectionConfig {
                 label: "chooser".to_string(),
                 auto_connect: false,
@@ -21230,6 +21387,11 @@ mod tests {
                 workspace.register_action(
                     |workspace, _: &zed_actions::database_panel::ExplainQuery, window, cx| {
                         explain_current_sql_query(workspace, window, cx);
+                    },
+                );
+                workspace.register_action(
+                    |workspace, _: &zed_actions::database_panel::CancelQuery, window, cx| {
+                        cancel_running_queries(workspace, window, cx);
                     },
                 );
             });
@@ -21287,14 +21449,16 @@ mod tests {
                 let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
                 workspace.add_panel(panel, window, cx);
             });
+            cx.update(|_window, cx| {
+                cx.set_global(crate::store::GlobalDatabaseStore(store.clone()))
+            });
             store.update(cx, |store, cx| {
-                store.add_connected_for_test(
-                    config,
+                let provider = provider.unwrap_or_else(|| {
                     std::sync::Arc::new(RecordingMockProvider {
                         calls: calls.clone(),
-                    }),
-                    cx,
-                );
+                    })
+                });
+                store.add_connected_for_test(config, provider, cx);
             });
             cx.run_until_parked();
 
@@ -21322,10 +21486,75 @@ mod tests {
             cx.run_until_parked();
             Self {
                 workspace,
+                store,
                 editor,
                 calls,
                 cx: visual,
             }
+        }
+
+        fn markers(&mut self) -> Vec<(u32, QueryExecutionStatus)> {
+            self.editor.read_with(&self.cx, |editor, _| {
+                editor
+                    .addon::<DbQueryEditorAddon>()
+                    .map(|addon| {
+                        addon
+                            .query_markers()
+                            .iter()
+                            .map(|marker| (marker.row, marker.status))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        }
+
+        fn result_view(&mut self) -> Option<Entity<crate::result_view::ResultView>> {
+            let panel = self.workspace.read_with(&self.cx, |workspace, cx| {
+                workspace.panel::<TerminalPanel>(cx)
+            })?;
+            let pane = panel.read_with(&self.cx, |panel, _| panel.pane())?;
+            pane.read_with(&self.cx, |pane, _| {
+                pane.items_of_type::<crate::result_view::ResultView>()
+                    .next()
+            })
+        }
+
+        fn running_queries(&mut self) -> usize {
+            self.store
+                .read_with(&self.cx, |store, _| store.running_queries().len())
+        }
+
+        fn stop_requests(&mut self) -> u64 {
+            self.store.read_with(&self.cx, |store, _| {
+                store
+                    .connections()
+                    .first()
+                    .map_or(0, |connection| store.stop_requests(connection.config.id))
+            })
+        }
+
+        /// Clicks the element a test selector names, with the mouse the way a
+        /// reader does.
+        fn click(&mut self, selector: &'static str) {
+            let bounds = self
+                .cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is not drawn"));
+            self.cx
+                .simulate_click(bounds.center(), gpui::Modifiers::none());
+            self.settle_a_stop();
+        }
+
+        /// Lets a stop run its course: it looks at the statement every so often
+        /// while the server answers, and the test clock only moves when told to.
+        fn settle_a_stop(&mut self) {
+            for _ in 0..5 {
+                self.cx.run_until_parked();
+                self.cx
+                    .executor()
+                    .advance_clock(std::time::Duration::from_millis(150));
+            }
+            self.cx.run_until_parked();
         }
 
         fn focus_editor(&mut self) {
@@ -21394,6 +21623,141 @@ mod tests {
                 });
             });
         }
+    }
+
+    async fn a_console_running_a_statement(
+        cx: &mut TestAppContext,
+    ) -> (
+        ChooserConsole,
+        std::sync::Arc<crate::query_runs::test_support::HangingProvider>,
+    ) {
+        let provider = crate::query_runs::test_support::HangingProvider::new(true, false);
+        let mut console =
+            ChooserConsole::open_on(cx, "SELECT SLEEP(60)", 0..0, Some(provider.clone())).await;
+        console.press("ctrl-enter");
+        assert_eq!(
+            console.markers(),
+            vec![(0, QueryExecutionStatus::Running)],
+            "the statement is running"
+        );
+        assert_eq!(console.running_queries(), 1);
+        (console, provider)
+    }
+
+    fn the_statement_was_stopped_on_the_server(
+        console: &mut ChooserConsole,
+        provider: &crate::query_runs::test_support::HangingProvider,
+    ) {
+        assert_eq!(
+            console.markers(),
+            vec![(0, QueryExecutionStatus::Cancelled)]
+        );
+        assert_eq!(console.running_queries(), 0);
+        assert_eq!(
+            *provider
+                .interrupts
+                .lock()
+                .expect("the lock is not poisoned"),
+            [db_client::interrupt::Interrupt::Statement]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_running_statement_is_stopped_from_its_gutter_marker(cx: &mut TestAppContext) {
+        let (mut console, provider) = a_console_running_a_statement(cx).await;
+        console.click("SQL_QUERY_STOP-0");
+        the_statement_was_stopped_on_the_server(&mut console, &provider);
+    }
+
+    #[gpui::test]
+    async fn a_stopped_statement_says_so_in_the_result_view_and_not_as_a_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut console, provider) = a_console_running_a_statement(cx).await;
+        console.click("SQL_QUERY_STOP-0");
+        the_statement_was_stopped_on_the_server(&mut console, &provider);
+        let view = console.result_view().expect("the result tab is open");
+        let (cancelled, error) = view.read_with(&console.cx, |view, _| {
+            (view.cancelled_for_test(), view.error.clone())
+        });
+        assert_eq!(
+            cancelled.as_deref(),
+            Some("Cancelled. The server stopped the statement.")
+        );
+        assert_eq!(error, None, "stopping is not a failure");
+    }
+
+    #[gpui::test]
+    async fn stopping_a_script_ends_it_at_the_statement_that_was_stopped(cx: &mut TestAppContext) {
+        let provider = crate::query_runs::test_support::HangingProvider::new(true, false);
+        let script = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        let mut console =
+            ChooserConsole::open_on(cx, script, 0..script.len(), Some(provider.clone())).await;
+        console.press("ctrl-enter");
+        assert_eq!(
+            *provider
+                .statements
+                .lock()
+                .expect("the lock is not poisoned"),
+            ["SELECT 1"],
+            "the script goes one statement at a time"
+        );
+
+        console.click("SQL_QUERY_STOP-0");
+
+        assert_eq!(
+            *provider
+                .statements
+                .lock()
+                .expect("the lock is not poisoned"),
+            ["SELECT 1"],
+            "the rest of the script is not run"
+        );
+        assert_eq!(
+            console.markers(),
+            vec![(0, QueryExecutionStatus::Cancelled)]
+        );
+    }
+
+    #[gpui::test]
+    async fn escape_stops_the_statement_that_runs_in_the_console(cx: &mut TestAppContext) {
+        let (mut console, provider) = a_console_running_a_statement(cx).await;
+        console.focus_editor();
+        console.press("escape");
+        console.settle_a_stop();
+        the_statement_was_stopped_on_the_server(&mut console, &provider);
+    }
+
+    #[gpui::test]
+    async fn the_stop_key_works_from_anywhere(cx: &mut TestAppContext) {
+        let (mut console, provider) = a_console_running_a_statement(cx).await;
+        console.press("ctrl-shift-f2");
+        console.settle_a_stop();
+        the_statement_was_stopped_on_the_server(&mut console, &provider);
+    }
+
+    #[gpui::test]
+    async fn escape_is_left_alone_when_nothing_is_running(cx: &mut TestAppContext) {
+        let mut console = ChooserConsole::open(cx, "SELECT 1", 0..0).await;
+        console.focus_editor();
+        console.press("escape");
+        assert_eq!(console.stop_requests(), 0, "Escape stopped nothing");
+        assert_eq!(console.calls().len(), 0);
+    }
+
+    #[gpui::test]
+    async fn the_transaction_is_rolled_back_when_the_marker_is_pressed(cx: &mut TestAppContext) {
+        let (mut console, provider) = a_console_running_a_statement(cx).await;
+        *provider
+            .transaction_open_since
+            .lock()
+            .expect("the lock is not poisoned") = Some(std::time::Instant::now());
+        console.click("SQL_QUERY_STOP-0");
+        assert_eq!(
+            provider.rollbacks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the transaction the statement was in is rolled back"
+        );
     }
 
     const SUBQUERY_SQL: &str = "SELECT * FROM a WHERE id IN (SELECT id FROM b)";

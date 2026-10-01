@@ -138,6 +138,8 @@ pub struct InlineResultView {
 enum InlineResultState {
     Loading,
     Error(String),
+    /// Stopped on request: said plainly, and not in the colour of a failure.
+    Cancelled(String),
     Loaded {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
@@ -154,6 +156,11 @@ impl InlineResultView {
 
     pub fn set_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.state = InlineResultState::Error(message);
+        cx.notify();
+    }
+
+    pub fn set_cancelled(&mut self, message: String, cx: &mut Context<Self>) {
+        self.state = InlineResultState::Cancelled(message);
         cx.notify();
     }
 
@@ -207,6 +214,16 @@ impl Render for InlineResultView {
                             .color(Color::Error),
                     )
                     .child(Label::new(message.clone()).color(Color::Error)),
+            ),
+            InlineResultState::Cancelled(message) => container.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::SquareMinus)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(message.clone()).color(Color::Muted)),
             ),
             InlineResultState::Loaded {
                 columns,

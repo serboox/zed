@@ -1105,7 +1105,7 @@ struct QueryHistoryEntry {
     id: u64,
 }
 
-/// What came of a statement, at the three certainties a result view has.
+/// What came of a statement, at the certainties a result view has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryOutcome {
     /// Submitted; nothing has come back yet.
@@ -1116,6 +1116,8 @@ enum QueryOutcome {
     /// The server refused it. No time: a failure returns no result, so there is
     /// none measured, and a made-up one would be a guess.
     Failed,
+    /// Stopped on request, so it neither answered nor was refused.
+    Cancelled,
 }
 
 /// How long a statement took, at the coarsest resolution that still separates
@@ -1475,6 +1477,9 @@ pub struct ResultView {
     title: SharedString,
     pub result: Option<QueryResult>,
     pub error: Option<String>,
+    /// What to say when the statement was stopped on request, which is not a
+    /// failure and is not drawn as one.
+    cancelled: Option<String>,
     // Active sort columns in priority order (index 0 = primary sort).
     sort_columns: Vec<SortColumn>,
     store: Option<WeakEntity<DatabaseStore>>,
@@ -1887,6 +1892,7 @@ impl ResultView {
             title: title.into(),
             result: None,
             error: None,
+            cancelled: None,
             sort_columns: Vec::new(),
             store: None,
             connection_id: None,
@@ -3112,6 +3118,7 @@ impl ResultView {
         self.is_loading = true;
         self.result = None;
         self.error = None;
+        self.cancelled = None;
         self.cell_drag_anchor = None;
         self.suppress_next_cell_click = false;
         self.value_editor_open = false;
@@ -3143,6 +3150,7 @@ impl ResultView {
         // about the wrong statement.
         self.statement_edge = None;
         self.error = None;
+        self.cancelled = None;
         self.cell_edit = None;
         self.status_message = None;
         self.pending_edits.clear();
@@ -3464,11 +3472,31 @@ impl ResultView {
             .into_any_element()
     }
 
+    /// Shows that the statement was stopped on request, with what became of it.
+    pub fn set_cancelled(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_history.take() {
+            self.resolve_history(id, QueryOutcome::Cancelled);
+        }
+        self.cancelled = Some(message);
+        self.error = None;
+        self.result = None;
+        self.is_loading = false;
+        self.fill_task = None;
+        self.cell_drag_anchor = None;
+        self.suppress_next_cell_click = false;
+        self.value_editor_open = false;
+        self.value_editor = None;
+        self.value_editor_resize_drag = None;
+        cx.emit(ResultViewEvent::ResultChanged);
+        cx.notify();
+    }
+
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
         if let Some(id) = self.pending_history.take() {
             self.resolve_history(id, QueryOutcome::Failed);
         }
         self.error = Some(error);
+        self.cancelled = None;
         self.result = None;
         self.is_loading = false;
         self.fill_task = None;
@@ -3578,6 +3606,7 @@ impl ResultView {
         self.result = None;
         self.reset_special_view();
         self.error = None;
+        self.cancelled = None;
         self.loaded_rows = 0;
         self.is_loading = true;
         cx.notify();
@@ -3653,6 +3682,7 @@ impl ResultView {
         }
         self.loaded_rows = self.result.as_ref().map_or(0, |result| result.rows.len());
         self.error = None;
+        self.cancelled = None;
         self.recompute_layout();
         cx.notify();
     }
@@ -6781,6 +6811,7 @@ impl ResultView {
             QueryOutcome::Running => ("running".to_string(), Color::Muted),
             QueryOutcome::Done { elapsed_ms } => (format_elapsed(elapsed_ms), Color::Muted),
             QueryOutcome::Failed => ("failed".to_string(), Color::Error),
+            QueryOutcome::Cancelled => ("cancelled".to_string(), Color::Muted),
         };
         let runs = (entry.runs > 1).then(|| format!("\u{d7}{}", entry.runs));
         let clock = format_clock(entry.at);
@@ -6897,6 +6928,80 @@ impl ResultView {
                     .color(Color::Muted),
             )
             .into_any_element()
+    }
+
+    /// The spinner, and under it the way out: a statement that has been running
+    /// for longer than the reader meant to wait has to be stoppable from the
+    /// place they are looking at while they wait.
+    #[cfg(test)]
+    pub(crate) fn cancelled_for_test(&self) -> Option<String> {
+        self.cancelled.clone()
+    }
+
+    fn render_loading(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let connection = self.connection_id;
+        let workspace = self.workspace.clone();
+        let stopping = connection.is_some_and(|connection| {
+            DatabaseStore::global(cx).is_some_and(|store| {
+                store
+                    .read(cx)
+                    .running_queries()
+                    .iter()
+                    .any(|query| query.connection == connection && query.stopping)
+            })
+        });
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(loading_spinner(
+                "loading-spinner",
+                IconSize::Custom(ui::rems_from_px(28_f32)),
+            ))
+            .when_some(connection, |el, connection| {
+                el.child(
+                    div()
+                        .debug_selector(|| "RESULT_STOP_QUERY".to_string())
+                        .child(
+                            Button::new("stop-query", if stopping { "Stopping…" } else { "Stop" })
+                                .style(cyberpunk::Rank::Destructive.style())
+                                .start_icon(
+                                    Icon::new(IconName::Stop)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Error),
+                                )
+                                .disabled(stopping)
+                                .tooltip(Tooltip::text(crate::query_stop::STOP_TOOLTIP))
+                                .on_click(move |_, window, cx| {
+                                    let workspace = workspace.clone().or_else(|| {
+                                        Workspace::for_window(window, cx)
+                                            .map(|workspace| workspace.downgrade())
+                                    });
+                                    crate::query_stop::stop_and_tell(connection, workspace, cx);
+                                }),
+                        ),
+                )
+            })
+    }
+
+    fn render_cancelled(&self, message: &str) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .debug_selector(|| "query-cancelled".to_string())
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                Icon::new(IconName::SquareMinus)
+                    .size(IconSize::Medium)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(message.to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
     }
 
     fn render_empty_state(&self) -> impl IntoElement {
@@ -12014,16 +12119,9 @@ impl Render for ResultView {
         self.sync_error_view(window, cx);
         let filter_bar = self.render_filter_bar(cx);
         let content = if self.is_loading {
-            div()
-                .flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .child(loading_spinner(
-                    "loading-spinner",
-                    IconSize::Custom(ui::rems_from_px(28_f32)),
-                ))
-                .into_any_element()
+            self.render_loading(cx).into_any_element()
+        } else if let Some(message) = self.cancelled.clone() {
+            self.render_cancelled(&message).into_any_element()
         } else if let Some(error) = self.error.clone() {
             self.render_error(&error, cx)
         } else if self
@@ -14057,6 +14155,60 @@ mod tests {
 
     struct ResultViewFrame {
         view: Entity<ResultView>,
+    }
+
+    /// The area that shows a statement running has a way to stop it, and
+    /// pressing it with the mouse stops the statement on the server.
+    #[gpui::test]
+    async fn the_loading_area_has_a_stop_that_stops_the_statement(cx: &mut gpui::TestAppContext) {
+        use crate::query_runs::test_support::HangingProvider;
+        use crate::store::GlobalDatabaseStore;
+
+        init_result_view_test(cx);
+        let provider = HangingProvider::new(true, false);
+        let config = db_client::ConnectionConfig::default();
+        let connection = config.id;
+        let store = cx.new(DatabaseStore::new);
+        cx.update(|cx| cx.set_global(GlobalDatabaseStore(store.clone())));
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider.clone(), cx);
+        });
+        let statement = store.update(cx, |store, cx| {
+            store.execute_query(connection, "shop".into(), "SELECT SLEEP(60)".into(), cx)
+        });
+        cx.run_until_parked();
+
+        let window = cx.add_window(move |_window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = ResultView::new("query", cx).with_connection(connection);
+                view.set_loading(cx);
+                view
+            });
+            ResultViewFrame { view }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view_frame(window, &mut cx);
+
+        let at = debug_center(&mut cx, "RESULT_STOP_QUERY");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(150));
+        }
+        cx.run_until_parked();
+
+        let error = statement
+            .await
+            .expect_err("a stopped statement is an error");
+        assert!(crate::query_runs::is_cancelled(&error), "{error:#}");
+        assert_eq!(
+            *provider
+                .interrupts
+                .lock()
+                .expect("the lock is not poisoned"),
+            [db_client::interrupt::Interrupt::Statement]
+        );
     }
 
     impl Render for ResultViewFrame {

@@ -677,6 +677,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         let db_exec_status = cx.new(db_client_ui::sql_exec::ExecStatusIndicator::new);
+        let db_query_status = {
+            let workspace_handle = cx.entity().downgrade();
+            cx.new(|cx| db_client_ui::query_stop::QueryStatusIndicator::new(workspace_handle, cx))
+        };
         let run_metrics_status = cx.new(|cx| {
             run_configurations::run_metrics_status_item::RunMetricsStatusItem::new(
                 workspace, window, cx,
@@ -700,6 +704,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_left_item(db_exec_status, window, cx);
+            status_bar.add_left_item(db_query_status, window, cx);
             // First among the right-hand items, which the bar draws in reverse
             // -- so this sits at the very edge, where a reader looks for the
             // state of the whole window rather than of the file in front of
@@ -1600,6 +1605,14 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 db_client_ui::run_current_sql_query(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::CancelQuery,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::cancel_running_queries(workspace, window, cx);
             },
         )
         .register_action(

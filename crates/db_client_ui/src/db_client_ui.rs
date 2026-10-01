@@ -16,6 +16,8 @@ mod inline_results;
 mod modify_table;
 pub mod native_dump;
 mod panel;
+pub mod query_runs;
+pub mod query_stop;
 mod rename_refactor;
 mod result_view;
 mod schema_diff;
@@ -31,10 +33,10 @@ mod table_copy;
 mod widgets;
 
 pub use panel::{
-    DatabasePanel, execute_current_sql_query_to_file, explain_analyze_current_sql_query,
-    explain_current_sql_query, format_current_sql_query, new_query_for_active_connection,
-    open_new_sql_query, run_current_sql_query, run_sql_file, save_run_configuration,
-    toggle_inline_results,
+    DatabasePanel, cancel_running_queries, execute_current_sql_query_to_file,
+    explain_analyze_current_sql_query, explain_current_sql_query, format_current_sql_query,
+    new_query_for_active_connection, open_new_sql_query, run_current_sql_query, run_sql_file,
+    save_run_configuration, toggle_inline_results,
 };
 pub use sql_exec::ExecStatusIndicator;
 pub use statement_chooser::{PositionInText, StatementAtPosition};

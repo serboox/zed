@@ -99,15 +99,25 @@ impl DatabaseStore {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let stops_before = this
+                .read_with(cx, |store, _| store.stop_requests(id))
+                .unwrap_or_default();
             for (index, statement) in statements.into_iter().enumerate() {
+                // A stop asked for elsewhere, from the status bar or the keyboard,
+                // between two statements ends the script as well.
                 let cancelled = this
-                    .read_with(cx, |store, _| {
-                        store
-                            .exec_jobs
-                            .iter()
-                            .find(|job| job.id == job_id)
-                            .map(|job| job.cancelled)
-                            .unwrap_or(true)
+                    .update(cx, |store, cx| {
+                        let stopped_elsewhere = store.stop_requests(id) != stops_before;
+                        let Some(job) = store.exec_jobs.iter_mut().find(|job| job.id == job_id)
+                        else {
+                            return true;
+                        };
+                        if stopped_elsewhere && !job.cancelled {
+                            job.cancelled = true;
+                            cx.emit(DatabaseStoreEvent::ExecJobsChanged);
+                            cx.notify();
+                        }
+                        job.cancelled
                     })
                     .unwrap_or(true);
                 if cancelled {
@@ -130,11 +140,17 @@ impl DatabaseStore {
                         };
                         job.completed += 1;
                         if let Err(error) = result {
-                            job.failed += 1;
-                            job.outcomes.push(ExecStatementOutcome {
-                                index,
-                                error: Some(error.to_string()),
-                            });
+                            // A statement stopped on request ends the script
+                            // and is not a failure of the statement.
+                            if crate::query_runs::is_cancelled(&error) {
+                                job.cancelled = true;
+                            } else {
+                                job.failed += 1;
+                                job.outcomes.push(ExecStatementOutcome {
+                                    index,
+                                    error: Some(error.to_string()),
+                                });
+                            }
                         }
                         cx.emit(DatabaseStoreEvent::ExecJobsChanged);
                         cx.notify();
@@ -159,12 +175,19 @@ impl DatabaseStore {
         Some(job_id)
     }
 
+    /// Ends the script after the statement it is on, and stops that statement
+    /// on the server, rolling back the transaction it had open.
     pub fn cancel_exec_job(&mut self, job_id: usize, cx: &mut Context<Self>) {
+        let mut connection = None;
         if let Some(job) = self.exec_jobs.iter_mut().find(|job| job.id == job_id) {
             job.cancelled = true;
+            connection = Some(job.connection_id);
         }
         cx.emit(DatabaseStoreEvent::ExecJobsChanged);
         cx.notify();
+        if let Some(connection) = connection {
+            drop(self.stop_queries(connection, cx));
+        }
     }
 
     pub fn dismiss_exec_job(&mut self, job_id: usize, cx: &mut Context<Self>) {
@@ -794,5 +817,130 @@ mod tests {
             header.bottom(),
             shell.bottom()
         );
+    }
+
+    fn a_store_with_a_server_that_hangs(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<DatabaseStore>,
+        ConnectionId,
+        std::sync::Arc<crate::query_runs::test_support::HangingProvider>,
+    ) {
+        let provider = crate::query_runs::test_support::HangingProvider::new(true, false);
+        let store = cx.new(DatabaseStore::new);
+        let config = db_client::ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider.clone(), cx);
+        });
+        (store, id, provider)
+    }
+
+    /// Cancelling a job used to leave its running statement to finish on the
+    /// server; it now stops it, and the rest of the script is not run.
+    #[gpui::test]
+    async fn cancelling_a_job_stops_its_running_statement_on_the_server(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (store, id, provider) = a_store_with_a_server_that_hangs(cx);
+        let job = store
+            .update(cx, |store, cx| {
+                store.start_exec_job(
+                    id,
+                    "shop".into(),
+                    "script".into(),
+                    "SELECT 1; SELECT 2;".into(),
+                    cx,
+                )
+            })
+            .expect("a job started");
+        cx.run_until_parked();
+        assert_eq!(
+            *provider
+                .statements
+                .lock()
+                .expect("the lock is not poisoned"),
+            ["SELECT 1"]
+        );
+
+        store.update(cx, |store, cx| store.cancel_exec_job(job, cx));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(150));
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            *provider
+                .interrupts
+                .lock()
+                .expect("the lock is not poisoned"),
+            [db_client::interrupt::Interrupt::Statement]
+        );
+        assert_eq!(
+            *provider
+                .statements
+                .lock()
+                .expect("the lock is not poisoned"),
+            ["SELECT 1"],
+            "the second statement never ran"
+        );
+        let (cancelled, failed, done) = store.read_with(cx, |store, _| {
+            let job = store
+                .exec_jobs
+                .iter()
+                .find(|j| j.id == job)
+                .expect("the job");
+            (job.cancelled, job.failed, job.done)
+        });
+        assert!(cancelled && done, "the job ended");
+        assert_eq!(failed, 0, "stopping is not a failure of the statement");
+    }
+
+    /// A stop asked for from the status bar or the keyboard ends the job too.
+    #[gpui::test]
+    async fn a_stop_from_elsewhere_ends_a_job_without_counting_a_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (store, id, provider) = a_store_with_a_server_that_hangs(cx);
+        let job = store
+            .update(cx, |store, cx| {
+                store.start_exec_job(
+                    id,
+                    "shop".into(),
+                    "script".into(),
+                    "SELECT 1; SELECT 2;".into(),
+                    cx,
+                )
+            })
+            .expect("a job started");
+        cx.run_until_parked();
+
+        drop(store.update(cx, |store, cx| store.stop_queries(id, cx)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(150));
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            *provider
+                .statements
+                .lock()
+                .expect("the lock is not poisoned"),
+            ["SELECT 1"]
+        );
+        let (cancelled, failed) = store.read_with(cx, |store, _| {
+            let job = store
+                .exec_jobs
+                .iter()
+                .find(|j| j.id == job)
+                .expect("the job");
+            (job.cancelled, job.failed)
+        });
+        assert!(cancelled);
+        assert_eq!(failed, 0);
     }
 }

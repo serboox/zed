@@ -1,4 +1,5 @@
 use crate::db_migration::ConnectionSecrets;
+use crate::query_runs::{CancelReport, QueryCancelled, RunningQueries, RunningQuery};
 use anyhow::{Context as _, Result};
 use credentials_provider::CredentialsProvider;
 use db_client::{
@@ -9,6 +10,7 @@ use db_client::{
     aerospike_provider::AerospikeProvider,
     cassandra_provider::CassandraProvider,
     clickhouse::ClickHouseProvider,
+    interrupt::{Interrupt, Interrupted},
     mongo_provider::MongoProvider,
     mysql::MySqlProvider,
     on_runtime,
@@ -21,6 +23,9 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use futures::future::{self, Either, Shared};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Task, TaskExt as _,
 };
@@ -390,6 +395,8 @@ pub enum DatabaseStoreEvent {
     ConnectionsChanged,
     SchemaChanged,
     ExecJobsChanged,
+    /// A statement began or ended, or a stop was asked for.
+    QueriesChanged,
 }
 
 /// Whichever kind of tunnel keeps a connection's underlying driver reachable
@@ -425,6 +432,21 @@ pub struct DatabaseStore {
     /// to keep out of the reader's way, not to queue in front of them on the
     /// one connection they have.
     queries_in_flight: HashMap<ConnectionId, Arc<AtomicUsize>>,
+    /// Every statement being run, for the lists and buttons that show and stop
+    /// them. Kept apart from the counter above, which only has to say whether
+    /// anything is running.
+    running_queries: Arc<RunningQueries>,
+    /// How many times a stop was asked for on each connection. A script that
+    /// runs statement after statement compares this with what it saw when it
+    /// began, so a stop that comes between two statements still stops it.
+    stop_requests: HashMap<ConnectionId, u64>,
+    /// The stop in progress on a connection, for whoever has to tell the reader
+    /// how it ended.
+    stops_in_progress: HashMap<ConnectionId, Shared<oneshot::Receiver<CancelReport>>>,
+    /// How the last stop on each connection ended. A statement that was stopped
+    /// can answer after the stop has settled, and it still has to be able to
+    /// tell the reader what happened.
+    last_stops: HashMap<ConnectionId, CancelReport>,
     run_configurations: Vec<RunConfiguration>,
     pub exec_jobs: Vec<crate::sql_exec::ExecJob>,
     pub(crate) next_exec_job_id: usize,
@@ -517,6 +539,132 @@ pub enum TreeItemRef {
 pub enum RelativePosition {
     Before,
     After,
+}
+
+/// Whether `error` is what a statement fails with when the server was asked to
+/// stop it, or its session was ended to do so.
+fn looks_like_being_stopped(error: &anyhow::Error) -> bool {
+    crate::query_runs::is_cancelled(error)
+        || db_client::interrupt::is_interruption(error)
+        || db_client::is_transport_error(error)
+}
+
+/// What a stop is about: the connection as it was when the stop was asked for.
+/// The connection can be replaced while the server is given its time, and the
+/// transaction to roll back is the one the statement was in, on the provider
+/// the statement ran on.
+struct StopTarget {
+    connection: ConnectionId,
+    epoch: u64,
+    provider: Option<Arc<dyn DbProvider>>,
+    /// The transaction that was open when the stop was asked for.
+    transaction_at_stop: Option<Instant>,
+}
+
+/// How long the server is given to stop a statement it was asked to stop, and
+/// then to end a session it was asked to end, before the caller stops waiting.
+const HOW_LONG_THE_SERVER_IS_GIVEN: Duration = Duration::from_secs(5);
+
+const HOW_OFTEN_TO_LOOK_AT_THE_STATEMENTS: Duration = Duration::from_millis(100);
+
+/// How many looks fit in the time the server is given. Counted rather than
+/// read off a clock, so the wait is the same wherever the clock is faked.
+const LOOKS_WHILE_THE_SERVER_IS_GIVEN_ITS_TIME: u128 =
+    HOW_LONG_THE_SERVER_IS_GIVEN.as_millis() / HOW_OFTEN_TO_LOOK_AT_THE_STATEMENTS.as_millis();
+
+/// Asks the server to stop `running`, waits for them to end, asks harder when
+/// they do not, and gives up on them when that does not help either.
+async fn stop_what_runs(
+    provider: Option<&Arc<dyn DbProvider>>,
+    queries: &Arc<RunningQueries>,
+    running: &[u64],
+    report: &mut CancelReport,
+    cx: &mut AsyncApp,
+) {
+    let still_running = || running.iter().any(|id| queries.is_running(*id));
+    let Some(provider) = provider.filter(|provider| provider.can_interrupt()) else {
+        queries.abandon(running);
+        return;
+    };
+    match provider.interrupt(Interrupt::Statement).await {
+        Ok(Interrupted::Requested) => report.server_stopped = true,
+        Ok(Interrupted::NothingRunning | Interrupted::Unsupported) => {}
+        Err(error) => log::warn!("asking the server to stop a statement: {error:#}"),
+    }
+    if wait_until(|| !still_running(), cx).await {
+        return;
+    }
+    match provider.interrupt(Interrupt::Session).await {
+        Ok(Interrupted::Requested) => {
+            report.server_stopped = true;
+            report.session_ended = true;
+        }
+        Ok(Interrupted::NothingRunning | Interrupted::Unsupported) => {}
+        Err(error) => log::warn!("asking the server to end the session: {error:#}"),
+    }
+    if wait_until(|| !still_running(), cx).await {
+        return;
+    }
+    queries.abandon(running);
+    report.server_stopped = false;
+}
+
+/// Whether `done` became true within [`HOW_LONG_THE_SERVER_IS_GIVEN`].
+async fn wait_until(done: impl Fn() -> bool, cx: &mut AsyncApp) -> bool {
+    for _ in 0..LOOKS_WHILE_THE_SERVER_IS_GIVEN_ITS_TIME {
+        if done() {
+            return true;
+        }
+        cx.background_executor()
+            .timer(HOW_OFTEN_TO_LOOK_AT_THE_STATEMENTS)
+            .await;
+    }
+    done()
+}
+
+/// Rolls back the transaction the stopped statement was in, and says so in the
+/// report.
+///
+/// The provider is asked rather than assumed: a driver that holds none has
+/// nothing to roll back. And it is the transaction that was open when the stop
+/// was asked for: one that ended since, or that another console opened since,
+/// is not the reader's to lose.
+async fn roll_back_what_is_held(
+    store: &gpui::WeakEntity<DatabaseStore>,
+    target: &StopTarget,
+    report: &mut CancelReport,
+    cx: &mut AsyncApp,
+) {
+    let Some(provider) = target.provider.as_ref() else {
+        return;
+    };
+    let now = provider.transaction_open_since();
+    let still_the_same_transaction = match (target.transaction_at_stop, now) {
+        (_, None) => false,
+        // None was open at the stop and one is now: the stopped statement
+        // opened it, which is what a rollback of its transaction is for.
+        (None, Some(_)) => true,
+        (Some(at_stop), Some(now)) => at_stop == now,
+    };
+    if !still_the_same_transaction {
+        return;
+    }
+    match provider.rollback_transaction().await {
+        Ok(()) => report.rolled_back = true,
+        Err(error) => report.rollback_failed = Some(format!("{error:#}")),
+    }
+    let open_since = provider.transaction_open_since();
+    store
+        .update(cx, |store, cx| {
+            // The transaction belonged to the connection it was opened on, not
+            // to whatever replaced it.
+            if let Some(connection) = store.connection_at_epoch(target.connection, target.epoch) {
+                connection.transaction_open_since = open_since;
+                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                cx.notify();
+            }
+        })
+        .ok();
 }
 
 /// How often the open transactions are looked at: to see whether one has been
@@ -791,6 +939,10 @@ impl DatabaseStore {
             schema_load_progress: HashMap::new(),
             schema_load_errors: HashMap::new(),
             queries_in_flight: HashMap::new(),
+            running_queries: Arc::new(RunningQueries::default()),
+            stop_requests: HashMap::new(),
+            stops_in_progress: HashMap::new(),
+            last_stops: HashMap::new(),
             run_configurations: Vec::new(),
             exec_jobs: Vec::new(),
             next_exec_job_id: 0,
@@ -1542,6 +1694,9 @@ impl DatabaseStore {
         // map's hold on it, which is otherwise one entry per connection the
         // reader ever had.
         self.queries_in_flight.remove(&id);
+        self.stop_requests.remove(&id);
+        self.stops_in_progress.remove(&id);
+        self.last_stops.remove(&id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         cx.spawn(async move |_this, cx| {
@@ -2720,50 +2875,190 @@ impl DatabaseStore {
 
         self.record_query_history(sql.clone(), cx);
 
+        let running_queries = self.running_queries.clone();
+        let (run, abandoned) = running_queries.begin(id, &database, &sql);
+        cx.emit(DatabaseStoreEvent::QueriesChanged);
+
         cx.spawn(async move |this, cx| {
             // Held from before the connection is even asked for: the schema
             // reader looks at this to decide whether to stand aside, and a query
             // that counts itself only once it has a provider can lose the
             // connection to a schema read that started in between.
             let _in_flight = this.update(cx, |store, _| store.a_query_starts(id))?;
-            let provider = this
-                .update(cx, |store, cx| store.ensure_connected(id, cx))?
-                .await?;
-            let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
-                return Err(anyhow::anyhow!("Connection not found"));
-            };
-            let result = provider.execute_query(&database, &sql).await;
-            match &result {
-                Ok(_) => {
-                    let open_since = provider.transaction_open_since();
-                    let edge = TransactionEdge {
-                        tracks: provider.holds_transactions(),
-                        before: transaction_before,
-                        after: open_since,
-                    };
-                    this.update(cx, |store, cx| {
-                        // The transaction belongs to the connection this
-                        // statement ran on, not to whatever replaced it.
-                        if let Some(conn) = store.connection_at_epoch(id, epoch) {
-                            conn.last_transaction_edge = Some(edge);
-                            if conn.transaction_open_since != open_since {
-                                conn.transaction_open_since = open_since;
-                                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
-                                cx.notify();
+            let run_id = run.id();
+            let work = Box::pin(async {
+                let provider = this
+                    .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                    .await?;
+                let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
+                    return Err(anyhow::anyhow!("Connection not found"));
+                };
+                let result = provider.execute_query(&database, &sql).await;
+                match &result {
+                    Ok(_) => {
+                        let open_since = provider.transaction_open_since();
+                        let edge = TransactionEdge {
+                            tracks: provider.holds_transactions(),
+                            before: transaction_before,
+                            after: open_since,
+                        };
+                        this.update(cx, |store, cx| {
+                            // The transaction belongs to the connection this
+                            // statement ran on, not to whatever replaced it.
+                            if let Some(conn) = store.connection_at_epoch(id, epoch) {
+                                conn.last_transaction_edge = Some(edge);
+                                if conn.transaction_open_since != open_since {
+                                    conn.transaction_open_since = open_since;
+                                    cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                                    cx.notify();
+                                }
                             }
-                        }
-                    })
-                    .ok();
+                        })
+                        .ok();
+                    }
+                    // A statement stopped on request fails in whatever way the
+                    // server stops it, and a session ended to stop it looks
+                    // like a connection that died. Neither says anything about
+                    // the connection's health.
+                    Err(error)
+                        if running_queries.is_stopping(run_id)
+                            && looks_like_being_stopped(error) => {}
+                    Err(error) => {
+                        this.update(cx, |store, cx| {
+                            store.note_operation_failure(id, epoch, error, cx);
+                        })
+                        .ok();
+                    }
                 }
-                Err(error) => {
-                    this.update(cx, |store, cx| {
-                        store.note_operation_failure(id, epoch, error, cx);
-                    })
-                    .ok();
+                result
+            });
+            let result = match future::select(work, abandoned).await {
+                Either::Left((result, _)) => result,
+                // Dropping the call is what stops waiting for the server, and
+                // is all that can be done where the server cannot be asked.
+                Either::Right(_) => Err(QueryCancelled.into()),
+            };
+            // What a statement that was asked to stop answers is taken for what it
+            // is. An error of the kind a server gives for a statement it stopped
+            // is the stop. Rows, or an error of its own such as a failed COMMIT,
+            // are an answer the reader has to see: the statement finished before
+            // the request reached it, or failed for a reason of its own, and
+            // saying "cancelled" over either would hide what happened.
+            let stopped = running_queries.is_stopping(run_id);
+            let outcome = match result {
+                Err(error) if stopped && looks_like_being_stopped(&error) => {
+                    Err(QueryCancelled.into())
                 }
-            }
-            result
+                Ok(answer) if stopped => {
+                    running_queries.note_completed_despite_stop(run_id);
+                    Ok(answer)
+                }
+                other => other,
+            };
+            drop(run);
+            this.update(cx, |_, cx| cx.emit(DatabaseStoreEvent::QueriesChanged))
+                .ok();
+            outcome
         })
+    }
+
+    /// The statements being run, on every connection.
+    pub fn running_queries(&self) -> Vec<RunningQuery> {
+        self.running_queries.all()
+    }
+
+    /// How many stops have been asked for on `id`.
+    pub fn stop_requests(&self, id: ConnectionId) -> u64 {
+        self.stop_requests.get(&id).copied().unwrap_or_default()
+    }
+
+    /// How the last stop on `id` ended.
+    pub fn last_stop(&self, id: ConnectionId) -> Option<CancelReport> {
+        self.last_stops.get(&id).cloned()
+    }
+
+    /// Whether `id` has a statement that has been sent and not yet answered.
+    pub fn has_running_queries(&self, id: ConnectionId) -> bool {
+        !self.running_queries.of_connection(id).is_empty()
+    }
+
+    /// The stop in progress on `id`, when there is one.
+    pub fn stop_in_progress(
+        &self,
+        id: ConnectionId,
+    ) -> Option<Shared<oneshot::Receiver<CancelReport>>> {
+        self.stops_in_progress.get(&id).cloned()
+    }
+
+    /// Asks for what `id` is running to stop, and for its transaction to be
+    /// rolled back.
+    ///
+    /// The server is asked to stop the statement, and when it ignores that the
+    /// session is ended, which also rolls back what the session held. Where the
+    /// server cannot be asked, whoever waits for the statement stops waiting.
+    /// The statements that are waiting their turn behind it never start. Then
+    /// the transaction the connection holds is rolled back, because a statement
+    /// that was stopped leaves its transaction in a state the reader never
+    /// chose: open and half done in MySQL, aborted in PostgreSQL.
+    ///
+    /// Answers with the report once everything has settled, or nothing when
+    /// there was nothing to stop. Calling it again while a stop is in progress
+    /// returns that stop.
+    pub fn stop_queries(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Option<Shared<oneshot::Receiver<CancelReport>>> {
+        if let Some(in_progress) = self.stops_in_progress.get(&id) {
+            return Some(in_progress.clone());
+        }
+        *self.stop_requests.entry(id).or_default() += 1;
+        let running = self.running_queries.mark_stopping(id);
+        if running.is_empty() {
+            return None;
+        }
+        cx.emit(DatabaseStoreEvent::QueriesChanged);
+        let connection = self.connections.iter().find(|conn| conn.config.id == id);
+        let target = StopTarget {
+            connection: id,
+            epoch: connection.map_or(0, |conn| conn.epoch),
+            provider: connection.and_then(|conn| conn.provider.clone()),
+            transaction_at_stop: connection
+                .and_then(|conn| conn.provider.as_ref())
+                .and_then(|provider| provider.transaction_open_since()),
+        };
+        let queries = self.running_queries.clone();
+        let (report_sender, report_receiver) = oneshot::channel();
+        let in_progress = report_receiver.shared();
+        self.stops_in_progress.insert(id, in_progress.clone());
+        cx.spawn(async move |this, cx| {
+            let mut report = CancelReport {
+                stopped: running.len(),
+                ..CancelReport::default()
+            };
+            stop_what_runs(
+                target.provider.as_ref(),
+                &queries,
+                &running,
+                &mut report,
+                cx,
+            )
+            .await;
+            report.finished_first = running
+                .iter()
+                .filter(|id| queries.take_completed_despite_stop(**id))
+                .count();
+            roll_back_what_is_held(&this, &target, &mut report, cx).await;
+            this.update(cx, |store, cx| {
+                store.stops_in_progress.remove(&id);
+                store.last_stops.insert(id, report.clone());
+                cx.emit(DatabaseStoreEvent::QueriesChanged);
+            })
+            .ok();
+            report_sender.send(report).ok();
+        })
+        .detach();
+        Some(in_progress)
     }
 
     /// Fetches a single Aerospike record by key. See
@@ -3373,6 +3668,7 @@ fn save_run_configs_to_disk(configs: &[RunConfiguration]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_runs::test_support::HangingProvider;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -5742,5 +6038,298 @@ mod tests {
             )
         });
         assert!(evicted);
+    }
+
+    fn a_running_statement(
+        cx: &mut gpui::TestAppContext,
+        provider: Arc<HangingProvider>,
+    ) -> (
+        Entity<DatabaseStore>,
+        ConnectionId,
+        Task<Result<db_client::schema::QueryResult>>,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider, cx);
+        });
+        let statement = store.update(cx, |store, cx| {
+            store.execute_query(id, "shop".into(), "SELECT SLEEP(60)".into(), cx)
+        });
+        cx.run_until_parked();
+        (store, id, statement)
+    }
+
+    #[gpui::test]
+    async fn a_stop_asks_the_server_and_the_statement_answers_as_cancelled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, false);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        assert_eq!(
+            store
+                .read_with(cx, |store, _| store.running_queries())
+                .len(),
+            1,
+            "the statement is listed while it runs"
+        );
+
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        let error = statement
+            .await
+            .expect_err("a stopped statement is an error");
+        assert!(crate::query_runs::is_cancelled(&error), "{error:#}");
+        let report = report.await.expect("the report arrives");
+
+        assert!(report.server_stopped && !report.session_ended && !report.rolled_back);
+        assert_eq!(*provider.interrupts.lock().unwrap(), [Interrupt::Statement]);
+        assert!(
+            store
+                .read_with(cx, |store, _| store.running_queries())
+                .is_empty(),
+            "a stopped statement is no longer listed"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_transaction_a_stopped_statement_was_in_is_rolled_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, false);
+        provider.hold_a_transaction();
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        statement.await.expect_err("stopped");
+        let report = report.await.expect("the report arrives");
+
+        assert!(report.rolled_back, "{report:?}");
+        assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+        assert!(provider.transaction_open_since().is_none());
+        assert!(
+            report
+                .describe()
+                .ends_with("The transaction was rolled back.")
+        );
+    }
+
+    #[gpui::test]
+    async fn nothing_is_rolled_back_where_no_transaction_is_held(cx: &mut gpui::TestAppContext) {
+        let provider = HangingProvider::new(true, false);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        statement.await.expect_err("stopped");
+        let report = report.await.expect("the report arrives");
+        assert!(!report.rolled_back);
+        assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn a_server_that_ignores_the_request_is_asked_to_end_the_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, true);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        for _ in 0..(LOOKS_WHILE_THE_SERVER_IS_GIVEN_ITS_TIME + 5) {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(HOW_OFTEN_TO_LOOK_AT_THE_STATEMENTS);
+        }
+        statement.await.expect_err("stopped");
+        let report = report.await.expect("the report arrives");
+
+        assert!(report.server_stopped && report.session_ended, "{report:?}");
+        assert_eq!(
+            *provider.interrupts.lock().unwrap(),
+            [Interrupt::Statement, Interrupt::Session]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_server_that_cannot_be_asked_is_given_up_on(cx: &mut gpui::TestAppContext) {
+        let provider = HangingProvider::new(false, false);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        let error = statement.await.expect_err("the caller stopped waiting");
+        assert!(crate::query_runs::is_cancelled(&error), "{error:#}");
+        let report = report.await.expect("the report arrives");
+
+        assert!(!report.server_stopped, "nothing was asked of the server");
+        assert!(provider.interrupts.lock().unwrap().is_empty());
+        assert!(report.describe().starts_with("Stopped waiting."));
+    }
+
+    #[gpui::test]
+    async fn a_stop_with_nothing_running_is_still_counted_for_a_script_between_statements(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, HangingProvider::new(true, false), cx);
+        });
+        assert_eq!(store.read_with(cx, |store, _| store.stop_requests(id)), 0);
+        assert!(
+            store
+                .update(cx, |store, cx| store.stop_queries(id, cx))
+                .is_none()
+        );
+        assert_eq!(store.read_with(cx, |store, _| store.stop_requests(id)), 1);
+    }
+
+    #[gpui::test]
+    async fn a_second_stop_while_one_is_in_progress_is_the_same_stop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, true);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let first = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        let second = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("the stop in progress");
+        for _ in 0..(LOOKS_WHILE_THE_SERVER_IS_GIVEN_ITS_TIME + 5) {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(HOW_OFTEN_TO_LOOK_AT_THE_STATEMENTS);
+        }
+        statement.await.expect_err("stopped");
+        assert_eq!(
+            first.await.expect("the report arrives"),
+            second.await.expect("the same report arrives")
+        );
+        assert_eq!(
+            provider
+                .interrupts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|how| **how == Interrupt::Statement)
+                .count(),
+            1,
+            "the server was asked once"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_statement_that_finished_before_the_stop_arrived_is_not_called_cancelled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, false);
+        provider.finish_when_released();
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+
+        statement
+            .await
+            .expect("its answer is shown: it was done before the stop reached it");
+        let report = report.await.expect("the report arrives");
+
+        assert_eq!(report.finished_first, 1, "{report:?}");
+        assert!(report.describe().starts_with("Not stopped"));
+    }
+
+    #[gpui::test]
+    async fn an_error_of_the_statements_own_is_not_hidden_by_a_stop(cx: &mut gpui::TestAppContext) {
+        let provider = HangingProvider::new(true, false);
+        provider.fail_when_released("deferred constraint violated");
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+
+        let error = statement.await.expect_err("it failed");
+        report.await.expect("the report arrives");
+
+        assert!(!crate::query_runs::is_cancelled(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("deferred constraint violated"));
+    }
+
+    #[gpui::test]
+    async fn a_transaction_another_console_opened_meanwhile_is_not_rolled_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider = HangingProvider::new(true, false);
+        provider.hold_a_transaction();
+        provider.replace_the_transaction_when_stopped();
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        statement.await.expect_err("stopped");
+        let report = report.await.expect("the report arrives");
+
+        assert!(!report.rolled_back, "{report:?}");
+        assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn the_rollback_goes_to_the_provider_the_statement_ran_on(cx: &mut gpui::TestAppContext) {
+        let old = HangingProvider::new(true, false);
+        old.hold_a_transaction();
+        let (store, id, statement) = a_running_statement(cx, old.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        // The connection is replaced while the server is given its time.
+        let new = HangingProvider::new(true, false);
+        new.hold_a_transaction();
+        store.update(cx, |store, cx| {
+            let config = store.connections()[0].config.clone();
+            store.add_connected_for_test(config, new.clone(), cx);
+        });
+        statement.await.expect_err("stopped");
+        let report = report.await.expect("the report arrives");
+
+        assert!(report.rolled_back, "{report:?}");
+        assert_eq!(old.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            new.rollbacks.load(Ordering::SeqCst),
+            0,
+            "the transaction of the new connection is not the one that was stopped"
+        );
+        assert!(new.transaction_open_since().is_some());
+    }
+
+    #[gpui::test]
+    async fn what_a_stop_leaves_behind_goes_with_the_connection(cx: &mut gpui::TestAppContext) {
+        let provider = HangingProvider::new(true, false);
+        let (store, id, statement) = a_running_statement(cx, provider.clone());
+        let report = store
+            .update(cx, |store, cx| store.stop_queries(id, cx))
+            .expect("something was running");
+        statement.await.expect_err("stopped");
+        report.await.expect("the report arrives");
+        assert!(
+            store
+                .read_with(cx, |store, _| store.last_stop(id))
+                .is_some()
+        );
+        assert_eq!(store.read_with(cx, |store, _| store.stop_requests(id)), 1);
+
+        store.update(cx, |store, cx| store.remove_connection(id, cx));
+
+        assert!(
+            store
+                .read_with(cx, |store, _| store.last_stop(id))
+                .is_none()
+        );
+        assert_eq!(store.read_with(cx, |store, _| store.stop_requests(id)), 0);
     }
 }

@@ -845,6 +845,9 @@ pub mod database_panel {
             ToggleFocus,
             /// Executes the current SQL query or selection against the active database connection.
             RunQuery,
+            /// Stops the SQL statements being run, on the server, and rolls back
+            /// the transaction they had open.
+            CancelQuery,
             /// Runs EXPLAIN on the current SQL query or selection and shows the query plan.
             ExplainQuery,
             /// Runs EXPLAIN ANALYZE on the current SQL query or selection and

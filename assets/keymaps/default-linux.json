@@ -1846,6 +1846,22 @@
       "ctrl-shift-e": "database_panel::ExplainQuery"
     }
   },
+  // Stops the statement a database console is running, on the server, and rolls
+  // back the transaction it had open. Escape does it only while a statement is
+  // running in this console and no menu wants the key, so it never takes
+  // Escape from anything else. The function key works from anywhere.
+  {
+    "context": "Editor && mode == full && db_query_running && !showing_completions && !showing_code_actions",
+    "bindings": {
+      "escape": "database_panel::CancelQuery"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-shift-f2": "database_panel::CancelQuery"
+    }
+  },
   // After the database console's own binding, which claims ctrl-enter for every
   // full-mode editor there is. The body of a request is one of those, so the
   // key reached a query runner that has nothing to run here; later index wins,
