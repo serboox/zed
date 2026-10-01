@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::MAX_RESULT_ROWS;
 use crate::connection::ConnectionConfig;
+use crate::interrupt::{CONTROL_TIMEOUT, Interrupt, Interrupted, StatementTracker, tag_comment};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
@@ -15,6 +16,9 @@ pub struct ClickHouseProvider {
     base_url: String,
     username: String,
     password: String,
+    /// What the console is running, so that it can be stopped from outside the
+    /// call that runs it.
+    statements: StatementTracker,
 }
 
 impl ClickHouseProvider {
@@ -29,6 +33,7 @@ impl ClickHouseProvider {
             base_url,
             username: config.username.clone(),
             password: config.password.clone(),
+            statements: StatementTracker::new(),
         };
 
         provider
@@ -785,6 +790,29 @@ impl DbProvider for ClickHouseProvider {
         })
     }
 
+    fn can_interrupt(&self) -> bool {
+        true
+    }
+
+    /// ClickHouse has no session to end, so both kinds of request ask the same
+    /// thing. The statement is found among the server's running ones by the
+    /// comment in front of its text, and the request names itself out of the
+    /// match.
+    async fn interrupt(&self, _how: Interrupt) -> Result<Interrupted> {
+        let Some(running) = self.statements.cancel() else {
+            return Ok(Interrupted::NothingRunning);
+        };
+        let kill = format!(
+            "KILL QUERY WHERE query LIKE '%{}%' AND query NOT LIKE '%KILL QUERY%' SYNC",
+            running.tag
+        );
+        tokio::time::timeout(CONTROL_TIMEOUT, self.execute_dml(&kill, None))
+            .await
+            .context("Timed out asking ClickHouse to stop the statement")?
+            .context("ClickHouse refused to stop the statement")?;
+        Ok(Interrupted::Requested)
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let db_opt = if database.is_empty() {
@@ -792,9 +820,11 @@ impl DbProvider for ClickHouseProvider {
         } else {
             Some(database)
         };
+        let running = self.statements.start(self.statements.arrive())?;
         let prefixed = format!(
-            "{}{}",
+            "{}{}{}",
             crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            tag_comment(Some(running.tag())),
             sql
         );
 
@@ -1304,5 +1334,51 @@ mod integration_tests {
             );
         })
         .await;
+    }
+
+    /// A statement that runs for a long time is stopped from outside, and the
+    /// provider is still good afterwards.
+    #[tokio::test]
+    #[ignore]
+    async fn a_running_statement_is_stopped_from_outside() {
+        let config = test_config_from_env()
+            .expect("CLICKHOUSE_TEST_URL env var required for integration tests");
+        let provider = std::sync::Arc::new(
+            ClickHouseProvider::connect(&config)
+                .await
+                .expect("Failed to connect"),
+        );
+        let running = {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                provider
+                    .execute_query("", "SELECT count() FROM numbers(100000000000000)")
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        assert_eq!(
+            provider
+                .interrupt(crate::interrupt::Interrupt::Statement)
+                .await
+                .expect("the interrupt is sent"),
+            crate::interrupt::Interrupted::Requested
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("a stopped statement is an error");
+        assert!(
+            format!("{error:#}").contains("QUERY_WAS_CANCELLED")
+                || format!("{error:#}").contains("cancel"),
+            "{error:#}"
+        );
+        let after = provider
+            .execute_query("", "SELECT 41 + 1")
+            .await
+            .expect("the provider is still good");
+        assert_eq!(after.rows, vec![vec![Some("42".to_string())]]);
     }
 }

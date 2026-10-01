@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use tokio::runtime::{Handle, Runtime};
 
 use crate::QUERY_TIMEOUT;
+use crate::interrupt::{Interrupt, Interrupted};
 use crate::provider::DbProvider;
 use crate::schema::{
     ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, QueryResult, TableInfo, TriggerInfo,
@@ -121,6 +122,15 @@ impl DbProvider for RuntimeProvider {
     // would ever ask it to.
     fn holds_transactions(&self) -> bool {
         self.inner.holds_transactions()
+    }
+
+    fn can_interrupt(&self) -> bool {
+        self.inner.can_interrupt()
+    }
+
+    async fn interrupt(&self, how: Interrupt) -> Result<Interrupted> {
+        let inner = self.inner.clone();
+        on_runtime(async move { inner.interrupt(how).await }).await
     }
 
     async fn begin_transaction(
@@ -400,6 +410,13 @@ mod tests {
             self.assert_in_tokio("get_table_ddl").await?;
             Ok(String::new())
         }
+        fn can_interrupt(&self) -> bool {
+            true
+        }
+        async fn interrupt(&self, _how: Interrupt) -> Result<Interrupted> {
+            self.assert_in_tokio("interrupt").await?;
+            Ok(Interrupted::Requested)
+        }
     }
 
     #[test]
@@ -424,6 +441,17 @@ mod tests {
                 .execute_query("db", "SELECT 1")
                 .await
                 .expect("query");
+            assert!(
+                provider.can_interrupt(),
+                "what the wrapped provider can do is not lost behind the wrapper"
+            );
+            assert_eq!(
+                provider
+                    .interrupt(Interrupt::Statement)
+                    .await
+                    .expect("interrupt"),
+                Interrupted::Requested
+            );
         });
 
         let recorded = calls.lock().expect("poisoned").clone();
@@ -435,6 +463,7 @@ mod tests {
                 "list_tables",
                 "describe_table",
                 "execute_query",
+                "interrupt",
             ]
         );
     }
