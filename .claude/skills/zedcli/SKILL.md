@@ -73,6 +73,10 @@ WINDOW  RUN         PID      STATE    CPU   MEMORY  COMMAND
 
 - `ps` lists task runs (running and finished) and debug sessions. Each running
   run carries its whole process tree with CPU (share of one core) and memory.
+- A run sent over ssh (its configuration names a machine) adds a row `on <machine>`
+  with the program there, and that program's own processes under it; the local
+  row and tree are only the ssh client. A machine that does not answer leaves the
+  client alone. `--json` carries the far side as `remote`.
 - `run NAME` starts a configuration **and first stops any run of it that is
   still going, with every process it started** — the editor never keeps two
   instances of one configuration. So `run` on a running server is a restart.

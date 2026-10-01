@@ -3,13 +3,15 @@ use std::time::{Duration, Instant};
 
 use cli::{
     ApiEnvironmentInfo, ApiRequestInfo, ApiResponseInfo, ApiTestInfo, CliRequest, CliResponse,
-    CliResponseSink, ConfigurationInfo, DebugSessionInfo, ProcessInfo, RunAction, RunInfo,
-    RunState, WindowInfo, WindowSelector, WorkspaceInfo, exit_status,
+    CliResponseSink, ConfigurationInfo, DebugSessionInfo, ProcessInfo, RemoteRunInfo, RunAction,
+    RunInfo, RunState, WindowInfo, WindowSelector, WorkspaceInfo, exit_status,
 };
+use futures::StreamExt as _;
 use gpui::{AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 use run_configurations::configurations_file::Kind;
+use run_configurations::over_ssh::RemoteRun;
 use run_configurations::{
-    configurations_store, configurations_view, process_metrics, run_instances,
+    configurations_store, configurations_view, process_metrics, remote_metrics, run_instances,
 };
 use terminal::TaskStatus;
 use util::ResultExt as _;
@@ -146,6 +148,8 @@ pub fn admit(request: CliRequest, cx: &mut AsyncApp) -> Result<CliRequest, (Stri
 /// Long enough for a busy process to show, short enough not to keep the reader
 /// waiting on a list.
 const CPU_SAMPLED_OVER: Duration = Duration::from_millis(300);
+
+const MOST_REMOTE_RUNS_READ_AT_ONCE: usize = 8;
 
 /// How long a request waits for a project's run configuration files to be read:
 /// this many looks, [`STORE_LOOKED_AT_EVERY`] apart. Counted rather than timed,
@@ -354,6 +358,8 @@ struct RunSeen {
     command: String,
     state: RunState,
     shell: Option<u32>,
+    /// The machine a run was sent to, and how to ask it about the run.
+    remote: Option<(String, RemoteRun)>,
 }
 
 pub async fn list_runs(
@@ -391,6 +397,11 @@ pub async fn list_runs(
                         shell: terminal
                             .pid_getter()
                             .map(|getter| getter.fallback_pid().as_u32()),
+                        remote: run_configurations::over_ssh::remote_run_of(
+                            task.spawned_task.command.as_deref(),
+                            &task.spawned_task.args,
+                        )
+                        .map(|run| (run.destination.clone(), run)),
                     });
                 }
                 let project = workspace.read(cx).project().clone();
@@ -436,21 +447,37 @@ pub async fn list_runs(
         })
         .collect();
     let executor = cx.background_executor().clone();
-    let trees = cx
+    let remotes: Vec<Option<(String, RemoteRun)>> = seen
+        .iter()
+        .map(|run| {
+            run.remote
+                .clone()
+                .filter(|_| run.state == RunState::Running)
+        })
+        .collect();
+    let (trees, remote_trees) = cx
         .background_executor()
-        .spawn(async move { trees_of(&roots, &executor).await })
+        .spawn(async move {
+            futures::future::join(
+                trees_of(&roots, &executor),
+                remote_trees_of(&remotes, &executor),
+            )
+            .await
+        })
         .await;
 
     let runs = seen
         .into_iter()
         .zip(trees)
-        .map(|(run, processes)| RunInfo {
+        .zip(remote_trees)
+        .map(|((run, processes), remote)| RunInfo {
             window: run.window,
             label: run.label,
             command: run.command,
             state: run.state,
             pid: run.shell,
             processes,
+            remote,
         })
         .collect();
     responses
@@ -460,6 +487,55 @@ pub async fn list_runs(
         })
         .log_err();
     responses.send(CliResponse::Exit { status: 0 }).log_err();
+}
+
+/// What each run sent over ssh is on its far machine, read twice
+/// [`CPU_SAMPLED_OVER`] apart like the local trees, a few runs at a time so many
+/// runs cannot start that many ssh processes at once. A machine that does not
+/// answer leaves its run with the local client only.
+async fn remote_trees_of(
+    remotes: &[Option<(String, RemoteRun)>],
+    executor: &gpui::BackgroundExecutor,
+) -> Vec<Option<RemoteRunInfo>> {
+    let reads: Vec<_> = remotes
+        .iter()
+        .map(|remote| remote_tree_of(remote, executor))
+        .collect();
+    futures::stream::iter(reads)
+        .buffered(MOST_REMOTE_RUNS_READ_AT_ONCE)
+        .collect()
+        .await
+}
+
+async fn remote_tree_of(
+    remote: &Option<(String, RemoteRun)>,
+    executor: &gpui::BackgroundExecutor,
+) -> Option<RemoteRunInfo> {
+    let (machine, run) = remote.as_ref()?;
+    let first = remote_metrics::read(run, executor).await?;
+    let first_at = Instant::now();
+    let mut watcher = process_metrics::Watcher::default();
+    watcher.metrics_of(first.root, &first.samples, first_at, first.uptime);
+    executor.timer(CPU_SAMPLED_OVER).await;
+    let second = remote_metrics::read(run, executor).await?;
+    let metrics =
+        watcher.metrics_of(second.root, &second.samples, Instant::now(), second.uptime)?;
+    Some(RemoteRunInfo {
+        machine: machine.clone(),
+        processes: metrics.tree.into_iter().map(process_info).collect(),
+    })
+}
+
+fn process_info(process: process_metrics::ProcessReading) -> ProcessInfo {
+    ProcessInfo {
+        pid: process.pid,
+        parent: process.parent,
+        name: process.name.to_string(),
+        cpu_percent: process.cpu,
+        memory_bytes: process.memory,
+        threads: process.threads,
+        state: process.state.to_string(),
+    }
 }
 
 /// Each run's process tree, read twice [`CPU_SAMPLED_OVER`] apart so each
@@ -500,21 +576,7 @@ async fn trees_of(
             };
             watcher
                 .metrics_of(*root, &second, second_at, process_metrics::machine_uptime())
-                .map(|metrics| {
-                    metrics
-                        .tree
-                        .into_iter()
-                        .map(|process| ProcessInfo {
-                            pid: process.pid,
-                            parent: process.parent,
-                            name: process.name.to_string(),
-                            cpu_percent: process.cpu,
-                            memory_bytes: process.memory,
-                            threads: process.threads,
-                            state: process.state.to_string(),
-                        })
-                        .collect()
-                })
+                .map(|metrics| metrics.tree.into_iter().map(process_info).collect())
                 .unwrap_or_default()
         })
         .collect()
@@ -1322,10 +1384,20 @@ mod tests {
         workspace: &Entity<Workspace>,
         label: &str,
     ) -> Entity<Terminal> {
+        a_run_of(cx, workspace, label, "sleep", vec!["60".to_string()]).await
+    }
+
+    async fn a_run_of(
+        cx: &mut TestAppContext,
+        workspace: &Entity<Workspace>,
+        label: &str,
+        command: &str,
+        args: Vec<String>,
+    ) -> Entity<Terminal> {
         let template = task::TaskTemplate {
             label: label.to_string(),
-            command: "sleep".to_string(),
-            args: vec!["60".to_string()],
+            command: command.to_string(),
+            args,
             ..task::TaskTemplate::default()
         };
         let resolved = template
@@ -1441,6 +1513,150 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!is_running(&run, cx), "Stop ends the run");
+    }
+
+    /// A run sent over ssh is listed with what it is on the far machine, below its
+    /// local client. The far machine is this one, reached by a stand-in for `ssh`.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_run_over_ssh_is_listed_with_its_program_on_the_far_machine(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let app_state = two_projects(cx).await;
+        let (alpha, workspace) = window_with(cx, path!("/alpha"));
+        let directory = std::env::temp_dir().join(format!("ps-over-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory for the stand-in");
+        let stand_in = directory.join("ssh");
+        std::fs::write(
+            &stand_in,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec sh -c \"$*\"\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+            .expect("it can run");
+        let tag = run_configurations::over_ssh::RunTag {
+            token: "listedoverss".into(),
+            control_path: directory.join("zed-ssh-listedoverss"),
+        };
+        std::fs::write(&tag.control_path, "").expect("the connection is there");
+        let machine = run_configurations::over_ssh::Machine::parse("deploy@build.example.com")
+            .expect("a machine");
+        let (_, args) = run_configurations::over_ssh::run_tagged_over_ssh(
+            &machine,
+            &tag,
+            "sleep",
+            &["61".to_string()],
+            None,
+            &[],
+        );
+        let run = a_run_of(
+            cx,
+            &workspace,
+            "api",
+            stand_in.to_str().expect("a path"),
+            args,
+        )
+        .await;
+
+        let mut remote = None;
+        for _ in 0..100 {
+            let responses = ask(
+                cx,
+                &app_state,
+                CliRequest::ListRuns {
+                    selector: selector_for(alpha),
+                },
+            );
+            remote = responses.iter().find_map(|response| match response {
+                CliResponse::Runs { runs, .. } => runs
+                    .iter()
+                    .find(|listed| listed.label == "api")
+                    .and_then(|listed| listed.remote.clone()),
+                _ => None,
+            });
+            if remote.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        run.update(cx, |terminal, _| terminal.kill_active_task());
+        std::fs::remove_dir_all(&directory).ok();
+        let remote = remote.expect("the far machine answered");
+        assert_eq!(remote.machine, "deploy@build.example.com");
+        assert!(
+            remote
+                .processes
+                .iter()
+                .any(|process| process.name == "sleep"),
+            "the program over there is listed: {:?}",
+            remote.processes
+        );
+    }
+
+    /// Many runs sent over ssh are read a few at a time. The stand-in for `ssh`
+    /// notes when each call starts and ends, and no more than the limit overlap.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn runs_over_ssh_are_read_a_few_at_a_time(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        cx.executor().allow_parking();
+        let directory = std::env::temp_dir().join(format!("ps-read-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory for the stand-in");
+        let calls = directory.join("calls");
+        let stand_in = directory.join("ssh");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\necho start >> '{0}'\nsleep 0.2\necho end >> '{0}'\nexit 1\n",
+                calls.display()
+            ),
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+            .expect("it can run");
+        let control_path = directory.join("control");
+        std::fs::write(&control_path, "").expect("the connection is there");
+        let run_count = MOST_REMOTE_RUNS_READ_AT_ONCE * 3;
+        let remotes: Vec<Option<(String, RemoteRun)>> = (0..run_count)
+            .map(|index| {
+                Some((
+                    format!("machine-{index}"),
+                    RemoteRun {
+                        program: stand_in.to_string_lossy().into_owned(),
+                        destination: "far".into(),
+                        port: None,
+                        control_path: control_path.clone(),
+                        token: format!("token{index}"),
+                    },
+                ))
+            })
+            .collect();
+
+        let executor = cx.background_executor.clone();
+        let trees = remote_trees_of(&remotes, &executor).await;
+        let log = std::fs::read_to_string(&calls).expect("the stand-in was called");
+        std::fs::remove_dir_all(&directory).ok();
+
+        assert_eq!(trees.len(), run_count, "every run has its answer");
+        let (mut started, mut running, mut most_at_once) = (0, 0usize, 0usize);
+        for line in log.lines() {
+            match line {
+                "start" => {
+                    started += 1;
+                    running += 1;
+                    most_at_once = most_at_once.max(running);
+                }
+                "end" => running = running.saturating_sub(1),
+                _ => {}
+            }
+        }
+        assert_eq!(started, run_count, "every run was read");
+        assert!(most_at_once > 1, "reads overlap at all: {most_at_once}");
+        assert!(
+            most_at_once <= MOST_REMOTE_RUNS_READ_AT_ONCE,
+            "no more than the limit at once, got {most_at_once}"
+        );
     }
 
     /// A configuration that names a machine is run there from the command line

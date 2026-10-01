@@ -1073,20 +1073,22 @@ fn runs_as(format: RowFormat, runs: &[RunInfo], sessions: &[DebugSessionInfo]) -
             String::new(),
             run.command.clone(),
         ]);
-        for process in run.processes.iter().skip(1) {
-            let depth = depth_of(process.pid, &run.processes);
+        rows.extend(process_rows(&run.processes, 1));
+        if let Some(remote) = &run.remote
+            && let Some(root) = remote.processes.first()
+        {
             rows.push(vec![
                 String::new(),
-                format!("{}└ {}", "  ".repeat(depth.saturating_sub(1)), process.name),
-                process.pid.to_string(),
-                process.state.clone(),
-                process
-                    .cpu_percent
+                format!("on {}", remote.machine),
+                root.pid.to_string(),
+                root.state.clone(),
+                root.cpu_percent
                     .map(|cpu| format!("{cpu:.1}%"))
                     .unwrap_or_default(),
-                memory(process.memory_bytes),
-                format!("{} threads", process.threads),
+                memory(root.memory_bytes),
+                root.name.clone(),
             ]);
+            rows.extend(process_rows(&remote.processes, 1));
         }
     }
     let mut text = match rows.is_empty() {
@@ -1116,6 +1118,29 @@ fn runs_as(format: RowFormat, runs: &[RunInfo], sessions: &[DebugSessionInfo]) -
         ));
     }
     text
+}
+
+/// The rows of a run's processes below its root, each indented by how deep it is.
+fn process_rows(processes: &[cli::ProcessInfo], skip: usize) -> Vec<Vec<String>> {
+    processes
+        .iter()
+        .skip(skip)
+        .map(|process| {
+            let depth = depth_of(process.pid, processes);
+            vec![
+                String::new(),
+                format!("{}└ {}", "  ".repeat(depth.saturating_sub(1)), process.name),
+                process.pid.to_string(),
+                process.state.clone(),
+                process
+                    .cpu_percent
+                    .map(|cpu| format!("{cpu:.1}%"))
+                    .unwrap_or_default(),
+                memory(process.memory_bytes),
+                format!("{} threads", process.threads),
+            ]
+        })
+        .collect()
 }
 
 /// How many parents stand between a process and the root of its run.

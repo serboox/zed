@@ -401,6 +401,18 @@ pub struct RunInfo {
     pub pid: Option<u32>,
     /// The run's processes, the shell first and every parent before its children.
     pub processes: Vec<ProcessInfo>,
+    /// What the run is on the far machine, when it was sent over ssh and that
+    /// machine answered: `processes` are then those of the local ssh client.
+    #[serde(default)]
+    pub remote: Option<RemoteRunInfo>,
+}
+
+/// The processes of a run on the machine it was sent to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteRunInfo {
+    pub machine: String,
+    /// The run's root there first, and every parent before its children.
+    pub processes: Vec<ProcessInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

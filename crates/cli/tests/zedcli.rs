@@ -252,6 +252,7 @@ fn ps_names_the_directory_it_was_run_from_and_prints_each_process_of_a_run() {
                             state: "S".into(),
                         },
                     ],
+                    remote: None,
                 }],
                 debug_sessions: Vec::new(),
             },
@@ -278,6 +279,63 @@ fn ps_names_the_directory_it_was_run_from_and_prints_each_process_of_a_run() {
         "the window is chosen by the directory zedcli runs in"
     );
     assert!(!selector.all && selector.window.is_none());
+}
+
+/// A run sent over ssh is listed with the processes on the far machine below its
+/// local client, under the machine's name.
+#[test]
+fn ps_lists_the_processes_of_a_run_on_the_machine_it_was_sent_to() {
+    let process = |pid, parent, name: &str, memory: u64| ProcessInfo {
+        pid,
+        parent,
+        name: name.into(),
+        cpu_percent: Some(0.),
+        memory_bytes: memory << 20,
+        threads: 1,
+        state: "S".into(),
+    };
+    let editor = FakeEditor::answering(move |_| {
+        vec![
+            CliResponse::Runs {
+                runs: vec![RunInfo {
+                    window: 7,
+                    label: "api on deploy@build.example.com".into(),
+                    command: "ssh -t deploy@build.example.com".into(),
+                    state: RunState::Running,
+                    pid: Some(100),
+                    processes: vec![process(100, 1, "ssh", 9)],
+                    remote: Some(cli::RemoteRunInfo {
+                        machine: "deploy@build.example.com".into(),
+                        processes: vec![process(900, 1, "api", 52), process(901, 900, "worker", 7)],
+                    }),
+                }],
+                debug_sessions: Vec::new(),
+            },
+            CliResponse::Exit { status: 0 },
+        ]
+    });
+    let output = zedcli(editor.data_dir.path(), &["ps"], None, None);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        text.contains("on deploy@build.example.com") && text.contains("52 MB"),
+        "the far machine is named and its program is listed: {text}"
+    );
+    assert!(
+        text.contains("900") && text.contains("└ worker") && text.contains("7 MB"),
+        "with its own children: {text}"
+    );
+    editor.request();
+}
+
+/// An editor from before runs carried their far side still answers in a form
+/// the client reads.
+#[test]
+fn a_run_from_an_older_editor_has_no_far_side() {
+    let older =
+        r#"{"window":1,"label":"a","command":"c","state":"running","pid":5,"processes":[]}"#;
+    let run: RunInfo = serde_json::from_str(older).expect("it reads");
+    assert_eq!(run.remote, None);
 }
 
 #[test]
