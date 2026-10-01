@@ -2,6 +2,7 @@ pub mod aerospike_provider;
 pub mod cassandra_provider;
 pub mod clickhouse;
 pub mod connection;
+pub mod interrupt;
 pub mod kubernetes_tunnel;
 pub mod mongo_provider;
 pub mod mysql;

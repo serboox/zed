@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::MAX_RESULT_ROWS;
 use crate::connection::{ConnectionConfig, SslMode};
+use crate::interrupt::{
+    BETWEEN_LOOKS, CONTROL_TIMEOUT, HOW_LONG_TO_LOOK_FOR_THE_STATEMENT, Interrupt, Interrupted,
+    StatementTracker, tag_comment,
+};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind,
@@ -30,6 +34,9 @@ pub struct PostgresProvider {
     /// numbers for the same thing is how a guard ends up meaning nothing.
     transaction_idle_limit: Option<Duration>,
     held_transaction: AsyncMutex<Option<HeldTransaction>>,
+    /// What the console is running, so that it can be stopped from outside the
+    /// call that runs it.
+    statements: StatementTracker,
     /// When the held transaction opened, deliberately outside the async mutex
     /// above. A statement running inside the transaction holds that mutex for
     /// as long as the statement takes, so a `transaction_open_since` that
@@ -172,10 +179,82 @@ fn search_path_statement(schema: &str) -> String {
     format!("SET search_path = \"{}\"", schema.replace('"', "\"\""))
 }
 
-fn prefixed_statement(sql: &str) -> String {
+/// Asks the server to stop the statement that carries `tag`, over a connection
+/// of its own, since the one the statement runs on is busy.
+///
+/// The statement is found in `pg_stat_activity` by the comment in front of its
+/// text, not by a process number remembered from earlier: the number goes stale
+/// when the connection is replaced, and a transaction is held on a connection
+/// that is not the pool's.
+async fn stop_the_statement(
+    options: &PgConnectOptions,
+    tag: &str,
+    how: Interrupt,
+) -> Result<Interrupted> {
+    let mut control = tokio::time::timeout(CONTROL_TIMEOUT, PgConnection::connect_with(options))
+        .await
+        .context("Timed out opening a connection to stop the statement")?
+        .context("Failed to open a connection to stop the statement")?;
+    let answer = find_and_stop(&mut control, tag, how).await;
+    match tokio::time::timeout(CONTROL_TIMEOUT, control.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!("closing the connection that stopped a statement: {error:#}")
+        }
+        Err(_) => log::warn!("closing the connection that stopped a statement timed out"),
+    }
+    answer
+}
+
+async fn find_and_stop(
+    control: &mut PgConnection,
+    tag: &str,
+    how: Interrupt,
+) -> Result<Interrupted> {
+    let function = match how {
+        Interrupt::Statement => "pg_cancel_backend",
+        Interrupt::Session => "pg_terminate_backend",
+    };
+    let pattern = format!("%{tag}%");
+    let deadline = Instant::now() + HOW_LONG_TO_LOOK_FOR_THE_STATEMENT;
+    loop {
+        let processes: Vec<i32> = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE $1",
+            )
+            .bind(&pattern)
+            .fetch_all(&mut *control),
+        )
+        .await
+        .context("Timed out listing the statements the server is running")?
+        .context("Failed to list the statements the server is running")?;
+        if !processes.is_empty() {
+            for process in processes {
+                let stop = format!("SELECT {function}({process})");
+                tokio::time::timeout(
+                    CONTROL_TIMEOUT,
+                    sqlx::query(AssertSqlSafe(stop.as_str())).execute(&mut *control),
+                )
+                .await
+                .context("Timed out asking the server to stop the statement")?
+                .context("The server refused to stop the statement")?;
+            }
+            return Ok(Interrupted::Requested);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Interrupted::NothingRunning);
+        }
+        tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
+}
+
+fn prefixed_statement(sql: &str, tag: Option<&str>) -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        tag_comment(tag),
         sql
     )
 }
@@ -510,6 +589,7 @@ impl PostgresProvider {
             connect_options: opts,
             transaction_idle_limit: config.transaction_idle_limit(),
             held_transaction: AsyncMutex::new(None),
+            statements: StatementTracker::new(),
             transaction_opened_at: Mutex::new(None),
         })
     }
@@ -879,6 +959,17 @@ impl DbProvider for PostgresProvider {
         }
     }
 
+    fn can_interrupt(&self) -> bool {
+        true
+    }
+
+    async fn interrupt(&self, how: Interrupt) -> Result<Interrupted> {
+        let Some(running) = self.statements.cancel() else {
+            return Ok(Interrupted::NothingRunning);
+        };
+        stop_the_statement(&self.connect_options, &running.tag, how).await
+    }
+
     fn holds_transactions(&self) -> bool {
         true
     }
@@ -963,9 +1054,11 @@ impl DbProvider for PostgresProvider {
         // pool instead, on purpose: browsing a schema must not become part of
         // the reader's transaction, where it would read under their snapshot
         // and hold its own locks until they were finished.
+        let arrival = self.statements.arrive();
         let mut held = self.held_transaction.lock().await;
+        let running = self.statements.start(arrival)?;
         let effect = transaction_effect(sql);
-        let prefixed = prefixed_statement(sql);
+        let prefixed = prefixed_statement(sql, Some(running.tag()));
 
         let Some(mut transaction) = held.take() else {
             if effect == TransactionEffect::Opens {
@@ -1021,7 +1114,7 @@ impl DbProvider for PostgresProvider {
                 .with_context(|| format!("Failed to run `{statement}`"))?;
         }
         let start = Instant::now();
-        let answer = collect_rows(&mut connection, prefixed_statement(query).as_str())
+        let answer = collect_rows(&mut connection, prefixed_statement(query, None).as_str())
             .await
             .map(|(columns, rows)| rows_result(columns, rows, start));
         if let Err(error) = sqlx::raw_sql(AssertSqlSafe("ROLLBACK"))
@@ -1045,9 +1138,11 @@ impl DbProvider for PostgresProvider {
         // Routed exactly as `execute_query` is, and for the same reason: an
         // export the reader asked for inside their transaction has to see the
         // rows their transaction sees, not the rows everyone else does.
+        let arrival = self.statements.arrive();
         let mut held = self.held_transaction.lock().await;
+        let running = self.statements.start(arrival)?;
         let effect = transaction_effect(sql);
-        let prefixed = prefixed_statement(sql);
+        let prefixed = prefixed_statement(sql, Some(running.tag()));
 
         let Some(mut transaction) = held.take() else {
             if effect == TransactionEffect::Opens {
@@ -1425,11 +1520,11 @@ mod transaction_statement_tests {
 
     #[test]
     fn classifies_a_statement_behind_the_application_name_comment() {
-        let commit = prefixed_statement("commit;");
+        let commit = prefixed_statement("commit;", None);
         assert_eq!(transaction_effect(&commit), TransactionEffect::Ends);
-        let begin = prefixed_statement("  BEGIN  ");
+        let begin = prefixed_statement("  BEGIN  ", None);
         assert_eq!(transaction_effect(&begin), TransactionEffect::Opens);
-        let savepoint = prefixed_statement("ROLLBACK TO SAVEPOINT a");
+        let savepoint = prefixed_statement("ROLLBACK TO SAVEPOINT a", None);
         assert_eq!(transaction_effect(&savepoint), TransactionEffect::Neither);
     }
 
@@ -1672,9 +1767,11 @@ mod ddl_rendering_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::PostgresProvider;
+    use crate::interrupt::{Interrupt, Interrupted, is_interruption};
     use crate::provider::DbProvider;
     use crate::schema::ProcedureKind;
     use crate::{ConnectionConfig, DatabaseDriver};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn test_config_from_env() -> Option<ConnectionConfig> {
@@ -2577,5 +2674,215 @@ mod integration_tests {
             );
         })
         .await;
+    }
+
+    const A_LONG_QUERY: &str = "SELECT pg_sleep(120)";
+
+    async fn connected() -> std::sync::Arc<PostgresProvider> {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        std::sync::Arc::new(
+            PostgresProvider::connect(&config)
+                .await
+                .expect("Failed to connect"),
+        )
+    }
+
+    fn run_in_the_background(
+        provider: &std::sync::Arc<PostgresProvider>,
+        sql: &str,
+    ) -> tokio::task::JoinHandle<anyhow::Result<crate::schema::QueryResult>> {
+        let provider = provider.clone();
+        let sql = sql.to_string();
+        tokio::spawn(async move { provider.execute_query("public", &sql).await })
+    }
+
+    /// A statement that runs for a long time is stopped from outside, the
+    /// server says so, and the connection it ran on is still good.
+    #[tokio::test]
+    #[ignore]
+    async fn a_running_statement_is_stopped_and_the_session_survives() {
+        let provider = connected().await;
+        let running = run_in_the_background(&provider, A_LONG_QUERY);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Statement)
+                .await
+                .expect("the interrupt is sent"),
+            Interrupted::Requested
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("a stopped statement is an error");
+        assert!(is_interruption(&error), "{error:#}");
+
+        let after = provider
+            .execute_query("public", "SELECT 41 + 1")
+            .await
+            .expect("the connection is still good");
+        assert_eq!(after.rows, vec![vec![Some("42".to_string())]]);
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Statement)
+                .await
+                .expect("a second interrupt is harmless"),
+            Interrupted::NothingRunning
+        );
+    }
+
+    /// The transaction the statement ran in is rolled back once the statement
+    /// is stopped, and what it staged before is gone with it.
+    #[tokio::test]
+    #[ignore]
+    async fn a_transaction_is_rolled_back_when_its_running_statement_is_stopped() {
+        let provider = connected().await;
+        provider
+            .execute_query("public", "DROP TABLE IF EXISTS zed_cancel_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "CREATE TABLE zed_cancel_probe (a int)")
+            .await
+            .expect("create");
+
+        provider
+            .begin_transaction("public", None)
+            .await
+            .expect("the transaction opens");
+        provider
+            .execute_query("public", "INSERT INTO zed_cancel_probe VALUES (1)")
+            .await
+            .expect("staged");
+        let running = run_in_the_background(
+            &provider,
+            &format!("INSERT INTO zed_cancel_probe SELECT COUNT(*) FROM ({A_LONG_QUERY}) x"),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        provider
+            .interrupt(Interrupt::Statement)
+            .await
+            .expect("the interrupt is sent");
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("a stopped statement is an error");
+        assert!(
+            provider.transaction_open_since().is_some(),
+            "the server stopped the statement, not the transaction"
+        );
+
+        provider
+            .rollback_transaction()
+            .await
+            .expect("the rollback goes through");
+        assert!(provider.transaction_open_since().is_none());
+        let rows = provider
+            .execute_query("public", "SELECT COUNT(*) FROM zed_cancel_probe")
+            .await
+            .expect("count");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("public", "DROP TABLE zed_cancel_probe")
+            .await
+            .expect("drop");
+    }
+
+    /// A statement still waiting for the connection when the cancel comes never
+    /// reaches the server.
+    #[tokio::test]
+    #[ignore]
+    async fn a_statement_waiting_for_the_connection_does_not_start_after_a_cancel() {
+        let provider = connected().await;
+        provider
+            .execute_query("public", "DROP TABLE IF EXISTS zed_cancel_queue_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("public", "CREATE TABLE zed_cancel_queue_probe (a int)")
+            .await
+            .expect("create");
+
+        let running = run_in_the_background(&provider, A_LONG_QUERY);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let waiting =
+            run_in_the_background(&provider, "INSERT INTO zed_cancel_queue_probe VALUES (1)");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        provider
+            .interrupt(Interrupt::Statement)
+            .await
+            .expect("the interrupt is sent");
+
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the running statement ended")
+            .expect("the task ran")
+            .expect_err("stopped");
+        let error = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiting statement ended")
+            .expect("the task ran")
+            .expect_err("it never started");
+        assert!(is_interruption(&error), "{error:#}");
+        let rows = provider
+            .execute_query("public", "SELECT COUNT(*) FROM zed_cancel_queue_probe")
+            .await
+            .expect("count");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("public", "DROP TABLE zed_cancel_queue_probe")
+            .await
+            .expect("drop");
+    }
+
+    /// Ending the session is the second step. The statement that was stopped
+    /// that way is not sent again on the connection that replaces it.
+    #[tokio::test]
+    #[ignore]
+    async fn a_statement_stopped_by_ending_its_session_is_not_sent_again() {
+        let provider = connected().await;
+        provider
+            .execute_query("public", "DROP TABLE IF EXISTS zed_cancel_session_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("public", "CREATE TABLE zed_cancel_session_probe (a bigint)")
+            .await
+            .expect("create");
+
+        let running = run_in_the_background(
+            &provider,
+            &format!(
+                "INSERT INTO zed_cancel_session_probe SELECT COUNT(*) FROM ({A_LONG_QUERY}) x"
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Session)
+                .await
+                .expect("the session is ended"),
+            Interrupted::Requested
+        );
+        let error = tokio::time::timeout(Duration::from_secs(15), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("stopped");
+        assert!(is_interruption(&error), "{error:#}");
+
+        let rows = provider
+            .execute_query("public", "SELECT COUNT(*) FROM zed_cancel_session_probe")
+            .await
+            .expect("the provider reconnects for the next statement");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("public", "DROP TABLE zed_cancel_session_probe")
+            .await
+            .expect("drop");
     }
 }

@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::interrupt::{Interrupt, Interrupted};
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo,
     QueryResult, SequenceInfo, TableInfo, TriggerInfo, UserInfo,
@@ -138,6 +139,31 @@ pub trait DbProvider: Send + Sync {
             sink.write_row(row)?;
         }
         Ok(result.rows.len() as u64)
+    }
+
+    /// Whether `interrupt` can have this connection's server stop a running
+    /// statement. Where it cannot, whoever is waiting for the statement stops
+    /// waiting instead, and the server may well finish it.
+    fn can_interrupt(&self) -> bool {
+        false
+    }
+
+    /// Stops what this connection is running, from outside the call that runs
+    /// it, by asking the server over a connection of its own: the one the
+    /// statement runs on is busy, and a request queued behind the statement
+    /// would arrive when it no longer mattered.
+    ///
+    /// Either request also keeps the statements that are waiting for the
+    /// connection from ever starting. The first request for a statement is
+    /// [`Interrupt::Statement`]. [`Interrupt::Session`] is the second step for
+    /// a statement that ignores the first: the server ends the session, which
+    /// rolls back the transaction it held. A connection reconnects afterwards,
+    /// but the statement that was running is not sent again.
+    ///
+    /// Must not wait for anything the running statement holds, which is why it
+    /// is separate from the statement calls.
+    async fn interrupt(&self, _how: Interrupt) -> Result<Interrupted> {
+        Ok(Interrupted::Unsupported)
     }
 
     async fn get_database_ddl(&self, database: &str) -> Result<String> {

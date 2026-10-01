@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use crate::MAX_RESULT_ROWS;
 
 use crate::connection::{ConnectionConfig, SslMode};
+use crate::interrupt::{
+    BETWEEN_LOOKS, CONTROL_TIMEOUT, HOW_LONG_TO_LOOK_FOR_THE_STATEMENT, Interrupt, Interrupted,
+    StatementCancelled, StatementTracker, tag_comment,
+};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo,
@@ -194,6 +198,9 @@ pub struct MySqlProvider {
     // single-flight -- two callers can never build and swap in two
     // replacement pools at once.
     op_lock: AsyncMutex<()>,
+    /// What the console is running, so that it can be stopped from outside the
+    /// call that runs it.
+    statements: StatementTracker,
     /// The transaction this connection is holding open, if any, and the one
     /// physical connection it lives on.
     ///
@@ -359,6 +366,7 @@ impl MySqlProvider {
             pool: RwLock::new(pool),
             connect_options: opts,
             op_lock: AsyncMutex::new(()),
+            statements: StatementTracker::new(),
             held: AsyncMutex::new(None),
             transaction_opened_at: Mutex::new(None),
             current_database: Mutex::new(None),
@@ -462,6 +470,7 @@ impl MySqlProvider {
         database: &str,
         abandoned_after: Option<Duration>,
         opening_statement: &str,
+        tag: Option<&str>,
     ) -> Result<QueryResult> {
         if held.is_some() {
             anyhow::bail!(
@@ -516,6 +525,7 @@ impl MySqlProvider {
             opening_statement,
             0,
             self.row_stall_limit,
+            tag,
         )
         .await?;
         self.remember_the_transaction_opened(Some(Instant::now()));
@@ -549,13 +559,21 @@ impl MySqlProvider {
         database: &str,
         sql: &str,
         pool_wait_ms: u64,
+        tag: Option<&str>,
     ) -> Result<QueryResult> {
         self.switch_to(pool, database).await?;
         let mut connection = pool
             .acquire()
             .await
             .context("Failed to take a connection for the query")?;
-        run_the_statement(&mut connection, sql, pool_wait_ms, self.row_stall_limit).await
+        run_the_statement(
+            &mut connection,
+            sql,
+            pool_wait_ms,
+            self.row_stall_limit,
+            tag,
+        )
+        .await
     }
 
     fn current_pool(&self) -> MySqlPool {
@@ -730,11 +748,13 @@ async fn run_the_statement(
     sql: &str,
     pool_wait_ms: u64,
     row_stall_limit: Option<Duration>,
+    tag: Option<&str>,
 ) -> Result<QueryResult> {
     let start = Instant::now();
     let prefixed = format!(
-        "{}{}",
+        "{}{}{}",
         crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        tag_comment(tag),
         sql
     );
 
@@ -759,6 +779,87 @@ async fn run_the_statement(
             streaming_ms: None,
         }),
     })
+}
+
+/// Asks the server to stop the statement that carries `tag`, over a connection
+/// of its own, since the one the statement runs on is busy.
+///
+/// The statement is found in the server's list of what it is running by the
+/// comment in front of its text rather than by a connection number remembered
+/// from earlier, which would be stale after a reconnect and wrong for a
+/// transaction held on a connection of its own.
+async fn kill_the_statement(
+    options: &MySqlConnectOptions,
+    tag: &str,
+    how: Interrupt,
+) -> Result<Interrupted> {
+    let mut control = tokio::time::timeout(
+        CONTROL_TIMEOUT,
+        sqlx::MySqlConnection::connect_with(options),
+    )
+    .await
+    .context("Timed out opening a connection to stop the statement")?
+    .context("Failed to open a connection to stop the statement")?;
+    let answer = find_and_kill(&mut control, tag, how).await;
+    match tokio::time::timeout(CONTROL_TIMEOUT, control.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!("closing the connection that stopped a statement: {error:#}")
+        }
+        Err(_) => log::warn!("closing the connection that stopped a statement timed out"),
+    }
+    answer
+}
+
+async fn find_and_kill(
+    control: &mut sqlx::MySqlConnection,
+    tag: &str,
+    how: Interrupt,
+) -> Result<Interrupted> {
+    let deadline = Instant::now() + HOW_LONG_TO_LOOK_FOR_THE_STATEMENT;
+    loop {
+        let threads = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            sqlx::raw_sql("SHOW FULL PROCESSLIST").fetch_all(&mut *control),
+        )
+        .await
+        .context("Timed out listing the statements the server is running")?
+        .context("Failed to list the statements the server is running")?;
+        let mut target = None;
+        for thread in &threads {
+            let info: Option<String> = thread
+                .try_get(7)
+                .context("Failed to read what a thread of the server is running")?;
+            if info.is_some_and(|info| info.contains(tag)) {
+                // Signed on some servers and unsigned on others, and the driver
+                // accepts only the width that matches.
+                let id = thread
+                    .try_get::<i64, _>(0)
+                    .or_else(|_| thread.try_get::<u64, _>(0).map(|id| id as i64))
+                    .context("Failed to read the number of a thread of the server")?;
+                target = Some(id);
+                break;
+            }
+        }
+        if let Some(id) = target {
+            let kill = match how {
+                Interrupt::Statement => format!("KILL QUERY {id}"),
+                Interrupt::Session => format!("KILL {id}"),
+            };
+            tokio::time::timeout(
+                CONTROL_TIMEOUT,
+                sqlx::raw_sql(AssertSqlSafe(kill.as_str())).execute(&mut *control),
+            )
+            .await
+            .context("Timed out asking the server to stop the statement")?
+            .context("The server refused to stop the statement")?;
+            return Ok(Interrupted::Requested);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Interrupted::NothingRunning);
+        }
+        tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
 }
 
 /// Streams a read query's rows into a `QueryResult`, stopping at
@@ -913,10 +1014,12 @@ async fn stream_into_the_sink(
     sql: &str,
     sink: &mut dyn crate::provider::RowSink,
     row_stall_limit: Option<Duration>,
+    tag: Option<&str>,
 ) -> Result<u64> {
     let prefixed = format!(
-        "{}{}",
+        "{}{}{}",
         crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        tag_comment(tag),
         sql
     );
 
@@ -1596,10 +1699,14 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
+        // Taken before waiting, so that a cancel that comes while this waits for
+        // the connection reaches it.
+        let arrival = self.statements.arrive();
         // Lock order is `op_lock` then `held`, the same way round everywhere
         // -- see the note on the `held` field.
         let _guard = self.op_lock.lock().await;
         let mut held = self.held.lock().await;
+        let running = self.statements.start(arrival)?;
         let effect = what_it_does_to_the_transaction(sql);
 
         // The console's own statements are the only ones routed onto the held
@@ -1626,8 +1733,14 @@ impl DbProvider for MySqlProvider {
             // the transaction with it, and sending the statement again on a
             // fresh connection would run it outside the transaction the
             // reader still believes they are in.
-            let answer =
-                run_the_statement(&mut transaction.connection, sql, 0, self.row_stall_limit).await;
+            let answer = run_the_statement(
+                &mut transaction.connection,
+                sql,
+                0,
+                self.row_stall_limit,
+                Some(running.tag()),
+            )
+            .await;
             if effect == WhatItDoesToTheTransaction::Finishes && answer.is_ok() {
                 self.release_the_transaction(&mut held);
             }
@@ -1636,7 +1749,13 @@ impl DbProvider for MySqlProvider {
 
         if effect == WhatItDoesToTheTransaction::Opens {
             return self
-                .open_a_held_transaction(&mut held, database, self.transaction_idle_limit, sql)
+                .open_a_held_transaction(
+                    &mut held,
+                    database,
+                    self.transaction_idle_limit,
+                    sql,
+                    Some(running.tag()),
+                )
                 .await;
         }
         drop(held);
@@ -1651,10 +1770,19 @@ impl DbProvider for MySqlProvider {
         let pool_wait_start = Instant::now();
         let pool = self.current_pool();
         let pool_wait_ms = pool_wait_start.elapsed().as_millis() as u64;
-        match self.run_the_query(&pool, database, sql, pool_wait_ms).await {
+        match self
+            .run_the_query(&pool, database, sql, pool_wait_ms, Some(running.tag()))
+            .await
+        {
             Err(error) if the_connection_died(&error) => {
+                // A session that was ended on purpose to stop this statement is
+                // not a dead connection: sending the statement again on a new
+                // one would run what the reader had just stopped.
+                if running.was_cancelled() {
+                    return Err(StatementCancelled.into());
+                }
                 let fresh = self.reconnect().await?;
-                self.run_the_query(&fresh, database, sql, pool_wait_ms)
+                self.run_the_query(&fresh, database, sql, pool_wait_ms, Some(running.tag()))
                     .await
             }
             answer => answer,
@@ -1667,8 +1795,10 @@ impl DbProvider for MySqlProvider {
         sql: &str,
         sink: &mut dyn crate::provider::RowSink,
     ) -> Result<u64> {
+        let arrival = self.statements.arrive();
         let _guard = self.op_lock.lock().await;
         let mut held = self.held.lock().await;
+        let running = self.statements.start(arrival)?;
 
         // Transaction control is refused here rather than routed. This path
         // exists to write a result set to a file, and a `COMMIT` sent down it
@@ -1694,6 +1824,7 @@ impl DbProvider for MySqlProvider {
                 sql,
                 sink,
                 self.row_stall_limit,
+                Some(running.tag()),
             )
             .await;
         }
@@ -1705,7 +1836,14 @@ impl DbProvider for MySqlProvider {
             .acquire()
             .await
             .context("Failed to take a connection for the export")?;
-        stream_into_the_sink(&mut connection, sql, sink, self.row_stall_limit).await
+        stream_into_the_sink(
+            &mut connection,
+            sql,
+            sink,
+            self.row_stall_limit,
+            Some(running.tag()),
+        )
+        .await
     }
 
     async fn execute_read_only(&self, database: &str, query: &str) -> Result<QueryResult> {
@@ -1731,7 +1869,7 @@ impl DbProvider for MySqlProvider {
                 .await
                 .with_context(|| format!("Failed to run `{statement}`"))?;
         }
-        let answer = run_the_statement(&mut connection, query, 0, self.row_stall_limit).await;
+        let answer = run_the_statement(&mut connection, query, 0, self.row_stall_limit, None).await;
         if let Err(error) = sqlx::raw_sql(AssertSqlSafe("ROLLBACK"))
             .execute(&mut connection)
             .await
@@ -1742,6 +1880,17 @@ impl DbProvider for MySqlProvider {
             log::warn!("closing a read-only connection: {error:#}");
         }
         answer
+    }
+
+    fn can_interrupt(&self) -> bool {
+        true
+    }
+
+    async fn interrupt(&self, how: Interrupt) -> Result<Interrupted> {
+        let Some(running) = self.statements.cancel() else {
+            return Ok(Interrupted::NothingRunning);
+        };
+        kill_the_statement(&self.connect_options, &running.tag, how).await
     }
 
     fn holds_transactions(&self) -> bool {
@@ -1755,8 +1904,14 @@ impl DbProvider for MySqlProvider {
     ) -> Result<()> {
         let _guard = self.op_lock.lock().await;
         let mut held = self.held.lock().await;
-        self.open_a_held_transaction(&mut held, database, abandoned_after, "START TRANSACTION")
-            .await?;
+        self.open_a_held_transaction(
+            &mut held,
+            database,
+            abandoned_after,
+            "START TRANSACTION",
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2088,6 +2243,7 @@ mod rename_table_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::{MySqlProvider, ROW_FETCH_TIMEOUT};
+    use crate::interrupt::{Interrupt, Interrupted, is_interruption};
     use crate::provider::DbProvider;
     use crate::schema::ProcedureKind;
     use crate::{ConnectionConfig, DatabaseDriver};
@@ -4207,5 +4363,255 @@ mod integration_tests {
             .execute_query(&database, "DROP TABLE zed_abandoned_probe")
             .await
             .expect("failed to drop the probe table");
+    }
+
+    /// A table of a couple of thousand rows, and a query that joins it with
+    /// itself three times. It runs for as long as anyone lets it, and, being a
+    /// loop over rows, it notices a request to stop.
+    async fn a_table_to_loop_over(provider: &MySqlProvider, table: &str) -> String {
+        provider
+            .execute_query("", &format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", &format!("CREATE TABLE {table} (n int) ENGINE=InnoDB"))
+            .await
+            .expect("create");
+        provider
+            .execute_query(
+                "",
+                &format!(
+                    "INSERT INTO {table} SELECT ordinal_position FROM information_schema.columns LIMIT 2000"
+                ),
+            )
+            .await
+            .expect("fill");
+        format!("SELECT SUM(a.n) FROM {table} a, {table} b, {table} c")
+    }
+
+    async fn connected() -> std::sync::Arc<MySqlProvider> {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        std::sync::Arc::new(
+            MySqlProvider::connect(&config)
+                .await
+                .expect("Failed to connect"),
+        )
+    }
+
+    fn run_in_the_background(
+        provider: &std::sync::Arc<MySqlProvider>,
+        sql: &str,
+    ) -> tokio::task::JoinHandle<anyhow::Result<crate::schema::QueryResult>> {
+        let provider = provider.clone();
+        let sql = sql.to_string();
+        tokio::spawn(async move { provider.execute_query("", &sql).await })
+    }
+
+    /// A statement that runs for a long time is stopped from outside, the
+    /// server says so, and the connection it ran on is still good.
+    #[tokio::test]
+    #[ignore]
+    async fn a_running_statement_is_stopped_and_the_session_survives() {
+        let provider = connected().await;
+        let long = a_table_to_loop_over(&provider, "zed_cancel_rows_one").await;
+        let running = run_in_the_background(&provider, &long);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Statement)
+                .await
+                .expect("the interrupt is sent"),
+            Interrupted::Requested
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("a stopped statement is an error");
+        assert!(is_interruption(&error), "{error:#}");
+
+        let after = provider
+            .execute_query("", "SELECT 41 + 1")
+            .await
+            .expect("the connection is still good");
+        assert_eq!(after.rows, vec![vec![Some("42".to_string())]]);
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Statement)
+                .await
+                .expect("a second interrupt is harmless"),
+            Interrupted::NothingRunning
+        );
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_rows_one")
+            .await
+            .expect("drop");
+    }
+
+    /// The transaction the statement ran in is rolled back once the statement
+    /// is stopped, and what it staged before is gone with it.
+    #[tokio::test]
+    #[ignore]
+    async fn a_transaction_is_rolled_back_when_its_running_statement_is_stopped() {
+        let provider = connected().await;
+        provider
+            .execute_query("", "DROP TABLE IF EXISTS zed_cancel_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "CREATE TABLE zed_cancel_probe (a int) ENGINE=InnoDB")
+            .await
+            .expect("create");
+
+        let long = a_table_to_loop_over(&provider, "zed_cancel_rows_two").await;
+        provider
+            .begin_transaction("", None)
+            .await
+            .expect("the transaction opens");
+        provider
+            .execute_query("", "INSERT INTO zed_cancel_probe VALUES (1)")
+            .await
+            .expect("staged");
+        let running = run_in_the_background(
+            &provider,
+            &format!("INSERT INTO zed_cancel_probe SELECT COUNT(*) FROM ({long}) x"),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        provider
+            .interrupt(Interrupt::Statement)
+            .await
+            .expect("the interrupt is sent");
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("a stopped statement is an error");
+        assert!(
+            provider.transaction_open_since().is_some(),
+            "the server stopped the statement, not the transaction"
+        );
+
+        provider
+            .rollback_transaction()
+            .await
+            .expect("the rollback goes through");
+        assert!(provider.transaction_open_since().is_none());
+        let rows = provider
+            .execute_query("", "SELECT COUNT(*) FROM zed_cancel_probe")
+            .await
+            .expect("count");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_rows_two")
+            .await
+            .expect("drop");
+    }
+
+    /// A statement still waiting for the connection when the cancel comes never
+    /// reaches the server.
+    #[tokio::test]
+    #[ignore]
+    async fn a_statement_waiting_for_the_connection_does_not_start_after_a_cancel() {
+        let provider = connected().await;
+        provider
+            .execute_query("", "DROP TABLE IF EXISTS zed_cancel_queue_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "CREATE TABLE zed_cancel_queue_probe (a int)")
+            .await
+            .expect("create");
+
+        let long = a_table_to_loop_over(&provider, "zed_cancel_rows_three").await;
+        let running = run_in_the_background(&provider, &long);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let waiting =
+            run_in_the_background(&provider, "INSERT INTO zed_cancel_queue_probe VALUES (1)");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        provider
+            .interrupt(Interrupt::Statement)
+            .await
+            .expect("the interrupt is sent");
+
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the running statement ended")
+            .expect("the task ran")
+            .expect_err("stopped");
+        let error = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiting statement ended")
+            .expect("the task ran")
+            .expect_err("it never started");
+        assert!(is_interruption(&error), "{error:#}");
+        let rows = provider
+            .execute_query("", "SELECT COUNT(*) FROM zed_cancel_queue_probe")
+            .await
+            .expect("count");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_queue_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_rows_three")
+            .await
+            .expect("drop");
+    }
+
+    /// Ending the session is the second step. The statement that was stopped
+    /// that way is not sent again on the connection that replaces it.
+    #[tokio::test]
+    #[ignore]
+    async fn a_statement_stopped_by_ending_its_session_is_not_sent_again() {
+        let provider = connected().await;
+        provider
+            .execute_query("", "DROP TABLE IF EXISTS zed_cancel_session_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "CREATE TABLE zed_cancel_session_probe (a bigint)")
+            .await
+            .expect("create");
+
+        let long = a_table_to_loop_over(&provider, "zed_cancel_rows_four").await;
+        let running = run_in_the_background(
+            &provider,
+            &format!("INSERT INTO zed_cancel_session_probe SELECT COUNT(*) FROM ({long}) x"),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            provider
+                .interrupt(Interrupt::Session)
+                .await
+                .expect("the session is ended"),
+            Interrupted::Requested
+        );
+        let error = tokio::time::timeout(Duration::from_secs(15), running)
+            .await
+            .expect("the statement ended soon after")
+            .expect("the task ran")
+            .expect_err("stopped");
+        assert!(is_interruption(&error), "{error:#}");
+
+        let rows = provider
+            .execute_query("", "SELECT COUNT(*) FROM zed_cancel_session_probe")
+            .await
+            .expect("the provider reconnects for the next statement");
+        assert_eq!(rows.rows, vec![vec![Some("0".to_string())]]);
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_session_probe")
+            .await
+            .expect("drop");
+        provider
+            .execute_query("", "DROP TABLE zed_cancel_rows_four")
+            .await
+            .expect("drop");
     }
 }
