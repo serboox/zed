@@ -4,7 +4,7 @@ use ui::{SpinnerLabel, div, prelude::*};
 
 use crate::TabularDataPreviewPane;
 
-use super::settings::settings_popover_menu;
+use super::settings::{refresh_controls, settings_popover_menu};
 
 impl Render for TabularDataPreviewPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -19,6 +19,11 @@ impl Render for TabularDataPreviewPane {
             self.list_state.remeasure();
         }
         let render_prep_start = Instant::now();
+        let empty_state_controls = ui::cyberpunk::segmented(
+            refresh_controls(cx.entity(), self.settings.refresh_mode)
+                .into_iter()
+                .chain([settings_popover_menu(cx.entity()).into_any_element()]),
+        );
         let table_with_settings = v_flex()
             .size_full()
             .bg(theme.colors().editor_background)
@@ -35,7 +40,7 @@ impl Render for TabularDataPreviewPane {
                                 .w_full()
                                 .justify_end()
                                 .p_1()
-                                .child(settings_popover_menu(cx.entity())),
+                                .child(empty_state_controls),
                         )
                         .child(
                             div()

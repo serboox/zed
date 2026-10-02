@@ -14,7 +14,11 @@ use ui::{
 };
 use workspace::{Item, Pane, Workspace};
 
-use crate::{parser::EditorState, settings::TabularDataPreviewSettings, types::TableLikeContent};
+use crate::{
+    parser::EditorState,
+    settings::{RefreshMode, TabularDataPreviewSettings},
+    types::TableLikeContent,
+};
 
 mod parser;
 mod renderer;
@@ -168,7 +172,11 @@ impl TabularDataPreviewPane {
                 editor,
                 |this: &mut TabularDataPreviewPane, _editor, event: &EditorEvent, cx| {
                     match event {
-                        EditorEvent::Edited { .. } | EditorEvent::DirtyChanged => {
+                        // `Edited` fires only for this editor's own transactions; a reload
+                        // from disk or an edit made elsewhere arrives as `BufferEdited`.
+                        EditorEvent::BufferEdited | EditorEvent::DirtyChanged
+                            if this.settings.refresh_mode == RefreshMode::Auto =>
+                        {
                             this.parse_from_active_editor(true, cx);
                         }
                         _ => {}
@@ -365,12 +373,182 @@ impl ColumnWidths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use std::path::Path;
+    use std::sync::Arc;
     use util::path;
-    use workspace::AppState;
+    use workspace::{AppState, MultiWorkspace};
+
+    const CSV_PATH: &str = path!("/project/data.csv");
+    const REFRESH_BUTTON: &str = "ICON-RotateCw";
+    const REFRESH_MODE_MENU: &str = "ICON-ChevronDown";
+    const SETTLE: Duration = Duration::from_millis(500);
+
+    struct OpenedPreview<'a> {
+        fs: Arc<FakeFs>,
+        buffer: Entity<language::Buffer>,
+        preview: Entity<TabularDataPreviewPane>,
+        /// A window whose only content is the preview, so its icon selectors are unique.
+        cx: &'a mut VisualTestContext,
+    }
+
+    async fn open_preview(cx: &mut TestAppContext) -> OpenedPreview<'_> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "data.csv": "a,b\n1,2\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(CSV_PATH, cx))
+            .await
+            .unwrap();
+
+        let (multi_workspace, workspace_cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(workspace_cx, |multi, _| multi.workspace().clone());
+        let editor = workspace_cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        let preview = workspace.update_in(workspace_cx, |_, window, cx| {
+            TabularDataPreviewPane::new(&editor, window, cx)
+        });
+
+        let (_, cx) = cx.add_window_view({
+            let preview = preview.clone();
+            move |_, _| PreviewHost(preview)
+        });
+        settle(cx);
+        OpenedPreview {
+            fs,
+            buffer,
+            preview,
+            cx,
+        }
+    }
+
+    struct PreviewHost(Entity<TabularDataPreviewPane>);
+
+    impl Render for PreviewHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    fn settle(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.executor().advance_clock(SETTLE);
+        cx.run_until_parked();
+    }
+
+    /// Rows as the table shows them: the parsed rows and the list the table draws from.
+    fn shown_rows(opened: &mut OpenedPreview) -> usize {
+        let (parsed, listed) = opened.preview.read_with(opened.cx, |preview, _| {
+            (
+                preview.engine.contents.rows.len(),
+                preview.list_state.item_count(),
+            )
+        });
+        assert_eq!(parsed, listed, "the drawn list must match the parsed rows");
+        listed
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not painted"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        settle(cx);
+    }
+
+    fn choose_refresh_mode(mode: RefreshMode, cx: &mut VisualTestContext) {
+        click(REFRESH_MODE_MENU, cx);
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        let item = format!("MENU_ITEM-{}", mode.label()).leak();
+        click(item, cx);
+    }
+
+    async fn write_csv(fs: &FakeFs, contents: &str) {
+        fs.insert_file(CSV_PATH, contents.as_bytes().to_vec()).await;
+    }
+
+    #[gpui::test]
+    async fn test_auto_refresh_follows_the_file_on_disk(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        assert_eq!(shown_rows(&mut opened), 1);
+
+        write_csv(&opened.fs, "a,b\n1,2\n3,4\n5,6\n").await;
+        settle(opened.cx);
+        assert_eq!(shown_rows(&mut opened), 3);
+    }
+
+    /// The second edit lands on an already dirty buffer, so no `DirtyChanged`
+    /// fires and only a subscription to the buffer's edits sees it.
+    #[gpui::test]
+    async fn test_auto_refresh_follows_edits_made_outside_the_editor(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        for (row, expected_rows) in [("3,4\n", 2), ("5,6\n", 3)] {
+            opened.buffer.update(opened.cx, |buffer, cx| {
+                let end = buffer.len();
+                buffer.edit([(end..end, row)], None, cx);
+            });
+            settle(opened.cx);
+            assert_eq!(shown_rows(&mut opened), expected_rows);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_manual_refresh_waits_for_the_button(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        choose_refresh_mode(RefreshMode::Manual, opened.cx);
+        assert_eq!(
+            opened
+                .preview
+                .read_with(opened.cx, |preview, _| preview.settings.refresh_mode),
+            RefreshMode::Manual
+        );
+
+        write_csv(&opened.fs, "a,b\n1,2\n3,4\n5,6\n").await;
+        settle(opened.cx);
+        assert_eq!(
+            shown_rows(&mut opened),
+            1,
+            "manual mode must not follow the file"
+        );
+
+        click(REFRESH_BUTTON, opened.cx);
+        assert_eq!(shown_rows(&mut opened), 3);
+    }
+
+    #[gpui::test]
+    async fn test_refresh_off_keeps_the_table_and_disables_the_button(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        choose_refresh_mode(RefreshMode::Off, opened.cx);
+
+        write_csv(&opened.fs, "a,b\n1,2\n3,4\n5,6\n").await;
+        settle(opened.cx);
+        click(REFRESH_BUTTON, opened.cx);
+        assert_eq!(shown_rows(&mut opened), 1);
+
+        choose_refresh_mode(RefreshMode::Auto, opened.cx);
+        assert_eq!(shown_rows(&mut opened), 3, "going back to auto catches up");
+    }
+
+    #[gpui::test]
+    async fn test_refresh_reads_a_change_the_file_watcher_missed(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        opened.fs.pause_events();
+        write_csv(&opened.fs, "a,b\n1,2\n3,4\n5,6\n").await;
+        settle(opened.cx);
+        assert_eq!(shown_rows(&mut opened), 1, "no event reached the worktree");
+
+        click(REFRESH_BUTTON, opened.cx);
+        assert_eq!(shown_rows(&mut opened), 3);
+    }
 
     #[gpui::test]
     async fn test_detects_tabular_files_outside_the_project(cx: &mut TestAppContext) {

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     TabularDataPreviewPane,
+    settings::RefreshMode,
     types::TableLikeContent,
     types::{LineNumber, TableCell},
 };
@@ -71,6 +72,38 @@ impl TabularDataPreviewPane {
         let editor = self.active_editor_state.editor.clone();
         self.is_parsing = true;
         self.parsing_task = Some(self.parse_in_background(wait_for_debounce, editor, cx));
+    }
+
+    /// Reparses the table, first reading the file again when it has no unsaved
+    /// edits, so a change the file watcher missed still shows up.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.settings.refresh_mode == RefreshMode::Off {
+            return;
+        }
+        let buffer = self
+            .active_editor_state
+            .editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton();
+        if let Some(buffer) = buffer
+            && !buffer.read(cx).is_dirty()
+        {
+            // The reload applies its diff as an edit, and the `BufferEdited`
+            // subscription reparses again once the new text is in.
+            drop(buffer.update(cx, |buffer, cx| buffer.reload(cx)));
+        }
+        self.parse_from_active_editor(false, cx);
+    }
+
+    pub(crate) fn set_refresh_mode(&mut self, mode: RefreshMode, cx: &mut Context<Self>) {
+        let catch_up = mode == RefreshMode::Auto && self.settings.refresh_mode != RefreshMode::Auto;
+        self.settings.refresh_mode = mode;
+        if catch_up {
+            self.parse_from_active_editor(false, cx);
+        }
+        cx.notify();
     }
 
     fn parse_in_background(

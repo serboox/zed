@@ -1,12 +1,12 @@
 use gpui::{Anchor, Entity};
 use ui::{
-    ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, IconName, IconPosition, IconSize,
-    Label, PopoverMenu, Tooltip, prelude::*,
+    ButtonSize, ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, IconButtonShape,
+    IconName, IconPosition, IconSize, Label, PopoverMenu, Tooltip, prelude::*,
 };
 
 use crate::{
     TabularDataPreviewPane,
-    settings::{FilterSortOrder, TabularDataPreviewSettings, VerticalAlignment},
+    settings::{FilterSortOrder, RefreshMode, TabularDataPreviewSettings, VerticalAlignment},
 };
 
 ///// Settings related /////
@@ -38,6 +38,60 @@ fn toggle_entry(
         entry
     };
     menu.item(entry)
+}
+
+/// The refresh-now button and the menu choosing when the table follows the file.
+pub(crate) fn refresh_controls(
+    view_entity: Entity<TabularDataPreviewPane>,
+    mode: RefreshMode,
+) -> [AnyElement; 2] {
+    let tooltip = match mode {
+        RefreshMode::Auto => "Refresh now (the table also follows every change)",
+        RefreshMode::Manual => "Refresh now (changes are not picked up on their own)",
+        RefreshMode::Off => "Refreshing is off; choose a mode in the menu next to this",
+    };
+    let refresh = IconButton::new("table-refresh", IconName::RotateCw)
+        .shape(IconButtonShape::Square)
+        .icon_size(IconSize::Small)
+        .size(ButtonSize::Compact)
+        .when(mode == RefreshMode::Auto, |button| {
+            button.icon_color(Color::Accent)
+        })
+        .disabled(mode == RefreshMode::Off)
+        .tooltip(Tooltip::text(tooltip))
+        .on_click({
+            let view_entity = view_entity.clone();
+            move |_, _, cx| view_entity.update(cx, |this, cx| this.refresh(cx))
+        });
+
+    let mode_menu = PopoverMenu::new("table-refresh-mode-menu")
+        .trigger_with_tooltip(
+            IconButton::new("table-refresh-mode", IconName::ChevronDown)
+                .icon_size(IconSize::XSmall)
+                .size(ButtonSize::Compact),
+            Tooltip::text("Refresh Mode"),
+        )
+        .anchor(Anchor::TopRight)
+        .menu(move |window, cx| {
+            let view_entity = view_entity.clone();
+            let current = view_entity.read(cx).settings.refresh_mode;
+            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                RefreshMode::ALL.into_iter().fold(menu, |menu, mode| {
+                    let view_entity = view_entity.clone();
+                    menu.toggleable_entry(
+                        mode.label(),
+                        mode == current,
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
+                            view_entity.update(cx, |this, cx| this.set_refresh_mode(mode, cx))
+                        },
+                    )
+                })
+            }))
+        });
+
+    [refresh.into_any_element(), mode_menu.into_any_element()]
 }
 
 pub(crate) fn settings_popover_menu(
