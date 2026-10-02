@@ -539,6 +539,19 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_manual_refresh_reads_a_change_the_file_watcher_missed(cx: &mut TestAppContext) {
+        let mut opened = open_preview(cx).await;
+        choose_refresh_mode(RefreshMode::Manual, opened.cx);
+        opened.fs.pause_events();
+        write_csv(&opened.fs, "a,b\n1,2\n3,4\n5,6\n").await;
+        settle(opened.cx);
+        assert_eq!(shown_rows(&mut opened), 1);
+
+        click(REFRESH_BUTTON, opened.cx);
+        assert_eq!(shown_rows(&mut opened), 3);
+    }
+
+    #[gpui::test]
     async fn test_refresh_reads_a_change_the_file_watcher_missed(cx: &mut TestAppContext) {
         let mut opened = open_preview(cx).await;
         opened.fs.pause_events();

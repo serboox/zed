@@ -10,7 +10,7 @@ use gpui::{
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
 use theme::{Theme, ThemeRegistry};
-use ui::{Tooltip, prelude::*};
+use ui::{RefreshMode, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
@@ -71,6 +71,7 @@ pub struct SvgPreviewView {
     zoom_level: f32,
     theme_mode: ViewerThemeMode,
     scroll_handle: ScrollHandle,
+    refresh_mode: RefreshMode,
     _refresh: Task<()>,
     _buffer_subscription: Option<Subscription>,
     _workspace_subscription: Option<Subscription>,
@@ -114,6 +115,7 @@ impl SvgPreviewView {
                 zoom_level: 1.0,
                 theme_mode: ViewerThemeMode::default(),
                 scroll_handle: ScrollHandle::new(),
+                refresh_mode: RefreshMode::default(),
                 _buffer_subscription: subscription,
                 _workspace_subscription: workspace_subscription,
                 _refresh: Task::ready(()),
@@ -178,6 +180,38 @@ impl SvgPreviewView {
             })
             .ok();
         });
+    }
+
+    /// Redraws the image, first reading the file again when it has no unsaved
+    /// edits, so a change the file watcher missed still shows up.
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refresh_mode == RefreshMode::Off {
+            return;
+        }
+        self.render_image(window, cx);
+        if let Some(buffer) = self.buffer.clone()
+            && !buffer.read(cx).is_dirty()
+        {
+            let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+            // Redraw here rather than through the subscription, which stays
+            // silent in manual mode.
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(Some(_changed)) = reload.await {
+                    this.update_in(cx, |this, window, cx| this.render_image(window, cx))
+                        .ok();
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn set_refresh_mode(&mut self, mode: RefreshMode, window: &mut Window, cx: &mut Context<Self>) {
+        let catch_up = mode == RefreshMode::Auto && self.refresh_mode != RefreshMode::Auto;
+        self.refresh_mode = mode;
+        if catch_up {
+            self.render_image(window, cx);
+        }
+        cx.notify();
     }
 
     fn handle_scroll_wheel(
@@ -284,7 +318,9 @@ impl SvgPreviewView {
             buffer,
             window,
             move |this, _buffer, event: &BufferEvent, window, cx| match event {
-                BufferEvent::Edited { .. } | BufferEvent::Saved => {
+                BufferEvent::Edited { .. } | BufferEvent::Saved
+                    if this.refresh_mode == RefreshMode::Auto =>
+                {
                     this.render_image(window, cx);
                 }
                 _ => {}
@@ -453,6 +489,23 @@ impl Render for SvgPreviewView {
                         .border_1()
                         .border_color(border)
                         .bg(elevated_surface_background)
+                        .children(ui::refresh_mode_controls(
+                            self.refresh_mode,
+                            {
+                                let view = cx.entity();
+                                move |window, cx| {
+                                    view.update(cx, |this, cx| this.refresh(window, cx))
+                                }
+                            },
+                            {
+                                let view = cx.entity();
+                                move |mode, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_refresh_mode(mode, window, cx)
+                                    })
+                                }
+                            },
+                        ))
                         .child(
                             IconButton::new("svg-theme-toggle", IconName::Screen)
                                 .icon_size(IconSize::Small)
@@ -518,6 +571,15 @@ mod tests {
         Bounds, Modifiers, Pixels, Point, TestAppContext, TouchPhase, VisualTestContext, hsla,
         point, size,
     };
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use std::path::Path;
+    use util::path;
+    use workspace::AppState;
+
+    const SVG_PATH: &str = path!("/project/picture.svg");
+    const REFRESH_BUTTON: &str = "ICON-RotateCw";
+    const REFRESH_MODE_MENU: &str = "ICON-ChevronDown";
 
     const VIEWPORT_WIDTH: f32 = 800.0;
     const VIEWPORT_HEIGHT: f32 = 600.0;
@@ -534,21 +596,51 @@ mod tests {
         svg: String,
         cx: &mut TestAppContext,
     ) -> (Entity<SvgPreviewView>, &mut VisualTestContext) {
+        init_test(cx);
+        let buffer = cx.new(|cx| Buffer::local(svg, cx));
+        host_preview(buffer, cx)
+    }
+
+    async fn open_preview_of_file(
+        svg: String,
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeFs>, Entity<SvgPreviewView>, &mut VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "picture.svg": svg }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(SVG_PATH, cx))
+            .await
+            .unwrap();
+        let (view, cx) = host_preview(buffer, cx);
+        (fs, view, cx)
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            settings::init(cx);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            AppState::test(cx);
         });
+    }
+
+    fn host_preview(
+        buffer: Entity<Buffer>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<SvgPreviewView>, &mut VisualTestContext) {
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let buffer = cx.new(|cx| Buffer::local(svg, cx));
             let mut view = SvgPreviewView {
                 focus_handle: cx.focus_handle(),
+                _buffer_subscription: Some(SvgPreviewView::create_buffer_subscription(
+                    &buffer, window, cx,
+                )),
                 buffer: Some(buffer),
                 current_svg: None,
                 zoom_level: 1.0,
                 theme_mode: ViewerThemeMode::default(),
                 scroll_handle: ScrollHandle::new(),
+                refresh_mode: RefreshMode::default(),
                 _refresh: Task::ready(()),
-                _buffer_subscription: None,
                 _workspace_subscription: None,
             };
             view.render_image(window, cx);
@@ -561,6 +653,43 @@ mod tests {
             "the test SVG must render"
         );
         (view, cx)
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not painted"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn choose_refresh_mode(mode: RefreshMode, cx: &mut VisualTestContext) {
+        click(REFRESH_MODE_MENU, cx);
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        click(format!("MENU_ITEM-{}", mode.label()).leak(), cx);
+    }
+
+    fn replace_svg(view: &Entity<SvgPreviewView>, svg: String, cx: &mut VisualTestContext) {
+        let buffer = view.read_with(cx, |view, _| view.buffer.clone().expect("a buffer"));
+        buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(0..end, svg)], None, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn painted_width(cx: &mut VisualTestContext) -> f32 {
+        cx.run_until_parked();
+        painted_image(cx).size.width.into()
+    }
+
+    fn assert_widened(before: f32, after: f32, what: &str) {
+        assert!(
+            (after / before - 1.5).abs() < 0.01,
+            "{what}: width went from {before} to {after}, expected 1.5x"
+        );
     }
 
     fn viewport(view: &Entity<SvgPreviewView>, cx: &mut VisualTestContext) -> Bounds<Pixels> {
@@ -632,6 +761,65 @@ mod tests {
             viewport_bounds.left(),
             "left edge after scrolling back left",
         );
+    }
+
+    #[gpui::test]
+    fn test_auto_refresh_redraws_on_every_edit(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(200, 100), cx);
+        let before = painted_width(cx);
+        replace_svg(&view, svg_of_size(300, 100), cx);
+        assert_widened(before, painted_width(cx), "auto mode");
+    }
+
+    #[gpui::test]
+    fn test_manual_refresh_waits_for_the_button(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(200, 100), cx);
+        choose_refresh_mode(RefreshMode::Manual, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_mode),
+            RefreshMode::Manual
+        );
+        let before = painted_width(cx);
+
+        replace_svg(&view, svg_of_size(300, 100), cx);
+        assert_eq!(
+            painted_width(cx),
+            before,
+            "manual mode must not follow edits"
+        );
+
+        click(REFRESH_BUTTON, cx);
+        assert_widened(before, painted_width(cx), "after pressing refresh");
+    }
+
+    #[gpui::test]
+    fn test_refresh_off_keeps_the_image_and_disables_the_button(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(200, 100), cx);
+        choose_refresh_mode(RefreshMode::Off, cx);
+        let before = painted_width(cx);
+
+        replace_svg(&view, svg_of_size(300, 100), cx);
+        click(REFRESH_BUTTON, cx);
+        assert_eq!(painted_width(cx), before);
+
+        choose_refresh_mode(RefreshMode::Auto, cx);
+        assert_widened(before, painted_width(cx), "going back to auto catches up");
+    }
+
+    #[gpui::test]
+    async fn test_manual_refresh_reads_a_change_the_file_watcher_missed(cx: &mut TestAppContext) {
+        let (fs, _view, cx) = open_preview_of_file(svg_of_size(200, 100), cx).await;
+        choose_refresh_mode(RefreshMode::Manual, cx);
+        let before = painted_width(cx);
+
+        fs.pause_events();
+        fs.insert_file(SVG_PATH, svg_of_size(300, 100).into_bytes())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(painted_width(cx), before, "no event reached the worktree");
+
+        click(REFRESH_BUTTON, cx);
+        assert_widened(before, painted_width(cx), "after pressing refresh");
     }
 
     #[gpui::test]

@@ -1,3 +1,5 @@
+pub use ui::RefreshMode;
+
 #[derive(Default, Clone, Copy, PartialEq)]
 pub enum RowRenderMechanism {
     /// More correct for multiline content, but slower.
@@ -33,29 +35,6 @@ pub enum FilterSortOrder {
     AlphaThenCount,
     /// Sort by number of occurrences descending, then alphabetically within ties
     CountThenAlpha,
-}
-
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
-pub enum RefreshMode {
-    /// Reparse on every buffer change: typing, an edit made elsewhere, or a reload from disk
-    #[default]
-    Auto,
-    /// Reparse only when the refresh button is pressed
-    Manual,
-    /// Keep the table as it is; the refresh button is disabled
-    Off,
-}
-
-impl RefreshMode {
-    pub const ALL: [RefreshMode; 3] = [RefreshMode::Auto, RefreshMode::Manual, RefreshMode::Off];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            RefreshMode::Auto => "Refresh Automatically",
-            RefreshMode::Manual => "Refresh Manually",
-            RefreshMode::Off => "Don't Refresh",
-        }
-    }
 }
 
 #[derive(Clone, Default)]

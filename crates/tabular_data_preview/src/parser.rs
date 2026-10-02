@@ -87,14 +87,21 @@ impl TabularDataPreviewPane {
             .buffer()
             .read(cx)
             .as_singleton();
+        self.parse_from_active_editor(false, cx);
         if let Some(buffer) = buffer
             && !buffer.read(cx).is_dirty()
         {
-            // The reload applies its diff as an edit, and the `BufferEdited`
-            // subscription reparses again once the new text is in.
-            drop(buffer.update(cx, |buffer, cx| buffer.reload(cx)));
+            let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+            // Reparse here rather than through the subscription, which stays
+            // silent in manual mode.
+            cx.spawn(async move |this, cx| {
+                if let Ok(Some(_changed)) = reload.await {
+                    this.update(cx, |this, cx| this.parse_from_active_editor(false, cx))
+                        .ok();
+                }
+            })
+            .detach();
         }
-        self.parse_from_active_editor(false, cx);
     }
 
     pub(crate) fn set_refresh_mode(&mut self, mode: RefreshMode, cx: &mut Context<Self>) {
