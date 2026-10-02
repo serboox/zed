@@ -7,10 +7,7 @@ use crate::{
 };
 mod filter;
 
-use dev_container::{
-    DevContainerConfig, DevContainerContext, find_devcontainer_configs,
-    start_dev_container_with_config,
-};
+use dev_container::{DevContainerConfig, DevContainerContext, start_dev_container_with_config};
 use editor::Editor;
 use extension_host::ExtensionStore;
 use filter::{FilterData, FilteredServer};
@@ -813,7 +810,6 @@ impl Mode {
 
 enum RemoteMatch {
     AddServer,
-    AddDevContainer,
     AddWsl,
     Separator,
     ServerHeader {
@@ -848,16 +844,12 @@ struct RemoteServerPickerDelegate {
     matches: Vec<RemoteMatch>,
     selected_index: usize,
     query: String,
-    has_open_project: bool,
-    is_local: bool,
 }
 
 impl RemoteServerPickerDelegate {
     fn new(
         remote_server_projects: WeakEntity<RemoteServerProjects>,
         ssh_config_servers: &BTreeSet<SharedString>,
-        has_open_project: bool,
-        is_local: bool,
         cx: &mut App,
     ) -> Self {
         let mut this = Self {
@@ -866,22 +858,12 @@ impl RemoteServerPickerDelegate {
             matches: Vec::new(),
             selected_index: 0,
             query: String::new(),
-            has_open_project,
-            is_local,
         };
         this.rebuild_matches();
         this
     }
 
-    fn reload(
-        &mut self,
-        ssh_config_servers: &BTreeSet<SharedString>,
-        has_open_project: bool,
-        is_local: bool,
-        cx: &mut App,
-    ) {
-        self.has_open_project = has_open_project;
-        self.is_local = is_local;
+    fn reload(&mut self, ssh_config_servers: &BTreeSet<SharedString>, cx: &mut App) {
         self.state = DefaultState::new(ssh_config_servers, cx);
         // Settings/ssh-config changes are rare, so re-applying the active query
         // synchronously here is fine; the per-keystroke path filters off-thread.
@@ -894,15 +876,9 @@ impl RemoteServerPickerDelegate {
     /// keystroke path, see [`Self::update_matches`]); this only reads
     /// [`DefaultState::filtered_servers`].
     fn rebuild_matches(&mut self) {
-        let has_open_project = self.has_open_project;
-        let is_local = self.is_local;
-
         let mut matches = Vec::new();
         if self.query.trim().is_empty() {
             matches.push(RemoteMatch::AddServer);
-            if has_open_project && is_local {
-                matches.push(RemoteMatch::AddDevContainer);
-            }
             if cfg!(target_os = "windows") {
                 matches.push(RemoteMatch::AddWsl);
             }
@@ -1154,13 +1130,6 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                     })
                     .ok();
             }
-            RemoteMatch::AddDevContainer => {
-                remote_server_projects
-                    .update(cx, |this, cx| {
-                        this.init_dev_container_mode(window, cx);
-                    })
-                    .ok();
-            }
             RemoteMatch::AddWsl => {
                 #[cfg(target_os = "windows")]
                 remote_server_projects
@@ -1266,9 +1235,6 @@ impl PickerDelegate for RemoteServerPickerDelegate {
             } => self.render_server_header(*server, host_positions),
             RemoteMatch::AddServer => {
                 Some(self.render_action_item(ix, IconName::Plus, "Connect SSH Server", selected))
-            }
-            RemoteMatch::AddDevContainer => {
-                Some(self.render_action_item(ix, IconName::Plus, "Connect Dev Container", selected))
             }
             RemoteMatch::AddWsl => {
                 Some(self.render_action_item(ix, IconName::Plus, "Add WSL Distro", selected))
@@ -1489,17 +1455,9 @@ impl RemoteServerProjects {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let remote_server_projects = cx.weak_entity();
-        // The modal is constructed inside a `workspace.update`, so the workspace
-        // entity can't be read here; start with conservative defaults and refresh
-        // the real flags via `defer_in` once construction completes.
         let default_picker = cx.new(|cx| {
-            let delegate = RemoteServerPickerDelegate::new(
-                remote_server_projects,
-                &BTreeSet::new(),
-                false,
-                true,
-                cx,
-            );
+            let delegate =
+                RemoteServerPickerDelegate::new(remote_server_projects, &BTreeSet::new(), cx);
             Picker::list(delegate, window, cx).embedded()
         });
         let mut read_ssh_config = RemoteSettings::get_global(cx).read_ssh_config;
@@ -1946,33 +1904,10 @@ impl RemoteServerProjects {
 
     /// Rebuilds the default picker's data from the latest settings/ssh-config
     /// and re-applies the current filter query.
-    fn workspace_flags(workspace: &WeakEntity<Workspace>, cx: &App) -> (bool, bool) {
-        let has_open_project = workspace
-            .upgrade()
-            .map(|workspace| {
-                workspace
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .next()
-                    .is_some()
-            })
-            .unwrap_or(false);
-        let is_local = workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).project().read(cx).is_local())
-            .unwrap_or(true);
-        (has_open_project, is_local)
-    }
-
     fn refresh_default_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ssh_config_servers = self.ssh_config_servers.clone();
-        let (has_open_project, is_local) = Self::workspace_flags(&self.workspace, cx);
         self.default_picker.update(cx, |picker, cx| {
-            picker
-                .delegate
-                .reload(&ssh_config_servers, has_open_project, is_local, cx);
+            picker.delegate.reload(&ssh_config_servers, cx);
             picker.refresh(window, cx);
         });
     }
@@ -2197,39 +2132,6 @@ impl RemoteServerProjects {
         });
         cx.emit(DismissEvent);
         cx.notify();
-    }
-
-    fn init_dev_container_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let configs = self
-            .workspace
-            .read_with(cx, |workspace, cx| find_devcontainer_configs(workspace, cx))
-            .unwrap_or_default();
-
-        if configs.len() > 1 {
-            let delegate = DevContainerPickerDelegate::new(configs, cx.weak_entity());
-            self.dev_container_picker =
-                Some(cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded()));
-
-            let state =
-                CreateRemoteDevContainer::new(DevContainerCreationProgress::SelectingConfig, cx);
-            self.mode = Mode::CreateRemoteDevContainer(state);
-            cx.notify();
-        } else if let Some((app_state, context)) = self
-            .workspace
-            .read_with(cx, |workspace, cx| {
-                let app_state = workspace.app_state().clone();
-                let context = DevContainerContext::from_workspace(workspace, cx)?;
-                Some((app_state, context))
-            })
-            .ok()
-            .flatten()
-        {
-            let config = configs.into_iter().next();
-            self.open_dev_container(config, app_state, context, window, cx);
-            self.view_in_progress_dev_container(window, cx);
-        } else {
-            log::error!("No active project directory for Dev Container");
-        }
     }
 
     fn open_dev_container(
@@ -3019,12 +2921,8 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
                         .map(SharedString::from)
                         .collect();
                     let ssh_config_servers = project.ssh_config_servers.clone();
-                    let (has_open_project, is_local) =
-                        RemoteServerProjects::workspace_flags(&project.workspace, cx);
                     project.default_picker.update(cx, |picker, cx| {
-                        picker
-                            .delegate
-                            .reload(&ssh_config_servers, has_open_project, is_local, cx);
+                        picker.delegate.reload(&ssh_config_servers, cx);
                         cx.notify();
                     });
                     cx.notify();
