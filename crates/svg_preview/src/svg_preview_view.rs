@@ -4,8 +4,8 @@ use std::sync::Arc;
 use file_icons::FileIcons;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task,
-    WeakEntity, Window, div, img, px,
+    ParentElement, Render, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled,
+    Subscription, Task, WeakEntity, Window, div, img, px,
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
@@ -19,6 +19,7 @@ use crate::{OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
 
 const MIN_SVG_ZOOM: f32 = 0.1;
 const MAX_SVG_ZOOM: f32 = 10.0;
+const SVG_IMAGE_SELECTOR: &str = "svg-image";
 
 const ONE_LIGHT_THEME: &str = "One Light";
 const ONE_DARK_THEME: &str = "One Dark";
@@ -69,6 +70,7 @@ pub struct SvgPreviewView {
     current_svg: Option<Result<Arc<RenderImage>, SharedString>>,
     zoom_level: f32,
     theme_mode: ViewerThemeMode,
+    scroll_handle: ScrollHandle,
     _refresh: Task<()>,
     _buffer_subscription: Option<Subscription>,
     _workspace_subscription: Option<Subscription>,
@@ -111,6 +113,7 @@ impl SvgPreviewView {
                 current_svg: None,
                 zoom_level: 1.0,
                 theme_mode: ViewerThemeMode::default(),
+                scroll_handle: ScrollHandle::new(),
                 _buffer_subscription: subscription,
                 _workspace_subscription: workspace_subscription,
                 _refresh: Task::ready(()),
@@ -398,26 +401,45 @@ impl Render for SvgPreviewView {
                     .id("svg-scroll")
                     .size_full()
                     .overflow_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .flex()
-                    .justify_center()
-                    .items_center()
-                    .map(|this| match self.current_svg.clone() {
-                        Some(Ok(image)) => {
-                            let image_size = image.size(0);
-                            let width = px(image_size.width.0 as f32 * zoom);
-                            let height = px(image_size.height.0 as f32 * zoom);
-                            this.child(img(image).w(width).h(height).with_fallback(|| {
-                                h_flex()
-                                    .p_4()
-                                    .gap_2()
-                                    .child(Icon::new(IconName::Warning))
-                                    .child("Failed to load SVG image")
-                                    .into_any_element()
-                            }))
-                        }
-                        Some(Err(e)) => this.child(div().p_4().child(e).into_any_element()),
-                        None => this.child(div().p_4().child("No SVG file selected")),
-                    }),
+                    .items_start()
+                    .child(
+                        // Centre inside a box no smaller than the viewport. Centring in the
+                        // scroll container pushes an overflowing image's top and left edges
+                        // out of scroll reach; taffy's cross-axis `m_auto` goes negative too.
+                        div()
+                            .flex_none()
+                            .min_w_full()
+                            .min_h_full()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .map(|this| match self.current_svg.clone() {
+                                Some(Ok(image)) => {
+                                    let image_size = image.size(0);
+                                    let width = px(image_size.width.0 as f32 * zoom);
+                                    let height = px(image_size.height.0 as f32 * zoom);
+                                    this.child(
+                                        img(image)
+                                            .debug_selector(|| SVG_IMAGE_SELECTOR.into())
+                                            .flex_none()
+                                            .w(width)
+                                            .h(height)
+                                            .with_fallback(|| {
+                                                h_flex()
+                                                    .p_4()
+                                                    .gap_2()
+                                                    .child(Icon::new(IconName::Warning))
+                                                    .child("Failed to load SVG image")
+                                                    .into_any_element()
+                                            }),
+                                    )
+                                }
+                                Some(Err(e)) => this.child(div().p_4().child(e).into_any_element()),
+                                None => this.child(div().p_4().child("No SVG file selected")),
+                            }),
+                    ),
             )
             .when(has_image, |this| {
                 this.child(
@@ -492,7 +514,142 @@ impl Item for SvgPreviewView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, hsla};
+    use gpui::{
+        Bounds, Modifiers, Pixels, Point, TestAppContext, TouchPhase, VisualTestContext, hsla,
+        point, size,
+    };
+
+    const VIEWPORT_WIDTH: f32 = 800.0;
+    const VIEWPORT_HEIGHT: f32 = 600.0;
+    const WHEEL_STEP: f32 = 200.0;
+    const WHEEL_TICKS: usize = 40;
+
+    fn svg_of_size(width: u32, height: u32) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -14 {width} {height}" width="{width}" height="{height}"><rect x="0" y="-14" width="{width}" height="{height}" fill="blue"/></svg>"#
+        )
+    }
+
+    fn open_preview(
+        svg: String,
+        cx: &mut TestAppContext,
+    ) -> (Entity<SvgPreviewView>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let buffer = cx.new(|cx| Buffer::local(svg, cx));
+            let mut view = SvgPreviewView {
+                focus_handle: cx.focus_handle(),
+                buffer: Some(buffer),
+                current_svg: None,
+                zoom_level: 1.0,
+                theme_mode: ViewerThemeMode::default(),
+                scroll_handle: ScrollHandle::new(),
+                _refresh: Task::ready(()),
+                _buffer_subscription: None,
+                _workspace_subscription: None,
+            };
+            view.render_image(window, cx);
+            view
+        });
+        cx.simulate_resize(size(px(VIEWPORT_WIDTH), px(VIEWPORT_HEIGHT)));
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| matches!(view.current_svg, Some(Ok(_)))),
+            "the test SVG must render"
+        );
+        (view, cx)
+    }
+
+    fn viewport(view: &Entity<SvgPreviewView>, cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        view.read_with(cx, |view, _| view.scroll_handle.bounds())
+    }
+
+    fn painted_image(cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.debug_bounds(SVG_IMAGE_SELECTOR)
+            .expect("the image must be painted")
+    }
+
+    fn spin_wheel(view: &Entity<SvgPreviewView>, delta: Point<Pixels>, cx: &mut VisualTestContext) {
+        for _ in 0..WHEEL_TICKS {
+            let position = viewport(view, cx).center();
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(delta),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+    }
+
+    fn assert_close(actual: Pixels, expected: Pixels, what: &str) {
+        assert!(
+            (actual - expected).abs() < px(0.5),
+            "{what}: painted at {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_tall_svg_scrolls_to_its_top_and_bottom(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(400, 2400), cx);
+        let viewport_bounds = viewport(&view, cx);
+        assert!(viewport_bounds.size.height < px(2400.0));
+
+        spin_wheel(&view, point(px(0.0), px(-WHEEL_STEP)), cx);
+        assert_close(
+            painted_image(cx).bottom(),
+            viewport_bounds.bottom(),
+            "bottom edge after scrolling down",
+        );
+
+        spin_wheel(&view, point(px(0.0), px(WHEEL_STEP)), cx);
+        assert_close(
+            painted_image(cx).top(),
+            viewport_bounds.top(),
+            "top edge after scrolling back up",
+        );
+    }
+
+    #[gpui::test]
+    fn test_wide_svg_scrolls_to_its_left_and_right(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(3000, 200), cx);
+        let viewport_bounds = viewport(&view, cx);
+        assert!(viewport_bounds.size.width < px(3000.0));
+
+        spin_wheel(&view, point(px(-WHEEL_STEP), px(0.0)), cx);
+        assert_close(
+            painted_image(cx).right(),
+            viewport_bounds.right(),
+            "right edge after scrolling right",
+        );
+
+        spin_wheel(&view, point(px(WHEEL_STEP), px(0.0)), cx);
+        assert_close(
+            painted_image(cx).left(),
+            viewport_bounds.left(),
+            "left edge after scrolling back left",
+        );
+    }
+
+    #[gpui::test]
+    fn test_small_svg_stays_centred(cx: &mut TestAppContext) {
+        let (view, cx) = open_preview(svg_of_size(200, 100), cx);
+        let viewport_bounds = viewport(&view, cx);
+        let image = painted_image(cx);
+        assert_close(
+            image.center().x,
+            viewport_bounds.center().x,
+            "horizontal centre",
+        );
+        assert_close(
+            image.center().y,
+            viewport_bounds.center().y,
+            "vertical centre",
+        );
+    }
 
     #[test]
     fn test_viewer_theme_mode_cycles() {
