@@ -366,17 +366,35 @@ fn main() {
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS {
         false
     } else if *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev {
-        // The dev channel still allows a second instance, but the first one
-        // answers `zedcli`: without a listener nothing on this channel can.
+        // A second launch hands its request to the running editor, so all
+        // windows share one process and its language servers.
+        // ZED_ALLOW_SECOND_INSTANCE=1 starts a separate process instead.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        crate::zed::listen_for_cli_connections(open_listener.clone())
-            .context("listening for zedcli")
-            .log_err();
+        {
+            let listening = crate::zed::listen_for_cli_connections(open_listener.clone())
+                .context("listening for zedcli")
+                .log_err()
+                .is_some();
+            !listening
+                && std::env::var("ZED_ALLOW_SECOND_INSTANCE").as_deref() != Ok("1")
+                && crate::zed::hand_over_to_running_instance(&args.paths_or_urls)
+                    .context("handing the launch over to the running editor")
+                    .log_err()
+                    .is_some()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
+            let another_instance_listens =
+                crate::zed::listen_for_cli_connections(open_listener.clone()).is_err();
+            if another_instance_listens {
+                crate::zed::hand_over_to_running_instance(&args.paths_or_urls)
+                    .context("handing the launch over to the running editor")
+                    .log_err();
+            }
+            another_instance_listens
         }
 
         #[cfg(target_os = "windows")]

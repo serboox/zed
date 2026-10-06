@@ -405,6 +405,84 @@ impl OpenListener {
     }
 }
 
+/// How long a second launch waits for the running editor to take its request.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the editor already listening on this channel's socket to open what
+/// this launch was asked for, the way the `zed` command does, so every window
+/// lives in one process and shares its language servers.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn hand_over_to_running_instance(paths_or_urls: &[String]) -> Result<()> {
+    use release_channel::RELEASE_CHANNEL_NAME;
+    use std::os::unix::net::UnixDatagram;
+
+    let sock_path = paths::data_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL_NAME));
+    let (server, server_name) =
+        ipc::IpcOneShotServer::<IpcHandshake>::new().context("creating the handshake")?;
+    let socket = UnixDatagram::unbound()?;
+    socket
+        .connect(&sock_path)
+        .context("reaching the running editor")?;
+    socket.send(format!("zed-cli://{server_name}").as_bytes())?;
+
+    let cwd = std::env::current_dir().ok();
+    let (urls, paths): (Vec<String>, Vec<String>) = paths_or_urls
+        .iter()
+        .cloned()
+        .partition(|argument| argument.contains("://"));
+    let paths = paths
+        .into_iter()
+        .map(|path| {
+            let path = PathBuf::from(path);
+            let absolute = match &cwd {
+                Some(cwd) if path.is_relative() => cwd.join(path),
+                _ => path,
+            };
+            std::fs::canonicalize(&absolute)
+                .unwrap_or(absolute)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    // A launch with nothing to open is a request for another window.
+    let open_behavior = if paths.is_empty() && urls.is_empty() {
+        cli::OpenBehavior::AlwaysNew
+    } else {
+        cli::OpenBehavior::Default
+    };
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let handed_over = (|| -> Result<()> {
+            let (_, handshake) = server.accept()?;
+            handshake.requests.send(CliRequest::Open {
+                paths,
+                urls,
+                diff_paths: Vec::new(),
+                diff_all: false,
+                wsl: None,
+                wait: false,
+                open_behavior,
+                env: None,
+                user_data_dir: None,
+                dev_container: false,
+                cwd,
+            })?;
+            while let Ok(response) = handshake.responses.recv() {
+                if matches!(response, CliResponse::Exit { .. }) {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        done_tx.send(handed_over).ok();
+    });
+    done_rx
+        .recv_timeout(HAND_OVER_TIMEOUT)
+        .context("the running editor did not answer")?
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
     use release_channel::RELEASE_CHANNEL_NAME;
