@@ -13125,6 +13125,9 @@ impl LspStore {
             } else {
                 self.stop_local_language_servers_for_buffers(&[], only_restart_servers.clone(), cx)
             };
+            for name in &stopped_names {
+                lsp::retire_shared_processes(&name.0);
+            }
             cx.spawn(async move |lsp_store, cx| {
                 stop_task.await;
                 lsp_store.update(cx, |lsp_store, cx| {

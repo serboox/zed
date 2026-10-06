@@ -1,4 +1,7 @@
 mod input_handler;
+mod shared_server;
+
+pub use shared_server::retire_shared_processes;
 
 pub use lsp_types::request::*;
 pub use lsp_types::*;
@@ -546,6 +549,40 @@ impl LanguageServer {
         };
         let root_uri = Uri::from_file_path(&working_dir)
             .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
+        let on_unhandled_notification = move |notification: &NotificationOrRequest| {
+            log::info!(
+                "Language server with id {} sent unhandled notification {}:\n{}",
+                server_id,
+                notification.method,
+                serde_json::to_string_pretty(&notification.params).unwrap(),
+            );
+            false
+        };
+
+        if shared_server::sharing_enabled() {
+            let connection = shared_server::connect(
+                &binary,
+                working_dir,
+                &server_name.0,
+                cx.background_executor().clone(),
+            );
+            return Ok(Self::new_internal(
+                server_id,
+                server_name,
+                connection.to_server,
+                connection.from_server,
+                None::<async_pipe::PipeReader>,
+                stderr_capture,
+                None,
+                code_action_kinds,
+                binary,
+                root_uri,
+                workspace_folders,
+                cx,
+                on_unhandled_notification,
+            ));
+        }
+
         log::info!(
             "starting language server process. binary path: \
             {:?}, working directory: {:?}, args: {:?}",
@@ -583,15 +620,7 @@ impl LanguageServer {
             root_uri,
             workspace_folders,
             cx,
-            move |notification| {
-                log::info!(
-                    "Language server with id {} sent unhandled notification {}:\n{}",
-                    server_id,
-                    notification.method,
-                    serde_json::to_string_pretty(&notification.params).unwrap(),
-                );
-                false
-            },
+            on_unhandled_notification,
         );
 
         Ok(server)
