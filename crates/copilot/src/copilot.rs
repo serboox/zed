@@ -87,6 +87,69 @@ struct RunningCopilotServer {
     lsp: Arc<LanguageServer>,
     sign_in_status: SignInStatus,
     registered_buffers: HashMap<EntityId, RegisteredBuffer>,
+    /// The buffer whose text the server holds for each URI. One server serves
+    /// every window, and two windows can each have a buffer for the same file.
+    document_owners: HashMap<lsp::Uri, EntityId>,
+}
+
+impl RunningCopilotServer {
+    /// Makes the server hold `buffer_id`'s text for its URI, replacing the text
+    /// of another buffer for the same file if that one held it.
+    fn claim_document(&mut self, buffer_id: EntityId) {
+        let Some(buffer) = self.registered_buffers.get(&buffer_id) else {
+            return;
+        };
+        match self.document_owners.insert(buffer.uri.clone(), buffer_id) {
+            Some(owner) if owner == buffer_id => return,
+            Some(_) => {
+                self.lsp
+                    .notify::<lsp::notification::DidCloseTextDocument>(
+                        lsp::DidCloseTextDocumentParams {
+                            text_document: lsp::TextDocumentIdentifier::new(buffer.uri.clone()),
+                        },
+                    )
+                    .ok();
+            }
+            None => {}
+        }
+        self.lsp
+            .notify::<lsp::notification::DidOpenTextDocument>(lsp::DidOpenTextDocumentParams {
+                text_document: lsp::TextDocumentItem::new(
+                    buffer.uri.clone(),
+                    buffer.language_id.clone(),
+                    buffer.snapshot_version,
+                    buffer.snapshot.text(),
+                ),
+            })
+            .ok();
+    }
+
+    fn claim_document_if_free(&mut self, buffer_id: EntityId) {
+        let is_free = self
+            .registered_buffers
+            .get(&buffer_id)
+            .is_some_and(|buffer| !self.document_owners.contains_key(&buffer.uri));
+        if is_free {
+            self.claim_document(buffer_id);
+        }
+    }
+
+    fn release_document(&mut self, buffer_id: EntityId, uri: &lsp::Uri) {
+        if self.document_owners.get(uri) == Some(&buffer_id) {
+            self.document_owners.remove(uri);
+            self.lsp
+                .notify::<lsp::notification::DidCloseTextDocument>(
+                    lsp::DidCloseTextDocumentParams {
+                        text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
+                    },
+                )
+                .ok();
+        }
+    }
+
+    fn holds_document(&self, buffer_id: EntityId, uri: &lsp::Uri) -> bool {
+        self.document_owners.get(uri) == Some(&buffer_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +267,9 @@ impl RegisteredBuffer {
                         if !content_changes.is_empty() {
                             buffer.snapshot_version += 1;
                             buffer.snapshot = new_snapshot;
+                        }
+                        let buffer = server.registered_buffers.get(&id)?;
+                        if !content_changes.is_empty() && server.holds_document(id, &buffer.uri) {
                             server
                                 .lsp
                                 .notify::<lsp::notification::DidChangeTextDocument>(
@@ -243,6 +309,9 @@ pub struct Copilot {
     server: CopilotServer,
     buffers: HashSet<WeakEntity<Buffer>>,
     server_id: LanguageServerId,
+    /// Every project this server answers for, so the file in focus in any
+    /// window reaches it.
+    watched_projects: HashMap<EntityId, [Subscription; 2]>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -314,6 +383,34 @@ pub(crate) struct CopilotEditPrediction {
 }
 
 impl Copilot {
+    /// Starts telling the server which file is in focus in `project`, so one
+    /// server can answer for every open window.
+    pub fn watch_project(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        let project_id = project.entity_id();
+        if self.watched_projects.contains_key(&project_id) {
+            return;
+        }
+        let focus = cx.subscribe(project, |this, project, event: &project::Event, cx| {
+            if let project::Event::ActiveEntryChanged(new_entry) = event
+                && let Ok(running) = this.server.as_authenticated()
+            {
+                let uri = new_entry
+                    .and_then(|id| project.read(cx).path_for_entry(id, cx))
+                    .and_then(|entry| project.read(cx).absolute_path(&entry, cx))
+                    .and_then(|abs_path| lsp::Uri::from_file_path(abs_path).ok());
+
+                running
+                    .lsp
+                    .notify::<DidFocus>(DidFocusParams { uri })
+                    .log_err();
+            }
+        });
+        let release = cx.observe_release(project, move |this, _, _| {
+            this.watched_projects.remove(&project_id);
+        });
+        self.watched_projects.insert(project_id, [focus, release]);
+    }
+
     pub fn new(
         project: Option<Entity<Project>>,
         new_server_id: LanguageServerId,
@@ -321,20 +418,6 @@ impl Copilot {
         node_runtime: NodeRuntime,
         cx: &mut Context<Self>,
     ) -> Self {
-        let send_focus_notification = project.map(|project| {
-            cx.subscribe(&project, |this, project, e: &project::Event, cx| {
-                if let project::Event::ActiveEntryChanged(new_entry) = e
-                    && let Ok(running) = this.server.as_authenticated()
-                {
-                    let uri = new_entry
-                        .and_then(|id| project.read(cx).path_for_entry(id, cx))
-                        .and_then(|entry| project.read(cx).absolute_path(&entry, cx))
-                        .and_then(|abs_path| lsp::Uri::from_file_path(abs_path).ok());
-
-                    _ = running.lsp.notify::<DidFocus>(DidFocusParams { uri });
-                }
-            })
-        });
         let global_authentication_events =
             cx.try_global::<GlobalCopilotAuth>().cloned().map(|auth| {
                 cx.subscribe(&auth.0, |_, _, _: &Event, cx| {
@@ -370,7 +453,6 @@ impl Copilot {
                 })
             });
         let _subscriptions = std::iter::once(cx.on_app_quit(Self::shutdown_language_server))
-            .chain(send_focus_notification)
             .chain(global_authentication_events)
             .collect();
         let mut this = Self {
@@ -379,8 +461,12 @@ impl Copilot {
             node_runtime,
             server: CopilotServer::Disabled,
             buffers: Default::default(),
+            watched_projects: Default::default(),
             _subscriptions,
         };
+        if let Some(project) = project {
+            this.watch_project(&project, cx);
+        }
         this.start_copilot(true, false, cx);
         cx.observe_global::<SettingsStore>(move |this, cx| {
             let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
@@ -543,12 +629,14 @@ impl Copilot {
                 lsp: Arc::new(server),
                 sign_in_status: SignInStatus::Authorized,
                 registered_buffers: Default::default(),
+                document_owners: Default::default(),
             }),
             _subscriptions: vec![
                 send_focus_notification,
                 cx.on_app_quit(Self::shutdown_language_server),
             ],
             buffers: Default::default(),
+            watched_projects: Default::default(),
         });
         (this, fake_server)
     }
@@ -718,6 +806,7 @@ impl Copilot {
                             awaiting_signing_in: awaiting_sign_in_after_start,
                         },
                         registered_buffers: Default::default(),
+                        document_owners: Default::default(),
                     });
                     this.update_sign_in_status(status, cx);
                 }
@@ -875,36 +964,18 @@ impl Copilot {
         let weak_buffer = buffer.downgrade();
         self.buffers.insert(weak_buffer.clone());
 
-        if let CopilotServer::Running(RunningCopilotServer {
-            lsp: server,
-            sign_in_status: status,
-            registered_buffers,
-            ..
-        }) = &mut self.server
-        {
-            if !matches!(status, SignInStatus::Authorized) {
+        if let CopilotServer::Running(server) = &mut self.server {
+            if !matches!(server.sign_in_status, SignInStatus::Authorized) {
                 return;
             }
 
-            let entry = registered_buffers.entry(buffer.entity_id());
+            let entry = server.registered_buffers.entry(buffer.entity_id());
             if let Entry::Vacant(e) = entry {
                 let Ok(uri) = uri_for_buffer(buffer, cx) else {
                     return;
                 };
                 let language_id = id_for_language(buffer.read(cx).language());
                 let snapshot = buffer.read(cx).snapshot();
-                server
-                    .notify::<lsp::notification::DidOpenTextDocument>(
-                        lsp::DidOpenTextDocumentParams {
-                            text_document: lsp::TextDocumentItem {
-                                uri: uri.clone(),
-                                language_id: language_id.clone(),
-                                version: 0,
-                                text: snapshot.text(),
-                            },
-                        },
-                    )
-                    .ok();
 
                 e.insert(RegisteredBuffer {
                     uri,
@@ -922,6 +993,7 @@ impl Copilot {
                         }),
                     ],
                 });
+                server.claim_document_if_free(buffer.entity_id());
             }
         }
     }
@@ -932,14 +1004,18 @@ impl Copilot {
         event: &language::BufferEvent,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        let buffer_id = buffer.entity_id();
         if let Ok(server) = self.server.as_running()
-            && let Some(registered_buffer) = server.registered_buffers.get_mut(&buffer.entity_id())
+            && let Some(registered_buffer) = server.registered_buffers.get_mut(&buffer_id)
         {
             match event {
                 language::BufferEvent::Edited { .. } => {
                     drop(registered_buffer.report_changes(&buffer, cx));
                 }
                 language::BufferEvent::Saved => {
+                    if server.document_owners.get(&registered_buffer.uri) != Some(&buffer_id) {
+                        return Ok(());
+                    }
                     server
                         .lsp
                         .notify::<lsp::notification::DidSaveTextDocument>(
@@ -963,27 +1039,8 @@ impl Copilot {
                     {
                         let old_uri = mem::replace(&mut registered_buffer.uri, new_uri);
                         registered_buffer.language_id = new_language_id;
-                        server
-                            .lsp
-                            .notify::<lsp::notification::DidCloseTextDocument>(
-                                lsp::DidCloseTextDocumentParams {
-                                    text_document: lsp::TextDocumentIdentifier::new(old_uri),
-                                },
-                            )
-                            .ok();
-                        server
-                            .lsp
-                            .notify::<lsp::notification::DidOpenTextDocument>(
-                                lsp::DidOpenTextDocumentParams {
-                                    text_document: lsp::TextDocumentItem::new(
-                                        registered_buffer.uri.clone(),
-                                        registered_buffer.language_id.clone(),
-                                        registered_buffer.snapshot_version,
-                                        registered_buffer.snapshot.text(),
-                                    ),
-                                },
-                            )
-                            .ok();
+                        server.release_document(buffer_id, &old_uri);
+                        server.claim_document_if_free(buffer_id);
                     }
                 }
                 _ => {}
@@ -994,17 +1051,11 @@ impl Copilot {
     }
 
     fn unregister_buffer(&mut self, buffer: &WeakEntity<Buffer>) {
+        let buffer_id = buffer.entity_id();
         if let Ok(server) = self.server.as_running()
-            && let Some(buffer) = server.registered_buffers.remove(&buffer.entity_id())
+            && let Some(buffer) = server.registered_buffers.remove(&buffer_id)
         {
-            server
-                .lsp
-                .notify::<lsp::notification::DidCloseTextDocument>(
-                    lsp::DidCloseTextDocumentParams {
-                        text_document: lsp::TextDocumentIdentifier::new(buffer.uri),
-                    },
-                )
-                .ok();
+            server.release_document(buffer_id, &buffer.uri);
         }
     }
 
@@ -1022,6 +1073,7 @@ impl Copilot {
         };
         let buffer_entity = buffer.clone();
         let lsp = server.lsp.clone();
+        server.claim_document(buffer.entity_id());
         let Some(registered_buffer) = server.registered_buffers.get_mut(&buffer.entity_id()) else {
             return Task::ready(Err(anyhow::anyhow!("buffer not registered")));
         };
@@ -1440,6 +1492,7 @@ mod tests {
             node_runtime: NodeRuntime::unavailable(),
             server: CopilotServer::Disabled,
             buffers: Default::default(),
+            watched_projects: Default::default(),
             _subscriptions: vec![],
         });
 
@@ -1786,6 +1839,7 @@ mod tests {
             node_runtime: NodeRuntime::unavailable(),
             server: CopilotServer::Disabled,
             buffers: Default::default(),
+            watched_projects: Default::default(),
             _subscriptions: vec![],
         });
 
@@ -1826,6 +1880,134 @@ mod tests {
                 "Copilot should be starting after disable_ai is set to false"
             );
         });
+    }
+
+    /// Two windows can each have a buffer for the same file, while one shared
+    /// server holds a single text per URI.
+    #[gpui::test]
+    async fn test_shared_server_holds_one_text_per_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (copilot, mut lsp) = Copilot::fake(cx);
+        let shared_file = || {
+            Arc::new(File {
+                abs_path: path!("/root/shared.txt").into(),
+                path: rel_path("shared.txt").into(),
+            })
+        };
+        let uri = lsp::Uri::from_file_path(path!("/root/shared.txt")).unwrap();
+        let open_buffer = |cx: &mut TestAppContext| {
+            cx.new(|cx| {
+                let mut buffer = Buffer::local("one", cx);
+                buffer.file_updated(shared_file(), cx);
+                buffer
+            })
+        };
+        let first_window = open_buffer(cx);
+        let second_window = open_buffer(cx);
+
+        copilot.update(cx, |copilot, cx| copilot.register_buffer(&first_window, cx));
+        copilot.update(cx, |copilot, cx| {
+            copilot.register_buffer(&second_window, cx)
+        });
+        assert_eq!(
+            lsp.receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .await,
+            lsp::DidOpenTextDocumentParams {
+                text_document: lsp::TextDocumentItem::new(
+                    uri.clone(),
+                    "plaintext".into(),
+                    0,
+                    "one".into()
+                ),
+            }
+        );
+
+        second_window.update(cx, |buffer, cx| buffer.edit([(3..3, " two")], None, cx));
+        cx.run_until_parked();
+        first_window.update(cx, |buffer, cx| buffer.edit([(3..3, " 1")], None, cx));
+        let change = lsp
+            .receive_notification::<lsp::notification::DidChangeTextDocument>()
+            .await;
+        assert_eq!(
+            change.content_changes[0].text, " 1",
+            "only the buffer whose text the server holds reports its edits"
+        );
+
+        lsp.set_request_handler::<request::NextEditSuggestions, _, _>(|_, _| async {
+            Ok(request::NextEditSuggestionsResult { edits: Vec::new() })
+        });
+        lsp.set_request_handler::<request::InlineCompletions, _, _>(|_, _| async {
+            Ok(request::InlineCompletionsResult { items: Vec::new() })
+        });
+        let position = second_window.read_with(cx, |buffer, _| buffer.anchor_before(0));
+        let completions = copilot.update(cx, |copilot, cx| {
+            copilot.completions(&second_window, position, cx)
+        });
+        assert_eq!(
+            lsp.receive_notification::<lsp::notification::DidCloseTextDocument>()
+                .await,
+            lsp::DidCloseTextDocumentParams {
+                text_document: lsp::TextDocumentIdentifier::new(uri.clone()),
+            }
+        );
+        assert_eq!(
+            lsp.receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .await,
+            lsp::DidOpenTextDocumentParams {
+                text_document: lsp::TextDocumentItem::new(
+                    uri.clone(),
+                    "plaintext".into(),
+                    1,
+                    "one two".into()
+                ),
+            },
+            "asking for a completion hands the file's text to the asking window"
+        );
+        completions.await.unwrap();
+
+        cx.update(|_| drop(second_window));
+        assert_eq!(
+            lsp.receive_notification::<lsp::notification::DidCloseTextDocument>()
+                .await,
+            lsp::DidCloseTextDocumentParams {
+                text_document: lsp::TextDocumentIdentifier::new(uri),
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_shared_server_follows_focus_in_every_project(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+        let (copilot, mut lsp) = Copilot::fake(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/first"), serde_json::json!({ "a.txt": "" }))
+            .await;
+        fs.insert_tree(path!("/second"), serde_json::json!({ "b.txt": "" }))
+            .await;
+        let first = Project::test(fs.clone(), [path!("/first").as_ref()], cx).await;
+        let second = Project::test(fs, [path!("/second").as_ref()], cx).await;
+        copilot.update(cx, |copilot, cx| {
+            copilot.watch_project(&first, cx);
+            copilot.watch_project(&second, cx);
+        });
+
+        for (project, file) in [
+            (&second, path!("/second/b.txt")),
+            (&first, path!("/first/a.txt")),
+        ] {
+            project.update(cx, |project, cx| {
+                let path = project.find_project_path(file, cx).unwrap();
+                project.set_active_path(Some(path), cx);
+            });
+            cx.run_until_parked();
+            let focus = lsp
+                .try_receive_notification::<DidFocus>()
+                .now_or_never()
+                .flatten()
+                .unwrap_or_else(|| panic!("the server heard nothing about {file}"));
+            assert_eq!(focus.uri, Some(lsp::Uri::from_file_path(file).unwrap()));
+        }
     }
 
     fn init_test(cx: &mut TestAppContext) {

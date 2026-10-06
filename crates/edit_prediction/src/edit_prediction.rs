@@ -21,7 +21,7 @@ use cloud_llm_client::{
     ZED_VERSION_HEADER_NAME,
 };
 use collections::{HashMap, HashSet};
-use copilot::{Copilot, Reinstall};
+use copilot::{Copilot, GlobalCopilotAuth, Reinstall};
 use credentials_provider::CredentialsProvider;
 use db::kvp::{Dismissable, KeyValueStore};
 use edit_prediction_context::{RelatedExcerptStore, RelatedExcerptStoreEvent, RelatedFile};
@@ -1282,20 +1282,21 @@ impl EditPredictionStore {
         if state.copilot.is_some() {
             return state.copilot.clone();
         }
-        let _project = project.clone();
-        let project = project.read(cx);
 
-        let node = project.node_runtime().cloned();
-        if let Some(node) = node {
-            let next_id = project.languages().next_language_server_id();
-            let fs = project.fs().clone();
-
-            let copilot = cx.new(|cx| Copilot::new(Some(_project), next_id, fs, node, cx));
-            state.copilot = Some(copilot.clone());
-            Some(copilot)
-        } else {
-            None
-        }
+        // One server answers for every window; each extra one cost about 140 MB.
+        let copilot = match GlobalCopilotAuth::try_global(cx) {
+            Some(auth) => auth.0.clone(),
+            None => {
+                let project = project.read(cx);
+                let node = project.node_runtime().cloned()?;
+                let server_id = project.languages().next_language_server_id();
+                let fs = project.fs().clone();
+                GlobalCopilotAuth::set_global(server_id, fs, node, cx).0
+            }
+        };
+        copilot.update(cx, |copilot, cx| copilot.watch_project(project, cx));
+        self.get_or_init_project(project, cx).copilot = Some(copilot.clone());
+        Some(copilot)
     }
 
     pub fn context_for_project_with_buffers<'a>(

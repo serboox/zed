@@ -58,6 +58,29 @@ use crate::{
 use super::*;
 
 #[gpui::test]
+async fn test_every_project_shares_one_copilot_server(cx: &mut TestAppContext) {
+    let (ep_store, _requests) = init_test_with_fake_client(cx);
+    let (copilot, _lsp) = copilot::Copilot::fake(cx);
+    cx.update(|cx| cx.set_global(copilot::GlobalCopilotAuth(copilot.clone())));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/first"), json!({ "a.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/second"), json!({ "b.txt": "" }))
+        .await;
+    let first = Project::test(fs.clone(), vec![path!("/first").as_ref()], cx).await;
+    let second = Project::test(fs, vec![path!("/second").as_ref()], cx).await;
+
+    let (first_copilot, second_copilot) = ep_store.update(cx, |ep_store, cx| {
+        (
+            ep_store.start_copilot_for_project(&first, cx),
+            ep_store.start_copilot_for_project(&second, cx),
+        )
+    });
+    assert_eq!(first_copilot, Some(copilot.clone()));
+    assert_eq!(second_copilot, Some(copilot));
+}
+
+#[gpui::test]
 async fn test_current_state(cx: &mut TestAppContext) {
     let (ep_store, mut requests) = init_test_with_fake_client(cx);
     cx.update(|cx| set_jumps_feature_flag_override(cx, "on"));
