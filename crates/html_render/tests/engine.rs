@@ -241,8 +241,8 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         let middle = gpui::point(px(200.), px(150.));
         clicked.mouse_moved(middle);
-        clicked.mouse_down(middle, MouseButton::Left);
-        clicked.mouse_up(middle, MouseButton::Left);
+        clicked.mouse_down(middle, MouseButton::Primary);
+        clicked.mouse_up(middle, MouseButton::Primary);
         wait_for_colour(&mut clicked, [0, 0, 255], "a click the page handled");
 
         // The click left the button focused, so the keys have somewhere to go.
@@ -285,12 +285,12 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         let start = gpui::point(px(2.), px(8.));
         selectable.mouse_moved(start);
-        selectable.mouse_down(start, MouseButton::Left);
+        selectable.mouse_down(start, MouseButton::Primary);
         for x in [30., 60., 90., 120.] {
             selectable.mouse_moved(gpui::point(px(x), px(8.)));
             pump_for(&mut selectable, Duration::from_millis(120));
         }
-        selectable.mouse_up(gpui::point(px(120.), px(8.)), MouseButton::Left);
+        selectable.mouse_up(gpui::point(px(120.), px(8.)), MouseButton::Primary);
         pump_for(&mut selectable, Duration::from_millis(400));
 
         let selected = ask_for_selection(&mut selectable);
@@ -316,12 +316,12 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         let middle_line = px(48.);
         three_lines.mouse_moved(gpui::point(px(2.), middle_line));
-        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Left);
+        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Primary);
         for x in [40., 80., 110.] {
             three_lines.mouse_moved(gpui::point(px(x), middle_line));
             pump_for(&mut three_lines, Duration::from_millis(120));
         }
-        three_lines.mouse_up(gpui::point(px(110.), middle_line), MouseButton::Left);
+        three_lines.mouse_up(gpui::point(px(110.), middle_line), MouseButton::Primary);
         pump_for(&mut three_lines, Duration::from_millis(400));
 
         let one_line = ask_for_selection(&mut three_lines);
@@ -333,12 +333,12 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         // The same drag, but ending past the right edge of the text: a reader
         // sweeping to the end of a line must not be given the rest of the page.
         three_lines.mouse_moved(gpui::point(px(2.), middle_line));
-        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Left);
+        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Primary);
         for x in [200., 400., 580.] {
             three_lines.mouse_moved(gpui::point(px(x), middle_line));
             pump_for(&mut three_lines, Duration::from_millis(120));
         }
-        three_lines.mouse_up(gpui::point(px(580.), middle_line), MouseButton::Left);
+        three_lines.mouse_up(gpui::point(px(580.), middle_line), MouseButton::Primary);
         pump_for(&mut three_lines, Duration::from_millis(400));
 
         // A page taller than its window, to find out what the engine's own
@@ -380,12 +380,12 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         pump_for(&mut wrapped, Duration::from_millis(600));
         let line = px(100.);
         wrapped.mouse_moved(gpui::point(px(465.), line));
-        wrapped.mouse_down(gpui::point(px(465.), line), MouseButton::Left);
+        wrapped.mouse_down(gpui::point(px(465.), line), MouseButton::Primary);
         for x in [520., 620., 720., 815.] {
             wrapped.mouse_moved(gpui::point(px(x), line));
             pump_for(&mut wrapped, Duration::from_millis(120));
         }
-        wrapped.mouse_up(gpui::point(px(815.), line), MouseButton::Left);
+        wrapped.mouse_up(gpui::point(px(815.), line), MouseButton::Primary);
         pump_for(&mut wrapped, Duration::from_millis(400));
         for probe in [
             "(function(){var w=document.querySelectorAll('[data-zed-selection=word]');\
@@ -710,7 +710,7 @@ fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
     report("a turn of the wheel", width, height, scale, &mut scrolls, 0);
 
     let mut moves = Vec::new();
-    heavy.mouse_down(gpui::point(px(20.), px(20.)), MouseButton::Left);
+    heavy.mouse_down(gpui::point(px(20.), px(20.)), MouseButton::Primary);
     for step in 0..40 {
         heavy.mouse_moved(gpui::point(px(20. + step as f32 * 8.), px(40.)));
         let started = Instant::now();
@@ -718,7 +718,7 @@ fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
         heavy.pump();
         moves.push(started.elapsed());
     }
-    heavy.mouse_up(gpui::point(px(340.), px(40.)), MouseButton::Left);
+    heavy.mouse_up(gpui::point(px(340.), px(40.)), MouseButton::Primary);
     report(
         "a pointer moved while selecting",
         width,
@@ -2075,8 +2075,8 @@ fn the_page_answers_the_whole_panel(cx: &mut gpui::App) {
     );
     println!("THE WORDS ARE AT: {middle:?} of {}", box_of["box"]);
     assert_eq!(clicks(&mut page), "0", "the page has heard no click yet");
-    page.mouse_down(middle, MouseButton::Left);
-    page.mouse_up(middle, MouseButton::Left);
+    page.mouse_down(middle, MouseButton::Primary);
+    page.mouse_up(middle, MouseButton::Primary);
     pump_for(&mut page, Duration::from_millis(300));
     let taken = ask(&mut page, "picked()");
     assert!(
@@ -2091,8 +2091,8 @@ fn the_page_answers_the_whole_panel(cx: &mut gpui::App) {
 
     // Off again, and the page is the reader's to use.
     assert_eq!(ask(&mut page, "pick(0)"), "off");
-    page.mouse_down(middle, MouseButton::Left);
-    page.mouse_up(middle, MouseButton::Left);
+    page.mouse_down(middle, MouseButton::Primary);
+    page.mouse_up(middle, MouseButton::Primary);
     pump_for(&mut page, Duration::from_millis(300));
     assert_eq!(
         clicks(&mut page),

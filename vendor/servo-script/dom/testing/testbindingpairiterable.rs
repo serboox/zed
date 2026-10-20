@@ -8,7 +8,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 
 use crate::dom::bindings::codegen::Bindings::TestBindingPairIterableBinding::TestBindingPairIterableMethods;
 use crate::dom::bindings::error::Fallible;
@@ -26,13 +26,14 @@ pub(crate) struct TestBindingPairIterable {
 impl Iterable for TestBindingPairIterable {
     type Key = DOMString;
     type Value = u32;
-    fn get_iterable_length(&self) -> u32 {
+
+    fn get_iterable_length(&self, _cx: &mut JSContext) -> u32 {
         self.map.borrow().len() as u32
     }
-    fn get_value_at_index(&self, index: u32) -> u32 {
+    fn get_value_at_index(&self, _cx: &mut JSContext, index: u32) -> u32 {
         *self.map.borrow().get(index as usize).map(|a| &a.1).unwrap()
     }
-    fn get_key_at_index(&self, index: u32) -> DOMString {
+    fn get_key_at_index(&self, _cx: &mut JSContext, index: u32) -> DOMString {
         self.map
             .borrow()
             .get(index as usize)
@@ -48,14 +49,14 @@ impl TestBindingPairIterable {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<TestBindingPairIterable> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(TestBindingPairIterable {
                 reflector: Reflector::new(),
                 map: DomRefCell::new(vec![]),
             }),
             global,
             proto,
-            cx,
         )
     }
 }

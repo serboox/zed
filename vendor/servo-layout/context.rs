@@ -26,6 +26,8 @@ use style::dom::OpaqueNode;
 use style::values::computed::color::Color;
 use style::values::computed::image::{Gradient, Image};
 use style_traits::DevicePixel;
+use uuid::Uuid;
+use webrender_api::ImageKey;
 use webrender_api::units::{DeviceIntSize, DeviceSize};
 
 pub(crate) type CachedImageOrError = Result<CachedImage, ResolveImageError>;
@@ -270,7 +272,7 @@ impl ImageResolver {
         image_id: PendingImageId,
         size: DeviceIntSize,
         node: OpaqueNode,
-        svg_id: Option<String>,
+        svg_id: Option<Uuid>,
     ) -> Option<RasterImage> {
         let result = self
             .image_cache
@@ -285,6 +287,22 @@ impl ImageResolver {
                 });
         }
         result
+    }
+
+    /// Resolve a cached image to a WebRender [`ImageKey`]
+    pub(crate) fn image_key_from_cached_image(
+        &self,
+        image: &CachedImage,
+        size: DeviceIntSize,
+        node: Option<OpaqueNode>,
+    ) -> Option<ImageKey> {
+        match image {
+            CachedImage::Raster(raster_image) => raster_image.id,
+            CachedImage::Vector(vector_image) => node.and_then(|node| {
+                self.rasterize_vector_image(vector_image.id, size, node, vector_image.svg_id)
+                    .and_then(|rasterized_image| rasterized_image.id)
+            }),
+        }
     }
 
     pub(crate) fn queue_svg_element_for_serialization(&self, element: ServoLayoutNode<'_>) {

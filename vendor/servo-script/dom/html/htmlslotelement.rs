@@ -6,12 +6,11 @@ use std::cell::{Cell, Ref, RefCell};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::gc::RootedVec;
 use js::rust::HandleObject;
 use script_bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId};
 
-use crate::ScriptThread;
 use crate::dom::bindings::codegen::Bindings::HTMLSlotElementBinding::{
     AssignedNodesOptions, HTMLSlotElementMethods,
 };
@@ -33,6 +32,8 @@ use crate::dom::node::{
     BindContext, ForceSlottableNodeReconciliation, IsShadowTree, Node, NodeDamage, NodeTraits,
     UnbindContext,
 };
+use crate::dom::{FlatTreeParent, NodeFlags};
+use crate::event_loop::script_thread::ScriptThread;
 
 /// <https://html.spec.whatwg.org/multipage/#the-slot-element>
 #[dom_struct]
@@ -296,7 +297,7 @@ impl HTMLSlotElement {
                 if is_slottable {
                     rooted!(&in(cx) let slottable = Slottable(Dom::from_ref(&*child)));
                     // Step 6.1 Let foundSlot be the result of finding a slot given slottable.
-                    let found_slot = slottable.find_a_slot(false);
+                    let found_slot = slottable.find_a_slot(cx.no_gc(), false);
 
                     // Step 6.2 If foundSlot is slot, then append slottable to result.
                     if found_slot.is_some_and(|found_slot| &*found_slot == self) {
@@ -325,14 +326,14 @@ impl HTMLSlotElement {
 
         // Clear the style and layout data for all previously assigned slottables as well as
         // marking them as dirty, as they need a full restyle and layout.
+        let document = self.owner_document();
+        let had_assigned_nodes = !self.assigned_nodes().is_empty();
         for slottable in self.assigned_nodes().iter() {
-            slottable
-                .node()
-                .remove_style_and_layout_data_from_subtree(cx);
-            slottable.node().dirty(NodeDamage::Other);
+            document.remove_style_and_layout_data_from_subtree(cx.no_gc(), slottable.node());
+            slottable.node().dirty(cx.no_gc(), NodeDamage::Other);
         }
 
-        self.signal_a_slot_change();
+        self.signal_a_slot_change(cx);
 
         // If we don't disconnect the old slottables from this slot then they'll stay implicitily
         // connected, which causes problems later on. Only do this for slottables that have not
@@ -357,19 +358,36 @@ impl HTMLSlotElement {
             slottable.set_assigned_slot(Some(self));
         }
 
+        // If the `<slot>` element did not have assigned nodes before, be sure to clear
+        // the style and layout data on the fallback content of the element.
+        if !had_assigned_nodes && !slottables.is_empty() {
+            let node = self.upcast::<Node>();
+            for child in node.children() {
+                document.remove_style_and_layout_data_from_subtree(cx.no_gc(), &child);
+            }
+            node.dirty(cx.no_gc(), NodeDamage::Other);
+        }
+
         // Also clear the style and layout data for all currently assigned slottables
         // as well as marking them as dirty, as they need a full restyle and layout.
         for slottable in slottables.iter() {
-            slottable
-                .node()
-                .remove_style_and_layout_data_from_subtree(cx);
-            slottable.node().dirty(NodeDamage::Other);
+            document.remove_style_and_layout_data_from_subtree(cx.no_gc(), slottable.node());
+            slottable.node().dirty(cx.no_gc(), NodeDamage::Other);
+        }
+
+        if let Some(selection) = self.owner_document().selection()
+            && let FlatTreeParent::Parent(parent) =
+                self.upcast::<Node>().parent_in_flat_tree(cx.no_gc())
+            && parent.get_flag(NodeFlags::OVERLAPS_DOCUMENT_SELECTION)
+        {
+            selection.set_visible_selection_dirty();
         }
     }
 
     /// <https://dom.spec.whatwg.org/#signal-a-slot-change>
-    pub(crate) fn signal_a_slot_change(&self) {
-        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+    pub(crate) fn signal_a_slot_change(&self, cx: &JSContext) {
+        self.upcast::<Node>()
+            .dirty(cx.no_gc(), NodeDamage::ContentOrHeritage);
 
         if self.is_in_agents_signal_slots.get() {
             return;
@@ -381,7 +399,7 @@ impl HTMLSlotElement {
         mutation_observers.add_signal_slot(self);
 
         // Step 2. Queue a mutation observer microtask.
-        mutation_observers.queue_mutation_observer_microtask(ScriptThread::microtask_queue());
+        mutation_observers.queue_mutation_observer_microtask(cx);
     }
 
     pub(crate) fn remove_from_signal_slots(&self) {
@@ -398,15 +416,19 @@ impl HTMLSlotElement {
 
 impl Slottable {
     /// <https://dom.spec.whatwg.org/#find-a-slot>
-    pub(crate) fn find_a_slot(&self, open_flag: bool) -> Option<DomRoot<HTMLSlotElement>> {
+    pub(crate) fn find_a_slot(
+        &self,
+        no_gc: &NoGC,
+        open_flag: bool,
+    ) -> Option<DomRoot<HTMLSlotElement>> {
         // Step 1. If slottable’s parent is null, then return null.
-        let parent = self.node().GetParentNode()?;
+        let parent = self.node().get_parent_node_unrooted(no_gc)?;
 
         // Step 2. Let shadow be slottable’s parent’s shadow root.
         // Step 3. If shadow is null, then return null.
         let shadow_root = parent
             .downcast::<Element>()
-            .and_then(Element::shadow_root)?;
+            .and_then(|element| element.shadow_root_unrooted(no_gc))?;
 
         // Step 4. If the open flag is set and shadow’s mode is not "open", then return null.
         if open_flag && shadow_root.Mode() != ShadowRootMode::Open {
@@ -427,7 +449,7 @@ impl Slottable {
     /// <https://dom.spec.whatwg.org/#assign-a-slot>
     pub(crate) fn assign_a_slot(&self, cx: &JSContext) {
         // Step 1. Let slot be the result of finding a slot with slottable.
-        let slot = self.find_a_slot(false);
+        let slot = self.find_a_slot(cx.no_gc(), false);
 
         // Step 2. If slot is non-null, then run assign slottables for slot.
         if let Some(slot) = slot {
@@ -489,12 +511,10 @@ impl VirtualMethods for HTMLSlotElement {
             if let Some(shadow_root) = self.containing_shadow_root() {
                 // Shadow roots keep a list of slot descendants, so we need to tell it
                 // about our name change
-                let old_value = match mutation {
-                    AttributeMutation::Set(old, _) => old
-                        .map(|value| value.to_string().into())
-                        .unwrap_or_default(),
-                    AttributeMutation::Removed => attr.value().to_string().into(),
-                };
+                let old_value = mutation
+                    .old_value(attr)
+                    .map(|value| value.into())
+                    .unwrap_or_default();
 
                 shadow_root.unregister_slot(old_value, self);
                 shadow_root.register_slot(self);

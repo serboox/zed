@@ -25,8 +25,12 @@ extend-exclude = [
 
     # Not our typos.
     "crates/livekit_api/",
-    "vendor/servo-net/",
     "vendor/servo-script/",
+    "vendor/font-kit/",
+    "vendor/boa_engine/",
+    "vendor/boa_parser/",
+    "vendor/merman-render/",
+    "vendor/tree-sitter-sequel/",
     "vendor/servo-layout/",
     # Vim makes heavy use of partial typing tables.
     "crates/vim/",

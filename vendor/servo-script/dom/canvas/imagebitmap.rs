@@ -3,17 +3,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, Ref};
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use euclid::default::{Point2D, Rect, Size2D};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::realm::CurrentRealm;
 use pixels::{CorsStatus, Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
 use rustc_hash::FxHashMap;
 use script_bindings::cell::DomRefCell;
 use script_bindings::error::{Error, Fallible};
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::id::{ImageBitmapId, ImageBitmapIndex};
 use servo_constellation_traits::SerializableImageBitmap;
 
@@ -27,7 +26,7 @@ use crate::dom::bindings::serializable::Serializable;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::types::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 
 #[dom_struct]
 pub(crate) struct ImageBitmap {
@@ -55,10 +54,10 @@ impl ImageBitmap {
         global: &GlobalScope,
         bitmap_data: Snapshot,
     ) -> DomRoot<ImageBitmap> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(ImageBitmap::new_inherited(bitmap_data)),
             global,
-            cx,
         )
     }
 
@@ -275,7 +274,7 @@ impl ImageBitmap {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-createimagebitmap>
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn create_image_bitmap(
         global_scope: &GlobalScope,
         image: ImageBitmapSource,
@@ -285,7 +284,7 @@ impl ImageBitmap {
         sh: Option<i32>,
         options: &ImageBitmapOptions,
         realm: &mut CurrentRealm,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let p = Promise::new_in_realm(realm);
 
         // Step 1. If either sw or sh is given and is 0, then return a promise rejected with a RangeError.
@@ -319,13 +318,13 @@ impl ImageBitmap {
 
         // The promise with image bitmap should be fulfilled on the bitmap task source.
         let fullfill_promise_on_bitmap_task_source =
-            |promise: &Rc<Promise>, image_bitmap: &ImageBitmap| {
-                let trusted_promise = TrustedPromise::new(promise.clone());
+            |promise: &RootedPromise, image_bitmap: &ImageBitmap| {
+                let trusted_promise = TrustedPromise::from(promise);
                 let trusted_image_bitmap = Trusted::new(image_bitmap);
 
                 global_scope.task_manager().bitmap_task_source().queue(
                     task!(resolve_promise: move |cx| {
-                        let promise = trusted_promise.root();
+                        let promise = trusted_promise.root(cx);
                         let image_bitmap = trusted_image_bitmap.root();
 
                         promise.resolve_native(cx, &image_bitmap);
@@ -335,12 +334,12 @@ impl ImageBitmap {
 
         // The promise with "InvalidStateError" DOMException should be rejected
         // on the bitmap task source.
-        let reject_promise_on_bitmap_task_source = |promise: &Rc<Promise>| {
-            let trusted_promise = TrustedPromise::new(promise.clone());
+        let reject_promise_on_bitmap_task_source = |promise: &RootedPromise| {
+            let trusted_promise = TrustedPromise::from(promise);
 
             global_scope.task_manager().bitmap_task_source().queue(
                 task!(reject_promise: move |cx| {
-                    let promise = trusted_promise.root();
+                    let promise = trusted_promise.root(cx);
 
                     promise.reject_error(cx, Error::InvalidState(None));
                 }),
@@ -573,7 +572,7 @@ impl ImageBitmap {
                     image_data.get_size().cast(),
                     SnapshotPixelFormat::RGBA,
                     alpha_mode,
-                    image_data.to_vec(),
+                    image_data.to_vec(realm.no_gc()),
                 );
 
                 // Step 6.3. Set imageBitmap's bitmap data to image's image data,
@@ -608,7 +607,7 @@ impl Serializable for ImageBitmap {
     type Data = SerializableImageBitmap;
 
     /// <https://html.spec.whatwg.org/multipage/#the-imagebitmap-interface:serialization-steps>
-    fn serialize(&self) -> Result<(ImageBitmapId, Self::Data), ()> {
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(ImageBitmapId, Self::Data), ()> {
         // <https://html.spec.whatwg.org/multipage/#structuredserializeinternal>
         // Step 19.1. If value has a [[Detached]] internal slot whose value is
         // true, then throw a "DataCloneError" DOMException.

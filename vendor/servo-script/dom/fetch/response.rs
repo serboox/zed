@@ -3,9 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::rc::Rc;
 use std::str::FromStr;
 
+use bytes::Bytes;
 use dom_struct::dom_struct;
 use http::header::HeaderMap as HyperHeaders;
 use hyper_serde::Serde;
@@ -13,14 +13,12 @@ use js::rust::{HandleObject, HandleValue};
 use net_traits::http_status::HttpStatus;
 use script_bindings::cell::DomRefCell;
 use script_bindings::cformat;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use script_bindings::str::DOMString;
 use servo_url::ServoUrl;
 use url::Position;
 
-use crate::body::{
-    BodyMixin, BodyType, Extractable, ExtractedBody, body_text_stream,
-    clone_body_stream_for_dom_body, consume_body,
-};
+use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::HeadersBinding::HeadersMethods;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::{
@@ -33,10 +31,13 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{ByteString, USVString, serialize_jsval_to_json_utf8};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::{Guard, Headers, is_obs_text, is_vchar};
-use crate::dom::promise::Promise;
 use crate::dom::stream::readablestream::ReadableStream;
 use crate::dom::stream::underlyingsourcecontainer::UnderlyingSourceType;
-use crate::script_runtime::{CanGc, StreamConsumer};
+use crate::fetch::body::{
+    BodyMixin, BodyType, Extractable, ExtractedBody, body_text_stream,
+    clone_body_stream_for_dom_body, consume_body,
+};
+use crate::runtime::script_runtime::StreamConsumer;
 
 #[dom_struct]
 pub(crate) struct Response {
@@ -64,13 +65,7 @@ pub(crate) struct Response {
 }
 
 impl Response {
-    pub(crate) fn new_inherited(cx: &mut js::context::JSContext, global: &GlobalScope) -> Response {
-        let stream = ReadableStream::new_with_external_underlying_source(
-            cx,
-            global,
-            UnderlyingSourceType::FetchResponse,
-        )
-        .expect("Failed to create ReadableStream with external underlying source");
+    pub(crate) fn new_inherited(body_stream: Option<&ReadableStream>) -> Response {
         Response {
             reflector_: Reflector::new(),
             headers_reflector: Default::default(),
@@ -78,8 +73,8 @@ impl Response {
             response_type: DomRefCell::new(DOMResponseType::Default),
             url: DomRefCell::new(None),
             url_list: DomRefCell::new(vec![]),
-            body_stream: MutNullableDom::new(Some(&*stream)),
-            fetch_body_stream: MutNullableDom::new(Some(&*stream)),
+            body_stream: MutNullableDom::new(body_stream),
+            fetch_body_stream: MutNullableDom::new(body_stream),
             stream_consumer: DomRefCell::new(None),
             redirected: Cell::new(false),
         }
@@ -95,11 +90,26 @@ impl Response {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<Response> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(Response::new_inherited(cx, global)),
-            global,
-            proto,
+        reflect_dom_object_with_proto(cx, Box::new(Response::new_inherited(None)), global, proto)
+    }
+
+    /// Create a `Response` whose body stream receives the chunks delivered by the network.
+    /// This is only for the fetch machinery; a JS-created `Response` is never network-backed.
+    pub(crate) fn new_fetch_response(
+        cx: &mut js::context::JSContext,
+        global: &GlobalScope,
+    ) -> DomRoot<Response> {
+        let stream = ReadableStream::new_with_external_underlying_source(
             cx,
+            global,
+            UnderlyingSourceType::FetchResponse,
+        )
+        .expect("Failed to create ReadableStream with external underlying source");
+        reflect_dom_object_with_proto(
+            cx,
+            Box::new(Response::new_inherited(Some(&stream))),
+            global,
+            None,
         )
     }
 
@@ -269,7 +279,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
         response.Headers(cx).set_guard(Guard::Response);
 
         // 4. Perform initialize a response given responseObject, init, and (body, "application/json").
-        body.content_type = Some("application/json".into());
+        body.content_type = Some(DOMString::from_static("application/json"));
         initialize_response(cx, Some(body), init, response)
     }
 
@@ -316,7 +326,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
     /// <https://fetch.spec.whatwg.org/#dom-response-headers>
     fn Headers(&self, cx: &mut js::context::JSContext) -> DomRoot<Headers> {
         self.headers_reflector
-            .or_init(|| Headers::for_response(&self.global(), CanGc::from_cx(cx)))
+            .or_init(|| Headers::for_response(cx, &self.global()))
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-response-clone>
@@ -330,7 +340,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
         let new_response = Response::new(cx, &self.global());
         new_response
             .Headers(cx)
-            .copy_from_headers(self.Headers(cx))?;
+            .copy_from_headers(&self.Headers(cx))?;
         new_response
             .Headers(cx)
             .set_guard(self.Headers(cx).get_guard());
@@ -366,32 +376,32 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-text>
-    fn Text(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Text(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Text)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-blob>
-    fn Blob(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Blob(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Blob)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-formdata>
-    fn FormData(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn FormData(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::FormData)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-json>
-    fn Json(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Json(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Json)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-arraybuffer>
-    fn ArrayBuffer(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn ArrayBuffer(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::ArrayBuffer)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-bytes>
-    fn Bytes(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Bytes(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Bytes)
     }
 
@@ -432,7 +442,7 @@ fn initialize_response(
 
     // 5. If init["headers"] exists, then fill response’s headers with init["headers"].
     if let Some(ref headers_member) = init.headers {
-        response.Headers(cx).fill(Some(headers_member.clone()))?;
+        response.Headers(cx).fill(Some(headers_member))?;
     }
 
     // 6. If body is non-null, then:
@@ -539,12 +549,12 @@ impl Response {
         *self.stream_consumer.borrow_mut() = sc;
     }
 
-    pub(crate) fn stream_chunk(&self, cx: &mut js::context::JSContext, chunk: Vec<u8>) {
+    pub(crate) fn stream_chunk(&self, cx: &mut js::context::JSContext, chunk: Bytes) {
         // Note, are these two actually mutually exclusive?
         if let Some(stream_consumer) = self.stream_consumer.borrow().as_ref() {
-            stream_consumer.consume_chunk(chunk.as_slice());
+            stream_consumer.consume_chunk(&chunk);
         } else if let Some(body) = self.fetch_body_stream.get() {
-            body.enqueue_native(cx, chunk);
+            body.enqueue_native(cx, chunk.to_vec());
         }
     }
 

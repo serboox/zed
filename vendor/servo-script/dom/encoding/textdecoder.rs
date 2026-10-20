@@ -9,7 +9,7 @@ use dom_struct::dom_struct;
 use encoding_rs::Encoding;
 use js::context::JSContext;
 use js::rust::HandleObject;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 
 use crate::dom::bindings::codegen::Bindings::TextDecoderBinding;
 use crate::dom::bindings::codegen::Bindings::TextDecoderBinding::{
@@ -58,11 +58,11 @@ impl TextDecoder {
         fatal: bool,
         ignore_bom: bool,
     ) -> DomRoot<TextDecoder> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(TextDecoder::new_inherited(encoding, fatal, ignore_bom)),
             global,
             proto,
-            cx,
         )
     }
 }
@@ -108,6 +108,7 @@ impl TextDecoderMethods<crate::DomTypeHolder> for TextDecoder {
     /// <https://encoding.spec.whatwg.org/#dom-textdecoder-decode>
     fn Decode(
         &self,
+        cx: &mut JSContext,
         input: Option<ArrayBufferViewOrArrayBuffer>,
         options: &TextDecodeOptions,
     ) -> Fallible<USVString> {
@@ -142,7 +143,7 @@ impl TextDecoderMethods<crate::DomTypeHolder> for TextDecoder {
         // Step 5.3.2 If result is finished, then return the result of running serialize I/O
         //      queue with this and output.
         self.decoder
-            .decode(input.as_ref(), !options.stream)
+            .decode(cx.no_gc(), input.as_ref(), !options.stream)
             .map(USVString)
     }
 }
