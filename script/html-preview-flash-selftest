@@ -5,6 +5,7 @@ if [[ $# -lt 1 ]]; then
   echo "usage: $0 <document.html> [ticks] [KEY=VALUE ...]" >&2
   echo "KEY=VALUE pairs are added to the editor's environment, for example ZED_HTML_PAGE_SHARING=0" >&2
   echo "FLASH_CAPTURE=1 also records what the compositor shows of the window and counts its white frames" >&2
+  echo "FLASH_SCALE=2 gives the virtual monitor a scale factor of 2, as a high-density screen has" >&2
   exit 2
 fi
 
@@ -100,9 +101,15 @@ if [[ ! -S "$XDG_RUNTIME_DIR/$display" ]]; then
   tail -5 "$scratch/mutter.log" >&2
   exit 1
 fi
+if [[ -n "${FLASH_SCALE:-}" ]]; then
+  /usr/bin/python3 -I "$scratch/scale.py" "$FLASH_SCALE" >"$scratch/scale.log" 2>&1 \
+    || { echo "the monitor scale was not set:" >&2; tail -5 "$scratch/scale.log" >&2; }
+fi
 if [[ -n "$capture" ]]; then
   mkdir -p "$scratch/frames"
-  /usr/bin/python3 -I "$scratch/record.py" "${monitor%x*}" "${monitor#*x}" "$scratch/frames" \
+  record_width="$(echo "${monitor%x*} / ${FLASH_SCALE:-1}" | bc)"
+  record_height="$(echo "${monitor#*x} / ${FLASH_SCALE:-1}" | bc)"
+  /usr/bin/python3 -I "$scratch/record.py" "$record_width" "$record_height" "$scratch/frames" \
     >"$scratch/record.log" 2>&1 &
   recorder_pid=$!
   for _ in $(seq 1 50); do
@@ -157,6 +164,32 @@ if [[ -n "$capture" ]]; then
 fi
 INNER
 chmod +x "$inner"
+
+cat >| "$scratch/scale.py" <<'SCALE'
+import sys
+import time
+
+import dbus
+
+scale = float(sys.argv[1])
+bus = dbus.SessionBus()
+name = "org.gnome.Mutter.DisplayConfig"
+for _ in range(150):
+    if bus.name_has_owner(name):
+        break
+    time.sleep(0.2)
+config = dbus.Interface(bus.get_object(name, "/org/gnome/Mutter/DisplayConfig"), name)
+serial, monitors, _logical, _properties = config.GetCurrentState()
+connector = str(monitors[0][0][0])
+mode = next(str(mode[0]) for mode in monitors[0][1] if mode[6].get("is-current"))
+config.ApplyMonitorsConfig(
+    serial,
+    1,
+    [(0, 0, dbus.Double(scale), 0, True, [(connector, mode, {})])],
+    {},
+)
+print("scale", scale, "on", connector, mode)
+SCALE
 
 cat >| "$scratch/record.py" <<'RECORD'
 import os
