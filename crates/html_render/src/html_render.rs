@@ -15,6 +15,8 @@ use primeorder as _;
 #[cfg(all(feature = "servo", target_os = "linux"))]
 mod dma_buf_export;
 #[cfg(feature = "servo")]
+mod flash_probe;
+#[cfg(feature = "servo")]
 mod gpu_surface;
 #[cfg(all(feature = "servo", target_os = "linux"))]
 mod shared_buffer;
@@ -23,6 +25,7 @@ mod shared_texture;
 
 #[cfg(feature = "servo")]
 mod engine {
+    use crate::flash_probe::FlashProbe;
     use crate::gpu_surface::GpuSurface;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
@@ -194,6 +197,16 @@ mod engine {
             self.tell_of_our_own.try_send(()).ok();
         }
 
+        /// The same, for a thread of its own to call.
+        pub fn nudger(&self) -> impl Fn() + Send + 'static {
+            let tell = self.tell.clone();
+            let tell_of_our_own = self.tell_of_our_own.clone();
+            move || {
+                tell.try_send(()).ok();
+                tell_of_our_own.try_send(()).ok();
+            }
+        }
+
         /// Waits until we hand the engine something. What the reader does always
         /// reaches the page at once, even while the engine's own asking to be
         /// turned is being ignored.
@@ -340,6 +353,9 @@ mod engine {
         /// Whether a frame has been drawn but the graphics card has not yet
         /// reached the mark left after it, so the window may not read it.
         awaiting_the_card: std::cell::Cell<bool>,
+        /// Set only when the environment asks for the preview to be checked for
+        /// going blank while it scrolls.
+        flash: Option<FlashProbe>,
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
@@ -456,6 +472,23 @@ mod engine {
             webview.focus();
             webview.resize(size);
 
+            let flash = FlashProbe::from_environment();
+            if let Some(flash) = flash.as_ref().filter(|flash| flash.scrolls_itself()) {
+                let nudge = engine.nudger();
+                let ticks = flash.ticks_asked_for();
+                let stopped = flash.stop_flag();
+                std::thread::spawn(move || {
+                    // Long enough to cover the load, the settling and every tick.
+                    for _ in 0..ticks.saturating_add(1_000) {
+                        if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                        nudge();
+                    }
+                });
+            }
+
             Ok(Self {
                 engine,
                 rendering_context,
@@ -469,6 +502,7 @@ mod engine {
                 shared: false,
                 refused: false,
                 awaiting_the_card: std::cell::Cell::new(false),
+                flash,
                 frame: None,
                 document,
                 previous: None,
@@ -573,6 +607,15 @@ mod engine {
         /// Lets the engine run and picks up the newest frame it painted. Returns
         /// whether there is something new to show.
         pub fn pump(&mut self) -> bool {
+            if let Some(flash) = self.flash.as_ref() {
+                flash.report_if_done(self.shared);
+            }
+            if let Some(flash) = self.flash.as_ref()
+                && flash.tick_is_due(self.is_loading())
+            {
+                let middle = gpui::point(self.viewport.width / 2., self.viewport.height / 2.);
+                self.scrolled(middle, gpui::point(gpui::px(0.), gpui::px(-40.)));
+            }
             // Only the graphics card is being waited on. Turning the engine over
             // will not make the card any faster, and a turn is a select over
             // every channel the engine has and a context made current: measured
@@ -583,6 +626,7 @@ mod engine {
                 self.bind();
                 if self.rendering_context.frame_is_drawn() {
                     self.awaiting_the_card.set(false);
+                    self.note_the_frame_shown();
                     return true;
                 }
                 return false;
@@ -608,6 +652,9 @@ mod engine {
                 // marked, and the frame is shown on the turn the card reaches
                 // the mark rather than by standing and waiting for it.
                 if painted {
+                    if let Some(flash) = self.flash.as_ref() {
+                        flash.painted();
+                    }
                     self.rendering_context.seal_frame();
                     // The face just finished is what the window is handed; the
                     // next frame goes into the other one, so the page never
@@ -619,7 +666,13 @@ mod engine {
                 // not there on some later turn.
                 let awaited = self.awaiting_the_card.take();
                 if self.rendering_context.frame_is_drawn() {
-                    return painted || awaited;
+                    let shown = painted || awaited;
+                    if shown {
+                        self.note_the_frame_shown();
+                    } else if let Some(flash) = self.flash.as_ref() {
+                        flash.report_if_done(true);
+                    }
+                    return shown;
                 }
                 // Waited for on a clock of its own rather than by asking the
                 // engine again: whoever drives the page comes back for it.
@@ -649,6 +702,14 @@ mod engine {
                 self.engine.nudge();
             }
             false
+        }
+
+        /// Tells the flash probe, when there is one, that the window is about to
+        /// be handed a frame, and whether that frame is blank.
+        fn note_the_frame_shown(&self) {
+            if let Some(flash) = self.flash.as_ref() {
+                flash.shown(self.rendering_context.drawn_face_is_blank(), true);
+            }
         }
 
         /// Whether the page is waiting for nothing but the graphics card to

@@ -760,6 +760,41 @@ impl GpuSurface {
         }
     }
 
+    /// Whether every pixel sampled from the face just finished is white. Only
+    /// the flash probe asks: it reads single pixels back, which makes the card
+    /// finish what it was doing.
+    pub(crate) fn drawn_face_is_blank(&self) -> bool {
+        let size = self.size.get();
+        let (width, height) = (size.width as i32, size.height as i32);
+        if width < 12 || height < 12 {
+            return false;
+        }
+        let gl = &self.gleam_gl;
+        let mut previous = [0];
+        #[allow(unsafe_code)]
+        unsafe {
+            gl.get_integer_v(gleam::gl::READ_FRAMEBUFFER_BINDING, &mut previous);
+        }
+        gl.bind_framebuffer(
+            gleam::gl::READ_FRAMEBUFFER,
+            self.target.borrow().drawn().framebuffer,
+        );
+        let mut blank = true;
+        'grid: for column in 0..6 {
+            for row in 0..6 {
+                let x = width * (2 * column + 1) / 12;
+                let y = height * (2 * row + 1) / 12;
+                let pixel = gl.read_pixels(x, y, 1, 1, gleam::gl::RGBA, gleam::gl::UNSIGNED_BYTE);
+                if pixel.len() != 4 || pixel.iter().any(|channel| *channel != 255) {
+                    blank = false;
+                    break 'grid;
+                }
+            }
+        }
+        gl.bind_framebuffer(gleam::gl::READ_FRAMEBUFFER, previous[0] as u32);
+        blank
+    }
+
     fn forget_seal(&self) {
         self.asked.set(0);
         let sealed = self.sealed.replace(std::ptr::null());
