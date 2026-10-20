@@ -262,26 +262,41 @@ from PIL import Image
 frames_directory, zed_offset = sys.argv[1], float(sys.argv[2])
 rate = 30.0
 paths = sorted(glob.glob(f"{frames_directory}/f*.jpg"))
-white = []
-for path in paths:
-    luma = numpy.asarray(Image.open(path).convert("L").resize((8, 8), Image.BOX), dtype=numpy.uint8)
-    white.append(int(luma.min()) >= 250)
 
-runs = []
-start = None
-for index, is_white in enumerate(white):
-    if is_white and start is None:
-        start = index
-    elif not is_white and start is not None:
-        runs.append((start, index - start))
-        start = None
-if start is not None:
-    runs.append((start, len(white) - start))
+
+def is_white(picture):
+    cells = numpy.asarray(picture.resize((8, 8), Image.BOX), dtype=numpy.uint8)
+    return int(cells.min()) >= 250
+
+
+def runs_of(flags):
+    runs = []
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index - start))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags) - start))
+    return runs
+
+
+window_flags = []
+page_flags = []
+for path in paths:
+    picture = Image.open(path).convert("L")
+    width, height = picture.size
+    window_flags.append(is_white(picture))
+    page_flags.append(is_white(picture.crop((width // 4, height // 4, width * 3 // 4, height * 3 // 4))))
 
 print(f"{len(paths)} frames at {rate:.0f} fps ({len(paths) / rate:.1f} s), editor started at {zed_offset:.1f} s")
-for first, length in runs:
-    print(f"  white window at {first / rate - zed_offset:7.2f} s after the editor started, for {length} frame(s), about {length * 1000 / rate:.0f} ms")
-print(f"white runs: {len(runs)}")
+for label, flags in (("window", window_flags), ("page area (middle quarter)", page_flags)):
+    runs = runs_of(flags)
+    for first, length in runs:
+        print(f"  white {label} at {first / rate - zed_offset:7.2f} s after the editor started, for {length} frame(s), about {length * 1000 / rate:.0f} ms")
+    print(f"white {label} runs: {len(runs)}")
 ANALYZE
 
 timeout "$(( wait_seconds + 60 ))" dbus-run-session -- "$inner" "$scratch" "$zed_binary" "$ticks" "$wait_seconds" "$width_height" "${extra_environment[@]}"
