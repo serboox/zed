@@ -5,13 +5,13 @@
 use std::ptr;
 
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::gc::CustomAutoRooterGuard;
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use js::typedarray;
 use js::typedarray::HeapUint8Array;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use script_bindings::trace::RootedTraceableBox;
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
@@ -41,12 +41,7 @@ impl TextEncoder {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<TextEncoder> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(TextEncoder::new_inherited()),
-            global,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(TextEncoder::new_inherited()), global, proto)
     }
 }
 
@@ -62,7 +57,7 @@ impl TextEncoderMethods<crate::DomTypeHolder> for TextEncoder {
 
     /// <https://encoding.spec.whatwg.org/#dom-textencoder-encoding>
     fn Encoding(&self) -> DOMString {
-        DOMString::from("utf-8")
+        DOMString::from_static("utf-8")
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-textencoder-encode>
@@ -75,13 +70,15 @@ impl TextEncoderMethods<crate::DomTypeHolder> for TextEncoder {
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-textencoder-encodeinto>
-    #[expect(unsafe_code)]
     fn EncodeInto(
         &self,
+        no_gc: &NoGC,
         source: USVString,
         mut destination: CustomAutoRooterGuard<typedarray::Uint8Array>,
     ) -> TextEncoderEncodeIntoResult {
-        let available = destination.len();
+        let dest = destination.as_mut_slice_safe(no_gc).unwrap_or(&mut []);
+
+        let available = dest.len();
 
         // Bail out if the destination has no space available.
         if available == 0 {
@@ -93,8 +90,6 @@ impl TextEncoderMethods<crate::DomTypeHolder> for TextEncoder {
 
         let mut read = 0;
         let mut written = 0;
-
-        let dest = unsafe { destination.as_mut_slice() };
 
         // Step 3, 4, 5, 6
         // Turn the source into a queue of scalar values.

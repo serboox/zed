@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88.0"
 name = "servo-layout"
-version = "0.4.0"
+version = "0.7.0"
 authors = ["The Servo Project Developers"]
 build = false
 publish = true
@@ -44,6 +44,9 @@ features = ["serde"]
 [dependencies.app_units]
 version = "0.7"
 
+[dependencies.arrayvec]
+version = "0.7"
+
 [dependencies.css_counters]
 path = "../../crates/css_counters"
 
@@ -57,29 +60,29 @@ version = "2.11"
 version = "0.3"
 
 [dependencies.embedder_traits]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-embedder-traits"
 
 [dependencies.euclid]
 version = "0.22"
 
 [dependencies.fonts]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-fonts"
 
 [dependencies.fonts_traits]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-fonts-traits"
 
-[dependencies.icu_locid]
-version = "1.5.0"
+[dependencies.icu_locale_core]
+version = "2.1.0"
 
 [dependencies.icu_properties]
-version = "1.5.0"
+version = "2.1.0"
 features = ["compiled_data"]
 
 [dependencies.icu_segmenter]
-version = "1.5.0"
+version = "2.1.0"
 
 [dependencies.itertools]
 version = "0.15"
@@ -89,21 +92,21 @@ version = "0.13.1"
 features = ["euclid"]
 
 [dependencies.layout_api]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-layout-api"
 
 [dependencies.log]
 version = "0.4.32"
 
 [dependencies.malloc_size_of]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-malloc-size-of"
 
 [dependencies.malloc_size_of_derive]
 version = "0.1"
 
 [dependencies.net_traits]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-net-traits"
 
 [dependencies.num-derive]
@@ -116,19 +119,23 @@ version = "0.2"
 version = "1.21.4"
 
 [dependencies.paint_api]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-paint-api"
 
 [dependencies.parking_lot]
 version = "0.12"
 features = ["serde"]
 
+[dependencies.phf]
+version = "0.14"
+features = ["macros"]
+
 [dependencies.pixels]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-pixels"
 
 [dependencies.profile_traits]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-profile-traits"
 
 [dependencies.rayon]
@@ -138,36 +145,36 @@ version = "1"
 version = "2.1.2"
 
 [dependencies.script]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-script"
 
 [dependencies.script_traits]
-version = "=0.4.0"
+version = "=0.7.0"
 package = "servo-script-traits"
 
 [dependencies.selectors]
-version = "0.39"
+version = "0.41"
 
 [dependencies.serde]
 version = "1.0.228"
 
 [dependencies.servo-base]
-version = "=0.4.0"
+version = "=0.7.0"
 
 [dependencies.servo-config]
-version = "=0.4.0"
+version = "=0.7.0"
 
 [dependencies.servo-geometry]
-version = "=0.4.0"
+version = "=0.7.0"
 
 [dependencies.servo-tracing]
-version = "=0.4.0"
+version = "=0.7.0"
 
 [dependencies.servo-url]
-version = "=0.4.0"
+version = "=0.7.0"
 
 [dependencies.servo_arc]
-version = "0.4.3"
+version = "0.5.0"
 
 [dependencies.smallvec]
 version = "1.15"
@@ -181,16 +188,16 @@ version = "0.28"
 features = ["derive"]
 
 [dependencies.stylo]
-version = "0.19"
+version = "0.22"
 
 [dependencies.stylo_atoms]
-version = "0.19"
+version = "0.22"
 
 [dependencies.stylo_traits]
-version = "0.19"
+version = "0.22"
 
 [dependencies.taffy]
-version = "0.11.0"
+version = "0.14.0"
 features = [
     "calc",
     "detailed_layout_info",
@@ -215,9 +222,28 @@ version = "0.1.1"
 [dependencies.url]
 version = "2.5"
 
+[dependencies.uuid]
+version = "1.23.3"
+features = [
+    "v4",
+    "v5",
+]
+
 [dependencies.web_atoms]
-version = "0.2.4"
+version = "0.3.0"
 
 [dependencies.webrender_api]
-version = "0.69"
+version = "0.70"
 
+[lints.clippy]
+manual_string_new = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(crown)",
+    "cfg(coverage)",
+    "cfg(llvm_pgo)",
+    "cfg(ohos_mock)",
+]

@@ -9,9 +9,6 @@
 //! Servo's handles are `Rc`-based and its event loop has to be pumped by hand,
 //! so everything here lives on the foreground thread.
 
-#[cfg(feature = "servo")]
-use primeorder as _;
-
 #[cfg(all(feature = "servo", target_os = "linux"))]
 mod dma_buf_export;
 #[cfg(feature = "servo")]
@@ -257,7 +254,6 @@ mod engine {
         preferences.layout_container_queries_enabled = true;
         preferences.layout_writing_mode_enabled = true;
         preferences.layout_variable_fonts_enabled = true;
-        preferences.layout_css_attr_enabled = true;
         // `counter-reset` and `counter-increment` are among the properties the engine
         // only reads with this on, and a page that numbers its headings or steps
         // with them would otherwise get no numbers.
@@ -473,7 +469,7 @@ mod engine {
                     .delegate(delegate.clone())
                     .build()
             };
-            webview.focus();
+            webview.set_focused(true);
             webview.resize(size);
 
             let flash = FlashProbe::from_environment();
@@ -1098,7 +1094,11 @@ mod engine {
                 return;
             }
             self.throttled = throttled;
-            self.webview.set_throttled(throttled);
+            if throttled {
+                self.webview.hide();
+            } else {
+                self.webview.show();
+            }
         }
 
         pub fn key(&self, event: keyboard_types::KeyboardEvent) {

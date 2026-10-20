@@ -10,7 +10,7 @@ use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::ErrorEventBinding;
@@ -20,7 +20,6 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 
@@ -52,15 +51,10 @@ impl ErrorEvent {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<ErrorEvent> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(ErrorEvent::new_inherited()),
-            global,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(ErrorEvent::new_inherited()), global, proto)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -78,7 +72,7 @@ impl ErrorEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -113,7 +107,7 @@ impl ErrorEventMethods<crate::DomTypeHolder> for ErrorEvent {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: DOMString,
-        init: RootedTraceableBox<ErrorEventBinding::ErrorEventInit>,
+        init: &ErrorEventBinding::ErrorEventInit,
     ) -> Fallible<DomRoot<ErrorEvent>> {
         let msg = match init.message.as_ref() {
             Some(message) => message.clone(),

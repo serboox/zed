@@ -2545,8 +2545,8 @@ fn asks_to_copy(keystroke: &gpui::Keystroke) -> bool {
 #[cfg(feature = "servo")]
 fn servo_button(button: MouseButton) -> Option<html_render::MouseButton> {
     match button {
-        MouseButton::Left => Some(html_render::MouseButton::Left),
-        MouseButton::Middle => Some(html_render::MouseButton::Middle),
+        MouseButton::Left => Some(html_render::MouseButton::Primary),
+        MouseButton::Middle => Some(html_render::MouseButton::Auxiliary),
         MouseButton::Right | MouseButton::Navigate(_) => None,
     }
 }

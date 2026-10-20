@@ -3,16 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::f32;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_media::audio::audio_node::{AudioNodeInit, AudioNodeMessage, AudioNodeType};
 use servo_media::audio::buffer_source_node::{
     AudioBufferSourceNodeMessage, AudioBufferSourceNodeOptions,
 };
-use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
 use crate::conversions::ConvertWithCx;
@@ -62,6 +61,7 @@ impl AudioBufferSourceNode {
             1, /* outputs */
         )?;
         let node_id = source_node.node().node_id();
+        // <https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-playbackrate>
         let playback_rate = AudioParam::new(
             cx,
             window,
@@ -74,6 +74,7 @@ impl AudioBufferSourceNode {
             f32::MIN,
             f32::MAX,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-detune>
         let detune = AudioParam::new(
             cx,
             window,
@@ -120,11 +121,11 @@ impl AudioBufferSourceNode {
         options: &AudioBufferSourceOptions,
     ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
         let node = AudioBufferSourceNode::new_inherited(cx, window, context, options)?;
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(node),
             window,
             proto,
-            cx,
         ))
     }
 }
@@ -169,7 +170,7 @@ impl AudioBufferSourceNodeMethods<crate::DomTypeHolder> for AudioBufferSourceNod
                 self.source_node
                     .node()
                     .message(AudioNodeMessage::AudioBufferSourceNode(
-                        AudioBufferSourceNodeMessage::SetBuffer((*buffer).clone()),
+                        AudioBufferSourceNodeMessage::SetBuffer(buffer),
                     ));
             }
         }
@@ -259,7 +260,7 @@ impl AudioBufferSourceNodeMethods<crate::DomTypeHolder> for AudioBufferSourceNod
                 self.source_node
                     .node()
                     .message(AudioNodeMessage::AudioBufferSourceNode(
-                        AudioBufferSourceNodeMessage::SetBuffer((*buffer).clone()),
+                        AudioBufferSourceNodeMessage::SetBuffer(buffer),
                     ));
             }
         }
@@ -286,7 +287,7 @@ impl ConvertWithCx<AudioBufferSourceNodeOptions> for AudioBufferSourceOptions {
             buffer: self
                 .buffer
                 .as_ref()
-                .and_then(|b| (*b.as_ref()?.get_channels(cx)).clone()),
+                .and_then(|b| b.as_ref()?.get_channels(cx).map(|buffer| (*buffer).clone())),
             detune: *self.detune,
             loop_enabled: self.loop_,
             loop_end: Some(*self.loopEnd),

@@ -9,9 +9,8 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
-use js::realm::AutoRealm;
 use js::rust::HandleValue as SafeHandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::error::ErrorToJsval;
 use crate::dom::bindings::reflector::DomGlobal;
@@ -19,11 +18,11 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{RootedPromise, TracedPromise};
 use crate::dom::stream::defaultteeunderlyingsource::DefaultTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::realms::enter_auto_realm;
+use crate::runtime::job_queue::MicrotaskRunnable;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -35,11 +34,8 @@ pub(crate) struct DefaultTeeReadRequestMicrotask {
 
 impl MicrotaskRunnable for DefaultTeeReadRequestMicrotask {
     fn handler(&self, cx: &mut JSContext) {
-        self.tee_read_request.chunk_steps(cx, &self.chunk);
-    }
-
-    fn enter_realm<'cx>(&self, cx: &'cx mut js::context::JSContext) -> AutoRealm<'cx> {
-        enter_auto_realm(cx, &*self.tee_read_request)
+        let mut realm = enter_auto_realm(cx, &*self.tee_read_request);
+        self.tee_read_request.chunk_steps(&mut realm, &self.chunk);
     }
 }
 
@@ -60,8 +56,7 @@ pub(crate) struct DefaultTeeReadRequest {
     canceled_2: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     clone_for_branch_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     tee_underlying_source: Dom<DefaultTeeUnderlyingSource>,
 }
 impl DefaultTeeReadRequest {
@@ -76,10 +71,11 @@ impl DefaultTeeReadRequest {
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
         clone_for_branch_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         tee_underlying_source: &DefaultTeeUnderlyingSource,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(DefaultTeeReadRequest {
                 reflector_: Reflector::new(),
                 stream: Dom::from_ref(stream),
@@ -90,11 +86,10 @@ impl DefaultTeeReadRequest {
                 canceled_1,
                 canceled_2,
                 clone_for_branch_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 tee_underlying_source: Dom::from_ref(tee_underlying_source),
             }),
             &*stream.global(),
-            cx,
         )
     }
     /// Call into cancel of the stream,
@@ -119,10 +114,9 @@ impl DefaultTeeReadRequest {
             chunk: Heap::boxed(*chunk.handle()),
             tee_read_request: Dom::from_ref(self),
         };
-        self.stream.global().enqueue_microtask(
-            cx,
-            Microtask::ReadableStreamTeeReadRequest(tee_read_request_chunk),
-        );
+        self.stream
+            .global()
+            .enqueue_microtask(cx, Box::new(tee_read_request_chunk));
     }
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
     #[expect(clippy::borrowed_box)]
