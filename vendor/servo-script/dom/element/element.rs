@@ -1011,6 +1011,15 @@ impl Element {
             .map(|data| data.element_data.borrow().styles.primary().clone())
     }
 
+    /// The style as the last layout left it. Unlike `style`, it does not ask for a
+    /// layout, so it can be read while the results of one are still being handled.
+    pub(crate) fn style_left_by_the_last_layout(&self) -> Option<ServoArc<ComputedValues>> {
+        self.style_data
+            .borrow()
+            .as_ref()
+            .and_then(|data| data.element_data.borrow().styles.get_primary().cloned())
+    }
+
     pub(crate) fn is_styled(&self) -> bool {
         self.style_data.borrow().is_some()
     }

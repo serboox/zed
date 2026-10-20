@@ -16,6 +16,7 @@ const REQUIRE: &str = "ZED_REQUIRE_HTML_ENGINE";
 
 const ROW_HEIGHT: usize = 80;
 const PAGE_WIDTH: usize = 400;
+const ROWS: usize = 9;
 
 /// Drawings styled only by the page's own stylesheet, one per row: a rectangle
 /// painted green by a rule, red text painted by a rule, a rectangle that a rule
@@ -23,9 +24,16 @@ const PAGE_WIDTH: usize = 400;
 /// reach through the page's own markup above the drawing. The drawing is
 /// rasterised without its surroundings, so that rule does not match. The last
 /// rectangle is painted by a stylesheet the page adds after the drawing was
-/// already made, which has to make the drawing again.
+/// already made, which has to make the drawing again. Then a rectangle painted
+/// through a custom property the root sets, one painted by a stylesheet the page
+/// links to, one painted with `currentColor` where the root sets the colour, and one
+/// painted with `currentColor` where a wrapper of the drawing sets a colour of its own.
 const PAGE: &str = "<html><head>\
+    <link rel=\"stylesheet\" href=\"svg.css\">\
     <style>\
+        :root { --cyan: #00ffff }\
+        body { color: #ffff00 }\
+        svg .var { fill: var(--cyan) }\
         svg .box { fill: #00ff00 }\
         svg text.label { font: 56px sans-serif; fill: #ff0000 }\
         .card svg .inside { fill: #0000ff }\
@@ -42,6 +50,14 @@ const PAGE: &str = "<html><head>\
         <rect class=\"inside\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg></div>\
     <svg width=\"400\" height=\"80\" style=\"display:block\">\
         <rect class=\"late\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg>\
+    <svg width=\"400\" height=\"80\" style=\"display:block\">\
+        <rect class=\"var\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg>\
+    <svg width=\"400\" height=\"80\" style=\"display:block\">\
+        <rect class=\"linked\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg>\
+    <svg width=\"400\" height=\"80\" style=\"display:block\">\
+        <rect fill=\"currentColor\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg>\
+    <div style=\"color:#ff00ff\"><svg width=\"400\" height=\"80\" style=\"display:block\">\
+        <rect fill=\"currentColor\" x=\"0\" y=\"0\" width=\"400\" height=\"80\"/></svg></div>\
     <script>setTimeout(function () {\
         var style = document.createElement('style');\
         style.textContent = 'svg .late { fill: #0000ff }';\
@@ -63,6 +79,18 @@ fn is_red([red, green, blue]: [u8; 3]) -> bool {
 
 fn is_blue([red, green, blue]: [u8; 3]) -> bool {
     red < 40 && green < 40 && blue > 215
+}
+
+fn is_cyan([red, green, blue]: [u8; 3]) -> bool {
+    red < 40 && green > 215 && blue > 215
+}
+
+fn is_magenta([red, green, blue]: [u8; 3]) -> bool {
+    red > 215 && green < 40 && blue > 215
+}
+
+fn is_yellow([red, green, blue]: [u8; 3]) -> bool {
+    red > 215 && green > 215 && blue < 40
 }
 
 fn is_black([red, green, blue]: [u8; 3]) -> bool {
@@ -94,12 +122,17 @@ fn pixels_in_row(page: &HtmlPage, row: usize, wanted: impl Fn([u8; 3]) -> bool) 
 fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
     let workspace = tempfile::tempdir().expect("a scratch directory");
     hermetic_fonts::use_only_the_bundled_fonts(workspace.path());
+    std::fs::write(
+        workspace.path().join("svg.css"),
+        "svg .linked { fill: #ff00ff }",
+    )
+    .expect("a stylesheet to link to");
 
     cx.update(|cx| {
         let mut page = match HtmlPage::open(
             PAGE.to_string().into(),
-            None,
-            size(px(PAGE_WIDTH as f32), px((ROW_HEIGHT * 5) as f32)),
+            Some(workspace.path()),
+            size(px(PAGE_WIDTH as f32), px((ROW_HEIGHT * ROWS) as f32)),
             1.,
             cx,
         ) {
@@ -117,7 +150,7 @@ fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
             }
         };
 
-        let expectations: [(&str, usize, fn([u8; 3]) -> bool); 5] = [
+        let expectations: [(&str, usize, fn([u8; 3]) -> bool); ROWS] = [
             ("a rule paints a rectangle green", 0, is_green),
             ("a rule paints text red", 1, is_red),
             ("a print-only rule leaves a rectangle black", 2, is_black),
@@ -131,9 +164,21 @@ fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
                 4,
                 is_blue,
             ),
+            (
+                "a custom property the root sets paints a rectangle",
+                5,
+                is_cyan,
+            ),
+            ("a linked stylesheet paints a rectangle", 6, is_magenta),
+            ("currentColor is the colour the root sets", 7, is_yellow),
+            (
+                "currentColor is the colour a wrapper of the drawing sets",
+                8,
+                is_magenta,
+            ),
         ];
         let deadline = Instant::now() + DEADLINE;
-        let mut counts = [0; 5];
+        let mut counts = [0; ROWS];
         while Instant::now() < deadline {
             page.pump();
             for (index, (_, row, wanted)) in expectations.iter().enumerate() {

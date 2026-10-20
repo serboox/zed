@@ -300,6 +300,7 @@ impl StylesheetContext {
                 //
                 // Note that even in the failure case, we should create an empty stylesheet.
                 // That's why `set_stylesheet` also removes the previous stylesheet
+                link.set_source_text(String::from_utf8_lossy(&self.data).into_owned());
                 link.set_stylesheet(cx, stylesheet);
             }
             StylesheetContextSource::Import(import_rule) => {

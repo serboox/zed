@@ -91,6 +91,9 @@ pub(crate) struct HTMLLinkElement {
     #[conditional_malloc_size_of]
     #[no_trace]
     stylesheet: DomRefCell<Option<Arc<Stylesheet>>>,
+    /// The text of the stylesheet that was fetched, for what the parsed one no longer
+    /// holds: the properties the style system does not keep.
+    source_text: DomRefCell<String>,
     cssom_stylesheet: MutNullableDom<CSSStyleSheet>,
 
     /// <https://html.spec.whatwg.org/multipage/#a-style-sheet-that-is-blocking-scripts>
@@ -127,6 +130,7 @@ impl HTMLLinkElement {
             relations: Cell::new(LinkRelations::empty()),
             parser_inserted: Cell::new(creator.is_parser_created()),
             stylesheet: DomRefCell::new(None),
+            source_text: DomRefCell::new(String::new()),
             cssom_stylesheet: MutNullableDom::new(None),
             pending_loads: Cell::new(0),
             any_failed_load: Cell::new(false),
@@ -194,6 +198,14 @@ impl HTMLLinkElement {
 
     pub(crate) fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
         self.stylesheet.borrow().clone()
+    }
+
+    pub(crate) fn set_source_text(&self, text: String) {
+        *self.source_text.borrow_mut() = text;
+    }
+
+    pub(crate) fn source_text(&self) -> String {
+        self.source_text.borrow().clone()
     }
 
     pub(crate) fn get_cssom_stylesheet(&self, can_gc: CanGc) -> Option<DomRoot<CSSStyleSheet>> {

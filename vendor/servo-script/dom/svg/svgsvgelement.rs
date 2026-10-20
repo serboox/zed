@@ -15,8 +15,8 @@ use style::attr::AttrValue;
 use style::parser::ParserContext;
 use style::stylesheets::Origin;
 use style::values::specified::LengthPercentage;
-use style_traits::ParsingMode;
-use svg_page_style::{insert_style_into_drawing, style_applies_to_screen};
+use style_traits::{ParsingMode, ToCss};
+use svg_page_style::{insert_style_into_drawing, resolve_page_style, style_applies_to_screen};
 use uuid::Uuid;
 use xml5ever::serialize::TraversalScope;
 
@@ -28,6 +28,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
 use crate::dom::html::htmlstyleelement::HTMLStyleElement;
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::node::virtualmethods::VirtualMethods;
@@ -91,7 +92,12 @@ impl SVGSVGElement {
         };
 
         let xml_source: String = xml_source.into();
-        let xml_source = insert_style_into_drawing(&xml_source, &self.page_style_text());
+        let computed_color = self
+            .upcast::<Element>()
+            .style_left_by_the_last_layout()
+            .map(|style| style.clone_color().to_css_string());
+        let page_style = resolve_page_style(&self.page_style_text(), computed_color.as_deref());
+        let xml_source = insert_style_into_drawing(&xml_source, &page_style);
         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
         let data_url = format!("data:image/svg+xml;base64,{}", base64_encoded_source);
         match ServoUrl::parse(&data_url) {
@@ -112,17 +118,26 @@ impl SVGSVGElement {
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
         {
-            let Some(style) = node.downcast::<HTMLStyleElement>() else {
-                continue;
-            };
-            let element = style.upcast::<Element>();
-            let type_attribute = element.get_string_attribute(&local_name!("type"));
-            let media = element.get_string_attribute(&local_name!("media"));
-            if !style_applies_to_screen(&type_attribute.str(), &media.str()) {
-                continue;
+            if let Some(style) = node.downcast::<HTMLStyleElement>() {
+                let element = style.upcast::<Element>();
+                let type_attribute = element.get_string_attribute(&local_name!("type"));
+                let media = element.get_string_attribute(&local_name!("media"));
+                if style_applies_to_screen(&type_attribute.str(), &media.str()) {
+                    text.push_str(&node.child_text_content().str());
+                    text.push('\n');
+                }
+            } else if let Some(link) = node.downcast::<HTMLLinkElement>() {
+                if link.get_stylesheet().is_none() || link.is_effectively_disabled() {
+                    continue;
+                }
+                let media = link
+                    .upcast::<Element>()
+                    .get_string_attribute(&local_name!("media"));
+                if style_applies_to_screen("", &media.str()) {
+                    text.push_str(&link.source_text());
+                    text.push('\n');
+                }
             }
-            text.push_str(&node.child_text_content().str());
-            text.push('\n');
         }
         text
     }
