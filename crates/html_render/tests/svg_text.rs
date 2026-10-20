@@ -1,10 +1,12 @@
 #![cfg(feature = "servo")]
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{TestAppContext, px, size};
 use html_render::HtmlPage;
+
+#[path = "support/hermetic_fonts.rs"]
+mod hermetic_fonts;
 
 const DEADLINE: Duration = Duration::from_secs(45);
 
@@ -43,39 +45,6 @@ const PAGE: &str = "<html><body style=\"margin:0;background:#fff\">\
 /// letters at 56 px, or the rectangle, put thousands there.
 const MIN_INK: usize = 500;
 
-/// Gives the process a fontconfig that knows two bundled fonts and names no
-/// family for any generic one, which is what leaves the engine's own font
-/// database pointing `serif`, `monospace` and `sans-serif` at fonts that are
-/// not there. It has to be in place before the engine starts: the font database
-/// is read once, then.
-fn use_only_the_bundled_fonts(workspace: &Path) {
-    let fonts = workspace.join("fonts");
-    std::fs::create_dir_all(&fonts).expect("a directory for the fonts");
-    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts");
-    for font in [
-        "ibm-plex-sans/IBMPlexSans-Regular.ttf",
-        "lilex/Lilex-Regular.ttf",
-    ] {
-        let source = bundled.join(font);
-        let file_name = source.file_name().expect("a font has a file name");
-        std::fs::copy(&source, fonts.join(file_name))
-            .unwrap_or_else(|error| panic!("copying {}: {error}", source.display()));
-    }
-
-    let configuration = workspace.join("fonts.conf");
-    std::fs::write(
-        &configuration,
-        format!(
-            "<?xml version=\"1.0\"?><fontconfig><dir>{}</dir></fontconfig>",
-            fonts.display()
-        ),
-    )
-    .expect("a fontconfig file");
-    // SAFETY: nothing else in this test binary reads or writes the environment,
-    // and the engine, which does read it, has not been started yet.
-    unsafe { std::env::set_var("FONTCONFIG_FILE", &configuration) };
-}
-
 /// How many pixels in a row of the page are dark.
 fn dark_pixels_in_row(page: &HtmlPage, row: usize) -> usize {
     let Some(frame) = page.frame() else {
@@ -101,7 +70,7 @@ fn an_inline_svg_draws_its_text_whatever_fontconfig_names_the_generic_families(
     cx: &mut TestAppContext,
 ) {
     let workspace = tempfile::tempdir().expect("a scratch directory");
-    use_only_the_bundled_fonts(workspace.path());
+    hermetic_fonts::use_only_the_bundled_fonts(workspace.path());
 
     cx.update(|cx| {
         let mut page = match HtmlPage::open(

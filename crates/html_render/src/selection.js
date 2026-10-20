@@ -68,6 +68,12 @@
       if (!parent || SKIP[parent.nodeName] || parent.getAttribute("data-zed-selection")) {
         continue;
       }
+      // A drawing is made again from its markup whenever the page changes, and a
+      // span inside an SVG text element is not text to it: wrapped words would
+      // draw as nothing.
+      if (parent.closest && parent.closest("svg")) {
+        continue;
+      }
       texts.push(node);
     }
     for (var i = 0; i < texts.length; i++) {

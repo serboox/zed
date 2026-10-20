@@ -236,6 +236,7 @@ members = [
     "crates/symbol_index",
     "crates/structural_search",
     "crates/sum_tree",
+    "crates/svg_page_style",
     "crates/svg_preview",
     "crates/syntax_theme",
     "crates/system_specs",
@@ -1155,6 +1156,9 @@ notify = { path = "vendor/notify" }
 # `monospace`, ...) that names nothing installed is pointed at a family that is, because
 # an inline SVG's text is otherwise left out of the drawing altogether.
 servo-net = { path = "vendor/servo-net" }
+# `vendor/servo-script` is servo-script 0.4.0 with one change: an inline <svg> is handed the text of
+# the page's own `<style>` elements, so that a page can style its drawings with a stylesheet.
+servo-script = { path = "vendor/servo-script" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 

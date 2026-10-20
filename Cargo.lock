@@ -23135,8 +23135,6 @@ dependencies = [
 [[package]]
 name = "servo-script"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d6f453c29f1c48f43c8ab9aa5f46250363a2de624d77fd828bdae3f656e636b"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
@@ -23253,6 +23251,7 @@ dependencies = [
  "stylo_dom",
  "stylo_malloc_size_of",
  "stylo_traits",
+ "svg_page_style",
  "swapper",
  "tempfile",
  "tendril",
@@ -25099,6 +25098,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb"
 
 [[package]]
+name = "svg_page_style"
+version = "0.1.0"
+
+[[package]]
 name = "svg_preview"
 version = "0.1.0"
 dependencies = [
@@ -25106,6 +25109,8 @@ dependencies = [
  "gpui",
  "language",
  "multi_buffer",
+ "project",
+ "serde_json",
  "theme",
  "ui",
  "util",
@@ -25554,6 +25559,7 @@ dependencies = [
  "editor",
  "fuzzy",
  "gpui",
+ "language",
  "log",
  "picker",
  "project",
