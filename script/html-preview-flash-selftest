@@ -163,6 +163,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
@@ -172,6 +173,10 @@ width, height, frames = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 DBusGMainLoop(set_as_default=True)
 bus = dbus.SessionBus()
 name = "org.gnome.Mutter.ScreenCast"
+for _ in range(150):
+    if bus.name_has_owner(name):
+        break
+    time.sleep(0.2)
 screencast = dbus.Interface(bus.get_object(name, "/org/gnome/Mutter/ScreenCast"), name)
 session_path = screencast.CreateSession({})
 session = dbus.Interface(bus.get_object(name, session_path), name + ".Session")
