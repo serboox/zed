@@ -3616,6 +3616,8 @@ impl Window {
     /// Evaluate media query lists and report changes
     /// <https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes>
     pub(crate) fn evaluate_media_queries_and_report_changes(&self, cx: &mut JSContext) {
+        self.Document()
+            .tell_inline_svgs_media_may_have_changed(cx.no_gc());
         let mut realm = enter_auto_realm(cx, self);
         let cx = &mut realm.current_realm();
         rooted_vec!(let mut mql_list);

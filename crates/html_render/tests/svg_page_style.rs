@@ -7,6 +7,10 @@ use html_render::HtmlPage;
 
 #[path = "support/hermetic_fonts.rs"]
 mod hermetic_fonts;
+#[path = "support/pixels.rs"]
+mod pixels;
+
+use pixels::{is_black, is_blue, is_cyan, is_green, is_magenta, is_red, is_yellow};
 
 const DEADLINE: Duration = Duration::from_secs(45);
 
@@ -20,9 +24,8 @@ const ROWS: usize = 9;
 
 /// Drawings styled only by the page's own stylesheet, one per row: a rectangle
 /// painted green by a rule, red text painted by a rule, a rectangle that a rule
-/// in a `print` stylesheet would paint red, and a rectangle that a rule can only
-/// reach through the page's own markup above the drawing. The drawing is
-/// rasterised without its surroundings, so that rule does not match. The last
+/// in a `print` stylesheet would paint red, and a rectangle that a rule reaches
+/// through the page's own markup above the drawing. The next
 /// rectangle is painted by a stylesheet the page adds after the drawing was
 /// already made, which has to make the drawing again. Then a rectangle painted
 /// through a custom property the root sets, one painted by a stylesheet the page
@@ -69,55 +72,6 @@ const PAGE: &str = "<html><head>\
 /// that colour: the rectangles are 32 000 pixels, four letters at 56 px thousands.
 const MIN_PIXELS: usize = 500;
 
-fn is_green([red, green, blue]: [u8; 3]) -> bool {
-    red < 40 && green > 215 && blue < 40
-}
-
-fn is_red([red, green, blue]: [u8; 3]) -> bool {
-    red > 215 && green < 40 && blue < 40
-}
-
-fn is_blue([red, green, blue]: [u8; 3]) -> bool {
-    red < 40 && green < 40 && blue > 215
-}
-
-fn is_cyan([red, green, blue]: [u8; 3]) -> bool {
-    red < 40 && green > 215 && blue > 215
-}
-
-fn is_magenta([red, green, blue]: [u8; 3]) -> bool {
-    red > 215 && green < 40 && blue > 215
-}
-
-fn is_yellow([red, green, blue]: [u8; 3]) -> bool {
-    red > 215 && green > 215 && blue < 40
-}
-
-fn is_black([red, green, blue]: [u8; 3]) -> bool {
-    red < 40 && green < 40 && blue < 40
-}
-
-/// How many pixels of a row of the page satisfy `wanted`.
-fn pixels_in_row(page: &HtmlPage, row: usize, wanted: impl Fn([u8; 3]) -> bool) -> usize {
-    let Some(frame) = page.frame() else {
-        return 0;
-    };
-    let width = u32::from(frame.size(0).width) as usize;
-    let Some(bytes) = frame.as_bytes(0) else {
-        return 0;
-    };
-    let first = row * ROW_HEIGHT * width * 4;
-    let last = (row + 1) * ROW_HEIGHT * width * 4;
-    let Some(pixels) = bytes.get(first..last) else {
-        return 0;
-    };
-    pixels
-        .chunks_exact(4)
-        // The frames are premultiplied BGRA, which is what gpui draws.
-        .filter(|pixel| wanted([pixel[2], pixel[1], pixel[0]]))
-        .count()
-}
-
 #[gpui::test]
 fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
     let workspace = tempfile::tempdir().expect("a scratch directory");
@@ -155,9 +109,9 @@ fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
             ("a rule paints text red", 1, is_red),
             ("a print-only rule leaves a rectangle black", 2, is_black),
             (
-                "a rule through markup outside the drawing leaves a rectangle black",
+                "a rule through markup outside the drawing paints a rectangle",
                 3,
-                is_black,
+                is_blue,
             ),
             (
                 "a stylesheet added after the drawing was made paints it",
@@ -182,7 +136,7 @@ fn an_inline_svg_is_styled_by_the_page_stylesheet(cx: &mut TestAppContext) {
         while Instant::now() < deadline {
             page.pump();
             for (index, (_, row, wanted)) in expectations.iter().enumerate() {
-                counts[index] = pixels_in_row(&page, *row, wanted);
+                counts[index] = pixels::pixels_in_row(&page, *row, ROW_HEIGHT, wanted);
             }
             if counts.iter().all(|count| *count >= MIN_PIXELS) {
                 return;

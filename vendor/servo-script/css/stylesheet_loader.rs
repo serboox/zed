@@ -310,6 +310,12 @@ impl StylesheetContext {
             }
             StylesheetContextSource::Import(import_rule) => {
                 let mut guard = document.style_shared_author_lock().write();
+                let location = import_rule.write_with(&mut guard).source_location;
+                document.record_imported_sheet_text(
+                    location.line,
+                    location.column,
+                    String::from_utf8_lossy(&self.data).into_owned(),
+                );
                 import_rule.write_with(&mut guard).stylesheet = ImportSheet::Sheet(stylesheet);
             }
         }

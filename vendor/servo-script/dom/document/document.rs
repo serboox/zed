@@ -454,6 +454,10 @@ pub(crate) struct Document {
     /// List of stylesheets associated with nodes in this document. |None| if the list needs to be refreshed.
     #[custom_trace]
     stylesheets: DomRefCell<DocumentStylesheetSet<ServoStylesheetInDocument>>,
+
+    /// The text of the style sheets that `@import` rules fetched, in the order they arrived.
+    /// An inline SVG is drawn apart from the page, so it is handed this text with the rest.
+    imported_sheet_texts: DomRefCell<Vec<(u32, u32, String)>>,
     stylesheet_list: MutNullableDom<StyleSheetList>,
     ready_state: Cell<DocumentReadyState>,
     /// The script element that is currently executing.
@@ -1940,6 +1944,32 @@ impl Document {
         {
             if let Some(svg) = node.downcast::<crate::dom::svg::svgsvgelement::SVGSVGElement>() {
                 svg.page_style_changed(no_gc);
+            }
+        }
+    }
+
+    /// Keeps the text of a sheet an `@import` rule fetched, with where in its own sheet the
+    /// rule stood, because the sheets arrive in whatever order the network gives them.
+    pub(crate) fn record_imported_sheet_text(&self, line: u32, column: u32, text: String) {
+        self.imported_sheet_texts
+            .borrow_mut()
+            .push((line, column, text));
+    }
+
+    /// The text of the imported sheets, in the order their `@import` rules came in.
+    pub(crate) fn imported_sheet_texts(&self) -> Vec<String> {
+        let mut texts = self.imported_sheet_texts.borrow().clone();
+        texts.sort_by_key(|(line, column, _)| (*line, *column));
+        texts.into_iter().map(|(_, _, text)| text).collect()
+    }
+
+    pub(crate) fn tell_inline_svgs_media_may_have_changed(&self, no_gc: &NoGC) {
+        for node in self
+            .upcast::<Node>()
+            .traverse_preorder(crate::dom::iterators::ShadowIncluding::No)
+        {
+            if let Some(svg) = node.downcast::<crate::dom::svg::svgsvgelement::SVGSVGElement>() {
+                svg.media_may_have_changed(no_gc);
             }
         }
     }
@@ -4096,6 +4126,7 @@ impl Document {
             iframes: IFrameCollection::new(),
             shared_style_locks,
             stylesheets: DomRefCell::new(DocumentStylesheetSet::new()),
+            imported_sheet_texts: Default::default(),
             stylesheet_list: MutNullableDom::new(None),
             // https://html.spec.whatwg.org/multipage/#current-document-readiness
             // > Each Document has a current document readiness, a string, initially "complete".

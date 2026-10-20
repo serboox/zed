@@ -12,29 +12,38 @@ use js::rust::HandleObject;
 use layout_api::SVGElementData;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
+use style::media_queries::MediaList as StyleMediaList;
 use style::parser::ParserContext;
+use style::stylesheets::CustomMediaEvaluator;
 use style::stylesheets::Origin;
 use style::values::specified::LengthPercentage;
 use style_traits::{ParsingMode, ToCss};
-use svg_page_style::{insert_style_into_drawing, resolve_page_style, style_applies_to_screen};
+use svg_page_style::{
+    Condition, flatten_conditional_rules, insert_style_into_drawing, resolve_page_style,
+    style_applies_to_screen,
+};
 use uuid::Uuid;
 use xml5ever::serialize::TraversalScope;
 
+use crate::dom::bindings::codegen::Bindings::CSSBinding::CSSMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::css::css::CSS;
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::html::htmllinkelement::HTMLLinkElement;
 use crate::dom::html::htmlstyleelement::HTMLStyleElement;
 use crate::dom::iterators::ShadowIncluding;
+use crate::dom::media::medialist::MediaList;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{
     ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, UnbindContext,
 };
+use crate::dom::svg::pagestylematcher::PageRuleMatcher;
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
 
 #[dom_struct]
@@ -47,6 +56,10 @@ pub(crate) struct SVGSVGElement {
     // on each layout and must be invalidated when the subtree changes.
     #[no_trace]
     cached_serialized_data_url: AtomicRefCell<Option<Result<ServoUrl, ()>>>,
+    /// The media queries the page's stylesheets asked when the drawing was serialised, and what
+    /// each answered, so that the drawing is serialised again when one of them answers otherwise.
+    #[no_trace]
+    media_conditions: AtomicRefCell<Vec<(String, bool)>>,
 }
 
 impl SVGSVGElement {
@@ -59,6 +72,7 @@ impl SVGSVGElement {
             svggraphicselement: SVGGraphicsElement::new_inherited(local_name, prefix, document),
             uuid: Uuid::new_v4(),
             cached_serialized_data_url: Default::default(),
+            media_conditions: Default::default(),
         }
     }
 
@@ -97,7 +111,28 @@ impl SVGSVGElement {
             return;
         }
 
-        self.process_use_elements(cx, &cloned_node);
+        let computed_color = self
+            .upcast::<Element>()
+            .style_left_by_the_last_layout()
+            .map(|style| style.clone_color().to_css_string());
+        let mut conditions = Vec::new();
+        let page_css =
+            flatten_conditional_rules(&self.page_style_text(), &mut |condition| match condition {
+                Condition::Media(query) => {
+                    let holds = self.media_condition_holds(query);
+                    conditions.push((query.to_string(), holds));
+                    holds
+                }
+                Condition::Supports(query) => {
+                    CSS::Supports_(&self.owner_window(), DOMString::from(query))
+                }
+            });
+        *self.media_conditions.borrow_mut() = conditions;
+        let page_style = resolve_page_style(&page_css, computed_color.as_deref());
+        let matcher = PageRuleMatcher::new(&self.owner_document(), &page_style);
+        matcher.mark(cx, self.upcast(), &cloned_node);
+
+        self.process_use_elements(cx, &cloned_node, &matcher);
 
         let Ok(xml_source) = cloned_node.xml_serialize(TraversalScope::IncludeNode) else {
             *self.cached_serialized_data_url.borrow_mut() = Some(Err(()));
@@ -105,12 +140,7 @@ impl SVGSVGElement {
         };
 
         let xml_source: String = xml_source.into();
-        let computed_color = self
-            .upcast::<Element>()
-            .style_left_by_the_last_layout()
-            .map(|style| style.clone_color().to_css_string());
-        let page_style = resolve_page_style(&self.page_style_text(), computed_color.as_deref());
-        let xml_source = insert_style_into_drawing(&xml_source, &page_style);
+        let xml_source = insert_style_into_drawing(&xml_source, &matcher.drawing_style());
         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
         let data_url = format!("data:image/svg+xml;base64,{base64_encoded_source}");
         match ServoUrl::parse(&data_url) {
@@ -127,6 +157,10 @@ impl SVGSVGElement {
     fn page_style_text(&self) -> String {
         let document = self.owner_document();
         let mut text = String::new();
+        for imported in document.imported_sheet_texts() {
+            text.push_str(&imported);
+            text.push('\n');
+        }
         for node in document
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
@@ -155,12 +189,17 @@ impl SVGSVGElement {
         text
     }
 
-    fn process_use_elements(&self, cx: &mut JSContext, root_node: &Node) {
+    fn process_use_elements(
+        &self,
+        cx: &mut JSContext,
+        root_node: &Node,
+        matcher: &PageRuleMatcher,
+    ) {
         for node in root_node.traverse_preorder(ShadowIncluding::No) {
             if let Some(element) = node.downcast::<Element>()
                 && element.local_name() == &local_name!("use")
             {
-                self.process_single_use_element(cx, element, root_node)
+                self.process_single_use_element(cx, element, root_node, matcher)
             }
         }
     }
@@ -170,6 +209,7 @@ impl SVGSVGElement {
         cx: &mut JSContext,
         use_element: &Element,
         root_node: &Node,
+        matcher: &PageRuleMatcher,
     ) {
         let href = use_element.get_string_attribute(&local_name!("href"));
         let Some(id_string) = href.str().strip_prefix("#").map(DOMString::from) else {
@@ -205,7 +245,31 @@ impl SVGSVGElement {
             CloneChildrenFlag::CloneChildren,
             None,
         );
+        matcher.mark(cx, referenced_node, &cloned_node);
         let _ = root_node.AppendChild(cx, &cloned_node);
+    }
+
+    fn media_condition_holds(&self, condition: &str) -> bool {
+        let window = self.owner_window();
+        let media_list: StyleMediaList = MediaList::parse_media_list(condition, &window);
+        media_list.evaluate(
+            window.layout().device(),
+            self.owner_document().quirks_mode(),
+            &mut CustomMediaEvaluator::none(),
+        )
+    }
+
+    /// A media feature of the page may have changed, such as its width or its theme. A
+    /// drawing made with a media query that answers otherwise now has to be made again.
+    pub(crate) fn media_may_have_changed(&self, no_gc: &NoGC) {
+        let answers_otherwise = self
+            .media_conditions
+            .borrow()
+            .iter()
+            .any(|(condition, was)| self.media_condition_holds(condition) != *was);
+        if answers_otherwise {
+            self.invalidate_cached_serialized_subtree_and_rasterization_result(no_gc);
+        }
     }
 
     /// The drawing was serialised with the page's style as it was then. When that

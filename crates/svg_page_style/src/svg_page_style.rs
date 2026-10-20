@@ -121,7 +121,7 @@ impl RootDeclarations {
             body: HashMap::new(),
         };
         let mut position = 0;
-        for rule in top_level_rules(css) {
+        for rule in style_rules(css) {
             for selector in rule.selectors.split(',') {
                 let selector = selector.trim().to_ascii_lowercase();
                 let for_html = specificity_for_html(&selector);
@@ -276,34 +276,242 @@ fn strip_comments(css: &str) -> String {
     stripped
 }
 
-struct Rule<'a> {
-    selectors: &'a str,
-    block: &'a str,
+/// A style rule: the text of its selector list and of its declaration block, and
+/// the cascade layer it is in, if any, as a rank in the order the layers were named.
+pub struct StyleRule<'a> {
+    pub selectors: &'a str,
+    pub block: &'a str,
+    pub layer: Option<usize>,
 }
 
-/// The style rules of a stylesheet that are not inside an at-rule.
-fn top_level_rules(css: &str) -> Vec<Rule<'_>> {
+/// The style rules of a stylesheet, without comments, that are not inside an at-rule,
+/// and those inside `@layer` blocks, which say which layer they are in.
+pub fn style_rules(css: &str) -> Vec<StyleRule<'_>> {
     let mut rules = Vec::new();
+    let mut layers = Vec::new();
+    collect_style_rules(css, None, "", &mut layers, &mut rules);
+    rules
+}
+
+fn layer_rank(layers: &mut Vec<String>, name: String) -> usize {
+    match layers.iter().position(|known| *known == name) {
+        Some(rank) => rank,
+        None => {
+            layers.push(name);
+            layers.len() - 1
+        }
+    }
+}
+
+/// What follows the name of the at-rule `prelude` starts with, when it is `@name`.
+fn at_rule_arguments<'a>(prelude: &'a str, name: &str) -> Option<&'a str> {
+    let after_at = prelude.trim_start().strip_prefix('@')?;
+    let head = after_at.get(..name.len())?;
+    if !head.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let arguments = &after_at[name.len()..];
+    (arguments.is_empty()
+        || arguments.starts_with(|character: char| character.is_whitespace() || character == '('))
+    .then_some(arguments)
+}
+
+fn collect_style_rules<'a>(
+    css: &'a str,
+    layer: Option<usize>,
+    prefix: &str,
+    layers: &mut Vec<String>,
+    rules: &mut Vec<StyleRule<'a>>,
+) {
     let mut rest = css;
-    while let Some(open) = outside_strings(rest)
-        .find(|(_, character)| *character == '{')
-        .map(|(index, _)| index)
+    while let Some((index, character)) =
+        outside_strings(rest).find(|(_, character)| matches!(character, '{' | ';'))
     {
-        let Some(length) = balanced_block_length(&rest[open..]) else {
-            break;
+        if character == ';' {
+            if let Some(names) = at_rule_arguments(&rest[..index], "layer") {
+                for name in names
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    layer_rank(layers, format!("{prefix}{name}"));
+                }
+            }
+            rest = &rest[index + 1..];
+            continue;
+        }
+        let Some(length) = balanced_block_length(&rest[index..]) else {
+            return;
         };
-        // What comes before the last `;` of the prelude belongs to an at-rule
-        // without a block, such as `@import`.
-        let prelude = rest[..open].rsplit(';').next().unwrap_or_default().trim();
-        if !prelude.starts_with('@') && !prelude.is_empty() {
-            rules.push(Rule {
+        let prelude = rest[..index].trim();
+        let body = &rest[index + 1..index + length - 1];
+        rest = &rest[index + length..];
+        if let Some(name) = at_rule_arguments(prelude, "layer") {
+            let name = name.trim();
+            let full_name = if name.is_empty() {
+                format!("{prefix}\0anonymous{}", layers.len())
+            } else {
+                format!("{prefix}{name}")
+            };
+            let rank = layer_rank(layers, full_name.clone());
+            collect_style_rules(body, Some(rank), &format!("{full_name}."), layers, rules);
+        } else if !prelude.starts_with('@') && !prelude.is_empty() {
+            rules.push(StyleRule {
                 selectors: prelude,
-                block: &rest[open + 1..open + length - 1],
+                block: body,
+                layer,
             });
         }
-        rest = &rest[open + length..];
     }
-    rules
+}
+
+/// The selectors of a selector list: the text between its top-level commas.
+pub fn split_selector_list(selectors: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, character) in outside_strings(selectors) {
+        match character {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(selectors[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(selectors[start..].trim());
+    parts.retain(|selector| !selector.is_empty());
+    parts
+}
+
+const MOST_NESTED_CONDITIONS: usize = 64;
+
+/// A condition on a group of rules, as written after the `@` keyword.
+pub enum Condition<'a> {
+    Media(&'a str),
+    Supports(&'a str),
+}
+
+/// The stylesheet with its conditional group rules resolved: the rules inside an
+/// `@media` or `@supports` block stay, without the block, when `condition_holds` says
+/// its condition does, and are dropped when it does not. What depends on a container
+/// is dropped: a drawing is rasterised apart from the page, so nothing else can be
+/// asked. An `@layer` block stays a block, with what is inside it resolved, so that
+/// the layer it makes can still be told. Everything else, including statements such
+/// as `@import`, is left as it was.
+pub fn flatten_conditional_rules(
+    css: &str,
+    condition_holds: &mut dyn FnMut(Condition<'_>) -> bool,
+) -> String {
+    let css = strip_comments(css);
+    let mut flattened = String::with_capacity(css.len());
+    flatten_into(&css, condition_holds, 0, &mut flattened);
+    flattened
+}
+
+fn flatten_into(
+    css: &str,
+    condition_holds: &mut dyn FnMut(Condition<'_>) -> bool,
+    depth: usize,
+    flattened: &mut String,
+) {
+    let mut rest = css;
+    while let Some((index, character)) =
+        outside_strings(rest).find(|(_, character)| matches!(character, '{' | ';'))
+    {
+        if character == ';' {
+            flattened.push_str(&rest[..=index]);
+            rest = &rest[index + 1..];
+            continue;
+        }
+        let Some(length) = balanced_block_length(&rest[index..]) else {
+            flattened.push_str(rest);
+            return;
+        };
+        let prelude = &rest[..index];
+        let body = &rest[index + 1..index + length - 1];
+        rest = &rest[index + length..];
+        let within_limit = depth < MOST_NESTED_CONDITIONS;
+        if let Some(query) = at_rule_arguments(prelude, "media") {
+            if within_limit && condition_holds(Condition::Media(query.trim())) {
+                flatten_into(body, condition_holds, depth + 1, flattened);
+            }
+        } else if let Some(query) = at_rule_arguments(prelude, "supports") {
+            if within_limit && condition_holds(Condition::Supports(query.trim())) {
+                flatten_into(body, condition_holds, depth + 1, flattened);
+            }
+        } else if at_rule_arguments(prelude, "layer").is_some() {
+            flattened.push_str(prelude);
+            flattened.push('{');
+            if within_limit {
+                flatten_into(body, condition_holds, depth + 1, flattened);
+            }
+            flattened.push('}');
+        } else if ["container", "scope", "starting-style"]
+            .iter()
+            .any(|name| at_rule_arguments(prelude, name).is_some())
+        {
+            // A drawing has no container to ask, so what depends on one is dropped.
+        } else {
+            flattened.push_str(prelude);
+            flattened.push('{');
+            flattened.push_str(body);
+            flattened.push('}');
+        }
+    }
+    flattened.push_str(rest);
+}
+
+/// The attribute that marks an element of a drawing with the rules that match it.
+pub const MARKER_ATTRIBUTE: &str = "data-zed-matched-rules";
+
+/// A style rule that matched an element of a drawing in the page, where the page's
+/// selectors could be matched against the page's own tree.
+pub struct MatchedRule {
+    /// What the rule's elements carry in [`MARKER_ATTRIBUTE`].
+    pub marker: usize,
+    /// How specific the most specific selector that matched is.
+    pub specificity: u32,
+    /// Where the rule stood in the page's stylesheets.
+    pub order: usize,
+    /// The cascade layer the rule was in, if any, as a rank in the order the layers were named.
+    pub layer: Option<usize>,
+    pub block: String,
+}
+
+/// The value of [`MARKER_ATTRIBUTE`] for an element that these rules matched.
+pub fn marker_value(markers: &[usize]) -> String {
+    markers
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The rules for the drawing, in the order the cascade applies them: by layer, by
+/// specificity, and by where they stood in the page's stylesheets when that is the same. Each is
+/// aimed at the elements that carry its marker, so the drawing's rasteriser, which
+/// knows no selector but an attribute's, applies exactly what the page's engine did.
+pub fn emit_matched_rules(rules: &[MatchedRule]) -> String {
+    let mut sorted: Vec<&MatchedRule> = rules.iter().collect();
+    // A rule in no layer beats every rule in a layer, whatever their specificities.
+    sorted.sort_by_key(|rule| {
+        (
+            rule.layer.unwrap_or(usize::MAX),
+            rule.specificity,
+            rule.order,
+        )
+    });
+    let mut css = String::new();
+    for rule in sorted {
+        css.push_str(&format!(
+            "[{MARKER_ATTRIBUTE}~=\"{}\"] {{ {} }}\n",
+            rule.marker, rule.block
+        ));
+    }
+    css
 }
 
 /// The length of the `{ ... }` block `text` starts with, braces included.
@@ -810,6 +1018,155 @@ mod tests {
             resolved.contains(".c29999 { fill: red;"),
             "{}",
             &resolved[resolved.len() - 80..]
+        );
+    }
+
+    #[test]
+    fn a_media_block_stays_without_its_wrapper_when_its_query_holds() {
+        let css = "a { x: 1 } @media (min-width: 600px) { b { y: 2 } } @media print { c { z: 3 } } d { w: 4 }";
+        let mut asked = Vec::new();
+        let flattened = flatten_conditional_rules(css, &mut |condition| match condition {
+            Condition::Media(query) => {
+                asked.push(query.to_string());
+                query.contains("min-width")
+            }
+            Condition::Supports(_) => true,
+        });
+        assert!(flattened.contains("b { y: 2 }"), "{flattened}");
+        assert!(!flattened.contains("c {"), "{flattened}");
+        assert!(!flattened.contains("@media"), "{flattened}");
+        assert!(flattened.contains("a { x: 1 }") && flattened.contains("d { w: 4 }"));
+        assert_eq!(asked, ["(min-width: 600px)", "print"]);
+    }
+
+    #[test]
+    fn conditional_blocks_nest_and_other_at_rules_are_left_alone() {
+        let css = "@import url(\"a.css\"); @layer base, theme; \
+            @layer base { a { x: 1 } } \
+            @supports (display: grid) { @media screen { b { y: 2 } } } \
+            @supports not (display: grid) { c { z: 3 } } \
+            @container (min-width: 1px) { d { w: 4 } } \
+            @font-face { font-family: \"F\"; src: url(f.woff) } \
+            e::before { content: \"} {\" }";
+        let mut supports = Vec::new();
+        let flattened = flatten_conditional_rules(css, &mut |condition| match condition {
+            Condition::Media(_) => true,
+            Condition::Supports(query) => {
+                supports.push(query.to_string());
+                !query.starts_with("not")
+            }
+        });
+        assert!(flattened.contains("@import url(\"a.css\");"), "{flattened}");
+        assert!(flattened.contains("@layer base, theme;"), "{flattened}");
+        assert!(
+            flattened.contains("@layer base {") && flattened.contains("a { x: 1 }"),
+            "{flattened}"
+        );
+        assert!(
+            flattened.contains("b { y: 2 }") && !flattened.contains("@supports"),
+            "{flattened}"
+        );
+        assert!(
+            !flattened.contains("c {") && !flattened.contains("d {"),
+            "{flattened}"
+        );
+        assert_eq!(supports, ["(display: grid)", "not (display: grid)"]);
+        assert!(
+            flattened.contains("@font-face { font-family: \"F\"; src: url(f.woff) }"),
+            "{flattened}"
+        );
+        assert!(flattened.contains("content: \"} {\""), "{flattened}");
+    }
+
+    #[test]
+    fn an_unfinished_conditional_block_does_not_panic() {
+        let _ = flatten_conditional_rules("@media (a) { b { c: d }", &mut |_| true);
+        let _ = flatten_conditional_rules("@media", &mut |_| true);
+        let _ = flatten_conditional_rules("}}{{ @media {", &mut |_| false);
+        let deep = "@media a { ".repeat(80) + "x { y: z }" + &" }".repeat(80);
+        let _ = flatten_conditional_rules(&deep, &mut |_| true);
+        let _ = style_rules("@layer a { @layer b { c { d: e }");
+    }
+
+    #[test]
+    fn a_rule_says_which_layer_it_is_in() {
+        let css = "@layer reset, base; @layer base { a { x: 1 } @layer inner { i { x: 5 } } } \
+                   @layer reset { b { y: 2 } } c { z: 3 } @layer { d { w: 4 } }";
+        let layers: Vec<(&str, Option<usize>)> = style_rules(css)
+            .into_iter()
+            .map(|rule| (rule.selectors, rule.layer))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                ("a", Some(1)),
+                ("i", Some(2)),
+                ("b", Some(0)),
+                ("c", None),
+                ("d", Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selector_list_is_split_at_its_top_level_commas() {
+        assert_eq!(split_selector_list("a, b > c ,d"), ["a", "b > c", "d"]);
+        assert_eq!(
+            split_selector_list(":is(a, b) .c, [title=\"x,y\"], :not(.d, .e)"),
+            [":is(a, b) .c", "[title=\"x,y\"]", ":not(.d, .e)"]
+        );
+        assert_eq!(split_selector_list(" , "), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn matched_rules_are_emitted_in_the_order_the_cascade_applies_them() {
+        let rule = |marker, specificity, order, block: &str| MatchedRule {
+            marker,
+            specificity,
+            order,
+            layer: None,
+            block: block.to_string(),
+        };
+        let css = emit_matched_rules(&[
+            rule(0, 1 << 10, 0, "fill: red"),
+            rule(1, 1 << 10 | 1, 1, "fill: green"),
+            rule(2, 1 << 10, 2, "fill: blue"),
+            rule(3, 1, 3, "stroke: black"),
+        ]);
+        let order: Vec<&str> = css.lines().collect();
+        assert_eq!(order.len(), 4, "{css}");
+        assert!(
+            order[0].contains("\"3\"") && order[0].contains("stroke: black"),
+            "{css}"
+        );
+        assert!(order[1].contains("\"0\""), "{css}");
+        assert!(order[2].contains("\"2\""), "{css}");
+        assert!(order[3].contains("\"1\""), "{css}");
+        assert!(
+            order[0].starts_with(&format!("[{MARKER_ATTRIBUTE}~=")),
+            "{css}"
+        );
+        assert_eq!(marker_value(&[3, 10, 7]), "3 10 7");
+    }
+
+    #[test]
+    fn a_rule_in_no_layer_beats_one_in_a_layer_and_a_later_layer_beats_an_earlier_one() {
+        let rule = |marker, specificity, layer, block: &str| MatchedRule {
+            marker,
+            specificity,
+            order: marker,
+            layer,
+            block: block.to_string(),
+        };
+        let css = emit_matched_rules(&[
+            rule(0, 1, None, "fill: red"),
+            rule(1, 1 << 20, Some(1), "fill: green"),
+            rule(2, 1 << 20, Some(0), "fill: blue"),
+        ]);
+        let order: Vec<&str> = css.lines().collect();
+        assert!(
+            order[0].contains("\"2\"") && order[1].contains("\"1\"") && order[2].contains("\"0\""),
+            "{css}"
         );
     }
 
