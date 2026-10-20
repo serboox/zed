@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <document.html> [width] [height]" >&2
+  echo "Draws the document with a browser and with the editor's HTML engine (on the remote builder)" >&2
+  echo "and lists the blocks of the page where the two differ most." >&2
+  echo "environment: PARITY_OUTPUT (directory for the pictures), PARITY_BLOCK (block size in pixels, 50)," >&2
+  echo "PARITY_THRESHOLD (mean-luma difference that counts as a discrepancy, 35), PARITY_ROWS (rows listed, 25)" >&2
+  exit 2
+fi
+
+document="$(realpath "$1")"
+width="${2:-1400}"
+height="${3:-4000}"
+repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+output="${PARITY_OUTPUT:-$(mktemp -d /tmp/html-preview-parity.XXXXXX)}"
+mkdir -p "$output"
+
+browser=""
+for candidate in google-chrome google-chrome-stable chromium-browser chromium; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    browser="$candidate"
+    break
+  fi
+done
+if [[ -z "$browser" ]]; then
+  echo "missing: a Chrome or Chromium to compare with" >&2
+  exit 1
+fi
+for needed in /usr/bin/python3 kubectl; do
+  if ! command -v "$needed" >/dev/null 2>&1; then
+    echo "missing: $needed" >&2
+    exit 1
+  fi
+done
+
+# Both sides get the same two fonts, or text would wrap differently and shift every block below it.
+echo "--- the browser draws ${document##*/} at ${width}x${height}"
+profile="$output/browser-profile"
+fonts="$output/browser-fonts"
+mkdir -p "$fonts"
+cp -f "$repository/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf" "$repository/assets/fonts/lilex/Lilex-Regular.ttf" "$fonts/"
+cat >| "$output/browser-fonts.conf" <<CONF
+<?xml version="1.0"?><fontconfig><dir>$fonts</dir></fontconfig>
+CONF
+FONTCONFIG_FILE="$output/browser-fonts.conf" timeout 180 nice -n 10 "$browser" --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
+  --user-data-dir="$profile" --window-size="${width},${height}" --virtual-time-budget=10000 \
+  --screenshot="$output/browser.png" "file://$document" >"$output/browser.log" 2>&1 || {
+  echo "the browser failed:" >&2
+  tail -5 "$output/browser.log" >&2
+  exit 1
+}
+rm -rf -- "${profile:?}" "${fonts:?}"
+
+source "$repository/.remote-build/scripts/env.sh"
+pod="$(zrb_pod_name)"
+remote_directory="/workspace/parity"
+
+echo "--- the engine draws it on the builder"
+"$repository/.remote-build/scripts/sync.sh" >/dev/null
+kubectl_zrb exec -i "$pod" -- bash -lc "rm -rf $remote_directory && mkdir -p $remote_directory && cat >| $remote_directory/document.html" <"$document"
+# The files the document names with a relative path (pictures, stylesheets, fonts) go along, under the same paths.
+resources="$output/resources.txt"
+/usr/bin/python3 -I - "$document" >|"$resources" <<'PYTHON'
+import os
+import re
+import sys
+import urllib.parse
+
+document = sys.argv[1]
+base = os.path.dirname(document)
+text = open(document, encoding="utf-8", errors="replace").read()
+wanted = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".css", ".woff", ".woff2", ".ttf", ".otf"}
+found = set()
+pattern = re.compile(r"""(?:src|href|poster)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)""")
+
+
+def collect(source_text, directory):
+    for match in pattern.finditer(source_text):
+        reference = match.group(1) or match.group(2)
+        if re.match(r"^(?:[a-z][a-z0-9+.-]*:|//|#)", reference, re.I):
+            continue
+        path = os.path.normpath(os.path.join(directory, urllib.parse.unquote(reference.split("#")[0].split("?")[0])))
+        if path.startswith(base + os.sep) and os.path.isfile(path) and os.path.splitext(path)[1].lower() in wanted \
+                and os.path.getsize(path) <= 8_000_000 and path not in found:
+            found.add(path)
+            if path.lower().endswith(".css"):
+                collect(open(path, encoding="utf-8", errors="replace").read(), os.path.dirname(path))
+
+
+collect(text, base)
+print("\n".join(sorted(os.path.relpath(path, base) for path in found)[:400]))
+PYTHON
+if [[ -s "$resources" ]]; then
+  echo "    sending $(wc -l <"$resources") files the document refers to"
+  tar -C "$(dirname "$document")" -cf - -T "$resources" | kubectl_zrb exec -i "$pod" -- tar -xf - -C "$remote_directory"
+fi
+started="$("$repository/.remote-build/scripts/build.sh" parity "cd $ZRB_REMOTE_REPO_DIR && rm -f $remote_directory/engine.png && ZED_HTML_RENDER_DOCUMENT=$remote_directory/document.html ZED_HTML_RENDER_OUTPUT=$remote_directory/engine.png ZED_HTML_RENDER_WIDTH=$width ZED_HTML_RENDER_HEIGHT=$height ZED_REQUIRE_HTML_ENGINE=1 nice -n 10 cargo test --profile release-fast --features servo -p html_render --test render_document --jobs 4 2>&1 | grep -E \"^error|panicked|test result\"")"
+log="${started##*log=}"
+"$repository/.remote-build/scripts/wait-for-run.sh" "$log" >/dev/null
+kubectl_zrb exec "$pod" -- bash -lc "cat $log"
+
+size="$(kubectl_zrb exec "$pod" -- stat -c %s "$remote_directory/engine.png")"
+expected="$(kubectl_zrb exec "$pod" -- sha256sum "$remote_directory/engine.png" | cut -c1-64)"
+rm -f "$output/engine.png"
+chunk=600000
+for (( offset = 0; offset * chunk < size; offset++ )); do
+  kubectl_zrb exec "$pod" -- bash -lc "dd if=$remote_directory/engine.png bs=$chunk skip=$offset count=1 2>/dev/null | base64 -w0" | base64 -d >>"$output/engine.png"
+done
+if [[ "$(sha256sum "$output/engine.png" | cut -c1-64)" != "$expected" ]]; then
+  echo "the picture was damaged on the way from the builder" >&2
+  exit 1
+fi
+kubectl_zrb exec "$pod" -- rm -rf "$remote_directory"
+
+echo "--- where they differ"
+/usr/bin/python3 -I - "$output" "${PARITY_BLOCK:-50}" "${PARITY_THRESHOLD:-35}" "${PARITY_ROWS:-25}" <<'PYTHON'
+import sys
+import numpy
+from PIL import Image
+
+output, block, threshold, rows = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+browser = Image.open(f"{output}/browser.png").convert("RGB")
+engine = Image.open(f"{output}/engine.png").convert("RGB")
+width = min(browser.width, engine.width)
+height = min(browser.height, engine.height)
+browser = browser.crop((0, 0, width, height))
+engine = engine.crop((0, 0, width, height))
+
+
+def block_means(image):
+    luma = numpy.asarray(image.convert("L"), dtype=numpy.float64)
+    rows_count, columns_count = height // block, width // block
+    luma = luma[: rows_count * block, : columns_count * block]
+    return luma.reshape(rows_count, block, columns_count, block).mean(axis=(1, 3))
+
+
+browser_means, engine_means = block_means(browser), block_means(engine)
+difference = numpy.abs(browser_means - engine_means)
+flagged = difference >= threshold
+total = difference.size
+print(f"{width}x{height}, {total} blocks of {block}px, {int(flagged.sum())} differ by {threshold:.0f} or more "
+      f"({100 * flagged.sum() / total:.1f} %), mean difference {difference.mean():.1f}")
+order = numpy.argsort(difference, axis=None)[::-1][:rows]
+print(f"{'x':>6} {'y':>6} {'browser':>8} {'engine':>7} {'diff':>6}")
+for flat in order:
+    row, column = divmod(int(flat), difference.shape[1])
+    if difference[row, column] < threshold:
+        break
+    print(f"{column * block:>6} {row * block:>6} {browser_means[row, column]:>8.0f} {engine_means[row, column]:>7.0f} {difference[row, column]:>6.0f}")
+
+heat = numpy.zeros((height, width, 3), dtype=numpy.uint8)
+heat[..., :] = 255
+for row in range(difference.shape[0]):
+    for column in range(difference.shape[1]):
+        if flagged[row, column]:
+            heat[row * block:(row + 1) * block, column * block:(column + 1) * block] = (255, 80, 80)
+sheet = Image.new("RGB", (width * 3, height), "white")
+sheet.paste(browser, (0, 0))
+sheet.paste(engine, (width, 0))
+blend = Image.blend(engine, Image.fromarray(heat), 0.45)
+sheet.paste(blend, (width * 2, 0))
+sheet.save(f"{output}/side-by-side.png")
+print(f"pictures: {output}/browser.png {output}/engine.png {output}/side-by-side.png")
+PYTHON

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <recording> [crop] [threshold]" >&2
+  echo "  crop       ffmpeg crop=W:H:X:Y of the area the page is drawn in (default: the middle quarter of the frame)" >&2
+  echo "  threshold  luma 0-255 from which a cell counts as white (default: 250); a frame is white only when every cell of an 8x8 grid over the crop is" >&2
+  exit 2
+fi
+
+recording="$1"
+crop="${2:-iw/2:ih/2:iw/4:ih/4}"
+threshold="${3:-250}"
+
+for needed in ffmpeg ffprobe /usr/bin/python3; do
+  if ! command -v "$needed" >/dev/null 2>&1; then
+    echo "missing: $needed" >&2
+    exit 1
+  fi
+done
+if [[ ! -f "$recording" ]]; then
+  echo "no such recording: $recording" >&2
+  exit 1
+fi
+
+frame_rate="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$recording")"
+
+# 64 bytes per frame: the mean luma of each cell of an 8x8 grid over the cropped area.
+# A page that merely has a white region is not a flash; a flash is white in every cell.
+timeout 600 nice -n 10 ffmpeg -v error -nostdin -threads 4 -i "$recording" \
+  -vf "crop=${crop},scale=8:8:flags=area,format=gray" -f rawvideo -pix_fmt gray - |
+  /usr/bin/python3 -I -c '
+import sys
+from fractions import Fraction
+
+rate = Fraction(sys.argv[1])
+threshold = int(sys.argv[2])
+cells = 64
+raw = sys.stdin.buffer.read()
+lumas = [min(raw[at:at + cells]) for at in range(0, len(raw) - cells + 1, cells)]
+frame_ms = float(1000 / rate)
+
+if not lumas:
+    sys.exit("no frames were read from the recording")
+
+runs = []
+start = None
+for index, luma in enumerate(lumas):
+    if luma >= threshold and start is None:
+        start = index
+    elif luma < threshold and start is not None:
+        runs.append((start, index - start))
+        start = None
+if start is not None:
+    runs.append((start, len(lumas) - start))
+
+print(f"{len(lumas)} frames at {float(rate):.2f} fps ({len(lumas) / float(rate):.1f} s), every cell white from luma {threshold}")
+for start, length in runs:
+    print(f"  white at {start / float(rate):7.2f} s for {length} frame(s), about {length * frame_ms:.0f} ms")
+print(f"white runs: {len(runs)}")
+' "$frame_rate" "$threshold"
