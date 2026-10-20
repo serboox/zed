@@ -5,8 +5,8 @@
 // getBoundingClientRect() gives zeroes. Element geometry, on the other hand,
 // works.
 //
-// So every word is wrapped in a span once, on the first drag, and those spans
-// are what the pointer is matched against; the character within a word comes
+// So every word is wrapped in an element once, on the first drag, and those
+// elements are what the pointer is matched against; the character within a word comes
 // from interpolating across the word's own box. The highlight is drawn as
 // translucent boxes in an overlay, so the page's text is never restyled, and the
 // selected string is handed to the editor through __zedSelection.text().
@@ -48,9 +48,11 @@
     }
   }
 
-  // Every word gets a span of its own, so that there is something with a
+  // Every word gets an element of its own, so that there is something with a
   // measurable box for each run of text. Whitespace is left as it was, so the
-  // page's own layout does not shift.
+  // page's own layout does not shift. The element is not a span: a page's rules
+  // about spans (`.card span { font-size: 13px }` is common) would restyle every
+  // word of text they were never written for.
   function wrapWords() {
     if (words) {
       return words;
@@ -90,7 +92,7 @@
           replacement.appendChild(document.createTextNode(piece));
           continue;
         }
-        var span = document.createElement("span");
+        var span = document.createElement("zed-selection-word");
         span.setAttribute("data-zed-selection", "word");
         span.textContent = piece;
         replacement.appendChild(span);
