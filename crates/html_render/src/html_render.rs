@@ -258,6 +258,10 @@ mod engine {
         preferences.layout_writing_mode_enabled = true;
         preferences.layout_variable_fonts_enabled = true;
         preferences.layout_css_attr_enabled = true;
+        // `counter-reset` and `counter-increment` are among the properties the engine
+        // only reads with this on, and a page that numbers its headings or steps
+        // with them would otherwise get no numbers.
+        preferences.layout_unimplemented = true;
         // What the page is told it is talking to. Servo's own string says Servo
         // as well as Firefox, and a good many sites read that and serve
         // something older or refuse outright; this is the string Firefox's own

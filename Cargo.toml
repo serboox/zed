@@ -50,6 +50,7 @@ members = [
     "crates/copilot_chat",
     "crates/crashes",
     "crates/credentials_provider",
+    "crates/css_counters",
     "crates/dap",
     "crates/dap_adapters",
     "crates/db",
@@ -300,7 +301,13 @@ default-members = ["crates/zed"]
 # The collaboration server is built on its own. Nothing in the editor depends on
 # it, and its ORM pins an older sqlite binding than the rest of the tree now
 # links -- only one package in a graph may bind the native sqlite library.
-exclude = ["crates/collab", "vendor/notify", "vendor/servo-net"]
+exclude = [
+    "crates/collab",
+    "vendor/notify",
+    "vendor/servo-layout",
+    "vendor/servo-net",
+    "vendor/servo-script",
+]
 
 [workspace.package]
 publish = false
@@ -1159,6 +1166,10 @@ servo-net = { path = "vendor/servo-net" }
 # `vendor/servo-script` is servo-script 0.4.0 with one change: an inline <svg> is handed the text of
 # the page's own `<style>` elements, so that a page can style its drawings with a stylesheet.
 servo-script = { path = "vendor/servo-script" }
+# `vendor/servo-layout` is servo-layout 0.4.0 with CSS counters: `counter-reset`,
+# `counter-increment`, `counter()` and `counters()` in `content`, and the numbers of an ordered list, which
+# the engine writes as 0 for every item.
+servo-layout = { path = "vendor/servo-layout" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 

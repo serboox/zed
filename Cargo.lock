@@ -5556,6 +5556,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "css_counters"
+version = "0.1.0"
+
+[[package]]
 name = "cssparser"
 version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22593,13 +22597,12 @@ dependencies = [
 [[package]]
 name = "servo-layout"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0f0bd04025788e478c48c190ebb4587af1047bac4768e563e522ae4171bf4e5"
 dependencies = [
  "accesskit",
  "app_units",
  "atomic_refcell",
  "bitflags 2.13.1",
+ "css_counters",
  "data-url",
  "euclid",
  "icu_locid",
