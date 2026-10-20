@@ -299,13 +299,30 @@ impl GpuSurface {
     /// more than insisting on the fastest one.
     pub(crate) fn new(size: PhysicalSize<u32>) -> Result<Self, Error> {
         let connection = Connection::new()?;
-        let candidates: [(&str, fn(&Connection) -> Result<Adapter, Error>); 3] = [
-            ("the graphics card", Connection::create_hardware_adapter),
-            ("the default adapter", Connection::create_adapter),
-            ("a software rasterizer", Connection::create_software_adapter),
+        let _environment = GlEnvironment::capture();
+        // The card the window draws on comes first: it is the only one a buffer
+        // can be shared with, and asking for the "high performance" one sets
+        // DRI_PRIME for the whole process, after which a page opened later can
+        // land on a software rasterizer that is called the graphics card.
+        let candidates: [(&str, bool, fn(&Connection) -> Result<Adapter, Error>); 3] = [
+            (
+                "the graphics card",
+                false,
+                Connection::create_low_power_adapter,
+            ),
+            (
+                "the high-performance graphics card",
+                false,
+                Connection::create_hardware_adapter,
+            ),
+            (
+                "a software rasterizer",
+                true,
+                Connection::create_software_adapter,
+            ),
         ];
         let mut last = Error::Failed;
-        for (what, choose) in candidates {
+        for (what, software_is_fine, choose) in candidates {
             let adapter = match choose(&connection) {
                 Ok(adapter) => adapter,
                 Err(error) => {
@@ -316,7 +333,25 @@ impl GpuSurface {
             };
             match Self::build(&connection, &adapter, size) {
                 Ok(surface) => {
-                    log::info!("the HTML engine draws on {what}");
+                    let renderer = surface.renderer_name();
+                    let software = is_software_renderer(&renderer);
+                    if software && !software_is_fine {
+                        log::warn!(
+                            "{what} turned out to be a software rasterizer ({renderer}), \
+                             so the next one is tried"
+                        );
+                        last = Error::Failed;
+                        continue;
+                    }
+                    if software {
+                        // A processor writing into memory the window reads is not
+                        // ordered by anything the window can wait on, and it is
+                        // slow enough for the window to see a frame half drawn.
+                        #[cfg(any(target_os = "linux", target_os = "windows"))]
+                        surface.cannot_share.set(true);
+                        log::info!("frames of a software rasterizer are copied to the window");
+                    }
+                    log::info!("the HTML engine draws on {what}: {renderer}");
                     return Ok(surface);
                 }
                 Err(error) => {
@@ -326,6 +361,10 @@ impl GpuSurface {
             }
         }
         Err(last)
+    }
+
+    fn renderer_name(&self) -> String {
+        self.gleam_gl.get_string(gleam::gl::RENDERER)
     }
 
     fn build(
@@ -1021,5 +1060,104 @@ mod nothing {
         }
 
         pub(crate) fn discard(&self, _buffer: &SharedBuffer) {}
+    }
+}
+
+/// The two variables surfman sets for the whole process each time it makes a
+/// context -- which card to use, and whether to use none -- and never puts back.
+/// Left set, the software rasterizer chosen once for one page is chosen again for
+/// every page after it.
+struct GlEnvironment {
+    software: Option<std::ffi::OsString>,
+    prime: Option<std::ffi::OsString>,
+}
+
+impl GlEnvironment {
+    const SOFTWARE: &'static str = "LIBGL_ALWAYS_SOFTWARE";
+    const PRIME: &'static str = "DRI_PRIME";
+
+    fn capture() -> Self {
+        Self {
+            software: std::env::var_os(Self::SOFTWARE),
+            prime: std::env::var_os(Self::PRIME),
+        }
+    }
+
+    fn restore(name: &str, value: &Option<std::ffi::OsString>) {
+        // The environment is process-wide and surfman rewrites it from this thread
+        // in the same way; nothing here is any more racy than that.
+        #[allow(unsafe_code)]
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+impl Drop for GlEnvironment {
+    fn drop(&mut self) {
+        Self::restore(Self::SOFTWARE, &self.software);
+        Self::restore(Self::PRIME, &self.prime);
+    }
+}
+
+/// Whether the name OpenGL gives its renderer is that of a rasterizer that runs
+/// on the processor.
+fn is_software_renderer(renderer: &str) -> bool {
+    let renderer = renderer.to_ascii_lowercase();
+    ["llvmpipe", "softpipe", "swrast", "software"]
+        .iter()
+        .any(|software| renderer.contains(software))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GlEnvironment, is_software_renderer};
+
+    #[test]
+    fn a_rasterizer_that_runs_on_the_processor_is_recognised_by_its_name() {
+        assert!(is_software_renderer("llvmpipe (LLVM 21.1.8, 256 bits)"));
+        assert!(is_software_renderer("softpipe"));
+        assert!(is_software_renderer("Software Rasterizer"));
+        assert!(is_software_renderer("Mesa swrast"));
+    }
+
+    #[test]
+    fn a_graphics_card_is_not_taken_for_one() {
+        assert!(!is_software_renderer(
+            "Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2)"
+        ));
+        assert!(!is_software_renderer(
+            "NVIDIA GeForce RTX 3050 Ti Laptop GPU/PCIe/SSE2"
+        ));
+        assert!(!is_software_renderer(
+            "AMD Radeon Graphics (radeonsi, renoir)"
+        ));
+    }
+
+    #[test]
+    fn what_surfman_sets_for_one_page_is_put_back_for_the_next() {
+        let before = (
+            std::env::var_os(GlEnvironment::SOFTWARE),
+            std::env::var_os(GlEnvironment::PRIME),
+        );
+        {
+            let _environment = GlEnvironment::capture();
+            // SAFETY: the only test in this process that touches the environment.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var(GlEnvironment::SOFTWARE, "1");
+                std::env::set_var(GlEnvironment::PRIME, "1");
+            }
+        }
+        assert_eq!(
+            (
+                std::env::var_os(GlEnvironment::SOFTWARE),
+                std::env::var_os(GlEnvironment::PRIME)
+            ),
+            before
+        );
     }
 }

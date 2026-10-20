@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <document.html> [ticks] [KEY=VALUE ...]" >&2
+  echo "KEY=VALUE pairs are added to the editor's environment, for example ZED_HTML_PAGE_SHARING=0" >&2
+  exit 2
+fi
+
+document="$(realpath "$1")"
+ticks="${2:-600}"
+shift $(( $# >= 2 ? 2 : 1 ))
+zed_binary="${ZED_BINARY:-$HOME/.local/lib/zed-fast/zed}"
+wait_seconds="${FLASH_WAIT_SECONDS:-150}"
+width_height="${FLASH_MONITOR:-1800x1000}"
+
+for needed in mutter dbus-run-session "$zed_binary"; do
+  if ! command -v "$needed" >/dev/null 2>&1 && [[ ! -x "$needed" ]]; then
+    echo "missing: $needed" >&2
+    exit 1
+  fi
+done
+
+scratch="$(mktemp -d /tmp/zed-flash-selftest.XXXXXX)"
+cleanup() {
+  rm -rf -- "${scratch:?}"
+}
+trap cleanup EXIT
+mkdir -p "$scratch/home/.config/zed" "$scratch/project"
+cp "$document" "$scratch/project/page.html"
+if [[ -n "${FLASH_SECOND_DOCUMENT:-}" ]]; then
+  cp "$FLASH_SECOND_DOCUMENT" "$scratch/project/second.html"
+fi
+cat >| "$scratch/home/.config/zed/settings.json" <<'JSON'
+{
+  "session": { "trust_all_worktrees": true },
+  "telemetry": { "diagnostics": false, "metrics": false },
+  "auto_update": false
+}
+JSON
+
+extra_environment=("$@")
+inner="$scratch/inner.sh"
+cat >| "$inner" <<'INNER'
+#!/usr/bin/env bash
+set -uo pipefail
+scratch="$1"; zed_binary="$2"; ticks="$3"; wait_seconds="$4"; monitor="$5"; shift 5
+display="wayland-flash-$$"
+mutter --headless --wayland --no-x11 --virtual-monitor "$monitor" --wayland-display "$display" \
+  >"$scratch/mutter.log" 2>&1 &
+mutter_pid=$!
+trap 'kill "${zed_pid:-}" "$mutter_pid" 2>/dev/null; wait 2>/dev/null' EXIT
+for _ in $(seq 1 50); do
+  [[ -S "$XDG_RUNTIME_DIR/$display" ]] && break
+  sleep 0.2
+done
+if [[ ! -S "$XDG_RUNTIME_DIR/$display" ]]; then
+  echo "the headless compositor did not start:" >&2
+  tail -5 "$scratch/mutter.log" >&2
+  exit 1
+fi
+open_files=("$scratch/project/page.html")
+if [[ -f "$scratch/project/second.html" ]]; then
+  open_files+=("$scratch/project/second.html")
+fi
+env -u DISPLAY -u XDG_SESSION_TYPE WAYLAND_DISPLAY="$display" HOME="$scratch/home" \
+  ZED_HTML_FLASH_PROBE=1 ZED_HTML_FLASH_SELFTEST="$ticks" "$@" \
+  "$zed_binary" "$scratch/project" "${open_files[@]}" \
+  >"$scratch/zed.out" 2>&1 &
+zed_pid=$!
+log="$scratch/home/.local/share/zed/logs/Zed.log"
+for _ in $(seq 1 "$wait_seconds"); do
+  if [[ -f "$log" ]] && grep -q "flash selftest:" "$log"; then
+    break
+  fi
+  if ! kill -0 "$zed_pid" 2>/dev/null; then
+    echo "the editor exited early" >&2
+    break
+  fi
+  sleep 1
+done
+echo "--- what the engine said about drawing and sharing"
+grep -E "HTML engine draws on|handed to the window|frames are copied|frame sharing|will not draw|no longer lent|Running on" "$log" 2>/dev/null | cut -c1-220 || true
+echo "--- the probe"
+grep -E "flash selftest|white from edge to edge" "$log" 2>/dev/null | cut -c1-260 | tail -25 || true
+INNER
+chmod +x "$inner"
+
+timeout "$(( wait_seconds + 60 ))" dbus-run-session -- "$inner" "$scratch" "$zed_binary" "$ticks" "$wait_seconds" "$width_height" "${extra_environment[@]}"
