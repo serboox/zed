@@ -4,6 +4,7 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <document.html> [ticks] [KEY=VALUE ...]" >&2
   echo "KEY=VALUE pairs are added to the editor's environment, for example ZED_HTML_PAGE_SHARING=0" >&2
+  echo "FLASH_CAPTURE=1 also records what the compositor shows of the window and counts its white frames" >&2
   exit 2
 fi
 
@@ -14,7 +15,15 @@ zed_binary="${ZED_BINARY:-$HOME/.local/lib/zed-fast/zed}"
 wait_seconds="${FLASH_WAIT_SECONDS:-150}"
 width_height="${FLASH_MONITOR:-1800x1000}"
 
-for needed in mutter dbus-run-session "$zed_binary"; do
+needed_tools=(mutter dbus-run-session "$zed_binary")
+if [[ "${FLASH_CAPTURE:-}" == 1 ]]; then
+  needed_tools+=(pipewire wireplumber gst-launch-1.0 bc)
+  if ! /usr/bin/python3 -I -c "import dbus, gi, numpy, PIL" 2>/dev/null; then
+    echo "missing: python modules dbus, gi, numpy and PIL for FLASH_CAPTURE=1" >&2
+    exit 1
+  fi
+fi
+for needed in "${needed_tools[@]}"; do
   if ! command -v "$needed" >/dev/null 2>&1 && [[ ! -x "$needed" ]]; then
     echo "missing: $needed" >&2
     exit 1
@@ -46,10 +55,42 @@ cat >| "$inner" <<'INNER'
 set -uo pipefail
 scratch="$1"; zed_binary="$2"; ticks="$3"; wait_seconds="$4"; monitor="$5"; shift 5
 display="wayland-flash-$$"
+capture=""
+if [[ "${FLASH_CAPTURE:-}" == 1 ]]; then
+  capture=1
+fi
+if [[ -n "$capture" ]]; then
+  export PIPEWIRE_RUNTIME_DIR="$scratch/pipewire"
+  mkdir -p "$PIPEWIRE_RUNTIME_DIR"
+  chmod 700 "$PIPEWIRE_RUNTIME_DIR"
+  pipewire >"$scratch/pipewire.log" 2>&1 &
+  pipewire_pid=$!
+  for _ in $(seq 1 50); do
+    [[ -S "$PIPEWIRE_RUNTIME_DIR/pipewire-0" ]] && break
+    sleep 0.2
+  done
+  # A session manager has to link the compositor's stream to the recorder, and it is kept
+  # away from every device of the machine.
+  mkdir -p "$scratch/wireplumber-config/wireplumber/wireplumber.conf.d"
+  cat >| "$scratch/wireplumber-config/wireplumber/wireplumber.conf.d/10-no-devices.conf" <<'CONF'
+wireplumber.profiles = {
+  main = {
+    monitor.bluez = disabled
+    monitor.libcamera = disabled
+    monitor.v4l2 = disabled
+    monitor.alsa = disabled
+    monitor.alsa-midi = disabled
+  }
+}
+CONF
+  XDG_CONFIG_HOME="$scratch/wireplumber-config" wireplumber >"$scratch/wireplumber.log" 2>&1 &
+  wireplumber_pid=$!
+  sleep 2
+fi
 mutter --headless --wayland --no-x11 --virtual-monitor "$monitor" --wayland-display "$display" \
   >"$scratch/mutter.log" 2>&1 &
 mutter_pid=$!
-trap 'kill "${zed_pid:-}" "$mutter_pid" 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'kill "${zed_pid:-}" "${recorder_pid:-}" "$mutter_pid" "${wireplumber_pid:-}" "${pipewire_pid:-}" 2>/dev/null; wait 2>/dev/null' EXIT
 for _ in $(seq 1 50); do
   [[ -S "$XDG_RUNTIME_DIR/$display" ]] && break
   sleep 0.2
@@ -58,6 +99,17 @@ if [[ ! -S "$XDG_RUNTIME_DIR/$display" ]]; then
   echo "the headless compositor did not start:" >&2
   tail -5 "$scratch/mutter.log" >&2
   exit 1
+fi
+if [[ -n "$capture" ]]; then
+  mkdir -p "$scratch/frames"
+  /usr/bin/python3 -I "$scratch/record.py" "${monitor%x*}" "${monitor#*x}" "$scratch/frames" \
+    >"$scratch/record.log" 2>&1 &
+  recorder_pid=$!
+  for _ in $(seq 1 50); do
+    [[ -f "$scratch/frames/.recording" ]] && break
+    sleep 0.2
+  done
+  recording_started="$(date +%s.%N)"
 fi
 open_files=("$scratch/project/page.html")
 if [[ -f "$scratch/project/second.html" ]]; then
@@ -68,6 +120,7 @@ env -u DISPLAY -u XDG_SESSION_TYPE WAYLAND_DISPLAY="$display" HOME="$scratch/hom
   "$zed_binary" "$scratch/project" "${open_files[@]}" \
   >"$scratch/zed.out" 2>&1 &
 zed_pid=$!
+zed_started="$(date +%s.%N)"
 log="$scratch/home/.local/share/zed/logs/Zed.log"
 for _ in $(seq 1 "$wait_seconds"); do
   if [[ -f "$log" ]] && grep -q "flash selftest:" "$log"; then
@@ -83,7 +136,114 @@ echo "--- what the engine said about drawing and sharing"
 grep -E "HTML engine draws on|handed to the window|frames are copied|frame sharing|will not draw|no longer lent|Running on" "$log" 2>/dev/null | cut -c1-220 || true
 echo "--- the probe"
 grep -E "flash selftest|white from edge to edge" "$log" 2>/dev/null | cut -c1-260 | tail -25 || true
+if [[ -n "$capture" ]]; then
+  kill -TERM "$recorder_pid" 2>/dev/null
+  wait "$recorder_pid" 2>/dev/null
+  echo "--- what the compositor showed of the window"
+  /usr/bin/python3 -I "$scratch/analyze.py" "$scratch/frames" "$(echo "$zed_started - $recording_started" | bc -l)" 2>&1 | tail -30 || true
+  if [[ -z "$(ls "$scratch/frames" 2>/dev/null | grep -m1 jpg)" ]]; then
+    echo "--- no frames were recorded; the recorder said:"
+    tail -8 "$scratch/record.log" 2>/dev/null
+    tail -4 "$scratch/pipewire.log" 2>/dev/null
+    capture_failed=1
+  fi
+  if [[ -n "${FLASH_KEEP_FRAMES:-}" ]]; then
+    mkdir -p "$FLASH_KEEP_FRAMES"
+    cp -f "$scratch"/frames/*.jpg "$FLASH_KEEP_FRAMES"/ 2>/dev/null || true
+  fi
+  if [[ -n "${capture_failed:-}" ]]; then
+    exit 3
+  fi
+fi
 INNER
 chmod +x "$inner"
+
+cat >| "$scratch/record.py" <<'RECORD'
+import os
+import signal
+import subprocess
+import sys
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+width, height, frames = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+name = "org.gnome.Mutter.ScreenCast"
+screencast = dbus.Interface(bus.get_object(name, "/org/gnome/Mutter/ScreenCast"), name)
+session_path = screencast.CreateSession({})
+session = dbus.Interface(bus.get_object(name, session_path), name + ".Session")
+stream_path = session.RecordArea(0, 0, width, height, {"cursor-mode": dbus.UInt32(0)})
+recorder = None
+
+
+def stream_added(node_id):
+    global recorder
+    recorder = subprocess.Popen([
+        "gst-launch-1.0", "-q", "pipewiresrc", f"path={int(node_id)}", "do-timestamp=true",
+        "!", "videoconvert", "!", "videorate", "!", "video/x-raw,framerate=30/1",
+        "!", "jpegenc", "quality=70", "!", "multifilesink", f"location={frames}/f%05d.jpg",
+    ])
+    open(os.path.join(frames, ".recording"), "w").write("ok")
+
+
+bus.add_signal_receiver(stream_added, signal_name="PipeWireStreamAdded",
+                        dbus_interface=name + ".Stream", path=stream_path)
+session.Start()
+loop = GLib.MainLoop()
+
+
+def stop(*_):
+    if recorder is not None:
+        recorder.send_signal(signal.SIGINT)
+        try:
+            recorder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            recorder.kill()
+    try:
+        session.Stop()
+    except dbus.DBusException:
+        pass
+    loop.quit()
+
+
+signal.signal(signal.SIGTERM, stop)
+GLib.timeout_add(100, lambda: True)
+loop.run()
+RECORD
+
+cat >| "$scratch/analyze.py" <<'ANALYZE'
+import glob
+import sys
+
+import numpy
+from PIL import Image
+
+frames_directory, zed_offset = sys.argv[1], float(sys.argv[2])
+rate = 30.0
+paths = sorted(glob.glob(f"{frames_directory}/f*.jpg"))
+white = []
+for path in paths:
+    luma = numpy.asarray(Image.open(path).convert("L").resize((8, 8), Image.BOX), dtype=numpy.uint8)
+    white.append(int(luma.min()) >= 250)
+
+runs = []
+start = None
+for index, is_white in enumerate(white):
+    if is_white and start is None:
+        start = index
+    elif not is_white and start is not None:
+        runs.append((start, index - start))
+        start = None
+if start is not None:
+    runs.append((start, len(white) - start))
+
+print(f"{len(paths)} frames at {rate:.0f} fps ({len(paths) / rate:.1f} s), editor started at {zed_offset:.1f} s")
+for first, length in runs:
+    print(f"  white window at {first / rate - zed_offset:7.2f} s after the editor started, for {length} frame(s), about {length * 1000 / rate:.0f} ms")
+print(f"white runs: {len(runs)}")
+ANALYZE
 
 timeout "$(( wait_seconds + 60 ))" dbus-run-session -- "$inner" "$scratch" "$zed_binary" "$ticks" "$wait_seconds" "$width_height" "${extra_environment[@]}"
