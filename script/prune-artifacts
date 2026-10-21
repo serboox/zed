@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Deletes the workflow artifacts of a repository except those of its newest builds.
+#
+# GitHub counts every artifact against the repository's storage quota, and a
+# build of all three platforms leaves about a gigabyte and a half. A run is one
+# set: the artifacts it uploaded are kept or deleted together.
+#
+# Usage: script/prune-artifacts <owner/repo> [builds-to-keep] [bundle-prefix]
+#
+#   builds-to-keep  how many of the newest builds keep their artifacts; 2 by default
+#   bundle-prefix   what the name of an artifact starts with when it is a build's
+#                   product; without it every run with an artifact is a build.
+#                   A failed run leaves only logs, and a log is not a build to
+#                   keep in place of the last good one.
+#
+# What is newer than the oldest build kept is never deleted, and neither is
+# anything a run that is still going has uploaded.
+#
+# Needs `gh` with a token that may delete artifacts (`actions: write`).
+# DRY_RUN=1 only prints what would be deleted. PRUNE_ARTIFACTS_LISTING names a
+# file holding the JSON the listing step would have produced, and
+# PRUNE_ARTIFACTS_ACTIVE_RUNS a JSON array of the ids of runs still going, so
+# the choice of what to delete can be checked without a repository.
+set -euo pipefail
+
+repository="${1:?usage: script/prune-artifacts <owner/repo> [builds-to-keep] [bundle-prefix]}"
+keep="${2:-2}"
+bundle_prefix="${3:-}"
+case "$keep" in
+  '' | *[!0-9]* | 0) echo "builds-to-keep must be a number above zero, not '$keep'" >&2; exit 2 ;;
+esac
+
+if [ -n "${PRUNE_ARTIFACTS_LISTING:-}" ]; then
+  listing="$(cat "$PRUNE_ARTIFACTS_LISTING")"
+  active_runs="${PRUNE_ARTIFACTS_ACTIVE_RUNS:-[]}"
+else
+  active_runs="$(for status in queued in_progress; do
+    gh api --paginate "repos/$repository/actions/runs?status=$status&per_page=100" --jq '.workflow_runs[].id'
+  done | jq -s '.')"
+  listing="$(gh api --paginate "repos/$repository/actions/artifacts?per_page=100" \
+    --jq '.artifacts[] | select(.expired | not) | {id, name, run: .workflow_run.id, created: .created_at}' |
+    jq -s '.')"
+fi
+
+doomed="$(echo "$listing" | jq -r --argjson keep "$keep" --arg prefix "$bundle_prefix" --argjson active "$active_runs" '
+  group_by(.run)
+  | map({
+      run: .[0].run,
+      ids: map(.id),
+      newest: (map(.created) | max),
+      is_build: (map(.name | startswith($prefix)) | any)
+    })
+  | . as $runs
+  | [$runs[] | select(.is_build)] | sort_by(.newest) | reverse as $builds
+  | if ($builds | length) < $keep then []
+    else $runs
+      | map(select(.newest < $builds[$keep - 1].newest and (.run as $run | $active | index($run) | not)))
+      | map(.ids[])
+    end
+  | .[]')"
+
+if [ -z "$doomed" ]; then
+  echo "nothing to delete: $(echo "$listing" | jq 'map(.run) | unique | length') run(s) with artifacts, $keep build(s) kept"
+  exit 0
+fi
+
+deleted=0
+failed=0
+for artifact_id in $doomed; do
+  if [ "${DRY_RUN:-}" = 1 ]; then
+    echo "would delete artifact $artifact_id"
+    deleted=$((deleted + 1))
+    continue
+  fi
+  if output="$(gh api -X DELETE "repos/$repository/actions/artifacts/$artifact_id" 2>&1 < /dev/null)"; then
+    deleted=$((deleted + 1))
+  elif echo "$output" | grep -q 'HTTP 404'; then
+    # Gone already, which is what was asked for.
+    deleted=$((deleted + 1))
+  else
+    failed=$((failed + 1))
+    echo "could not delete artifact $artifact_id: $output" >&2
+  fi
+done
+
+echo "artifacts deleted: $deleted, failed: $failed, builds kept: $keep"
+[ "$failed" -eq 0 ]

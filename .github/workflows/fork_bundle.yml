@@ -729,3 +729,27 @@ jobs:
         with:
           name: release-changes-draft
           path: draft-*.md
+
+  # Every build leaves about a gigabyte and a half of artifacts, and GitHub
+  # counts them against the repository's storage. The artifacts of the last two
+  # builds are kept and the rest are deleted. It waits for a run that did not
+  # fail, so a broken run never costs the last good build.
+  prune_artifacts:
+    name: Keep the artifacts of the last two builds only
+    needs: [plan, tests, linux, windows, macos, release]
+    if: >-
+      always() && !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && github.ref == 'refs/heads/personal_zed_fork'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: script/prune-artifacts
+          sparse-checkout-cone-mode: false
+      - run: script/prune-artifacts "$GITHUB_REPOSITORY" 2 zed-
+        env:
+          GH_TOKEN: ${{ github.token }}

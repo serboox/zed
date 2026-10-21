@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Checks which artifacts script/prune-artifacts would delete, from a made-up listing.
+set -euo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prune-artifacts"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+cat > "$work/listing.json" <<'JSON'
+[
+  {"id": 11, "name": "zed-linux", "run": 100, "created": "2026-01-01T10:00:00Z"},
+  {"id": 12, "name": "zed-windows", "run": 100, "created": "2026-01-01T10:05:00Z"},
+  {"id": 21, "name": "zed-linux", "run": 200, "created": "2026-01-08T10:00:00Z"},
+  {"id": 22, "name": "zed-windows", "run": 200, "created": "2026-01-08T10:07:00Z"},
+  {"id": 23, "name": "release-changes-draft", "run": 200, "created": "2026-01-08T10:09:00Z"},
+  {"id": 31, "name": "zed-linux", "run": 300, "created": "2026-01-15T10:00:00Z"},
+  {"id": 41, "name": "zed-linux", "run": 400, "created": "2026-01-22T10:00:00Z"},
+  {"id": 42, "name": "zed-windows", "run": 400, "created": "2026-01-22T10:02:00Z"}
+]
+JSON
+export PRUNE_ARTIFACTS_LISTING="$work/listing.json"
+export DRY_RUN=1
+
+doomed() { "$script" example/repo "$@" | sed -n 's/^would delete artifact //p' | sort -n | tr '\n' ' '; }
+
+# The two newest runs keep all of their artifacts, whatever order the listing is in.
+[ "$(doomed)" = "11 12 21 22 23 " ] || fail "default keeps runs 400 and 300 and deletes the rest: $(doomed)"
+[ "$(doomed 2)" = "11 12 21 22 23 " ] || fail "two runs kept: $(doomed 2)"
+
+# A run is kept or deleted as a whole.
+[ "$(doomed 1)" = "11 12 21 22 23 31 " ] || fail "one run kept: $(doomed 1)"
+[ "$(doomed 3)" = "11 12 " ] || fail "three runs kept: $(doomed 3)"
+
+# A run that is still going keeps what it has uploaded, however old that is.
+[ "$(PRUNE_ARTIFACTS_ACTIVE_RUNS='[100]' doomed)" = "21 22 23 " ] || fail "an active run is not deleted from: $(PRUNE_ARTIFACTS_ACTIVE_RUNS='[100]' doomed)"
+# ...but it still counts as a build: the two newest are the same with or without it.
+[ "$(PRUNE_ARTIFACTS_ACTIVE_RUNS='[400]' doomed)" = "11 12 21 22 23 " ] || fail "the newest run, active, still ranks first: $(PRUNE_ARTIFACTS_ACTIVE_RUNS='[400]' doomed)"
+
+# Exactly as many runs as asked for leave nothing to delete, and so do fewer.
+[ -z "$(doomed 5)" ] || fail "five builds kept of four: $(doomed 5)"
+"$script" example/repo 9 | grep -q '^nothing to delete' || fail "nothing to delete is said"
+
+# An empty listing is not an error.
+echo '[]' > "$work/empty.json"
+PRUNE_ARTIFACTS_LISTING="$work/empty.json" "$script" example/repo | grep -q '^nothing to delete' || fail "an empty listing"
+
+# A count that is not a number above zero is refused before anything is listed.
+for bad in two 0 -1; do
+  if "$script" example/repo "$bad" > /dev/null 2>&1; then
+    fail "'$bad' for the number of builds is refused"
+  fi
+done
+
+# A failed run leaves a log and no bundle. It is not a build, so it does not push
+# the last good build out of the two that are kept.
+cat > "$work/failed.json" <<'JSON'
+[
+  {"id": 11, "name": "zed-linux", "run": 100, "created": "2026-01-01T10:00:00Z"},
+  {"id": 21, "name": "zed-linux", "run": 200, "created": "2026-01-08T10:00:00Z"},
+  {"id": 31, "name": "windows-window-test-log", "run": 300, "created": "2026-01-15T10:00:00Z"},
+  {"id": 41, "name": "zed-linux", "run": 400, "created": "2026-01-22T10:00:00Z"}
+]
+JSON
+failed="$(PRUNE_ARTIFACTS_LISTING="$work/failed.json" "$script" example/repo 2 zed- | sed -n 's/^would delete artifact //p' | sort -n | tr '\n' ' ')"
+[ "$failed" = "11 " ] || fail "the log of a failed run stays while it is newer than the oldest build kept, and run 200 is kept: $failed"
+without_prefix="$(PRUNE_ARTIFACTS_LISTING="$work/failed.json" "$script" example/repo 2 | sed -n 's/^would delete artifact //p' | sort -n | tr '\n' ' ')"
+[ "$without_prefix" = "11 21 " ] || fail "without a prefix the failed run counts as a build: $without_prefix"
+
+# Logs of a failed run that is older than the oldest build kept go with it.
+cat > "$work/old-failed.json" <<'JSON'
+[
+  {"id": 11, "name": "windows-window-test-log", "run": 100, "created": "2026-01-01T10:00:00Z"},
+  {"id": 21, "name": "zed-linux", "run": 200, "created": "2026-01-08T10:00:00Z"},
+  {"id": 41, "name": "zed-linux", "run": 400, "created": "2026-01-22T10:00:00Z"}
+]
+JSON
+old="$(PRUNE_ARTIFACTS_LISTING="$work/old-failed.json" "$script" example/repo 2 zed- | sed -n 's/^would delete artifact //p' | sort -n | tr '\n' ' ')"
+[ "$old" = "11 " ] || fail "an old failed run's log is deleted when two builds are kept: $old"
+
+echo "ok"
