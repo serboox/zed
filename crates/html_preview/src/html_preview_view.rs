@@ -209,6 +209,8 @@ pub struct HtmlPreviewView {
     scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
+    /// Where the document lives, for the address bar to read.
+    document_address: Option<url::Url>,
     pending_update_task: Option<Task<Result<()>>>,
     /// Where the page is painted, so a click can be told where it landed and a
     /// resize can be passed on to the engine.
@@ -576,6 +578,7 @@ impl HtmlPreviewView {
                 scroll_handle: ScrollHandle::new(),
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
+                document_address: None,
                 pending_update_task: None,
                 page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
                 context_menu: None,
@@ -713,6 +716,8 @@ impl HtmlPreviewView {
                 }
                 EditorEvent::FileHandleChanged => {
                     this.base_directory = Self::get_folder_for_active_editor(editor.read(cx), cx);
+                    this.document_address =
+                        Self::get_address_for_active_editor(editor.read(cx), cx);
                     this.update_preview_from_active_editor(false, window, cx);
                 }
                 _ => {}
@@ -720,6 +725,7 @@ impl HtmlPreviewView {
         );
 
         self.base_directory = Self::get_folder_for_active_editor(editor.read(cx), cx);
+        self.document_address = Self::get_address_for_active_editor(editor.read(cx), cx);
         self.active_editor = Some(EditorState {
             editor,
             _subscription: subscription,
@@ -964,7 +970,9 @@ impl HtmlPreviewView {
                     // Where the page has got to, in the bar. Only when the
                     // reader is not typing there: an address half typed is not
                     // to be taken away.
-                    let now_at = page.address().map(|address| address.to_string());
+                    let now_at = page
+                        .address_as(view.document_address.as_ref())
+                        .map(|address| address.to_string());
                     if now_at != view.showing_address
                         && !view.address.focus_handle(cx).contains_focused(window, cx)
                     {
@@ -1211,6 +1219,14 @@ impl HtmlPreviewView {
         _: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         root
+    }
+
+    /// The address of the file the editor holds, which is what the address bar reads
+    /// while the page is that document.
+    fn get_address_for_active_editor(editor: &Editor, cx: &App) -> Option<url::Url> {
+        let file = editor.file_at(MultiBufferOffset(0), cx)?;
+        let file = file.as_local()?;
+        url::Url::from_file_path(file.abs_path(cx)).ok()
     }
 
     fn get_folder_for_active_editor(editor: &Editor, cx: &App) -> Option<PathBuf> {

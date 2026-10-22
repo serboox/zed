@@ -21,12 +21,15 @@ mod pointer_pace;
 mod shared_buffer;
 #[cfg(all(feature = "servo", target_os = "windows"))]
 mod shared_texture;
+#[cfg(feature = "servo")]
+mod shown_address;
 
 #[cfg(feature = "servo")]
 mod engine {
     use crate::flash_probe::FlashProbe;
     use crate::gpu_surface::GpuSurface;
     use crate::pointer_pace::PointerPace;
+    use crate::shown_address::shown_address;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
     use std::rc::Rc;
@@ -574,6 +577,19 @@ mod engine {
         /// Where the page is now, as the engine has it.
         pub fn address(&self) -> Option<url::Url> {
             self.webview.url()
+        }
+
+        /// Where the page is now, as the reader should read it: a document of the
+        /// editor's own, which the engine loads from a temporary file, reads as
+        /// `shown_as`, the path it came from.
+        pub fn address_as(&self, shown_as: Option<&url::Url>) -> Option<url::Url> {
+            let current = self.webview.url()?;
+            let own: Vec<url::Url> = [self.document.as_ref(), self.previous.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|file| file.url().ok())
+                .collect();
+            shown_address(&current, &own, shown_as)
         }
 
         /// Whether there is anywhere to go back to, or forward to.
