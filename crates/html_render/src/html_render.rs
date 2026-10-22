@@ -15,6 +15,8 @@ mod dma_buf_export;
 mod flash_probe;
 #[cfg(feature = "servo")]
 mod gpu_surface;
+#[cfg(any(feature = "servo", test))]
+mod pointer_pace;
 #[cfg(all(feature = "servo", target_os = "linux"))]
 mod shared_buffer;
 #[cfg(all(feature = "servo", target_os = "windows"))]
@@ -24,6 +26,7 @@ mod shared_texture;
 mod engine {
     use crate::flash_probe::FlashProbe;
     use crate::gpu_surface::GpuSurface;
+    use crate::pointer_pace::PointerPace;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
     use std::rc::Rc;
@@ -324,6 +327,17 @@ mod engine {
         preferences
     }
 
+    /// How often the page is told where the pointer is. Each telling costs the engine
+    /// a search of the whole document for what is under it. An environment variable
+    /// of milliseconds wins, which is how the two are told apart when measuring.
+    fn pointer_interval() -> std::time::Duration {
+        let milliseconds = std::env::var("ZED_HTML_POINTER_INTERVAL_MS")
+            .ok()
+            .and_then(|milliseconds| milliseconds.parse::<u64>().ok())
+            .unwrap_or(40);
+        std::time::Duration::from_millis(milliseconds)
+    }
+
     /// One live page. Holds its own surface, so two previews never draw over one
     /// another, and hands out the latest frame the engine painted.
     pub struct HtmlPage {
@@ -356,6 +370,8 @@ mod engine {
         /// Set only when the environment asks for the preview to be checked for
         /// going blank while it scrolls.
         flash: Option<FlashProbe>,
+        /// Where the pointer is, held back to the pace the engine can keep.
+        pointer: RefCell<PointerPace<Point<Pixels>>>,
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
@@ -503,6 +519,7 @@ mod engine {
                 refused: false,
                 awaiting_the_card: std::cell::Cell::new(false),
                 flash,
+                pointer: RefCell::new(PointerPace::new(pointer_interval())),
                 frame: None,
                 document,
                 previous: None,
@@ -607,6 +624,10 @@ mod engine {
         /// Lets the engine run and picks up the newest frame it painted. Returns
         /// whether there is something new to show.
         pub fn pump(&mut self) -> bool {
+            let due = self.pointer.borrow_mut().due(std::time::Instant::now());
+            if let Some(point) = due {
+                self.tell_where_the_pointer_is(point);
+            }
             if let Some(flash) = self.flash.as_ref() {
                 flash.report_if_done(self.shared);
             }
@@ -816,7 +837,11 @@ mod engine {
                 // Again, in case the head went by without a turn of ours in
                 // between; the tools put themselves in only once.
                 self.evaluate(TOOLS_SHIM, |_| {});
-                self.evaluate(SELECTION_SHIM, |_| {});
+                // Left out when the environment says so, which is how the cost of the
+                // words it wraps is told apart when measuring.
+                if std::env::var_os("ZED_HTML_NO_SELECTION").is_none() {
+                    self.evaluate(SELECTION_SHIM, |_| {});
+                }
             }
         }
 
@@ -826,15 +851,42 @@ mod engine {
             self.delegate.link_for_new_tab.borrow_mut().take()
         }
 
+        /// The pointer has moved. The page hears of it at a pace it can keep, and
+        /// always of where the pointer ended up.
         pub fn mouse_moved(&self, point: Point<Pixels>) {
+            let told = self
+                .pointer
+                .borrow_mut()
+                .moved(point, std::time::Instant::now());
+            if let Some(point) = told {
+                self.tell_where_the_pointer_is(point);
+            }
+            self.engine.nudge();
+        }
+
+        fn tell_where_the_pointer_is(&self, point: Point<Pixels>) {
             self.webview
                 .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
                     self.device(point),
                 )));
-            self.engine.nudge();
+        }
+
+        /// What a click has to land on is where the pointer is, not where the page
+        /// last heard of it.
+        fn tell_where_the_pointer_is_now(&self) {
+            let held = self.pointer.borrow_mut().flush(std::time::Instant::now());
+            if let Some(point) = held {
+                self.tell_where_the_pointer_is(point);
+            }
+        }
+
+        /// How long until a pointer position that was held back is due, when one was.
+        pub fn pointer_due_in(&self) -> Option<std::time::Duration> {
+            self.pointer.borrow().due_in(std::time::Instant::now())
         }
 
         pub fn mouse_down(&self, point: Point<Pixels>, button: MouseButton) {
+            self.tell_where_the_pointer_is_now();
             self.webview
                 .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Down,
@@ -845,6 +897,7 @@ mod engine {
         }
 
         pub fn mouse_up(&self, point: Point<Pixels>, button: MouseButton) {
+            self.tell_where_the_pointer_is_now();
             self.webview
                 .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Up,

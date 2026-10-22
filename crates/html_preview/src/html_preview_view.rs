@@ -853,6 +853,8 @@ impl HtmlPreviewView {
             let mut turns_this_second = 0u32;
             let mut frames_this_second = 0u32;
             let mut said_at = std::time::Instant::now();
+            // How long until a pointer position held back from the page is due.
+            let mut pointer_due: Option<Duration> = None;
             // Set once a page has shown itself to be turning for nothing, and
             // cleared the moment it paints or the reader touches it.
             let mut only_spinning = false;
@@ -877,6 +879,7 @@ impl HtmlPreviewView {
                     (false, false, true) => UNSEEN_HEARTBEAT,
                     (false, false, false) => HEARTBEAT,
                 };
+                let heartbeat = wait_for_the_held_pointer(heartbeat, pointer_due);
                 // A page turning for nothing is left to the safety net, and its
                 // own asking is ignored until it paints something or the reader
                 // gives it something to do -- which reaches it at once, since
@@ -934,6 +937,7 @@ impl HtmlPreviewView {
                     arrived_this_second = false;
                     said_at = std::time::Instant::now();
                 }
+                let mut held_pointer = None;
                 let turn = view.update_in(cx, |view, window, cx| {
                     let out_of_sight = !view.on_screen;
                     let Some(page) = view.page.as_mut() else {
@@ -950,6 +954,7 @@ impl HtmlPreviewView {
                         page.resize(bounds.size, scale);
                     }
                     let painted = page.pump();
+                    held_pointer = page.pointer_due_in();
                     let drew = painted.then_some((bounds.size, scale));
                     let for_the_card = page.waiting_for_the_card();
                     let still_arriving = page.is_loading();
@@ -1072,6 +1077,7 @@ impl HtmlPreviewView {
                     }
                     Some((false, drew, for_the_card, still_arriving))
                 });
+                pointer_due = held_pointer;
                 match turn {
                     Ok(Some((out_of_sight, drew, for_the_card, still_arriving))) => {
                         unseen = out_of_sight;
@@ -2869,6 +2875,17 @@ fn worth_hurrying_the_arrival(arriving_for: Option<Duration>) -> bool {
     arriving_for.is_none_or(|arriving_for| arriving_for < HURRY_AN_ARRIVAL_FOR)
 }
 
+/// How long the driver may wait before turning the page again, given how long
+/// until a pointer position held back from the page is due. A position that waits
+/// for the safety net is a hover that arrives a quarter of a second late.
+#[cfg(feature = "servo")]
+fn wait_for_the_held_pointer(heartbeat: Duration, pointer_due: Option<Duration>) -> Duration {
+    match pointer_due {
+        Some(due) => heartbeat.min(due.max(Duration::from_millis(1))),
+        None => heartbeat,
+    }
+}
+
 /// Whether the page is being turned over and over for nothing. The engine asks
 /// to be turned whenever it thinks it has work; a page that asks many times in a
 /// second and paints not one frame has none, and turning it that often is a
@@ -3024,6 +3041,30 @@ mod how_often_the_page_is_asked {
             WHERE_THE_PAGE_STANDS > WHILE_THE_PAGE_MOVES,
             "a page at rest has not moved, and asking it as often as a moving one \
              is work for nothing"
+        );
+    }
+
+    #[test]
+    fn a_pointer_position_held_back_shortens_the_wait_for_it_and_only_for_it() {
+        assert_eq!(
+            wait_for_the_held_pointer(HEARTBEAT, None),
+            HEARTBEAT,
+            "with nothing held back the safety net is as long as it was"
+        );
+        assert_eq!(
+            wait_for_the_held_pointer(HEARTBEAT, Some(Duration::from_millis(12))),
+            Duration::from_millis(12),
+            "a position due in twelve milliseconds is not waited on for a quarter of a second"
+        );
+        assert_eq!(
+            wait_for_the_held_pointer(HEARTBEAT, Some(Duration::ZERO)),
+            Duration::from_millis(1),
+            "one that is due already is not turned for in a busy loop"
+        );
+        assert_eq!(
+            wait_for_the_held_pointer(Duration::from_millis(4), Some(Duration::from_secs(1))),
+            Duration::from_millis(4),
+            "and a position due later than the wait is not waited for any sooner"
         );
     }
 
