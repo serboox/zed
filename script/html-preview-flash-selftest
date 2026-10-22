@@ -6,10 +6,15 @@ if [[ $# -lt 1 ]]; then
   echo "KEY=VALUE pairs are added to the editor's environment, for example ZED_HTML_PAGE_SHARING=0" >&2
   echo "FLASH_CAPTURE=1 also records what the compositor shows of the window and counts its white frames" >&2
   echo "FLASH_SCALE=2 gives the virtual monitor a scale factor of 2, as a high-density screen has" >&2
+  echo "FLASH_KEEP_LOG=<file> keeps the editor's log of the run" >&2
+  echo "FLASH_TRACE=1 with FLASH_REAL_SCROLL samples what each thread of the editor does while it scrolls" >&2
+  echo "FLASH_PERF=Script#1,zed samples the named threads with perf while the pointer scrolls (needs a binary that has its symbol names)" >&2
+  echo "FLASH_REAL_SCROLL=steady|flick|notches scrolls with pointer events sent to the compositor, as a hand does, for FLASH_SCROLL_SECONDS (30) seconds, FLASH_SCROLL_PIXELS (8) pixels an event at 120 events a second, instead of the page scrolling itself" >&2
   exit 2
 fi
 
 document="$(realpath "$1")"
+export FLASH_TRACE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/html-preview-stall-trace"
 ticks="${2:-600}"
 shift $(( $# >= 2 ? 2 : 1 ))
 zed_binary="${ZED_BINARY:-$HOME/.local/lib/zed-fast/zed}"
@@ -122,27 +127,115 @@ open_files=("$scratch/project/page.html")
 if [[ -f "$scratch/project/second.html" ]]; then
   open_files+=("$scratch/project/second.html")
 fi
+selftest_environment=(ZED_HTML_FLASH_SELFTEST="$ticks")
+if [[ -n "${FLASH_REAL_SCROLL:-}" ]]; then
+  selftest_environment=()
+fi
 env -u DISPLAY -u XDG_SESSION_TYPE WAYLAND_DISPLAY="$display" HOME="$scratch/home" \
-  ZED_HTML_FLASH_PROBE=1 ZED_HTML_FLASH_SELFTEST="$ticks" "$@" \
+  ZED_HTML_FLASH_PROBE=1 "${selftest_environment[@]}" "$@" \
   "$zed_binary" "$scratch/project" "${open_files[@]}" \
   >"$scratch/zed.out" 2>&1 &
 zed_pid=$!
 zed_started="$(date +%s.%N)"
 log="$scratch/home/.local/share/zed/logs/Zed.log"
-for _ in $(seq 1 "$wait_seconds"); do
-  if [[ -f "$log" ]] && grep -q "flash selftest:" "$log"; then
-    break
+scroll_started=""
+scroll_ended=""
+if [[ -n "${FLASH_REAL_SCROLL:-}" ]]; then
+  for _ in $(seq 1 "$wait_seconds"); do
+    if [[ -f "$log" ]] && grep -q "handed to the window" "$log"; then
+      break
+    fi
+    if ! kill -0 "$zed_pid" 2>/dev/null; then
+      echo "the editor exited early" >&2
+      break
+    fi
+    sleep 1
+  done
+  sleep 5
+  logical_width="$(echo "${monitor%x*} / ${FLASH_SCALE:-1}" | bc)"
+  logical_height="$(echo "${monitor#*x} / ${FLASH_SCALE:-1}" | bc)"
+  scroll_started="$(date +%s.%N)"
+  trace_pid=""
+  perf_pids=()
+  if [[ -n "${FLASH_PERF:-}" ]]; then
+    # Which threads are sampled is a list of names, for example "Script#1,zed,WRRenderBackend".
+    for thread_name in ${FLASH_PERF//,/ }; do
+      thread_id=""
+      for task in /proc/"$zed_pid"/task/*; do
+        if [[ "$(cat "$task/comm" 2>/dev/null)" == "$thread_name" ]]; then
+          thread_id="$(basename "$task")"
+          break
+        fi
+      done
+      if [[ -n "$thread_id" ]]; then
+        perf record -q -F "${FLASH_PERF_RATE:-700}" --call-graph dwarf,16384 -t "$thread_id" \
+          -o "$scratch/perf-$thread_name.data" -- sleep "${FLASH_SCROLL_SECONDS:-30}" \
+          >"$scratch/perf-$thread_name.log" 2>&1 &
+        perf_pids+=($!)
+      else
+        echo "no thread called $thread_name to sample" >&2
+      fi
+    done
   fi
-  if ! kill -0 "$zed_pid" 2>/dev/null; then
-    echo "the editor exited early" >&2
-    break
+  if [[ "${FLASH_TRACE:-}" == 1 ]]; then
+    ZED_LOG="$log" bash "$FLASH_TRACE_SCRIPT" "${FLASH_SCROLL_SECONDS:-30}" "$zed_pid" >"$scratch/trace.out" 2>&1 &
+    trace_pid=$!
   fi
-  sleep 1
-done
+  /usr/bin/python3 -I "$scratch/scroll.py" "$FLASH_REAL_SCROLL" "${FLASH_SCROLL_SECONDS:-30}" \
+    "$logical_width" "$logical_height" "${FLASH_SCROLL_PIXELS:-8}" >"$scratch/scroll.log" 2>&1 \
+    || { echo "the pointer events were not sent:" >&2; tail -5 "$scratch/scroll.log" >&2; }
+  scroll_ended="$(date +%s.%N)"
+  if [[ -n "$trace_pid" ]]; then
+    wait "$trace_pid" 2>/dev/null || true
+  fi
+  for perf_pid in "${perf_pids[@]}"; do
+    wait "$perf_pid" 2>/dev/null || true
+  done
+  for data in "$scratch"/perf-*.data; do
+    [[ -f "$data" ]] || continue
+    thread_name="$(basename "$data" .data)"
+    echo "--- where ${thread_name#perf-} spent its time (self time, most first)" >>"$scratch/perf.out"
+    perf report -i "$data" --stdio --no-children -g none --sort symbol -F overhead,symbol 2>/dev/null \
+      | grep -v "^#" | grep -v "^$" | sed 's/^ *//' | sort -rn | head -"${FLASH_PERF_LINES:-40}" >>"$scratch/perf.out" || true
+    if [[ "${FLASH_PERF_CALLERS:-}" == 1 ]]; then
+      echo "--- and with the callers of the first few" >>"$scratch/perf.out"
+      perf report -i "$data" --stdio --children -g caller,0.5,callee --sort symbol 2>/dev/null \
+        | grep -v "^#" | grep -v "^$" | head -120 >>"$scratch/perf.out" || true
+    fi
+  done
+  sleep 2
+else
+  for _ in $(seq 1 "$wait_seconds"); do
+    if [[ -f "$log" ]] && grep -q "flash selftest:" "$log"; then
+      break
+    fi
+    if ! kill -0 "$zed_pid" 2>/dev/null; then
+      echo "the editor exited early" >&2
+      break
+    fi
+    sleep 1
+  done
+fi
 echo "--- what the engine said about drawing and sharing"
 grep -E "HTML engine draws on|handed to the window|frames are copied|frame sharing|will not draw|no longer lent|Running on" "$log" 2>/dev/null | cut -c1-220 || true
+if [[ -n "$scroll_started" ]]; then
+  echo "--- the pointer events"
+  tail -3 "$scratch/scroll.log" 2>/dev/null
+  echo "--- frames the engine painted each second while the pointer scrolled"
+  /usr/bin/python3 -I "$scratch/pace.py" "$log" "$scroll_started" "$scroll_ended" 2>&1 | tail -40 || true
+fi
+if [[ -s "$scratch/perf.out" ]]; then
+  cat "$scratch/perf.out"
+fi
+if [[ -n "$scroll_started" && -s "$scratch/trace.out" ]]; then
+  echo "--- what each thread of the editor did"
+  cat "$scratch/trace.out"
+fi
 echo "--- the probe"
 grep -E "flash selftest|white from edge to edge" "$log" 2>/dev/null | cut -c1-260 | tail -25 || true
+if [[ -n "${FLASH_KEEP_LOG:-}" ]]; then
+  command cp -f "$log" "$FLASH_KEEP_LOG" 2>/dev/null || true
+fi
 if [[ -n "$capture" ]]; then
   kill -TERM "$recorder_pid" 2>/dev/null
   wait "$recorder_pid" 2>/dev/null
@@ -251,6 +344,131 @@ signal.signal(signal.SIGTERM, stop)
 GLib.timeout_add(100, lambda: True)
 loop.run()
 RECORD
+
+cat >| "$scratch/scroll.py" <<'SCROLL'
+import math
+import sys
+import time
+
+import dbus
+
+pattern, seconds, width, height = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+pixels_per_event = float(sys.argv[5])
+VERTICAL = 0
+FINGER = 4
+FINISH = 1
+
+bus = dbus.SessionBus()
+name = "org.gnome.Mutter.RemoteDesktop"
+for _ in range(150):
+    if bus.name_has_owner(name):
+        break
+    time.sleep(0.2)
+remote = dbus.Interface(bus.get_object(name, "/org/gnome/Mutter/RemoteDesktop"), name)
+session = dbus.Interface(bus.get_object(name, remote.CreateSession()), name + ".Session")
+session.Start()
+session.NotifyPointerMotionRelative(-20000.0, -20000.0)
+session.NotifyPointerMotionRelative(width / 2, height / 2)
+# The window learns where the pointer is from its motion, so it is moved a little
+# before anything is scrolled.
+for jiggle in range(10):
+    session.NotifyPointerMotionRelative(3.0 if jiggle % 2 == 0 else -3.0, 2.0 if jiggle % 2 == 0 else -2.0)
+    time.sleep(0.1)
+time.sleep(1.0)
+
+rate = 120.0
+step = 1.0 / rate
+began = time.perf_counter()
+sent = 0.0
+
+
+def axis(pixels, flags=FINGER):
+    global sent
+    session.NotifyPointerAxis(0.0, float(pixels), dbus.UInt32(flags))
+    sent += pixels
+
+
+def at(moment):
+    wait = began + moment - time.perf_counter()
+    if wait > 0:
+        time.sleep(wait)
+
+
+if pattern == "steady":
+    tick = 0
+    while tick * step < seconds:
+        at(tick * step)
+        axis(pixels_per_event)
+        tick += 1
+elif pattern == "flick":
+    # A finger flick: a fast start that fades over a second and a half, then a pause.
+    tick = 0
+    while tick * step < seconds:
+        at(tick * step)
+        phase = (tick * step) % 3.0
+        if phase < 1.5:
+            axis(pixels_per_event * 9 * math.exp(-phase / 0.5))
+        tick += 1
+elif pattern == "notches":
+    # A wheel with notches: one every 90 ms.
+    tick = 0
+    while tick * 0.09 < seconds:
+        at(tick * 0.09)
+        session.NotifyPointerAxisDiscrete(dbus.UInt32(VERTICAL), dbus.Int32(1))
+        sent += 1
+        tick += 1
+else:
+    raise SystemExit("unknown pattern " + pattern)
+session.NotifyPointerAxis(0.0, 0.0, dbus.UInt32(FINISH | FINGER))
+print("pattern", pattern, "seconds", seconds, "events up to", round(sent), "units")
+session.Stop()
+SCROLL
+
+cat >| "$scratch/pace.py" <<'PACE'
+import re
+import sys
+from datetime import datetime
+
+log_path, started, ended = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+stamp = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d)")
+turned = re.compile(r"turned the engine (\d+) times in the last second, and the engine painted (\d+) frames")
+drew = re.compile(r"the page drew (\d+) frames at (\d+x\d+) and .*?: ([\d.]+)(ms|s) at the middle, ([\d.]+)(ms|s) at worst")
+
+
+def milliseconds(value, unit):
+    return float(value) * (1000.0 if unit == "s" else 1.0)
+
+
+per_second = {}
+worsts = []
+with open(log_path, errors="replace") as handle:
+    for line in handle:
+        found = stamp.match(line)
+        if not found:
+            continue
+        moment = datetime.fromisoformat(found.group(1)).timestamp()
+        if moment < started - 1 or moment > ended + 1:
+            continue
+        second = int(moment - started)
+        painted = turned.search(line)
+        if painted:
+            per_second[second] = max(per_second.get(second, 0), int(painted.group(2)))
+            continue
+        frames = drew.search(line)
+        if frames and frames.group(2) != "0x0":
+            worsts.append((second, int(frames.group(1)), milliseconds(frames.group(3), frames.group(4)),
+                           milliseconds(frames.group(5), frames.group(6))))
+
+if not per_second:
+    print("no per-second lines in the window")
+    raise SystemExit
+seconds = [per_second.get(second, 0) for second in range(0, int(ended - started) + 1)]
+print("painted per second:", " ".join(str(count) for count in seconds))
+inside = [count for count in seconds[1:-1]] or seconds
+print(f"seconds {len(seconds)}, mean {sum(inside) / len(inside):.1f}, min {min(inside)}, under 20: {sum(1 for c in inside if c < 20)}")
+for second, frames, middle, worst in worsts:
+    print(f"  at +{second}s: {frames} frames, {middle:.1f} ms at the middle, {worst:.0f} ms at worst")
+PACE
 
 cat >| "$scratch/analyze.py" <<'ANALYZE'
 import glob

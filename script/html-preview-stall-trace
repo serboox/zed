@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "usage: $0 [seconds] [pid]" >&2
+  echo "Samples what each thread of a running editor does for <seconds> (25) seconds while a page is" >&2
+  echo "scrolled by hand, and sets it beside the frames the preview logged in the same seconds." >&2
+  exit 2
+fi
+
+seconds="${1:-25}"
+pid="${2:-}"
+if [[ -z "$pid" ]]; then
+  pid="$(ps -eo pid,nlwp,comm --no-headers | awk '$3 == "zed" || $3 == "zed-fast" {print $2, $1}' | sort -rn | head -1 | awk '{print $2}')"
+fi
+if [[ -z "$pid" || ! -d "/proc/$pid" ]]; then
+  echo "no running editor found; pass its pid" >&2
+  exit 1
+fi
+log="${ZED_LOG:-$HOME/.local/share/zed/logs/Zed.log}"
+started="$(date +%s.%N)"
+echo "sampling pid $pid for ${seconds}s -- scroll the page now"
+
+/usr/bin/python3 -I - "$pid" "$seconds" <<'TRACE'
+import os
+import sys
+import time
+
+pid, seconds = sys.argv[1], float(sys.argv[2])
+clock = os.sysconf("SC_CLK_TCK")
+interval = 0.5
+
+
+def read_threads():
+    threads = {}
+    base = f"/proc/{pid}/task"
+    for tid in os.listdir(base):
+        try:
+            with open(f"{base}/{tid}/stat") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+        # The name is in parentheses and may hold spaces.
+        name = stat[stat.index("(") + 1:stat.rindex(")")]
+        fields = stat[stat.rindex(")") + 2:].split()
+        threads[tid] = (name, int(fields[11]) + int(fields[12]))
+    return threads
+
+
+previous = read_threads()
+totals = {}
+peaks = {}
+rows = []
+began = time.monotonic()
+while time.monotonic() - began < seconds:
+    time.sleep(interval)
+    now = read_threads()
+    elapsed = interval
+    busy = {}
+    for tid, (name, ticks) in now.items():
+        before = previous.get(tid, (name, ticks))[1]
+        percent = (ticks - before) / clock / elapsed * 100.0
+        if percent > 0:
+            busy[(tid, name)] = percent
+    previous = now
+    by_name = {}
+    for (tid, name), percent in busy.items():
+        by_name[name] = by_name.get(name, 0.0) + percent
+    for name, percent in by_name.items():
+        totals[name] = totals.get(name, 0.0) + percent * elapsed / 100.0
+        peaks[name] = max(peaks.get(name, 0.0), percent)
+    top = sorted(by_name.items(), key=lambda item: -item[1])[:4]
+    rows.append((time.monotonic() - began, sum(by_name.values()), top))
+
+print("time   all   busiest threads (percent of one core)")
+for moment, total, top in rows:
+    print(f"{moment:5.1f} {total:5.0f}%  " + "  ".join(f"{name[:18]} {percent:.0f}%" for name, percent in top))
+print()
+print("thread                cpu seconds   peak")
+for name, spent in sorted(totals.items(), key=lambda item: -item[1])[:10]:
+    print(f"{name[:20]:20} {spent:10.2f}   {peaks[name]:.0f}%")
+TRACE
+
+if [[ -f "$log" ]]; then
+  echo
+  echo "what the preview logged in those seconds:"
+  /usr/bin/python3 -I - "$log" "$started" <<'LOG'
+import re
+import sys
+from datetime import datetime
+
+log_path, started = sys.argv[1], float(sys.argv[2])
+stamp = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d)")
+with open(log_path, errors="replace") as handle:
+    for line in handle:
+        found = stamp.match(line)
+        if not found:
+            continue
+        moment = datetime.fromisoformat(found.group(1)).timestamp()
+        if moment >= started - 1 and ("html preview" in line or "the page drew" in line):
+            print(f"  +{moment - started:5.1f}s {line[found.end():].strip()[:160]}")
+LOG
+fi
