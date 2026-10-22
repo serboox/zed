@@ -1175,8 +1175,9 @@ boa_parser = { path = "vendor/boa_parser" }
 # `vendor/merman-render` is merman-render 0.8.0-alpha.5 with its requirements on `icu_collator` and
 # `icu_locale_core` widened to the 2.1 series that SpiderMonkey's `icu_capi` pins.
 merman-render = { path = "vendor/merman-render" }
-# `vendor/servo-script` is servo-script 0.7.0 with one change: an inline <svg> is handed the text of
-# the page's own `<style>` elements, so that a page can style its drawings with a stylesheet.
+# `vendor/servo-script` is servo-script 0.7.0 with two changes: an inline <svg> is handed the text of
+# the page's own `<style>` elements, so that a page can style its drawings with a stylesheet, and the
+# cursor is no longer looked up after every frame, which tested the pointer against every box of the page.
 servo-script = { path = "vendor/servo-script" }
 # `vendor/servo-layout` is servo-layout 0.7.0 with CSS counters: `counter-reset`,
 # `counter-increment`, `counter()` and `counters()` in `content`, and the numbers of an ordered list, which

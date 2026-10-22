@@ -4566,6 +4566,16 @@ impl ScriptThread {
     }
 
     fn handle_refresh_cursor(&self, pipeline_id: PipelineId) {
+        // The compositor asks for this after every frame it draws, and finding the cursor tests
+        // the point against every fragment of the page. The editor does not show the engine's
+        // cursor, and on a long document this was nine tenths of what the script thread did
+        // while it scrolled.
+        static REFRESH_THE_CURSOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*REFRESH_THE_CURSOR
+            .get_or_init(|| std::env::var_os("ZED_HTML_CURSOR_REFRESH").is_some())
+        {
+            return;
+        }
         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
             return;
         };
