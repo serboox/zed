@@ -10,6 +10,13 @@ name: Bundle this fork
 # than from hope. The tests report `HTML_ENGINE: ok` or, on a machine whose
 # graphics stack the engine cannot use, `HTML_ENGINE: unavailable`, and the job
 # summary repeats whichever it was.
+#
+# The Linux jobs run in containers on the repository's own runner. That costs no
+# GitHub minutes, and the packages travel between the jobs of a run through a
+# folder on the runner rather than as artifacts, which are counted against the
+# whole account. Everything Rust keeps between runs lives on one volume of fixed
+# size there. Windows and macOS need GitHub's runners, so they are built only
+# when their last build is thirty days old, or when somebody asks by hand.
 on:
   # A release a week, when the editor changed in that week -- the release job
   # says no when it did not. GitHub reads a scheduled workflow from the
@@ -96,10 +103,48 @@ jobs:
           esac
           echo "macos=$macos" >> "$GITHUB_OUTPUT"
 
+  # The Windows and macOS minutes are the dear ones, and their packages are the
+  # largest artifacts. They are built when the last build of each is older than
+  # MIN_DAYS, or when somebody asks for them by hand; every other run is Linux
+  # only, and a release made in between says so in its notes.
+  desktop-gate:
+    name: Decide whether the Windows and macOS packages are built
+    needs: [plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          MIN_DAYS: "30"
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "$EVENT" != workflow_dispatch ]; then
+            for name in zed-windows-x86_64 zed-macos-arm64; do
+              newest="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=1" \
+                --jq '.artifacts[0] | select(. != null and (.expired | not)) | .created_at')"
+              if [ -n "$newest" ]; then
+                age=$(( ($(date +%s) - $(date -d "$newest" +%s)) / 86400 ))
+                echo "$name was built $age days ago"
+                [ "$age" -lt "$MIN_DAYS" ] && build=false
+              fi
+            done
+          fi
+          echo "The Windows and macOS packages are built: $build"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
   # Nothing is packaged from a tree whose tests do not pass. An artifact that
   # installs and then misbehaves costs more than one that was never built, and
   # the three packaging jobs together run for hours -- this is the cheapest
-  # place to find out.
+  # place to find out. It stays on GitHub's runners: a debug build of the whole
+  # suite does not fit the volume the runner keeps Rust on.
   tests:
     name: Run the whole suite
     runs-on: ubuntu-latest
@@ -134,33 +179,61 @@ jobs:
         run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libgl1
       - uses: ./.github/actions/run_tests
 
+  # Built in a container on the repository's own runner. The Rust toolchain, the
+  # crate registry and every dependency artifact live on a volume of fixed size
+  # that is mounted into the container, so nothing Rust writes can outgrow it.
   linux:
     needs: [plan, tests]
     if: needs.plan.outputs.linux == 'yes'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, fork-builder]
     timeout-minutes: 350
+    container:
+      image: ubuntu:24.04
+      options: --init --memory 9g --cpus 6
+      volumes:
+        - /var/lib/ci-handoff:/handoff
+        - /var/lib/ci-rust:/var/lib/ci-rust
+    env:
+      CARGO_HOME: /var/lib/ci-rust/home/root/cargo
+      RUSTUP_HOME: /var/lib/ci-rust/home/root/rustup
+      CARGO_BUILD_BUILD_DIR: /var/lib/ci-rust/home/root/build/{workspace-path-hash}
+      CARGO_BUILD_JOBS: "6"
     steps:
+      - name: Install what the checkout needs
+        run: |
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git
+
       - uses: actions/checkout@v4
+
+      # The checkout belongs to the runner's user and everything in the container
+      # is root, which git refuses to work in until it is told it is fine.
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Only the pinned toolchain, and only for this machine: `script/linux` would
+      # otherwise fetch a second, unpinned one into the same volume.
+      - name: Install Rust on the volume
+        run: |
+          set -euxo pipefail
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | head -1)"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          "$CARGO_HOME/bin/rustup" toolchain install "$channel" --profile minimal
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
 
       - name: Install the editor's build dependencies
         run: script/linux
 
       - name: Install the packaging and headless-graphics tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base
-          sudo gem install --no-document fpm
-
-      - run: rustup show
-
-      # The engine's nine hundred crates never change, so compiling them once per
-      # push is the whole cost of these runs. This keeps the dependency artifacts
-      # between runs; the workspace's own crates are dropped before saving, so
-      # what comes back is only the part that would have been identical anyway.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: fork-bundle-linux
-          cache-on-failure: true
+          set -euxo pipefail
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            rpm xvfb xauth mesa-vulkan-drivers libegl1 libgl1 gettext-base ruby ruby-dev libffi-dev
+          gem install --no-document fpm
 
       - name: Build the packages with the HTML engine
         id: engine
@@ -174,38 +247,13 @@ jobs:
         if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
         run: script/fork-bundle-linux
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zed-linux-x86_64
-          path: target/fork-packages/*
-          if-no-files-found: error
-
-      # A package that installs and answers is worth more than a package that
-      # merely exists: this catches a wrong path, a broken launcher symlink or a
-      # missing library before the file reaches anyone.
-      - name: Install the .deb and ask the editor its version
+      # The jobs that follow, and the release, take the packages from here.
+      - name: Hand the packages to the jobs that follow
         run: |
           set -euo pipefail
-          sudo dpkg -i target/fork-packages/zed-fork_*.deb
-          zed-fork --version
-          sudo dpkg -r zed-fork
-
-      # The .rpm was only ever listed, never installed, so nothing said whether
-      # it would install at all. It is installed on the distribution that reads
-      # it -- a container, since this runner is Debian -- and the editor is
-      # asked its version from where the package put it.
-      - name: Install the .rpm in a Fedora container and ask the same
-        run: |
-          set -euo pipefail
-          rpm="$(ls target/fork-packages/zed-fork-*.rpm)"
-          docker run --rm -v "$PWD:/work" -w /work fedora:latest bash -euxc "
-            dnf install -y shadow-utils util-linux '$rpm'
-            # The editor refuses to run as root, and everything in a container
-            # is root unless somebody else is made, so somebody else is made.
-            useradd --create-home someone
-            runuser -l someone -c 'zed-fork --version'
-            rpm -e zed-fork
-          "
+          mkdir -p "/handoff/$GITHUB_RUN_ID/linux"
+          cp target/fork-packages/* "/handoff/$GITHUB_RUN_ID/linux/"
+          ls -la "/handoff/$GITHUB_RUN_ID/linux"
 
       - name: Test the HTML engine
         if: steps.engine.outcome == 'success'
@@ -218,9 +266,81 @@ jobs:
         if: always() && steps.engine.outcome == 'success'
         run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
 
+      # The volume has a fixed size. What the next run can reuse is the
+      # dependencies, which never change; the workspace's own crates change with
+      # every commit and would only fill it, so they go, with the finished
+      # binaries that this checkout holds.
+      - name: Keep only what the next run can reuse
+        if: always()
+        run: |
+          set -uo pipefail
+          build_root=/var/lib/ci-rust/home/root/build
+          names="$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.packages[].name')"
+          # A profile directory is the parent of a `.fingerprint` directory, however
+          # deep cargo nests the hash of the workspace path above it.
+          while IFS= read -r profile; do
+            for name in $names; do
+              under="${name//-/_}"
+              rm -rf "$profile"/.fingerprint/"$name"-???????????????? "$profile"/build/"$name"-????????????????
+              rm -f "$profile"/deps/"$name"-???????????????? "$profile"/deps/"$name"-????????????????.* \
+                "$profile"/deps/lib"$under"-????????????????.* "$profile"/deps/"$under"-???????????????? \
+                "$profile"/deps/"$under"-????????????????.*
+            done
+            rm -rf "$profile/incremental"
+          done < <(find "$build_root" -maxdepth 5 -type d -name .fingerprint -printf '%h\n')
+          rm -rf target
+          df -h /var/lib/ci-rust | awk 'NR==2 {print "Rust volume: " $3 " used of " $2}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # A package that installs and answers is worth more than a package that merely
+  # exists: these catch a wrong path, a broken launcher symlink or a missing
+  # library before the file reaches anyone. Each one runs on the distribution
+  # that reads the package, clean, in a container of its own.
+  deb-install:
+    name: Install the .deb on a clean Ubuntu and ask the editor its version
+    needs: [linux]
+    runs-on: [self-hosted, linux, x64, fork-builder]
+    timeout-minutes: 20
+    container:
+      image: ubuntu:24.04
+      options: --init --memory 1g
+      volumes:
+        - /var/lib/ci-handoff:/handoff
+    steps:
+      - name: Install the .deb and ask
+        run: |
+          set -euxo pipefail
+          dpkg -i "/handoff/$GITHUB_RUN_ID/linux/"zed-fork_*.deb
+          # The editor refuses to run as root, and everything in a container is
+          # root unless somebody else is made, so somebody else is made.
+          useradd --create-home someone
+          runuser -l someone -c 'zed-fork --version'
+          dpkg -r zed-fork
+
+  rpm-install:
+    name: Install the .rpm on a clean Fedora and ask the editor its version
+    needs: [linux]
+    runs-on: [self-hosted, linux, x64, fork-builder]
+    timeout-minutes: 20
+    container:
+      image: fedora:latest
+      options: --init --memory 1g
+      volumes:
+        - /var/lib/ci-handoff:/handoff
+    steps:
+      - name: Install the .rpm and ask
+        run: |
+          set -euxo pipefail
+          rpm="$(ls "/handoff/$GITHUB_RUN_ID/linux/"zed-fork-*.rpm)"
+          dnf install -y shadow-utils util-linux "$rpm"
+          # The editor refuses to run as root, and everything in a container is
+          # root unless somebody else is made, so somebody else is made.
+          useradd --create-home someone
+          runuser -l someone -c 'zed-fork --version'
+          rpm -e zed-fork
+
   windows:
-    needs: [plan, tests]
-    if: needs.plan.outputs.windows == 'yes'
+    needs: [plan, tests, desktop-gate]
+    if: needs.plan.outputs.windows == 'yes' && needs.desktop-gate.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 350
     steps:
@@ -419,8 +539,8 @@ jobs:
           exit 1
 
   macos:
-    needs: [plan, tests]
-    if: needs.plan.outputs.macos != '[]'
+    needs: [plan, tests, desktop-gate]
+    if: needs.plan.outputs.macos != '[]' && needs.desktop-gate.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -556,26 +676,60 @@ jobs:
   # week without changes to the editor ends in nothing: the step below says so.
   release:
     name: Publish the bundles where they can be downloaded
-    needs: [plan, tests, linux, windows, macos]
+    needs: [plan, tests, linux, deb-install, rpm-install, desktop-gate, windows, macos]
     if: >-
       always() && !cancelled()
       && !contains(needs.*.result, 'failure')
       && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, fork-builder]
+    timeout-minutes: 60
+    container:
+      image: ubuntu:24.04
+      options: --init --memory 1g
+      volumes:
+        - /var/lib/ci-handoff:/handoff
     permissions:
       contents: write
     steps:
+      - name: Install git and the GitHub CLI
+        run: |
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git gnupg
+          install -d -m 755 /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Everything the platform jobs built, unpacked into one directory: the
-      # files themselves, not the artifact containers they travelled in.
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Windows and macOS packages exist only in a run that built them; they
+      # come as artifacts, unpacked into one directory: the files themselves,
+      # not the containers they travelled in.
       - uses: actions/download-artifact@v4
+        if: needs.windows.result == 'success' || needs.macos.result == 'success'
         with:
           pattern: zed-*
           path: bundles
           merge-multiple: true
+
+      # The Linux packages never were artifacts: the build job left them in the
+      # folder of this run on the runner.
+      - name: Take the Linux packages of this run
+        run: |
+          set -euo pipefail
+          mkdir -p bundles
+          if [ -d "/handoff/$GITHUB_RUN_ID/linux" ]; then
+            cp "/handoff/$GITHUB_RUN_ID/linux/"* bundles/
+          fi
 
       # A release is for changes to the editor. A week in which only the
       # workflow or a document moved has nothing to hand anybody, and a release
@@ -638,6 +792,10 @@ jobs:
                 *)         echo "| | \`$(basename "$file")\` |" ;;
               esac
             done
+            if ! ls bundles/*.exe bundles/*.dmg > /dev/null 2>&1; then
+              echo
+              echo "This release has the Linux packages only. The Windows and macOS packages are built at most once in 30 days; the latest of them are attached to an earlier release."
+            fi
             # Only when the tag is one this checkout actually has: a release
             # list can name a tag that was never fetched, and asking git for a
             # range it cannot resolve would take the whole step down with it.
@@ -729,6 +887,14 @@ jobs:
         with:
           name: release-changes-draft
           path: draft-*.md
+
+      # This run's folder is not needed any more; those of runs that never got
+      # here, because something failed first, go when they are a week old.
+      - name: Clear the hand-off folders
+        if: always()
+        run: |
+          rm -rf "/handoff/$GITHUB_RUN_ID"
+          find /handoff -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +
 
   # Every build leaves about a gigabyte and a half of artifacts, and GitHub
   # counts them against the repository's storage. The artifacts of the last two

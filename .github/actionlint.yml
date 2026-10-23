@@ -34,6 +34,8 @@ self-hosted-runner:
     # Self Hosted Runners
     - self-mini-macos
     - self-32vcpu-windows-2022
+    # The fork's own Linux runner
+    - fork-builder
 
 # Disable shellcheck because it doesn't like powershell
 # This should have been triggered with initial rollout of actionlint
