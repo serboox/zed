@@ -7,7 +7,7 @@ name: Refresh the fork release descriptions
 # in place and keeps its files.
 on:
   push:
-    branches: [personal_zed_fork]
+    branches: [main]
     paths:
       - .github/release-changes/**
       - .github/workflows/fork_release_notes.yml
