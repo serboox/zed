@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Frees what a CI run need not keep on a Rust volume of fixed size.
+#
+# Two kinds of files go: the artifacts of the workspace's own crates, which
+# change with every commit, and the unpacked sources of registry and git
+# dependencies, which cargo unpacks again from its cache when it needs them.
+# The artifacts of the dependencies stay; they are the point of the cache.
+#
+# Usage: script/trim-ci-rust-cache <build root> [<cargo home>]
+#
+# Run it from the workspace, because it asks cargo for the workspace's crates.
+set -uo pipefail
+
+build_root="${1:?usage: script/trim-ci-rust-cache <build root> [<cargo home>]}"
+cargo_home="${2:-}"
+
+status=0
+if metadata="$(cargo metadata --no-deps --format-version 1 2>/dev/null)"; then
+  names="$(jq -r '.packages[] | .name, (.targets[].name)' <<< "${metadata}" | sort -u)"
+else
+  names=""
+fi
+if [ -z "${names}" ]; then
+  echo "cargo did not list the workspace's crates: their artifacts stay, the rest is trimmed" >&2
+  status=1
+fi
+
+# A profile directory is the parent of a `.fingerprint` directory, however deep
+# cargo nests the hash of the workspace path above it. Every file name ends in a
+# 16-digit hash, which keeps `foo` from matching `foo-bar`.
+while IFS= read -r profile; do
+  for name in ${names}; do
+    under="${name//-/_}"
+    rm -rf "${profile}"/.fingerprint/"${name}"-???????????????? "${profile}"/build/"${name}"-????????????????
+    rm -f "${profile}"/deps/"${name}"-???????????????? "${profile}"/deps/"${name}"-????????????????.* \
+      "${profile}"/deps/lib"${under}"-????????????????.* "${profile}"/deps/"${under}"-???????????????? \
+      "${profile}"/deps/"${under}"-????????????????.*
+  done
+  rm -rf "${profile}/incremental"
+done < <(find "${build_root}" -maxdepth 5 -type d -name .fingerprint -printf '%h\n')
+
+if [ -n "${cargo_home}" ]; then
+  rm -rf "${cargo_home}/registry/src" "${cargo_home}/git/checkouts"
+fi
+
+exit "${status}"

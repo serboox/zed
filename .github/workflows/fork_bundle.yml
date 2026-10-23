@@ -187,16 +187,20 @@ jobs:
     if: needs.plan.outputs.linux == 'yes'
     runs-on: [self-hosted, linux, x64, fork-builder]
     timeout-minutes: 350
+    # A job in a container runs its steps with `sh`, which has no `pipefail`.
+    defaults:
+      run:
+        shell: bash
     container:
       image: ubuntu:24.04
-      options: --init --memory 9g --cpus 6
+      options: --init --memory 9g --cpus 6 --oom-score-adj 800
       volumes:
-        - /var/lib/ci-handoff:/handoff
-        - /var/lib/ci-rust:/var/lib/ci-rust
+        - /var/lib/ci-handoff-zed:/handoff
+        - /var/lib/ci-rust/home/gh-zed:/rust
     env:
-      CARGO_HOME: /var/lib/ci-rust/home/root/cargo
-      RUSTUP_HOME: /var/lib/ci-rust/home/root/rustup
-      CARGO_BUILD_BUILD_DIR: /var/lib/ci-rust/home/root/build/{workspace-path-hash}
+      CARGO_HOME: /rust/cargo
+      RUSTUP_HOME: /rust/rustup
+      CARGO_BUILD_BUILD_DIR: /rust/build/{workspace-path-hash}
       CARGO_BUILD_JOBS: "6"
     steps:
       - name: Install what the checkout needs
@@ -255,6 +259,12 @@ jobs:
           cp target/fork-packages/* "/handoff/$GITHUB_RUN_ID/linux/"
           ls -la "/handoff/$GITHUB_RUN_ID/linux"
 
+      # Linking the test binaries needs the space that the finished build still
+      # holds; what the tests need of the workspace is built again.
+      - name: Make room for the engine's tests
+        if: steps.engine.outcome == 'success'
+        run: script/trim-ci-rust-cache /rust/build "$CARGO_HOME"
+
       - name: Test the HTML engine
         if: steps.engine.outcome == 'success'
         run: |
@@ -274,22 +284,9 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
-          build_root=/var/lib/ci-rust/home/root/build
-          names="$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.packages[].name')"
-          # A profile directory is the parent of a `.fingerprint` directory, however
-          # deep cargo nests the hash of the workspace path above it.
-          while IFS= read -r profile; do
-            for name in $names; do
-              under="${name//-/_}"
-              rm -rf "$profile"/.fingerprint/"$name"-???????????????? "$profile"/build/"$name"-????????????????
-              rm -f "$profile"/deps/"$name"-???????????????? "$profile"/deps/"$name"-????????????????.* \
-                "$profile"/deps/lib"$under"-????????????????.* "$profile"/deps/"$under"-???????????????? \
-                "$profile"/deps/"$under"-????????????????.*
-            done
-            rm -rf "$profile/incremental"
-          done < <(find "$build_root" -maxdepth 5 -type d -name .fingerprint -printf '%h\n')
+          script/trim-ci-rust-cache /rust/build "$CARGO_HOME"
           rm -rf target
-          df -h /var/lib/ci-rust | awk 'NR==2 {print "Rust volume: " $3 " used of " $2}' | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h /rust | awk 'NR==2 {print "Rust volume: " $3 " used of " $2}' | tee -a "$GITHUB_STEP_SUMMARY"
 
   # A package that installs and answers is worth more than a package that merely
   # exists: these catch a wrong path, a broken launcher symlink or a missing
@@ -300,11 +297,14 @@ jobs:
     needs: [linux]
     runs-on: [self-hosted, linux, x64, fork-builder]
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     container:
       image: ubuntu:24.04
-      options: --init --memory 1g
+      options: --init --memory 1g --oom-score-adj 800
       volumes:
-        - /var/lib/ci-handoff:/handoff
+        - /var/lib/ci-handoff-zed:/handoff
     steps:
       - name: Install the .deb and ask
         run: |
@@ -321,11 +321,14 @@ jobs:
     needs: [linux]
     runs-on: [self-hosted, linux, x64, fork-builder]
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     container:
       image: fedora:latest
-      options: --init --memory 1g
+      options: --init --memory 1g --oom-score-adj 800
       volumes:
-        - /var/lib/ci-handoff:/handoff
+        - /var/lib/ci-handoff-zed:/handoff
     steps:
       - name: Install the .rpm and ask
         run: |
@@ -683,11 +686,14 @@ jobs:
       && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, x64, fork-builder]
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     container:
       image: ubuntu:24.04
-      options: --init --memory 1g
+      options: --init --memory 1g --oom-score-adj 800
       volumes:
-        - /var/lib/ci-handoff:/handoff
+        - /var/lib/ci-handoff-zed:/handoff
     permissions:
       contents: write
     steps:
