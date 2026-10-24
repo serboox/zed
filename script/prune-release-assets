@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Deletes the files attached to the releases of a repository except those of its newest releases.
+#
+# The packages of an old release are never wanted again: the last release
+# supersedes them, and the one before it stays for going back one step. The
+# release itself, its notes and its tag stay.
+#
+# Usage: script/prune-release-assets <owner/repo> [releases-to-keep]
+#
+#   releases-to-keep  how many of the newest published releases keep their files;
+#                     2 by default
+#
+# A draft is a release that is still being filled, so it is neither counted nor
+# touched, and neither is a release that has no publication time. Releases
+# published in the same second are told apart by their id, which grows with the
+# time of creation.
+#
+# Needs `gh` with a token that may edit releases (`contents: write`).
+# DRY_RUN=1 only prints what would be deleted. PRUNE_RELEASES_LISTING names a file
+# holding the JSON the listing step would have produced, so the choice of what to
+# delete can be checked without a repository.
+set -euo pipefail
+
+repository="${1:?usage: script/prune-release-assets <owner/repo> [releases-to-keep]}"
+keep="${2:-2}"
+case "$keep" in
+  '' | *[!0-9]* | 0) echo "releases-to-keep must be a number above zero, not '$keep'" >&2; exit 2 ;;
+esac
+
+if [ -n "${PRUNE_RELEASES_LISTING:-}" ]; then
+  listing="$(cat "$PRUNE_RELEASES_LISTING")"
+else
+  listing="$(gh api --paginate "repos/$repository/releases?per_page=100" \
+    --jq '.[] | {id, tag: .tag_name, published: .published_at, draft: .draft, assets: [.assets[] | {id, name}]}' |
+    jq -s '.')"
+fi
+
+doomed="$(echo "$listing" | jq -r --argjson keep "$keep" '
+  [.[] | select((.draft | not) and .published != null)] | sort_by([.published, .id]) | reverse | .[$keep:]
+  | .[] | .tag as $tag | .assets[] | "\(.id)\t\($tag)\t\(.name)"')"
+
+if [ -z "$doomed" ]; then
+  echo "nothing to delete: $(echo "$listing" | jq '[.[] | select((.draft | not) and .published != null)] | length') published release(s), $keep kept"
+  exit 0
+fi
+
+deleted=0
+failed=0
+while IFS=$'\t' read -r asset_id tag name; do
+  if [ "${DRY_RUN:-}" = 1 ]; then
+    echo "would delete $tag: $name"
+    deleted=$((deleted + 1))
+    continue
+  fi
+  if output="$(gh api -X DELETE "repos/$repository/releases/assets/$asset_id" 2>&1 < /dev/null)"; then
+    deleted=$((deleted + 1))
+  elif echo "$output" | grep -q 'HTTP 404'; then
+    # Gone already, which is what was asked for.
+    deleted=$((deleted + 1))
+  else
+    failed=$((failed + 1))
+    echo "could not delete $tag: $name: $output" >&2
+  fi
+done <<< "$doomed"
+
+echo "release files deleted: $deleted, failed: $failed, releases kept: $keep"
+[ "$failed" -eq 0 ]

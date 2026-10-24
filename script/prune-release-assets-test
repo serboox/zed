@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Checks which release files script/prune-release-assets would delete, from a made-up listing.
+set -euo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prune-release-assets"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+# Out of order on purpose: the newest are chosen by date, not by position.
+cat > "$work/listing.json" <<'JSON'
+[
+  {"id": 102, "tag": "fork-b", "published": "2026-02-01T10:00:00Z", "draft": false,
+   "assets": [{"id": 21, "name": "b.deb"}, {"id": 22, "name": "b.rpm"}]},
+  {"id": 104, "tag": "fork-d", "published": "2026-04-01T10:00:00Z", "draft": false,
+   "assets": [{"id": 41, "name": "d.deb"}]},
+  {"id": 101, "tag": "fork-a", "published": "2026-01-01T10:00:00Z", "draft": false,
+   "assets": [{"id": 11, "name": "a.deb"}, {"id": 12, "name": "a.rpm"}]},
+  {"id": 190, "tag": "fork-draft", "published": null, "draft": true,
+   "assets": [{"id": 91, "name": "half-uploaded.deb"}]},
+  {"id": 103, "tag": "fork-c", "published": "2026-03-01T10:00:00Z", "draft": false,
+   "assets": [{"id": 31, "name": "c.deb"}]},
+  {"id": 100, "tag": "fork-empty", "published": "2025-12-01T10:00:00Z", "draft": false, "assets": []}
+]
+JSON
+export PRUNE_RELEASES_LISTING="$work/listing.json"
+export DRY_RUN=1
+
+doomed() { "$script" example/repo "$@" | sed -n 's/^would delete //p' | sort | tr '\n' ' '; }
+
+# The two newest published releases keep their files; every older one loses them.
+[ "$(doomed)" = "fork-a: a.deb fork-a: a.rpm fork-b: b.deb fork-b: b.rpm " ] || fail "default keeps fork-d and fork-c: $(doomed)"
+[ "$(doomed 2)" = "$(doomed)" ] || fail "two is the default"
+
+# One kept, three kept.
+[ "$(doomed 1)" = "fork-a: a.deb fork-a: a.rpm fork-b: b.deb fork-b: b.rpm fork-c: c.deb " ] || fail "one kept: $(doomed 1)"
+[ "$(doomed 3)" = "fork-a: a.deb fork-a: a.rpm " ] || fail "three kept: $(doomed 3)"
+
+# A draft is never touched, and nothing is left to delete when everything is kept.
+"$script" example/repo 2 | grep -q 'half-uploaded' && fail "a draft lost its file"
+[ -z "$(doomed 10)" ] || fail "everything kept: $(doomed 10)"
+"$script" example/repo 10 | grep -q '^nothing to delete' || fail "nothing-to-delete line missing"
+
+# Releases published in the same second are ordered by id, whatever order the listing has.
+cat > "$work/ties.json" <<'JSON'
+[
+  {"id": 3, "tag": "t3", "published": "2026-05-01T10:00:00Z", "draft": false, "assets": [{"id": 33, "name": "t3.deb"}]},
+  {"id": 1, "tag": "t1", "published": "2026-05-01T10:00:00Z", "draft": false, "assets": [{"id": 31, "name": "t1.deb"}]},
+  {"id": 2, "tag": "t2", "published": "2026-05-01T10:00:00Z", "draft": false, "assets": [{"id": 32, "name": "t2.deb"}]}
+]
+JSON
+[ "$(PRUNE_RELEASES_LISTING="$work/ties.json" "$script" example/repo 2 | sed -n 's/^would delete //p')" = "t1: t1.deb" ] \
+  || fail "with equal times the lowest id is the oldest"
+
+# A release that is not a draft but has no publication time is neither counted nor touched.
+cat > "$work/unpublished.json" <<'JSON'
+[
+  {"id": 1, "tag": "u1", "published": "2026-05-01T10:00:00Z", "draft": false, "assets": [{"id": 41, "name": "u1.deb"}]},
+  {"id": 2, "tag": "u2", "published": "2026-05-02T10:00:00Z", "draft": false, "assets": [{"id": 42, "name": "u2.deb"}]},
+  {"id": 3, "tag": "u3", "published": null, "draft": false, "assets": [{"id": 43, "name": "u3.deb"}]}
+]
+JSON
+out="$(PRUNE_RELEASES_LISTING="$work/unpublished.json" "$script" example/repo 2)"
+echo "$out" | grep -q 'u3' && fail "a release without a publication time was touched: $out"
+echo "$out" | grep -q '^nothing to delete: 2 published' || fail "it was counted as published: $out"
+
+# A bad count is refused; an empty one means the default.
+for bad in 0 abc 1x -1; do
+  if "$script" example/repo "$bad" > /dev/null 2>&1; then fail "count '$bad' was accepted"; fi
+done
+
+echo "prune-release-assets-test: ok"

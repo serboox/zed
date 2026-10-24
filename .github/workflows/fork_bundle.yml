@@ -701,7 +701,7 @@ jobs:
         run: |
           set -euxo pipefail
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git gnupg
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git gnupg jq
           install -d -m 755 /etc/apt/keyrings
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
             -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
@@ -856,6 +856,15 @@ jobs:
             done
           done
           gh release edit "$tag" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The packages of an older release are never wanted again; the last two
+      # releases keep theirs. The older ones keep their notes and their tags.
+      - name: Drop the packages of the older releases
+        if: steps.changed.outputs.commits != '0'
+        continue-on-error: true
+        run: script/prune-release-assets "$GITHUB_REPOSITORY" 2
         env:
           GH_TOKEN: ${{ github.token }}
 
