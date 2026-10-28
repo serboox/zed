@@ -237,6 +237,18 @@ Search terminal content with `Cmd+F` (macOS) or `Ctrl+Shift+F` (Linux/Windows). 
 
 In the terminal of a task, whose output is read rather than typed into, `Ctrl+F` opens the search on Linux and Windows too. In any other terminal `Ctrl+F` still goes to the shell.
 
+### Colorize Logs
+
+Log lines the terminal can tell apart (zap console output, JSON lines, logfmt, and the usual Rust, Python and Java formats) can be shown with their time, level, caller and fields in different colors. A **Colorize logs** checkbox appears in the corner of the terminal's tab bar while the terminal shows such logs. Text a program has colored itself is never changed. To turn it on in the settings:
+
+```json [settings]
+{
+  "terminal": {
+    "colorize_logs": true
+  }
+}
+```
+
 ## Vi Mode
 
 Toggle vi-style navigation in the terminal with `Ctrl+Shift+Space`. This allows you to navigate and select text using vi keybindings.

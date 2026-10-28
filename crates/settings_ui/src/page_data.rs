@@ -7719,7 +7719,7 @@ fn terminal_page() -> SettingsPage {
         ]
     }
 
-    fn behavior_settings_section() -> [SettingsPageItem; 6] {
+    fn behavior_settings_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Behavior Settings"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -7755,6 +7755,25 @@ fn terminal_page() -> SettingsPage {
                             .terminal
                             .get_or_insert_default()
                             .copy_on_select = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Colorize Logs",
+                description: "Whether to colour the time, level, caller and JSON fields of log lines that have no colours of their own.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("terminal.colorize_logs"),
+                    pick: |settings_content| {
+                        settings_content.terminal.as_ref()?.colorize_logs.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .terminal
+                            .get_or_insert_default()
+                            .colorize_logs = value;
                     },
                 }),
                 metadata: None,

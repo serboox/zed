@@ -27,7 +27,10 @@ use workspace::Workspace;
 use std::mem;
 use std::{fmt::Debug, rc::Rc};
 
-use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
+use crate::{
+    BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView,
+    log_colors::{self, LogColors},
+};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -441,6 +444,7 @@ impl TerminalElement {
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &Range)>,
         minimum_contrast: f32,
+        log_colors: Option<&LogColors>,
         cx: &App,
     ) -> (
         Vec<LayoutRect>,
@@ -478,7 +482,9 @@ impl TerminalElement {
             for cell in line {
                 let point = cell.point();
                 let cell = cell.cell();
-                let mut fg = cell.foreground();
+                let mut fg = log_colors
+                    .and_then(|colors| colors.color_at(display_line as usize, point.column))
+                    .unwrap_or_else(|| cell.foreground());
                 let mut bg = cell.background();
                 if cell.is_inverse() {
                     mem::swap(&mut fg, &mut bg);
@@ -1400,10 +1406,14 @@ impl Element for TerminalElement {
                     cursor_char,
                     selection,
                     cursor,
+                    columns,
                     ..
                 } = &self.terminal.read(cx).last_content;
                 let mode = *mode;
                 let display_offset = *display_offset;
+                let log_colors = (TerminalSettings::get_global(cx).colorize_logs
+                    && !mode.contains(Modes::ALT_SCREEN))
+                .then(|| LogColors::paint(&log_colors::rows_of(cells, *columns), *columns));
 
                 // searches, highlights to a single range representations
                 let mut relative_highlighted_ranges = Vec::new();
@@ -1451,6 +1461,7 @@ impl Element for TerminalElement {
                             .as_ref()
                             .map(|hover_match| (link_style, hover_match)),
                         minimum_contrast,
+                        log_colors.as_ref(),
                         cx,
                     )
                 } else {
@@ -1482,6 +1493,7 @@ impl Element for TerminalElement {
                             .as_ref()
                             .map(|hover_match| (link_style, hover_match)),
                         minimum_contrast,
+                        log_colors.as_ref(),
                         cx,
                     )
                 };

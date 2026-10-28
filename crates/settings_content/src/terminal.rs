@@ -120,6 +120,12 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: false
     pub copy_on_select: Option<bool>,
+    /// Whether to colour the parts of a log line that the terminal can tell
+    /// apart (time, level, caller, the names and values of JSON fields) in text
+    /// that has no colours of its own.
+    ///
+    /// Default: false
+    pub colorize_logs: Option<bool>,
     /// Whether to keep the text selection after copying it to the clipboard.
     ///
     /// Default: true
@@ -199,7 +205,7 @@ crate::fallible_options::flattened_deserialize!(TerminalSettingsContent {
     sections: { project },
     options: {
         font_size, font_family, font_fallbacks, line_height, font_features, font_weight,
-        cursor_shape, blinking, alternate_scroll, option_as_meta, copy_on_select,
+        cursor_shape, blinking, alternate_scroll, option_as_meta, copy_on_select, colorize_logs,
         keep_selection_on_copy, open_links_in_mouse_mode, button, dock, starts_open, flexible,
         default_width, default_height, max_scroll_history_lines, scroll_multiplier, toolbar,
         scrollbar, minimum_contrast, show_count_badge, bell,

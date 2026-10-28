@@ -22,7 +22,7 @@ use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
 use terminal::{TaskStatus, Terminal, terminal_settings::TerminalSettings};
 use ui::{
-    ButtonLike, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu,
+    ButtonLike, Checkbox, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu,
     SplitButton, Toggleable, Tooltip, prelude::*,
 };
 use util::{ResultExt, TryFutureExt, defer};
@@ -129,12 +129,20 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         let assistant_enabled = self.assistant_enabled;
+        let fs = self.fs.clone();
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, _window, cx| {
-                let split_context = pane
+                let active_terminal_view = pane
                     .active_item()
-                    .and_then(|item| item.downcast::<TerminalView>())
+                    .and_then(|item| item.downcast::<TerminalView>());
+                let split_context = active_terminal_view
+                    .as_ref()
                     .map(|terminal_view| terminal_view.read(cx).focus_handle.clone());
+                let offers_log_colors = active_terminal_view
+                    .as_ref()
+                    .is_some_and(|terminal_view| terminal_view.read(cx).shows_structured_logs(cx));
+                let colorize_logs = TerminalSettings::get_global(cx).colorize_logs;
+                let fs = fs.clone();
                 // Shown whether or not the terminal has the focus. A button that is
                 // only there once you have clicked into the panel cannot be found by
                 // somebody looking for it, and the corner it lives in is otherwise
@@ -144,6 +152,29 @@ impl TerminalPanel {
                 let focus_handle = pane.focus_handle(cx);
                 let right_children = h_flex()
                     .gap(DynamicSpacing::Base02.rems(cx))
+                    .when(offers_log_colors, |this| {
+                        this.child(
+                            Checkbox::new("terminal-colorize-logs", colorize_logs.into())
+                                .label("Colorize logs")
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text(
+                                    "Colour the time, level, caller and fields of log lines",
+                                ))
+                                .on_click(move |state, _window, cx| {
+                                    let colorize = state.selected();
+                                    settings::update_settings_file(
+                                        fs.clone(),
+                                        cx,
+                                        move |settings, _| {
+                                            settings
+                                                .terminal
+                                                .get_or_insert_default()
+                                                .colorize_logs = Some(colorize);
+                                        },
+                                    );
+                                }),
+                        )
+                    })
                     .child(
                         PopoverMenu::new("terminal-tab-bar-popover-menu")
                             .trigger_with_tooltip(
@@ -4065,6 +4096,61 @@ mod tests {
             "and the program must not receive the key as well"
         );
         end_them_all(&over, cx);
+    }
+
+    /// A terminal showing logs the log lens reads offers a checkbox in the
+    /// corner of the tab bar, and pressing it turns the colouring on. Output
+    /// that is not a log has nothing to colour, so the corner stays clear of it.
+    #[gpui::test]
+    async fn the_corner_offers_to_colour_logs_that_can_be_told_apart(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let terminal = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .unwrap()
+            .upgrade()
+            .expect("the terminal is alive");
+        cx.run_until_parked();
+        let checkbox = "CHECKBOX-terminal-colorize-logs";
+        assert!(
+            cx.debug_bounds(checkbox).is_none(),
+            "a terminal that shows no logs has nothing to colour"
+        );
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                // The shell's prompt is on the line the text would start on.
+                terminal.write_output(
+                    b"\r\n2026-10-28T09:01:09.123+0300\tINFO\tserver/main.go:264\tlistening\r\n",
+                    cx,
+                );
+                terminal.sync(window, cx);
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let bounds = cx
+            .debug_bounds(checkbox)
+            .expect("a terminal that shows logs offers to colour them");
+        assert!(!cx.update(|_, cx| TerminalSettings::get_global(cx).colorize_logs));
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|_, cx| TerminalSettings::get_global(cx).colorize_logs),
+            "pressing the checkbox turns the colouring on"
+        );
     }
 
     /// The same configuration started again still takes its own terminal over.

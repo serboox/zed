@@ -1,3 +1,4 @@
+pub mod log_colors;
 mod persistence;
 pub mod terminal_element;
 pub mod terminal_panel;
@@ -419,6 +420,13 @@ impl TerminalView {
 
     pub fn has_bell(&self) -> bool {
         self.has_bell
+    }
+
+    /// Whether the lines at the bottom of the screen are in a format the log
+    /// lens reads, which is when colouring the logs has something to go by.
+    pub fn shows_structured_logs(&self, cx: &App) -> bool {
+        let content = &self.terminal.read(cx).last_content;
+        log_colors::looks_structured(&log_colors::rows_of(&content.cells, content.columns))
     }
 
     pub fn custom_title(&self) -> Option<&str> {
@@ -2583,6 +2591,101 @@ mod tests {
             matches_found(&terminal, &text_query("error", true, true), &mut cx).await,
             1,
             "and both toggles together find the one lower-case word"
+        );
+    }
+
+    /// A log line the log lens reads is laid out in the colours of its parts,
+    /// and the same line is laid out in one colour without them.
+    #[gpui::test]
+    async fn a_log_line_is_laid_out_in_the_colours_of_its_parts(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+
+        let (terminal, mut cx) =
+            a_drawn_terminal_showing("2026-10-28 09:01:09,123 ERROR app: boom\r\n", None, cx).await;
+
+        let (plain_runs, painted_runs, error_red) = cx.update(|window, cx| {
+            let text_style = window.text_style();
+            let error_red = cx.theme().colors().terminal_ansi_red;
+            terminal.read_with(cx, |terminal, cx| {
+                let content = &terminal.last_content;
+                let colors = log_colors::LogColors::paint(
+                    &log_colors::rows_of(&content.cells, content.columns),
+                    content.columns,
+                );
+                let lay_out = |colors: Option<&log_colors::LogColors>| {
+                    TerminalElement::layout_grid(
+                        content.cells.iter(),
+                        0,
+                        &text_style,
+                        None,
+                        0.,
+                        colors,
+                        cx,
+                    )
+                    .1
+                };
+                (lay_out(None), lay_out(Some(&colors)), error_red)
+            })
+        });
+
+        assert!(
+            plain_runs
+                .windows(2)
+                .all(|pair| pair[0].style.color == pair[1].style.color),
+            "without the colouring the whole line has the one colour"
+        );
+        let level_run = painted_runs
+            .iter()
+            .find(|run| run.text == "ERROR")
+            .expect("the level is a run of its own once it has a colour of its own");
+        assert_eq!(level_run.style.color, error_red);
+        let message_run = painted_runs
+            .iter()
+            .find(|run| run.text == "boom")
+            .expect("the message is there");
+        assert_ne!(
+            message_run.style.color, error_red,
+            "and the message, which no part claims, keeps the colour it had"
+        );
+    }
+
+    /// A log line wider than the terminal wraps onto the next row, and the
+    /// colouring reads the two rows as the one line they are.
+    #[gpui::test]
+    async fn a_wrapped_log_line_is_coloured_across_its_rows(cx: &mut TestAppContext) {
+        use ::terminal::{Color, NamedColor};
+
+        let (terminal, mut cx) = a_drawn_terminal_showing("", None, cx).await;
+        let columns = terminal.read_with(&cx, |terminal, _| terminal.last_content.columns);
+        let line = format!(
+            "2026-10-28 09:01:09,123 ERROR app: {} k=1\r\n",
+            "x".repeat(columns)
+        );
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(line.as_bytes(), cx);
+                terminal.sync(window, cx);
+            });
+        });
+
+        let colors = terminal.read_with(&cx, |terminal, _| {
+            let content = &terminal.last_content;
+            log_colors::LogColors::paint(
+                &log_colors::rows_of(&content.cells, content.columns),
+                content.columns,
+            )
+        });
+
+        let key_column = "2026-10-28 09:01:09,123 ERROR app: ".len() + 1;
+        assert_eq!(
+            colors.color_at(1, key_column),
+            Some(Color::Named(NamedColor::BrightBlue)),
+            "the key on the second row is painted like the ones on the first"
+        );
+        assert_eq!(
+            colors.color_at(0, 24),
+            Some(Color::Named(NamedColor::Red)),
+            "and the level on the first row keeps its colour"
         );
     }
 

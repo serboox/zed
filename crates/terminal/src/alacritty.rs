@@ -505,6 +505,22 @@ impl Cell {
         self.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
     }
 
+    /// Whether the cell only holds the place of the other half of a wide
+    /// character, and so is no text.
+    #[inline]
+    pub fn is_wide_char_placeholder(&self) -> bool {
+        self.cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    }
+
+    /// Whether the text of this row goes on in the next one, because the line
+    /// was longer than the terminal is wide.
+    #[inline]
+    pub fn wraps_to_next_row(&self) -> bool {
+        self.cell.flags.contains(Flags::WRAPLINE)
+    }
+
     #[inline]
     pub fn is_dim(&self) -> bool {
         self.cell.flags.intersects(Flags::DIM)

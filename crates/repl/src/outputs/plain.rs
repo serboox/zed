@@ -364,7 +364,15 @@ impl Render for TerminalOutput {
         let minimum_contrast = TerminalSettings::get_global(cx).minimum_contrast;
         let (rects, batched_text_runs, block_element_rects) =
             terminal.read(cx).with_renderable_cells(|cells| {
-                TerminalElement::layout_grid(cells, 0, &text_style, None, minimum_contrast, cx)
+                TerminalElement::layout_grid(
+                    cells,
+                    0,
+                    &text_style,
+                    None,
+                    minimum_contrast,
+                    None,
+                    cx,
+                )
             });
 
         // lines are 0-indexed, so we must add 1 to get the number of lines

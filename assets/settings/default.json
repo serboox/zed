@@ -2166,6 +2166,10 @@
     // Whether or not selecting text in the terminal will automatically
     // copy to the system clipboard when the mouse button is released.
     "copy_on_select": false,
+    // Whether to colour the parts of a log line that the terminal can tell
+    // apart (time, level, caller, the names and values of JSON fields) in text
+    // that has no colours of its own.
+    "colorize_logs": false,
     // Whether to keep the text selection after copying it to the clipboard.
     "keep_selection_on_copy": true,
     // Whether cmd-click (ctrl-click on Linux and Windows) opens hyperlinks even
