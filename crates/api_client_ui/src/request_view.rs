@@ -3881,7 +3881,7 @@ impl RequestView {
                 };
                 v_flex()
                     .gap_2()
-                    .child(toggle)
+                    .child(h_flex().w_full().justify_end().child(toggle))
                     .child(body)
                     .into_any_element()
             }
@@ -3915,8 +3915,10 @@ impl RequestView {
                     .gap_2()
                     .child(
                         h_flex()
+                            .w_full()
                             .gap_3()
                             .items_center()
+                            .justify_between()
                             .child(self.render_auto_headers_switch(cx))
                             .child(toggle),
                     )
@@ -9231,6 +9233,66 @@ mod tests {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.params.len(), 3);
         });
+    }
+
+    #[gpui::test]
+    async fn the_bulk_edit_toggle_sits_in_the_right_corner_above_the_body(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+
+        for (tab, toggle_selector, table_selector, editor_selector) in [
+            (
+                RequestTab::Params,
+                "params-bulk-edit-toggle",
+                "params-table",
+                "params-bulk-editor",
+            ),
+            (
+                RequestTab::Headers,
+                "headers-bulk-edit-toggle",
+                "headers-table",
+                "headers-bulk-editor",
+            ),
+        ] {
+            view.update_in(&mut cx, |view, _window, _cx| view.active_tab = tab);
+            draw(&mut cx);
+
+            let toggle = cx
+                .debug_bounds(toggle_selector)
+                .expect("the toggle is drawn");
+            let table = cx.debug_bounds(table_selector).expect("the table is drawn");
+            assert!(
+                (toggle.right() - table.right()).abs() < px(1.),
+                "on {tab:?} the toggle ends at {:?} but the table ends at {:?}: it belongs in the right corner",
+                toggle.right(),
+                table.right()
+            );
+            assert!(
+                toggle.bottom() <= table.top(),
+                "on {tab:?} the toggle stays above the table"
+            );
+
+            view.update_in(&mut cx, |view, window, cx| {
+                if tab == RequestTab::Params {
+                    view.toggle_params_bulk_edit(window, cx);
+                } else {
+                    view.toggle_headers_bulk_edit(window, cx);
+                }
+            });
+            draw(&mut cx);
+
+            let toggle = cx
+                .debug_bounds(toggle_selector)
+                .expect("the toggle is drawn in Bulk Edit too");
+            let editor = cx
+                .debug_bounds(editor_selector)
+                .expect("the text editor is drawn");
+            assert!(
+                (toggle.right() - editor.right()).abs() < px(1.),
+                "on {tab:?} in Bulk Edit the toggle ends at {:?} but the editor ends at {:?}",
+                toggle.right(),
+                editor.right()
+            );
+        }
     }
 
     #[gpui::test]
