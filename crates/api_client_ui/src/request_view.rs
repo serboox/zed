@@ -628,6 +628,12 @@ pub struct RequestView {
     /// scratch, so the generation alone cannot tell "my claim is stale" from
     /// "this is a different tab".
     dock_tab: Option<EntityId>,
+    /// Whether this request was the tab in front of its own pane when the
+    /// workspace last announced a change of active item. The announcement also
+    /// comes when a title changes or the focus moves between panes, and none of
+    /// that may bring this request's reply to the front of the dock: only this
+    /// request coming to the front of its pane may.
+    was_in_front_of_its_pane: bool,
     /// Watches the dock's pane for the response tab above being closed, so the
     /// request closes with it. Replaced whenever a tab is opened for this
     /// request, which is the only moment there is a pane to watch.
@@ -963,6 +969,7 @@ impl RequestView {
             body_json_invalid: false,
             dock_generation: None,
             dock_tab: None,
+            was_in_front_of_its_pane: false,
             _response_pairing: None,
             _subscriptions: Vec::new(),
         };
@@ -2392,11 +2399,17 @@ impl RequestView {
         if !matches!(event, workspace::Event::ActiveItemChanged) {
             return;
         }
+        // The dock showing a run's logs must stay on them while some other tab
+        // of this pane retitles itself or closes; the reply follows only a
+        // request that was not in front of its pane and now is.
         let this_is_in_front = workspace
             .read(cx)
-            .active_item(cx)
+            .pane_for_item_id(cx.entity_id())
+            .and_then(|pane| pane.read(cx).active_item())
             .is_some_and(|item| item.item_id() == cx.entity_id());
-        if this_is_in_front {
+        let came_to_the_front = this_is_in_front && !self.was_in_front_of_its_pane;
+        self.was_in_front_of_its_pane = this_is_in_front;
+        if came_to_the_front {
             let request_id = self.request_id;
             workspace.update(cx, |workspace, cx| {
                 activate_response_tab(workspace, request_id, window, cx)
@@ -10247,6 +10260,136 @@ mod tests {
             front_response_tab(&terminal_panel, &mut cx),
             Some(first_tab),
             "switching request tabs has to switch the reply on screen with it"
+        );
+    }
+
+    /// Closing a tab behind the request in front leaves the logs of a run on
+    /// screen. Every tab that closes makes the workspace announce a change of
+    /// active item, and the reply of the request in front used to answer each
+    /// announcement by taking the dock back. That threw the reader onto the last
+    /// tab, the reply, instead of the logs of the run.
+    #[gpui::test]
+    async fn the_logs_of_a_run_stay_in_front_of_the_dock_when_a_tab_closes(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        let (centre_pane, background) = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let background = cx.new(|cx| TestItem::new(cx).with_label("A file"));
+            workspace.add_item_to_active_pane(
+                Box::new(background.clone()),
+                None,
+                false,
+                window,
+                cx,
+            );
+            workspace.activate_item(&second, true, true, window, cx);
+            (workspace.active_pane().clone(), background)
+        });
+        cx.run_until_parked();
+        let logs = terminal_panel.update_in(&mut cx, |panel, window, cx| {
+            let logs = cx.new(|cx| TestItem::new(cx).with_label("Run API"));
+            panel
+                .pane()
+                .expect("the terminal panel has its pane")
+                .update(cx, |pane, cx| {
+                    pane.add_item(Box::new(logs.clone()), false, false, None, window, cx);
+                });
+            logs
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(logs.entity_id()),
+            "the run's logs are what the dock shows once the run has started"
+        );
+
+        centre_pane
+            .update_in(&mut cx, |pane, window, cx| {
+                pane.close_item_by_id(background.entity_id(), SaveIntent::Close, window, cx)
+            })
+            .await
+            .expect("the tab closes");
+        cx.run_until_parked();
+
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(logs.entity_id()),
+            "closing a tab behind the request is no reason to leave the logs"
+        );
+    }
+
+    /// The dock showing something else, a run's logs say, stays on it when the
+    /// workspace announces a change of active item that is no change of the
+    /// request in front, such as a background tab of the centre retitling itself.
+    /// The reply used to follow every such announcement, and pushed the run's
+    /// logs aside for the front request's reply, which sits further along the
+    /// tabs of the same pane.
+    #[gpui::test]
+    async fn the_dock_stays_on_a_tab_that_is_not_a_reply_while_the_front_request_is_unchanged(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        // A tab of the centre that is not in front, with the second request back in
+        // front of it, and then the dock showing something that is not a reply.
+        let background = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let background = cx.new(|cx| TestItem::new(cx).with_label("A file"));
+            workspace.add_item_to_active_pane(
+                Box::new(background.clone()),
+                None,
+                false,
+                window,
+                cx,
+            );
+            workspace.activate_item(&second, true, true, window, cx);
+            background
+        });
+        cx.run_until_parked();
+        let logs = terminal_panel.update_in(&mut cx, |panel, window, cx| {
+            let logs = cx.new(|cx| TestItem::new(cx).with_label("Run API"));
+            panel
+                .pane()
+                .expect("the terminal panel has its pane")
+                .update(cx, |pane, cx| {
+                    pane.add_item(Box::new(logs.clone()), false, false, None, window, cx);
+                });
+            logs
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(logs.entity_id()),
+            "the logs are in front of the dock to begin with"
+        );
+
+        background.update(&mut cx, |_, cx| {
+            cx.emit(workspace::item::ItemEvent::UpdateTab)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(logs.entity_id()),
+            "a tab of the centre changing its title is no reason to leave the logs"
         );
     }
 
