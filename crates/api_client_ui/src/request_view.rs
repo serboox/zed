@@ -6525,6 +6525,80 @@ mod tests {
         );
     }
 
+    /// `localhost` is where a request is sent most while it is being written, so
+    /// when there is one it is offered first among the environments, not wherever
+    /// its letters put it. Only that name is promoted, whatever its case; a name
+    /// that merely starts with it is not, and the rest keep reading alphabetically.
+    #[gpui::test]
+    async fn localhost_is_offered_first_among_the_environments(cx: &mut TestAppContext) {
+        let (store, _request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            for name in [
+                "ams-prod-gcp",
+                "dal-prod-gcp",
+                "hk-prod-gc",
+                "LocalHost",
+                "localhost-staging",
+                "QA Test POD",
+            ] {
+                store.create_environment(name.into(), cx);
+            }
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        let rows = picker.read_with(&cx, |picker, cx| picker.delegate.rows_for_test(cx));
+        let rows: Vec<&str> = rows.iter().map(|row| row.as_ref()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Use Active Environment",
+                "LocalHost",
+                "ams-prod-gcp",
+                "dal-prod-gcp",
+                "hk-prod-gc",
+                "localhost-staging",
+                "QA Test POD",
+            ],
+            "localhost leads the environments, the others read alphabetically"
+        );
+    }
+
+    /// Pinning does not take that away: among the pinned ones `localhost` is
+    /// still the first.
+    #[gpui::test]
+    async fn localhost_leads_the_pinned_ones_too(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        let (alpha, local) = store.update(&mut cx, |store, cx| {
+            let alpha = store.create_environment("alpha".into(), cx);
+            let local = store.create_environment("localhost".into(), cx);
+            store.create_environment("zeta".into(), cx);
+            (alpha, local)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, alpha, cx);
+            store.toggle_request_pinned_environment(request_id, local, cx);
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        let rows = picker.read_with(&cx, |picker, cx| picker.delegate.rows_for_test(cx));
+        let rows: Vec<&str> = rows.iter().map(|row| row.as_ref()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Pinned to this request",
+                "localhost",
+                "alpha",
+                "Use Active Environment",
+                "zeta",
+            ],
+            "localhost first among the pinned ones, then the rest of them"
+        );
+    }
+
     /// A line under the pinned ones only when something follows them: a search
     /// that turns up nothing but pinned environments must not leave a line
     /// hanging off the bottom of the list.

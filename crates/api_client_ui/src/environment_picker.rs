@@ -18,6 +18,15 @@ const THE_ACTIVE_ONE: &str = "Use Active Environment";
 /// What the row that asks for no comparison is called.
 const NO_COMPARISON: &str = "Do Not Compare";
 
+/// The environment of the machine the reader is working on. A request is sent
+/// there more than anywhere while it is being written, so it is offered first
+/// rather than wherever its letters put it.
+const LOCALHOST: &str = "localhost";
+
+fn is_localhost(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(LOCALHOST)
+}
+
 /// What choosing a row in this picker means. The list itself is the same either
 /// way -- the same environments, the same pins, the same search -- because there
 /// is only one list of environments and one set of pins per request.
@@ -101,7 +110,8 @@ impl EnvironmentPickerDelegate {
     /// Builds the list: the pinned environments under a heading, a line, then
     /// the active-environment row and everything else. Both groups read
     /// alphabetically and blind to case, so a name that starts with a capital
-    /// sits among its neighbours rather than above every lower-case one.
+    /// sits among its neighbours rather than above every lower-case one. The
+    /// one exception is `localhost`, which leads whichever group it is in.
     fn rebuild(&mut self, query: &str, cx: &mut App) {
         let query = query.trim().to_lowercase();
         let store = self.store.read(cx);
@@ -126,8 +136,9 @@ impl EnvironmentPickerDelegate {
         }
         let by_name = |rows: &mut Vec<(EnvironmentId, SharedString)>| {
             rows.sort_by(|(_, one), (_, other)| {
-                one.to_lowercase()
-                    .cmp(&other.to_lowercase())
+                is_localhost(other)
+                    .cmp(&is_localhost(one))
+                    .then_with(|| one.to_lowercase().cmp(&other.to_lowercase()))
                     .then_with(|| one.cmp(other))
             });
         };
