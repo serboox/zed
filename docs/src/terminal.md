@@ -233,7 +233,9 @@ By default, text stays selected after copying. To clear the selection:
 
 ## Search
 
-Search terminal content with `Cmd+F` (macOS) or `Ctrl+Shift+F` (Linux/Windows). This opens the same search bar used in the editor.
+Search terminal content with `Cmd+F` (macOS) or `Ctrl+Shift+F` (Linux/Windows). This opens the same search bar used in the editor, with its match case and whole word toggles.
+
+In the terminal of a task, whose output is read rather than typed into, `Ctrl+F` opens the search on Linux and Windows too. In any other terminal `Ctrl+F` still goes to the shell.
 
 ## Vi Mode
 

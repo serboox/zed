@@ -1081,6 +1081,10 @@ impl TerminalView {
             dispatch_context.add("vi_mode");
         }
 
+        if self.terminal.read(cx).task().is_some() {
+            dispatch_context.add("task_terminal");
+        }
+
         let mode = self.terminal.read(cx).last_content.mode;
         dispatch_context.set(
             "screen",
@@ -1355,16 +1359,61 @@ fn subscribe_for_terminal_events(
     vec![terminal_subscription, terminal_events_subscription]
 }
 
-fn regex_search_for_query(query: &SearchQuery) -> Option<Search> {
-    let str = query.as_str();
-    if query.is_regex() {
-        if str == "." {
-            return None;
-        }
-        Search::new(str)
-    } else {
-        Search::new(&regex::escape(str))
+/// The pattern the terminal's searcher runs for a query.
+///
+/// The searcher on its own is case-insensitive for a lower-case pattern and
+/// case-sensitive for any other, whatever the search bar says. The flags below
+/// make the bar's case toggle mean what it says, which is what reading logs
+/// needs: `error` finds `ERROR`, and the toggle finds only `error`.
+///
+/// The searcher cannot run a Unicode word boundary, so the whole-word toggle
+/// uses the ASCII one. Like the editor's search, it asks for a boundary only at
+/// an edge of the query that is itself an ASCII word character: at any other
+/// edge a boundary would reject `(retry)` between spaces, or a word of another
+/// script wherever it stands.
+fn terminal_search_pattern(query: &SearchQuery) -> Option<String> {
+    let text = query.as_str();
+    // A plain text query that had to take the regex path is marked as escaped,
+    // and `as_str` then holds what was typed rather than a pattern.
+    let is_literal = !query.replacement_requires_context();
+    if !is_literal && text == "." {
+        return None;
     }
+    let mut pattern = if is_literal {
+        regex::escape(text)
+    } else {
+        text.to_string()
+    };
+    if query.whole_word() {
+        let is_ascii_word_character =
+            |character: char| character.is_ascii_alphanumeric() || character == '_';
+        let boundary = r"(?-u:\b)";
+        let before = if text.chars().next().is_some_and(is_ascii_word_character) {
+            boundary
+        } else {
+            ""
+        };
+        let after = if text
+            .chars()
+            .next_back()
+            .is_some_and(is_ascii_word_character)
+        {
+            boundary
+        } else {
+            ""
+        };
+        pattern = format!("{before}(?:{pattern}){after}");
+    }
+    let case_flag = if query.case_sensitive() {
+        "(?-i)"
+    } else {
+        "(?i)"
+    };
+    Some(format!("{case_flag}{pattern}"))
+}
+
+fn regex_search_for_query(query: &SearchQuery) -> Option<Search> {
+    Search::new(&terminal_search_pattern(query)?)
 }
 
 #[derive(Default)]
@@ -2112,8 +2161,8 @@ impl SearchableItem for TerminalView {
 
     fn supported_options(&self) -> SearchOptions {
         SearchOptions {
-            case: false,
-            word: false,
+            case: true,
+            word: true,
             regex: true,
             replacement: false,
             selection: false,
@@ -2455,6 +2504,149 @@ mod tests {
         })
     }
 
+    fn text_query(text: &str, whole_word: bool, case_sensitive: bool) -> SearchQuery {
+        SearchQuery::text(
+            text,
+            whole_word,
+            case_sensitive,
+            false,
+            Default::default(),
+            Default::default(),
+            false,
+            None,
+        )
+        .expect("a plain text query is valid")
+    }
+
+    fn regex_query(pattern: &str, whole_word: bool, case_sensitive: bool) -> SearchQuery {
+        SearchQuery::regex(
+            pattern,
+            whole_word,
+            case_sensitive,
+            false,
+            false,
+            Default::default(),
+            Default::default(),
+            false,
+            None,
+        )
+        .expect("the pattern is a valid regular expression")
+    }
+
+    async fn matches_found(
+        terminal: &Entity<Terminal>,
+        query: &SearchQuery,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        let search = regex_search_for_query(query).expect("the query can be searched for");
+        terminal
+            .update(cx, |terminal, cx| terminal.find_matches(search, cx))
+            .await
+            .len()
+    }
+
+    /// The case and whole-word toggles of the search bar decide what the
+    /// terminal finds. The searcher alone is case-insensitive for a lower-case
+    /// query and case-sensitive for any other, and knows nothing of whole words,
+    /// so logs could not be searched for `error` without also getting `ERROR`
+    /// and `terrorist`.
+    #[gpui::test]
+    async fn the_search_toggles_decide_which_matches_the_terminal_finds(cx: &mut TestAppContext) {
+        let (terminal, mut cx) = a_drawn_terminal_showing(
+            "ERROR one\r\nerror two\r\nError three\r\nterrorist\r\n",
+            None,
+            cx,
+        )
+        .await;
+
+        assert_eq!(
+            matches_found(&terminal, &text_query("error", false, false), &mut cx).await,
+            4,
+            "by default the case is ignored, and a part of a word counts"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("Error", false, false), &mut cx).await,
+            4,
+            "a capital in the query does not make it case-sensitive on its own"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("error", false, true), &mut cx).await,
+            2,
+            "with the case toggle on, only the lower-case ones are found"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("error", true, false), &mut cx).await,
+            3,
+            "with the whole-word toggle on, `terrorist` is left out"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("error", true, true), &mut cx).await,
+            1,
+            "and both toggles together find the one lower-case word"
+        );
+    }
+
+    /// Characters that mean something to a regular expression are searched for
+    /// as they are unless the regex toggle is on.
+    #[gpui::test]
+    async fn a_plain_query_is_searched_for_literally(cx: &mut TestAppContext) {
+        let (terminal, mut cx) =
+            a_drawn_terminal_showing("took 1.5s (retry)\r\ntook 1x5s retry\r\n", None, cx).await;
+
+        assert_eq!(
+            matches_found(
+                &terminal,
+                &text_query("1.5s (retry)", false, false),
+                &mut cx
+            )
+            .await,
+            1,
+            "the dot and the brackets are the characters of the text"
+        );
+    }
+
+    /// The whole-word toggle asks for a word boundary only at an edge that is a
+    /// word character itself. A text that starts or ends with a bracket has no
+    /// word to bound there, and a word of another script cannot be bound by the
+    /// ASCII boundary the searcher offers, so neither may stop being found.
+    #[gpui::test]
+    async fn whole_word_asks_for_a_boundary_only_where_there_is_a_word_to_bound(
+        cx: &mut TestAppContext,
+    ) {
+        let (terminal, mut cx) = a_drawn_terminal_showing(
+            "(retry) x(retry)y xretry\r\nошибка здесь, неошибка там\r\n",
+            None,
+            cx,
+        )
+        .await;
+
+        assert_eq!(
+            matches_found(&terminal, &text_query("(retry)", true, false), &mut cx).await,
+            2,
+            "a bracket is never part of a word, so what stands next to it does not matter"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("ошибка", true, false), &mut cx).await,
+            2,
+            "a word of another script is found wherever it stands"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("retry", true, false), &mut cx).await,
+            2,
+            "a word of the ASCII kind still has to stand alone, brackets do not touch it"
+        );
+        assert_eq!(
+            matches_found(&terminal, &text_query("retry", false, false), &mut cx).await,
+            3,
+            "and without the toggle the part of `xretry` counts too"
+        );
+        assert_eq!(
+            matches_found(&terminal, &regex_query(r"\(retry\)", true, false), &mut cx).await,
+            2,
+            "a regular expression that starts and ends with brackets is bound like the text"
+        );
+    }
+
     /// Selecting with the mouse copies the selection as soon as the button is
     /// released, the way kitty's `copy_on_select clipboard` does, when the
     /// setting is on.
@@ -2645,6 +2837,31 @@ mod tests {
             terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
             vec![vec![0x11]],
             "ctrl-q in a focused terminal should send 0x11 to the PTY, not trigger zed::Quit",
+        );
+    }
+
+    /// A shell keeps ctrl-f: readline binds it to "forward-char", and only the
+    /// terminals of tasks, whose output is read rather than typed into, give it
+    /// to the search.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn ctrl_f_in_a_plain_terminal_is_forwarded_to_the_shell(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-f");
+        assert_eq!(
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![vec![0x06]],
+            "ctrl-f in a plain terminal should send 0x06 to the PTY",
         );
     }
 

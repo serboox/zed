@@ -1438,6 +1438,16 @@
     },
   },
   {
+    // A terminal that runs a task is where logs are read and nothing is typed, so
+    // Ctrl+F is a search there. A shell keeps it for the shell, and so does a
+    // program that has taken the whole screen over, such as vim or less.
+    "context": "Terminal && task_terminal && screen == normal",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-f": "buffer_search::Deploy",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

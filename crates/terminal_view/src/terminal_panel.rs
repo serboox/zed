@@ -4005,6 +4005,68 @@ mod tests {
             .collect()
     }
 
+    /// Ctrl+F in the terminal of a task opens the search over its output and is
+    /// not sent to the program, which would take it for a control character.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn ctrl_f_in_the_terminal_of_a_task_opens_the_search_and_reaches_no_program(
+        cx: &mut TestAppContext,
+    ) {
+        let over = a_panel_over_tasks(cx).await;
+        cx.update(|cx| {
+            cx.bind_keys(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    settings::DEFAULT_KEYMAP_PATH,
+                    cx,
+                )
+                .unwrap(),
+            );
+        });
+        let terminal = spawn(&over, &a_long_task("api server", "api", false, true), cx).await;
+        let mut visual = VisualTestContext::from_window(over.window.into(), cx);
+        let view = visual
+            .update(|_, cx| the_views(&over, cx))
+            .pop()
+            .expect("the task has a terminal tab");
+        let workspace = over
+            .window
+            .read_with(&visual, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let searches_opened = std::rc::Rc::new(std::cell::Cell::new(0));
+        workspace.update(&mut visual, |workspace, _| {
+            let searches_opened = searches_opened.clone();
+            workspace.register_action(move |_, _: &zed_actions::buffer_search::Deploy, _, _| {
+                searches_opened.set(searches_opened.get() + 1);
+            });
+        });
+        workspace.update_in(&mut visual, |workspace, window, cx| {
+            workspace.open_panel::<TerminalPanel>(window, cx);
+        });
+        visual.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        visual.run_until_parked();
+        terminal.update(&mut visual, |terminal, _| terminal.take_input_log());
+
+        visual.simulate_keystrokes("ctrl-f");
+
+        assert_eq!(
+            searches_opened.get(),
+            1,
+            "ctrl-f in the logs of a task has to open the search"
+        );
+        assert!(
+            terminal
+                .update(&mut visual, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "and the program must not receive the key as well"
+        );
+        end_them_all(&over, cx);
+    }
+
     /// The same configuration started again still takes its own terminal over.
     #[gpui::test]
     async fn the_same_task_started_again_takes_its_own_terminal_over(cx: &mut TestAppContext) {
