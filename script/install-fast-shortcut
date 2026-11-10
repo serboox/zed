@@ -71,6 +71,9 @@ if [[ -x "$zedcli_binary" ]]; then
 fi
 rm -f "$old_desktop_file" "$apps_dir/dev.zed.Zed-Dev-Legacy.desktop" "$bin_dir/zed-fast-legacy"
 
+# GNOME's "New Window" item reruns Exec without arguments, and a running editor
+# opens no window for that. The shell prefers the new-window action, so it
+# opens a real second window.
 cat > "$desktop_file" <<EOF
 [Desktop Entry]
 Version=1.0
@@ -85,6 +88,11 @@ Exec=$link %U
 Icon=$icon
 Categories=Utility;TextEditor;Development;IDE;
 Keywords=zed;fast;dev;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=$link --new
 EOF
 
 if command -v update-desktop-database >/dev/null 2>&1; then
