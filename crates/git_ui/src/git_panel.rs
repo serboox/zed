@@ -7825,6 +7825,9 @@ impl GitPanel {
             return;
         }
         self.active_history_sha = active_history_sha;
+        if let Some(page) = self.history_page.clone() {
+            page.update(cx, |page, cx| page.set_active_sha(active_history_sha, cx));
+        }
         if let Some(index) = self.active_history_entry_index() {
             self.focused_history_entry = Some(index);
         }
@@ -7959,8 +7962,12 @@ impl GitPanel {
         let workspace = self.workspace.clone();
         let repo_id = repository.read(cx).id;
         let git_store = self.project.read(cx).git_store().clone();
+        let active_sha = self.active_history_sha;
         let page = cx.new(|cx| {
-            crate::git_graph::GitGraph::new(repo_id, git_store, workspace, None, window, cx)
+            let mut page =
+                crate::git_graph::GitGraph::new(repo_id, git_store, workspace, None, window, cx);
+            page.set_active_sha(active_sha, cx);
+            page
         });
         self.history_page = Some(page);
         cx.notify();
@@ -12639,6 +12646,42 @@ mod tests {
 
         test.open_commit(middle_sha);
         assert_eq!(test.history_state(), (Some(middle_sha), Some(1)));
+    }
+
+    #[gpui::test]
+    async fn test_history_page_highlights_the_open_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (mut test, [_, middle_sha, oldest_sha]) = history_panel_with_commits(cx).await;
+        let page = test
+            .panel
+            .read_with(&test.cx, |panel, _| panel.history_page.clone())
+            .expect("the History tab should draw the graph page");
+        let active_on_page =
+            |test: &HistoryPanelTest| page.read_with(&test.cx, |page, _| page.active_sha());
+        assert_eq!(active_on_page(&test), None);
+
+        test.open_commit(middle_sha);
+        assert_eq!(
+            active_on_page(&test),
+            Some(middle_sha),
+            "the page the History tab draws should light the commit that was opened"
+        );
+
+        test.open_commit(oldest_sha);
+        assert_eq!(active_on_page(&test), Some(oldest_sha));
+
+        test.workspace
+            .update_in(&mut test.cx, |workspace, window, cx| {
+                let test_item = cx.new(TestItem::new);
+                workspace.add_item_to_active_pane(Box::new(test_item), None, true, window, cx);
+            });
+        test.cx.run_until_parked();
+        assert_eq!(
+            active_on_page(&test),
+            None,
+            "a tab that is not a commit should leave nothing lit"
+        );
     }
 
     #[gpui::test]

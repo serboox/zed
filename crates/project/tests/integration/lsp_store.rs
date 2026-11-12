@@ -10,7 +10,8 @@ use fs::{FakeFs, Fs};
 use futures::{FutureExt, StreamExt};
 use gpui::{Entity, TestAppContext, UpdateGlobal as _};
 use language::{
-    Buffer, CodeLabel, DiagnosticSourceKind, FakeLspAdapter, HighlightId, LocalFile, rust_lang,
+    Buffer, CodeLabel, DiagnosticSourceKind, FakeLspAdapter, HighlightId, LocalFile, json_lang,
+    rust_lang,
 };
 use lsp::{LanguageServerId, LanguageServerName, Uri};
 use parking_lot::Mutex;
@@ -345,6 +346,205 @@ async fn a_server_does_not_start_until_it_is_asked_for(cx: &mut TestAppContext) 
             "asking for a server by hand must start exactly one"
         );
     });
+}
+
+// One server often serves several languages. Asking for it for one language
+// must not bring it up for the others, in whatever worktree they are opened.
+#[gpui::test]
+async fn a_server_started_by_hand_stays_off_for_the_languages_it_was_not_started_for(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    start_language_servers_by_hand(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/rust-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    fs.insert_tree(
+        path!("/other-rust-root"),
+        json!({ "lib.rs": "pub fn lib() {}" }),
+    )
+    .await;
+    fs.insert_tree(path!("/json-root"), json!({ "data.json": "{}" }))
+        .await;
+
+    let project = Project::test(
+        fs,
+        [
+            path!("/rust-root").as_ref(),
+            path!("/other-rust-root").as_ref(),
+            path!("/json-root").as_ref(),
+        ],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    language_registry.add(json_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "shared-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    language_registry.register_fake_lsp_adapter(
+        "JSON",
+        FakeLspAdapter {
+            name: "shared-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    let (rust_buffer, _rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/rust-root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        0,
+        "opening a file must not start a server that nobody asked for"
+    );
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 1);
+
+    let (json_buffer, _json_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/json-root/data.json"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        1,
+        "starting a server for Rust must not bring it up for JSON in another worktree"
+    );
+    assert!(fake_servers.next().now_or_never().is_none());
+
+    let (_other_rust_buffer, _other_rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/other-rust-root/lib.rs"), cx)
+        })
+        .await
+        .unwrap();
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        2,
+        "the language it was started for still starts it in another worktree"
+    );
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![json_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        3,
+        "asking for the server for JSON by hand allows it for JSON from then on"
+    );
+}
+
+// Stopping is the other half of starting by hand: the server stays off, for
+// every language, until someone asks for it again.
+#[gpui::test]
+async fn a_server_stopped_by_hand_does_not_come_back_on_its_own(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    start_language_servers_by_hand(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/rust-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    fs.insert_tree(
+        path!("/other-rust-root"),
+        json!({ "lib.rs": "pub fn lib() {}" }),
+    )
+    .await;
+
+    let project = Project::test(
+        fs,
+        [
+            path!("/rust-root").as_ref(),
+            path!("/other-rust-root").as_ref(),
+        ],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+
+    let (rust_buffer, _rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/rust-root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 1);
+
+    project.update(cx, |project, cx| {
+        project.stop_language_servers_for_buffers(
+            vec![rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 0);
+
+    let (other_rust_buffer, _other_rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/other-rust-root/lib.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        0,
+        "opening another file must not quietly bring a stopped server back"
+    );
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![other_rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 1);
 }
 
 #[gpui::test]
@@ -1290,6 +1490,34 @@ async fn project_with_rust_server(
             .0
     });
     (project, server_id)
+}
+
+fn start_language_servers_by_hand(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .project
+                    .all_languages
+                    .defaults
+                    .enable_language_server = Some(true);
+                content.global_lsp_settings = Some(settings::GlobalLspSettingsContent {
+                    start: Some(settings::LanguageServerStart::ByHand),
+                    ..Default::default()
+                });
+            });
+        });
+    });
+}
+
+fn running_server_count(project: &Entity<Project>, cx: &TestAppContext) -> usize {
+    project.read_with(cx, |project, cx| {
+        project
+            .lsp_store()
+            .read(cx)
+            .language_server_statuses()
+            .count()
+    })
 }
 
 fn buffer_paths(buffer: &Entity<Buffer>, cx: &TestAppContext) -> (String, PathBuf) {

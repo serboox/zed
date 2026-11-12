@@ -1,6 +1,9 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
-    commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
+    commit_context_menu::{
+        CommitContextMenuData, CommitContextMenuSource, commit_context_menu,
+        hidden_refs_context_menu,
+    },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_status_icon,
@@ -2390,11 +2393,11 @@ where
 
 /// Which columns the table draws. `true` means hidden, which is what the
 /// table's filter reads.
-pub(crate) fn column_mask(layout: HistoryLayout) -> TableRow<bool> {
+pub(crate) fn column_mask(layout: HistoryLayout, hidden: HiddenColumns) -> TableRow<bool> {
     TableRow::from_vec(
         vec![
-            !layout.labels.has_a_column(),
-            false,
+            !layout.labels.has_a_column() || hidden.hides(HistoryColumn::Labels),
+            hidden.hides(HistoryColumn::Graph),
             false,
             // A column only when every row has an age to put in it. Where the
             // age is shown on a row or two the age rides at the end of the
@@ -2404,6 +2407,98 @@ pub(crate) fn column_mask(layout: HistoryLayout) -> TableRow<bool> {
         ],
         TABLE_COLUMN_COUNT,
     )
+}
+
+/// A column of the history the reader can hide. The subject is not one of
+/// them: it is the column every other one gives its room to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryColumn {
+    Labels,
+    Graph,
+    Age,
+}
+
+impl HistoryColumn {
+    pub(crate) const ALL: [HistoryColumn; 3] = [
+        HistoryColumn::Labels,
+        HistoryColumn::Graph,
+        HistoryColumn::Age,
+    ];
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            HistoryColumn::Labels => "Refs",
+            HistoryColumn::Graph => "Graph",
+            HistoryColumn::Age => "Date",
+        }
+    }
+
+    /// Where the column is kept in the saved mask. The bits are the ones the
+    /// same columns have always been saved under, so a mask saved by an older
+    /// build still hides what it hid.
+    fn bit(self) -> u32 {
+        match self {
+            HistoryColumn::Labels => 5,
+            HistoryColumn::Graph => 0,
+            HistoryColumn::Age => 2,
+        }
+    }
+}
+
+/// The columns the reader hid, as the mask they are saved in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HiddenColumns(i32);
+
+impl HiddenColumns {
+    /// Bits this history does not know are dropped: they name columns it does
+    /// not have, and keeping them would hide nothing.
+    pub(crate) fn from_bits(bits: i32) -> Self {
+        let known = HistoryColumn::ALL
+            .iter()
+            .fold(0, |mask, column| mask | (1 << column.bit()));
+        Self(bits & known)
+    }
+
+    pub(crate) fn bits(self) -> i32 {
+        self.0
+    }
+
+    pub(crate) fn hides(self, column: HistoryColumn) -> bool {
+        self.0 & (1 << column.bit()) != 0
+    }
+
+    pub(crate) fn toggled(self, column: HistoryColumn) -> Self {
+        Self(self.0 ^ (1 << column.bit()))
+    }
+}
+
+/// One entry a column, in the order the columns are drawn. The subject is
+/// listed for completeness and cannot be hidden.
+fn columns_menu(menu: ContextMenu, hidden: HiddenColumns, graph: Entity<GitGraph>) -> ContextMenu {
+    let mut menu = menu.header("Columns");
+    let toggle = |menu: ContextMenu, column: HistoryColumn| {
+        let graph = graph.clone();
+        menu.toggleable_entry(
+            column.title(),
+            !hidden.hides(column),
+            IconPosition::End,
+            None,
+            move |_window, cx| {
+                graph.update(cx, |graph, cx| graph.toggle_column(column, cx));
+            },
+        )
+    };
+    menu = toggle(menu, HistoryColumn::Labels);
+    menu = toggle(menu, HistoryColumn::Graph);
+    menu = menu.toggleable_entry_disabled_when(
+        "Description",
+        true,
+        true,
+        IconPosition::End,
+        None,
+        |_window, _cx| {},
+    );
+    toggle(menu, HistoryColumn::Age)
 }
 
 /// What a node needs to look for a picture of its author.
@@ -2767,6 +2862,9 @@ pub struct GitGraph {
     /// What the last drop offered, so a test can tell one offer from another.
     #[cfg(test)]
     last_drop_offer: Option<DropOffer>,
+    /// The refs the last menu behind a "+N" count offered.
+    #[cfg(test)]
+    last_hidden_refs_menu: Option<Vec<SharedString>>,
     /// The commit the card is comparing the selected one against, picked with
     /// Shift. `None` means the card shows one commit, as it always has.
     compare_against: Option<usize>,
@@ -2791,6 +2889,8 @@ pub struct GitGraph {
     /// What the reader dragged the label column to, if they did. Manual beats
     /// automatic until they ask for the automatic back with a double click.
     column_override: Rc<Cell<Option<Pixels>>>,
+    /// The columns the reader hid from the menu of columns.
+    hidden_columns: HiddenColumns,
     /// Where the history was last laid out. An element cannot know its own
     /// size until it has been laid out, so this is read a frame late; a change
     /// asks for one more frame, and the layout settles on the frame after the
@@ -2826,11 +2926,48 @@ pub struct GitGraph {
     commit_details_message_collapsed: bool,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    /// The rest of a selection waiting for `pending_select_sha` to be found.
+    pending_picks: Option<PendingPicks>,
+    /// The commit open in the active commit view, which the History tab keeps
+    /// highlighted while the reader moves around the list.
+    active_sha: Option<Oid>,
     nav_history: Option<ItemNavHistory>,
+}
+
+/// What was picked beside the selected commit, kept by sha while the history
+/// reloads.
+struct PendingPicks {
+    picked: Vec<Oid>,
+    compare_against: Option<Oid>,
 }
 
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        // The rows are about to be numbered afresh, and a reload after a tag
+        // or a branch moved can put a different commit at the same row. What
+        // was selected is remembered by what it is and found again once the
+        // history is back, or dropped if it is not in it any more.
+        if let Some(selected) = self
+            .selected_entry_idx
+            .take()
+            .and_then(|idx| self.graph_data.commits.get(idx))
+            .map(|commit| commit.data.sha)
+        {
+            let sha_of = |row: &usize| {
+                self.graph_data
+                    .commits
+                    .get(*row)
+                    .map(|commit| commit.data.sha)
+            };
+            self.pending_picks = Some(PendingPicks {
+                picked: self.picked_rows.iter().filter_map(sha_of).collect(),
+                compare_against: self.compare_against.as_ref().and_then(sha_of),
+            });
+            self.pending_select_sha = Some(selected);
+        }
+        self.picked_rows.clear();
+        self.compare_against = None;
+        self.hovered_entry_idx = None;
         self.graph_first_lane.set(0);
         self.lit_branch = None;
         self.kept_rows = None;
@@ -2969,6 +3106,31 @@ impl GitGraph {
             })
     }
 
+    /// The menu that hides and shows the columns of the history.
+    fn render_columns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hidden = self.hidden_columns;
+        let graph = cx.entity();
+        PopoverMenu::new("git-graph-columns-menu")
+            .trigger(
+                IconButton::new("git-graph-columns", IconName::Table)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Columns")),
+            )
+            .menu(move |window, cx| {
+                let graph = graph.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    columns_menu(menu, hidden, graph)
+                }))
+            })
+    }
+
+    fn toggle_column(&mut self, column: HistoryColumn, cx: &mut Context<Self>) {
+        self.hidden_columns = self.hidden_columns.toggled(column);
+        // The choice is saved with the item, so the item is written again.
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
     /// The two buttons that change how large the history is drawn.
     ///
     /// A keystroke alone would leave the reader who has never read a keymap
@@ -3078,7 +3240,10 @@ impl GitGraph {
         let character = measure_text(window, "0");
 
         let mut widest_label = [px(0.); 4];
-        for name in self.graph_data.label_names.iter() {
+        // A hidden column of labels asks for no room, so the rest of the row
+        // is laid out as if the history carried none.
+        let labels_shown = !self.hidden_columns.hides(HistoryColumn::Labels);
+        for name in self.graph_data.label_names.iter().filter(|_| labels_shown) {
             let Some((kind, read)) = read_ref(name.as_ref(), head.as_deref(), &self.remote_names)
             else {
                 continue;
@@ -3107,6 +3272,10 @@ impl GitGraph {
         );
         if layout.age == AgeShown::Column {
             layout.age_width = self.widest_age(window).min(AGE_COLUMN_WIDTH);
+        }
+        if self.hidden_columns.hides(HistoryColumn::Age) {
+            layout.age = AgeShown::Nowhere;
+            layout.age_width = px(0.);
         }
         // The cap, not just the column: everything downstream places nodes and
         // edge rings by it, so narrowing the column alone would leave a node of
@@ -3140,6 +3309,9 @@ impl GitGraph {
     /// from the scroll position can know about.
     fn graph_column_width(&self, window: &Window, cx: &App, layout: HistoryLayout) -> Pixels {
         let _ = cx;
+        if self.hidden_columns.hides(HistoryColumn::Graph) {
+            return px(0.);
+        }
         let lanes = layout.lane_cap.min(self.graph_data.max_lanes.max(1));
         let rings = match self.graph_data.max_lanes > layout.lane_cap {
             true => self.metrics(window).lane,
@@ -3220,6 +3392,15 @@ impl GitGraph {
         self.metrics(window)
     }
 
+    /// What the column of labels takes: what the reader dragged it to, else
+    /// what the layout chose, and nothing at all once it is hidden.
+    fn label_column_width(&self, layout: HistoryLayout) -> Pixels {
+        if self.hidden_columns.hides(HistoryColumn::Labels) {
+            return px(0.);
+        }
+        self.column_override.get().unwrap_or(layout.label_width)
+    }
+
     fn table_column_widths(
         &self,
         window: &Window,
@@ -3230,9 +3411,7 @@ impl GitGraph {
         let graph = self.graph_column_width(window, cx, layout);
         let age = layout.age_width;
         let labels = self
-            .column_override
-            .get()
-            .unwrap_or(layout.label_width)
+            .label_column_width(layout)
             .min((container - graph - age - layout.subject_min).max(px(0.)));
         let subject = (container - graph - age - labels).max(px(1.));
         let share = |width: Pixels| DefiniteLength::Fraction(width / container);
@@ -3247,6 +3426,9 @@ impl GitGraph {
     /// How far the lane window can be pushed before its right edge meets the
     /// last lane.
     fn furthest_lane(&self, layout: HistoryLayout) -> usize {
+        if self.hidden_columns.hides(HistoryColumn::Graph) {
+            return 0;
+        }
         self.graph_data
             .max_lanes
             .saturating_sub(layout.lane_cap.max(1))
@@ -3327,11 +3509,7 @@ impl GitGraph {
 
         let container = self.history_width(window, cx).max(px(1.));
         let graph = self.graph_column_width(window, cx, layout);
-        let left = self
-            .column_override
-            .get()
-            .unwrap_or(layout.label_width)
-            .min(container);
+        let left = self.label_column_width(layout).min(container);
         let shown = layout.lane_cap.max(1) as f32 / self.graph_data.max_lanes.max(1) as f32;
         let at = self.graph_first_lane.get() as f32 / furthest as f32;
         let measured = self.graph_track.clone();
@@ -3406,11 +3584,7 @@ impl GitGraph {
 
         let metrics = self.row_metrics(window, cx);
         let container = self.history_width(window, cx).max(px(1.));
-        let labels = self
-            .column_override
-            .get()
-            .unwrap_or(layout.label_width)
-            .min(container);
+        let labels = self.label_column_width(layout).min(container);
         let first_lane = self.graph_first_lane.get();
         let lane_cap = layout.lane_cap.max(1);
         let lane = self
@@ -4283,7 +4457,7 @@ impl GitGraph {
         if !layout.labels.has_a_column() {
             return None;
         }
-        let at = self.column_override.get().unwrap_or(layout.label_width);
+        let at = self.label_column_width(layout);
         if at <= px(0.) {
             return None;
         }
@@ -4413,11 +4587,14 @@ impl GitGraph {
             picked_rows: Vec::new(),
             #[cfg(test)]
             last_drop_offer: None,
+            #[cfg(test)]
+            last_hidden_refs_menu: None,
             compare_against: None,
             lit_branch: None,
             graph_track: Rc::new(Cell::new(None)),
             graph_first_lane: Rc::new(Cell::new(0)),
             column_override: Rc::new(Cell::new(None)),
+            hidden_columns: HiddenColumns::default(),
             measured: Rc::new(Cell::new(None)),
             remote_names: Vec::new(),
             _remote_names_task: None,
@@ -4439,6 +4616,8 @@ impl GitGraph {
             commit_details_message_collapsed: false,
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            pending_picks: None,
+            active_sha: None,
             nav_history: None,
         };
 
@@ -4491,8 +4670,10 @@ impl GitGraph {
                                     .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
                             })
                         {
+                            self.restore_pending_picks(cx);
                             self.select_entry(pending_sha_index, ScrollStrategy::Nearest, cx);
                         }
+                        self.pending_picks = None;
                         let count = match self.graph_data.max_commit_count {
                             AllCommitCount::FullyLoaded(count) | AllCommitCount::Loading(count) => {
                                 count
@@ -4534,11 +4715,13 @@ impl GitGraph {
 
                                 if !is_loading && pending_sha_index.is_none() {
                                     self.pending_select_sha.take();
+                                    self.pending_picks = None;
                                 }
 
                                 pending_sha_index
                             })
                         {
+                            self.restore_pending_picks(cx);
                             self.select_entry(pending_selection_index, ScrollStrategy::Nearest, cx);
                             self.pending_select_sha.take();
                         }
@@ -4573,6 +4756,26 @@ impl GitGraph {
             RepositoryEvent::GraphEvent(_, _) => {}
             _ => {}
         }
+    }
+
+    /// Puts back what was picked beside a selection that is being restored,
+    /// so the card compares the same two commits it compared before.
+    fn restore_pending_picks(&mut self, cx: &App) {
+        let Some(pending) = self.pending_picks.take() else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(data) = repository
+            .read(cx)
+            .get_graph_data(self.log_source.clone(), self.log_order)
+        else {
+            return;
+        };
+        let row_of = |sha: &Oid| data.commit_oid_to_index.get(sha).copied();
+        self.picked_rows = pending.picked.iter().filter_map(row_of).collect();
+        self.compare_against = pending.compare_against.as_ref().and_then(row_of);
     }
 
     fn fetch_initial_graph_data(&mut self, cx: &mut App) {
@@ -4807,11 +5010,8 @@ impl GitGraph {
         // allows the chips stop naming anything and start eating the subject,
         // so the rest are counted instead and named in the count's tooltip.
         let shown = refs.len().min(mode.chips_a_row());
-        let rest: Vec<&str> = refs[shown..]
-            .iter()
-            .map(|(_, name)| name.as_ref())
-            .collect();
-        let overflow = (!rest.is_empty()).then(|| (rest.len(), rest.join(", ")));
+        let hidden: Vec<SharedString> =
+            refs[shown..].iter().map(|(_, name)| name.clone()).collect();
 
         h_flex()
             .h(metrics.row)
@@ -4849,26 +5049,68 @@ impl GitGraph {
                     .child(self.render_ref_chip(*kind, name, accent_color, mode, idx, cx))
                     .into_any_element()
             }))
-            .when_some(overflow, |this, (count, names)| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .id(ElementId::NamedInteger("more-refs".into(), idx as u64))
-                        .h(metrics.label)
-                        .flex()
-                        .items_center()
-                        .child(
-                            Chip::new(format!("+{count}"))
-                                .label_size(LabelSize::Small)
-                                .bg_color(accent_color.opacity(0.08))
-                                .border_color(accent_color.opacity(0.25)),
-                        )
-                        .tooltip(Tooltip::text(names)),
-                )
+            .when(!hidden.is_empty(), |this| {
+                this.child(self.render_hidden_refs_chip(
+                    idx,
+                    "more-refs",
+                    hidden,
+                    metrics,
+                    accent_color,
+                    cx,
+                ))
             })
             .when(carried_across, |this| {
                 this.child(Self::carried_across(idx, accent_color))
             })
+            .into_any_element()
+    }
+
+    /// The count standing in for the names a row has no room for. Its tooltip
+    /// names them and a right click offers each one's own menu, so a ref behind
+    /// the count can still be acted on.
+    fn render_hidden_refs_chip(
+        &self,
+        idx: usize,
+        id_prefix: &'static str,
+        hidden: Vec<SharedString>,
+        metrics: GraphMetrics,
+        accent_color: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let count = hidden.len();
+        let names = hidden
+            .iter()
+            .map(|name| name.as_ref())
+            .collect::<Vec<_>>()
+            .join(", ");
+        div()
+            .flex_none()
+            .id(ElementId::NamedInteger(id_prefix.into(), idx as u64))
+            .debug_selector(move || format!("GRAPH_MORE-{id_prefix}-{idx}"))
+            .h(metrics.label)
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(
+                Chip::new(format!("+{count}"))
+                    .label_size(LabelSize::Small)
+                    .bg_color(accent_color.opacity(0.08))
+                    .border_color(accent_color.opacity(0.25)),
+            )
+            .tooltip(Tooltip::text(names))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_hidden_refs_context_menu(
+                        event.position,
+                        idx,
+                        hidden.clone(),
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -5218,14 +5460,45 @@ impl GitGraph {
                 // beside the subject it marks rather than in the column of
                 // branches, where it would sit among names that mean something
                 // else and push them out of the room they have.
-                let tags: Vec<SharedString> = self
+                let mut tags: Vec<SharedString> = self
                     .refs_of(idx, head_branch_name.as_deref())
                     .into_iter()
                     .filter(|(kind, _)| *kind == RefKind::Tag)
                     .map(|(_, name)| name)
                     .collect();
+                let hidden_tags = tags.split_off(layout.labels.chips_a_row().min(tags.len()));
+                let mut tag_chips: Vec<AnyElement> = tags
+                    .into_iter()
+                    .map(|tag| {
+                        let named = tag.clone();
+                        div()
+                            .flex_none()
+                            .debug_selector(move || format!("GRAPH_TAG-{idx}-{named}"))
+                            .child(
+                                Chip::new(tag)
+                                    .label_size(LabelSize::Small)
+                                    .truncate()
+                                    .icon(RefKind::Tag.icon())
+                                    .bg_color(accent_color.opacity(0.10))
+                                    .border_color(accent_color.opacity(0.30)),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                if !hidden_tags.is_empty() {
+                    tag_chips.push(self.render_hidden_refs_chip(
+                        idx,
+                        "more-tags",
+                        hidden_tags,
+                        metrics,
+                        accent_color,
+                        cx,
+                    ));
+                }
 
-                let inline_label = (!layout.labels.has_a_column()).then(|| {
+                let labels_inline = !layout.labels.has_a_column()
+                    && !self.hidden_columns.hides(HistoryColumn::Labels);
+                let inline_label = labels_inline.then(|| {
                     self.render_refs_cell(
                         idx,
                         metrics,
@@ -5302,25 +5575,7 @@ impl GitGraph {
                                 .gap_1()
                                 .overflow_hidden()
                                 .child(subject_label)
-                                .children(tags.into_iter().take(layout.labels.chips_a_row()).map(
-                                    |tag| {
-                                        let named = tag.clone();
-                                        div()
-                                            .flex_none()
-                                            .debug_selector(move || {
-                                                format!("GRAPH_TAG-{idx}-{named}")
-                                            })
-                                            .child(
-                                                Chip::new(tag)
-                                                    .label_size(LabelSize::Small)
-                                                    .truncate()
-                                                    .icon(RefKind::Tag.icon())
-                                                    .bg_color(accent_color.opacity(0.10))
-                                                    .border_color(accent_color.opacity(0.30)),
-                                            )
-                                            .into_any_element()
-                                    },
-                                )),
+                                .children(tag_chips),
                         )
                         // The age keeps its place whether or not it is
                         // written: appearing on hover, it would push the
@@ -5619,10 +5874,7 @@ impl GitGraph {
         let diff_task = repository.update(cx, |repo, cx| match against {
             // Two commits picked with Shift: what is different between them,
             // not what either of them changed on its own.
-            Some(against) => {
-                let diff_receiver = repo.load_diff_between(against, diff_handle);
-                cx.background_spawn(async move { diff_receiver.await? })
-            }
+            Some(against) => repo.load_diff_between(against, diff_handle, cx),
             None => repo.load_commit_diff(diff_handle, false, cx),
         });
 
@@ -5748,6 +6000,18 @@ impl GitGraph {
 
         self.search_state.selected_index = Some(next_selection);
         self.select_commit_by_sha(oid, cx);
+    }
+
+    pub(crate) fn set_active_sha(&mut self, sha: Option<Oid>, cx: &mut Context<Self>) {
+        if self.active_sha != sha {
+            self.active_sha = sha;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_sha(&self) -> Option<Oid> {
+        self.active_sha
     }
 
     pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
@@ -5953,6 +6217,54 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, Some(index), window, cx);
     }
 
+    fn deploy_hidden_refs_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        hidden_refs: Vec<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.last_hidden_refs_menu = Some(hidden_refs.clone());
+        }
+        let repository = self
+            .get_repository(cx)
+            .map(|repository| repository.downgrade());
+        let context_menu = hidden_refs_context_menu(
+            CommitContextMenuData {
+                sha: commit.data.sha,
+                tag_names: commit
+                    .data
+                    .tag_names()
+                    .into_iter()
+                    .map(|tag_name| SharedString::from(tag_name.to_string()))
+                    .collect(),
+                selected: self.picked_commits(index),
+            },
+            CommitContextMenuSource::GitGraph,
+            hidden_refs,
+            self.focus_handle.clone(),
+            repository,
+            self.workspace.clone(),
+            Some(Rc::new({
+                let graph = cx.weak_entity();
+                move |name: SharedString, cx: &mut App| {
+                    graph
+                        .update(cx, |graph, cx| graph.toggle_solo(name.clone(), cx))
+                        .ok();
+                }
+            })),
+            window,
+            cx,
+        );
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
     fn set_context_menu(
         &mut self,
         context_menu: Entity<ContextMenu>,
@@ -6047,6 +6359,7 @@ impl GitGraph {
             )
             .child(self.render_label_switches(cx))
             .child(self.render_zoom_controls(cx))
+            .child(self.render_columns_menu(cx))
             .child(self.render_details_side_menu("toolbar", cx))
             .child(
                 h_flex()
@@ -7043,7 +7356,7 @@ impl Render for GitGraph {
         } else {
             let layout = self.history_layout(window, cx);
             let rows_in_the_list = self.rows_in_the_list(commit_count);
-            let column_filter = column_mask(layout);
+            let column_filter = column_mask(layout, self.hidden_columns);
             let table_width_config =
                 ColumnWidthConfig::explicit(self.table_column_widths(window, cx, layout));
 
@@ -7059,6 +7372,7 @@ impl Render for GitGraph {
             let table_focus_handle = self.table_interaction_state.read(cx).focus_handle.clone();
             let lit_branch = self.lit_branch.clone();
             let picked_rows = self.picked_rows.clone();
+            let active_sha = self.active_sha;
 
             let commits_table = Table::new(TABLE_COLUMN_COUNT)
                 .interactable(&self.table_interaction_state)
@@ -7100,6 +7414,19 @@ impl Render for GitGraph {
                         Some(cyberpunk::lane(commit.color_idx))
                     });
                     let band = lane.map(|lane| cyberpunk::lane_wash(lane).opacity(ROW_BAND));
+                    // The commit open in the active commit view stays lit as
+                    // strongly as a selection, so the reader can see where the
+                    // view they are reading sits in the history.
+                    let is_active = active_sha.is_some_and(|active| {
+                        weak.upgrade().is_some_and(|graph| {
+                            graph
+                                .read(cx)
+                                .graph_data
+                                .commits
+                                .get(index)
+                                .is_some_and(|commit| commit.data.sha == active)
+                        })
+                    });
 
                     let in_the_question = lit_branch
                         .as_ref()
@@ -7116,13 +7443,16 @@ impl Render for GitGraph {
                         // rows must never make the whole list flash.
                         .when(!in_the_question, |row| row.opacity(0.35))
                         .when_some(band, |row, band| row.bg(band))
-                        .when(is_selected || is_context_menu_target, |row| {
+                        .when(is_selected || is_context_menu_target || is_active, |row| {
                             row.bg(lane.map_or(selected_bg, |lane| {
                                 cyberpunk::lane_wash(lane).opacity(ROW_BAND_SELECTED)
                             }))
                         })
+                        .when(is_active, |row| {
+                            row.debug_selector(move || format!("GRAPH_ACTIVE_ROW-{index}"))
+                        })
                         .when(
-                            is_hovered && !is_selected && !is_context_menu_target,
+                            is_hovered && !is_selected && !is_context_menu_target && !is_active,
                             |row| {
                                 row.bg(lane.map_or(hover_bg, |lane| {
                                     cyberpunk::lane_wash(lane).opacity(ROW_BAND_HOVERED)
@@ -7452,6 +7782,7 @@ impl workspace::SerializableItem for GitGraph {
             selected_sha,
             search_query,
             search_case_sensitive,
+            hidden_columns,
         )) = db.get_git_graph(item_id, workspace_id).ok().flatten()
         else {
             return Task::ready(Err(anyhow::anyhow!("No git graph to deserialize")));
@@ -7464,6 +7795,7 @@ impl workspace::SerializableItem for GitGraph {
             selected_sha,
             search_query,
             search_case_sensitive,
+            hidden_columns,
         };
 
         let window_handle = window.window_handle();
@@ -7506,6 +7838,9 @@ impl workspace::SerializableItem for GitGraph {
                 });
 
                 git_graph.update(cx, |graph, cx| {
+                    if let Some(bits) = state.hidden_columns {
+                        graph.hidden_columns = HiddenColumns::from_bits(bits);
+                    }
                     graph.search_state.case_sensitive =
                         state.search_case_sensitive.unwrap_or(false);
 
@@ -7544,7 +7879,9 @@ impl workspace::SerializableItem for GitGraph {
         let selected_sha = self
             .selected_entry_idx
             .and_then(|idx| self.graph_data.commits.get(idx))
-            .map(|commit| commit.data.sha.to_string());
+            .map(|commit| commit.data.sha)
+            .or(self.pending_select_sha)
+            .map(|sha| sha.to_string());
 
         let search_query = self.search_state.editor.read(cx).text(cx);
         let search_query = if search_query.is_empty() {
@@ -7557,6 +7894,7 @@ impl workspace::SerializableItem for GitGraph {
         let log_source_value = persistence::serialize_log_source_value(&self.log_source);
         let log_order = Some(persistence::serialize_log_order(&self.log_order));
         let search_case_sensitive = Some(self.search_state.case_sensitive);
+        let hidden_columns = Some(self.hidden_columns.bits());
 
         let db = persistence::GitGraphsDb::global(cx);
         Some(cx.background_spawn(async move {
@@ -7570,6 +7908,7 @@ impl workspace::SerializableItem for GitGraph {
                 selected_sha,
                 search_query,
                 search_case_sensitive,
+                hidden_columns,
             )
             .await
         }))
@@ -7712,6 +8051,7 @@ mod persistence {
         pub selected_sha: Option<String>,
         pub search_query: Option<String>,
         pub search_case_sensitive: Option<bool>,
+        pub hidden_columns: Option<i32>,
     }
 
     impl GitGraphsDb {
@@ -7725,14 +8065,16 @@ mod persistence {
                 log_order: Option<i32>,
                 selected_sha: Option<String>,
                 search_query: Option<String>,
-                search_case_sensitive: Option<bool>
+                search_case_sensitive: Option<bool>,
+                hidden_columns: Option<i32>
             ) -> Result<()> {
                 INSERT OR REPLACE INTO git_graphs(
                     item_id, workspace_id, repo_working_path,
                     log_source_type, log_source_value, log_order,
-                    selected_sha, search_query, search_case_sensitive
+                    selected_sha, search_query, search_case_sensitive,
+                    hidden_columns
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             }
         }
 
@@ -7747,7 +8089,8 @@ mod persistence {
                 Option<i32>,
                 Option<String>,
                 Option<String>,
-                Option<bool>
+                Option<bool>,
+                Option<i32>
             )>> {
                 SELECT
                     repo_working_path,
@@ -7756,7 +8099,8 @@ mod persistence {
                     log_order,
                     selected_sha,
                     search_query,
-                    search_case_sensitive
+                    search_case_sensitive,
+                    hidden_columns
                 FROM git_graphs
                 WHERE item_id = ? AND workspace_id = ?
             }
@@ -9753,6 +10097,7 @@ mod tests {
             selected_sha: Some(sha.to_string()),
             search_query: Some("fix bug".to_string()),
             search_case_sensitive: Some(true),
+            hidden_columns: None,
         };
 
         assert_eq!(
@@ -9777,6 +10122,7 @@ mod tests {
             selected_sha: None,
             search_query: None,
             search_case_sensitive: None,
+            hidden_columns: None,
         };
         assert_eq!(
             persistence::deserialize_log_source(&all_state),
@@ -9903,6 +10249,12 @@ mod tests {
             selected_sha.clone(),
             Some("some query".to_string()),
             Some(true),
+            Some(
+                HiddenColumns::default()
+                    .toggled(HistoryColumn::Labels)
+                    .toggled(HistoryColumn::Age)
+                    .bits(),
+            ),
         )
         .await
         .expect("save should succeed");
@@ -9955,6 +10307,13 @@ mod tests {
             assert_eq!(
                 graph.search_state.case_sensitive, true,
                 "search case sensitivity should be restored"
+            );
+
+            assert!(
+                graph.hidden_columns.hides(HistoryColumn::Labels)
+                    && graph.hidden_columns.hides(HistoryColumn::Age)
+                    && !graph.hidden_columns.hides(HistoryColumn::Graph),
+                "hidden columns should be restored"
             );
         });
 
@@ -12594,6 +12953,402 @@ mod tests {
             graph.history_layout(window, cx).label_width
         });
         assert_eq!(back, chosen, "the automatic width did not come back");
+    }
+
+    /// One commit carrying more branches than a row shows.
+    fn crowded_commits() -> Vec<Arc<InitialGraphCommitData>> {
+        let mut rng = StdRng::seed_from_u64(61);
+        let oids: Vec<Oid> = (0..3).map(|_| Oid::random(&mut rng)).collect();
+        vec![
+            Arc::new(InitialGraphCommitData {
+                sha: oids[0],
+                parents: smallvec![oids[1]],
+                ref_names: vec![
+                    "HEAD -> main".into(),
+                    "feature-a".into(),
+                    "feature-b".into(),
+                ],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oids[1],
+                parents: smallvec![oids[2]],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oids[2],
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ]
+    }
+
+    #[gpui::test]
+    async fn test_a_ref_behind_the_count_still_has_its_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1400.), px(800.));
+        let (git_graph, cx) = history_in_a_workspace(cx, crowded_commits(), size).await;
+
+        let count = cx
+            .debug_bounds("GRAPH_MORE-more-refs-0")
+            .expect("a row with more branches than it shows should count the rest");
+        cx.simulate_mouse_move(count.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(count.center(), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(count.center(), MouseButton::Right, Modifiers::default());
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            let menu = graph
+                .context_menu
+                .as_ref()
+                .expect("a right click on the count should open a menu");
+            assert_eq!(menu.target_entry_index, Some(0));
+            assert_eq!(
+                graph.last_hidden_refs_menu,
+                Some(vec![SharedString::from("feature-b")]),
+                "the menu should offer exactly the refs the row had no room for"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_hidden_columns_keep_the_saved_bits(_cx: &mut TestAppContext) {
+        let mut all_hidden = HiddenColumns::default();
+        for column in HistoryColumn::ALL {
+            all_hidden = all_hidden.toggled(column);
+        }
+        for column in HistoryColumn::ALL {
+            assert!(all_hidden.hides(column));
+            assert!(!HiddenColumns::default().hides(column));
+            assert_eq!(
+                HiddenColumns::from_bits(HiddenColumns::default().toggled(column).bits()),
+                HiddenColumns::default().toggled(column),
+                "{column:?} did not survive being saved"
+            );
+        }
+
+        // A mask saved by an older build kept the graph in bit 0 and the date in
+        // bit 2; it has to go on hiding the same two and nothing else.
+        let legacy_bits_hiding_graph_and_date = 0b00101;
+        let restored = HiddenColumns::from_bits(legacy_bits_hiding_graph_and_date);
+        assert!(restored.hides(HistoryColumn::Graph));
+        assert!(restored.hides(HistoryColumn::Age));
+        assert!(!restored.hides(HistoryColumn::Labels));
+
+        // Bits of columns this history does not have hide nothing.
+        assert_eq!(HiddenColumns::from_bits(0b11010), HiddenColumns::default());
+    }
+
+    #[gpui::test]
+    async fn test_a_hidden_column_gives_its_room_to_the_subject(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1600.), px(800.));
+        let (git_graph, cx) = drawn_history(cx, labelled_commits(), size).await;
+        let redraw = |cx: &mut VisualTestContext| {
+            for _ in 0..2 {
+                cx.draw(point(px(0.), px(0.)), size, |_, _| {
+                    git_graph.clone().into_any_element()
+                });
+                cx.run_until_parked();
+            }
+        };
+
+        let subject_before = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 0))
+            .expect("the first row should have a subject");
+        assert!(cx.debug_bounds(selector("GRAPH_CELL", 0)).is_some());
+        assert!(cx.debug_bounds(selector("GRAPH_REFS", 0)).is_some());
+        assert!(cx.debug_bounds(selector("GRAPH_AGE", 0)).is_some());
+
+        git_graph.update(cx, |graph, cx| {
+            graph.toggle_column(HistoryColumn::Graph, cx)
+        });
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(selector("GRAPH_CELL", 0)).is_none(),
+            "a hidden graph was still painted"
+        );
+        assert!(
+            cx.debug_bounds("GRAPH_LANE_SCROLLBAR").is_none(),
+            "a hidden graph kept its scrollbar"
+        );
+        let subject_without_graph = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 0))
+            .expect("the subject is never hidden");
+        assert!(
+            subject_without_graph.size.width > subject_before.size.width,
+            "the room of the hidden graph did not go to the subject"
+        );
+
+        git_graph.update(cx, |graph, cx| {
+            graph.toggle_column(HistoryColumn::Labels, cx);
+            graph.toggle_column(HistoryColumn::Age, cx);
+        });
+        redraw(cx);
+        assert!(cx.debug_bounds(selector("GRAPH_REFS", 0)).is_none());
+        assert!(cx.debug_bounds("GRAPH_LABEL_DIVIDER").is_none());
+        assert!(cx.debug_bounds(selector("GRAPH_AGE", 0)).is_none());
+        let subject_alone = cx
+            .debug_bounds(selector("GRAPH_SUBJECT", 0))
+            .expect("the subject is never hidden");
+        assert!(
+            subject_alone.size.width > size.width * 0.9,
+            "with every other column hidden the subject is {} of {} wide",
+            subject_alone.size.width,
+            size.width
+        );
+
+        // And all of them come back.
+        git_graph.update(cx, |graph, cx| {
+            for column in HistoryColumn::ALL {
+                graph.toggle_column(column, cx);
+            }
+        });
+        redraw(cx);
+        assert!(cx.debug_bounds(selector("GRAPH_CELL", 0)).is_some());
+        assert!(cx.debug_bounds(selector("GRAPH_REFS", 0)).is_some());
+        assert!(cx.debug_bounds(selector("GRAPH_AGE", 0)).is_some());
+    }
+
+    #[gpui::test]
+    async fn test_closing_the_card_beside_the_history_settles_in_one_frame(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let size = gpui::size(px(1240.), px(700.));
+        let (git_graph, cx) = drawn_history(cx, unlabelled_commits(20), size).await;
+        git_graph.update(cx, |graph, cx| {
+            graph.details_at = DetailsAt::Right;
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        for _ in 0..2 {
+            cx.draw(point(px(0.), px(0.)), size, |_, _| {
+                git_graph.clone().into_any_element()
+            });
+            cx.run_until_parked();
+        }
+        let beside_the_card =
+            git_graph.update_in(cx, |graph, window, cx| graph.history_width(window, cx));
+        assert!(
+            beside_the_card < size.width - px(100.),
+            "the card was meant to take some of the width, the history has {beside_the_card:?}"
+        );
+
+        let redraws = Rc::new(Cell::new(0usize));
+        let _subscription = cx.update(|_, cx| {
+            let redraws = redraws.clone();
+            cx.observe(&git_graph, move |_, _| redraws.set(redraws.get() + 1))
+        });
+        git_graph.update_in(cx, |graph, window, cx| graph.cancel(&Cancel, window, cx));
+        let before = redraws.get();
+        cx.draw(point(px(0.), px(0.)), size, |_, _| {
+            git_graph.clone().into_any_element()
+        });
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+
+        let alone = git_graph.update_in(cx, |graph, window, cx| graph.history_width(window, cx));
+        assert!(
+            (alone - size.width).abs() < px(12.),
+            "one frame after the card closed the history still thinks it is {alone:?} wide"
+        );
+        assert!(
+            redraws.get() > before,
+            "the width changed and the history did not ask to be drawn again, \
+             so the columns stay sized for the card until something else redraws"
+        );
+
+        // The frame it asked for lays the graph out at the room its lanes need,
+        // not at the share of the row it had beside the card.
+        cx.draw(point(px(0.), px(0.)), size, |_, _| {
+            git_graph.clone().into_any_element()
+        });
+        cx.run_until_parked();
+        let (metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
+            (graph.row_metrics(window, cx), graph.graph_data.max_lanes)
+        });
+        let cell = cx
+            .debug_bounds(selector("GRAPH_CELL", 0))
+            .expect("the first row should have been painted");
+        assert!(
+            (cell.size.width - metrics.width_for(lanes.max(1))).abs() < px(1.),
+            "the graph is {} wide where its lanes need {}",
+            cell.size.width,
+            metrics.width_for(lanes.max(1))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_the_open_commit_stays_lit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1200.), px(700.));
+        let commits = unlabelled_commits(6);
+        let open = commits[2].sha;
+        let (git_graph, cx) = drawn_history(cx, commits, size).await;
+        let redraw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.draw(point(px(0.), px(0.)), size, |_, _| {
+                git_graph.clone().into_any_element()
+            });
+        };
+
+        assert!(cx.debug_bounds(selector("GRAPH_ACTIVE_ROW", 2)).is_none());
+
+        git_graph.update(cx, |graph, cx| graph.set_active_sha(Some(open), cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(selector("GRAPH_ACTIVE_ROW", 2)).is_some(),
+            "the row of the open commit was not lit"
+        );
+        for other in [0, 1, 3, 4, 5] {
+            assert!(
+                cx.debug_bounds(selector("GRAPH_ACTIVE_ROW", other))
+                    .is_none(),
+                "row {other} was lit for a commit it does not hold"
+            );
+        }
+
+        // Selecting another row leaves the open one lit beside it.
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(4, ScrollStrategy::Nearest, cx)
+        });
+        redraw(cx);
+        assert!(cx.debug_bounds(selector("GRAPH_ACTIVE_ROW", 2)).is_some());
+
+        git_graph.update(cx, |graph, cx| graph.set_active_sha(None, cx));
+        redraw(cx);
+        assert!(cx.debug_bounds(selector("GRAPH_ACTIVE_ROW", 2)).is_none());
+    }
+
+    #[gpui::test]
+    async fn test_a_selection_follows_its_commit_across_a_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let [newest, head, middle, root] =
+            [4u8, 1, 2, 3].map(|byte| Oid::from_bytes(&[byte; 20]).unwrap());
+        let chain = |shas: &[Oid]| -> Vec<Arc<InitialGraphCommitData>> {
+            shas.iter()
+                .enumerate()
+                .map(|(idx, sha)| {
+                    Arc::new(InitialGraphCommitData {
+                        sha: *sha,
+                        parents: match shas.get(idx + 1) {
+                            Some(parent) => smallvec![*parent],
+                            None => smallvec![],
+                        },
+                        ref_names: vec![],
+                    })
+                })
+                .collect()
+        };
+        fs.set_graph_commits(Path::new("/project/.git"), chain(&[head, middle, root]));
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        let redraw = |cx: &mut VisualTestContext| {
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(px(1200.), px(800.)),
+                |_, _| git_graph.clone().into_any_element(),
+            );
+            cx.run_until_parked();
+        };
+        cx.run_until_parked();
+        redraw(cx);
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            graph.picked_rows = vec![0, 1];
+            graph.compare_against = Some(0);
+        });
+
+        let selection = |cx: &mut VisualTestContext| {
+            git_graph.read_with(&*cx, |graph, _| {
+                let sha_at = |row: usize| {
+                    graph
+                        .graph_data
+                        .commits
+                        .get(row)
+                        .map(|commit| commit.data.sha)
+                };
+                (
+                    graph.selected_entry_idx.and_then(sha_at),
+                    graph
+                        .picked_rows
+                        .iter()
+                        .filter_map(|row| sha_at(*row))
+                        .collect::<Vec<_>>(),
+                    graph.compare_against.and_then(sha_at),
+                )
+            })
+        };
+        assert_eq!(
+            selection(cx),
+            (Some(middle), vec![head, middle], Some(head))
+        );
+
+        // A commit on top moves every row down by one, so the old row numbers
+        // now name other commits.
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            chain(&[newest, head, middle, root]),
+        );
+        repository
+            .update(cx, |repository, _| {
+                repository.create_tag("v1".to_string(), head.to_string())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        cx.run_until_parked();
+        redraw(cx);
+        assert_eq!(
+            selection(cx),
+            (Some(middle), vec![head, middle], Some(head)),
+            "after the reload the selection points at other commits"
+        );
+
+        // A commit that is no longer in the history takes its selection with it.
+        fs.set_graph_commits(Path::new("/project/.git"), chain(&[newest, head, root]));
+        repository
+            .update(cx, |repository, _| {
+                repository.create_tag("v2".to_string(), head.to_string())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        cx.run_until_parked();
+        redraw(cx);
+        assert_eq!(selection(cx), (None, vec![], None));
     }
 
     #[gpui::test]

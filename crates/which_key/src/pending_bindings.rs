@@ -271,6 +271,7 @@ impl RenderOnce for PendingBindings {
             );
 
         v_flex()
+            .debug_selector(|| "PENDING_BINDINGS".into())
             // Title section
             .child(
                 h_flex()

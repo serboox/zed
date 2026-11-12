@@ -2777,7 +2777,8 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
             highlights,
-        );
+        )
+        .with_active_syntax_theme(cx.theme().syntax());
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
         } else {
@@ -3935,6 +3936,7 @@ struct MarkdownElementBuilder {
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+    uses_active_syntax_theme: bool,
     highlights: MarkdownHighlights,
 }
 
@@ -4054,8 +4056,16 @@ impl MarkdownElementBuilder {
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
+            uses_active_syntax_theme: false,
             highlights,
         }
+    }
+
+    /// Code block highlights cached at parse time hold ids of the active theme, so they
+    /// are only valid for a renderer that paints with that same theme.
+    fn with_active_syntax_theme(mut self, active_syntax_theme: &Arc<SyntaxTheme>) -> Self {
+        self.uses_active_syntax_theme = Arc::ptr_eq(&self.syntax_theme, active_syntax_theme);
+        self
     }
 
     fn push_code_chip_text(
@@ -4319,15 +4329,19 @@ impl MarkdownElementBuilder {
         let text_style = self.text_style();
 
         if let Some(language) = self.code_block_stack.last().and_then(Option::as_ref)
-            && highlights.is_some()
+            && let Some(resolved) = highlights
         {
-            // Highlight ids index the theme they were resolved against, and this
-            // renderer paints with its own syntax theme rather than the app's.
-            let runs = language.highlight_text_with_theme(
-                &Rope::from(text),
-                0..text.len(),
-                &self.syntax_theme,
-            );
+            let runs = if self.uses_active_syntax_theme && resolved.is_current() {
+                resolved.runs.clone()
+            } else if self.uses_active_syntax_theme {
+                language.highlight_text_resolved(text, 0..text.len()).runs
+            } else {
+                // Highlight ids index the theme they were resolved against, and this
+                // renderer paints with its own syntax theme rather than the app's.
+                language
+                    .highlight_text_with_theme(&Rope::from(text), 0..text.len(), &self.syntax_theme)
+                    .into()
+            };
             let mut offset = 0;
             for (run_range, highlight_id) in runs.iter() {
                 if run_range.start > offset {
@@ -5989,6 +6003,80 @@ mod tests {
                 .runs
                 .as_ref(),
             "highlights of a changed code block must be recomputed"
+        );
+    }
+
+    #[test]
+    fn test_code_block_render_trusts_cached_highlights_only_for_the_active_theme() {
+        let language = language::rust_lang();
+        let active_theme = Arc::new(rust_test_theme());
+        language.set_theme(&active_theme);
+        let own_theme = Arc::new(SyntaxTheme::new(
+            [("function", gpui::yellow()), ("keyword", gpui::green())]
+                .into_iter()
+                .map(|(name, color)| {
+                    (
+                        name.to_owned(),
+                        gpui::HighlightStyle {
+                            color: Some(color),
+                            ..gpui::HighlightStyle::default()
+                        },
+                    )
+                }),
+        ));
+
+        let code = "fn main() {}\n";
+        let complete = language.highlight_text_resolved(code, 0..code.len());
+        assert!(
+            complete.runs.len() > 1,
+            "the sample must produce several runs"
+        );
+        let first_run_only = ResolvedHighlights {
+            sources: complete.sources.clone(),
+            runs: complete.runs[..1].to_vec().into(),
+        };
+        assert!(first_run_only.is_current());
+
+        let paint = |syntax_theme: &Arc<SyntaxTheme>, highlights: &ResolvedHighlights| {
+            let mut builder = MarkdownElementBuilder::new(
+                &StyleRefinement::default(),
+                TextStyle::default(),
+                syntax_theme.clone(),
+                MarkdownHighlights {
+                    search_highlights: Rc::from([]),
+                    active_search_highlight: None,
+                    search_match_color: gpui::yellow(),
+                    active_search_match_color: gpui::yellow(),
+                    selection: None,
+                    next_search_highlight_ix: 0,
+                },
+            )
+            .with_active_syntax_theme(&active_theme);
+            builder.code_block_stack.push(Some(language.clone()));
+            builder.push_highlighted_text(code, 0..code.len(), Some(highlights));
+            builder.pending_line.runs
+        };
+
+        let from_cache = paint(&active_theme, &first_run_only);
+        let recomputed = paint(&active_theme, &complete);
+        assert!(
+            from_cache.len() < recomputed.len(),
+            "a renderer painting with the active theme must use the highlights cached at parse time"
+        );
+
+        let with_own_theme = paint(&own_theme, &complete);
+        assert_eq!(
+            with_own_theme[0].color,
+            gpui::green(),
+            "a renderer painting with its own theme must resolve highlights against that theme"
+        );
+
+        language.set_theme(&active_theme);
+        assert!(!first_run_only.is_current());
+        assert_eq!(
+            paint(&active_theme, &first_run_only),
+            recomputed,
+            "cached highlights that went stale must be resolved again"
         );
     }
 

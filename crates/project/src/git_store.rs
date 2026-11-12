@@ -7132,14 +7132,18 @@ impl Repository {
     /// remote has no message for it yet, and saying so is better than showing a
     /// comparison of nothing.
     pub fn load_diff_between(
-        &mut self,
+        &self,
         from: String,
         to: String,
-    ) -> oneshot::Receiver<Result<CommitDiff>> {
-        self.send_job("load_diff_between", None, move |git_repo, cx| async move {
-            match git_repo {
+        cx: &App,
+    ) -> Task<Result<CommitDiff>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.spawn(async move |cx| {
+            let _permit = object_read_limiter.acquire_arc().await;
+            match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .load_diff(from, to, cx)
+                    .load_diff(from, to, cx.clone())
                     .await
                     .map(decode_commit_diff),
                 RepositoryState::Remote(_) => {
@@ -12393,6 +12397,68 @@ mod tests {
         held.await.unwrap();
         cx.run_until_parked();
         assert_eq!(by_ref.await.unwrap().unwrap().sha.as_ref(), sha);
+    }
+
+    #[gpui::test]
+    async fn test_diff_between_commits_does_not_wait_on_job_queue(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_gate, repository, oids) = setup_gated_blob_reads(cx, 1).await;
+        let to = oids[0].to_string();
+        let from = "1".repeat(40);
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let held = repository.update(cx, |repository, _| {
+            repository.send_job("hold", None, move |_, _| async move {
+                release_rx.await.ok();
+            })
+        });
+
+        let diff = repository.update(cx, |repository, cx| {
+            repository.load_diff_between(from, to, cx)
+        });
+        cx.run_until_parked();
+
+        diff.now_or_never()
+            .expect("load_diff_between waited on the job queue")
+            .unwrap();
+
+        release_tx.send(()).ok();
+        held.await.unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_diff_between_commits_shares_object_read_limit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (gate, repository, oids) =
+            setup_gated_blob_reads(cx, MAX_CONCURRENT_OBJECT_READS).await;
+        let to = oids[0].to_string();
+        let from = "1".repeat(40);
+
+        let _holding = oids
+            .iter()
+            .map(|oid| {
+                repository.update(cx, |repository, cx| repository.load_blob_content(*oid, cx))
+            })
+            .collect::<Vec<_>>();
+        cx.run_until_parked();
+        assert_eq!(gate.waiting(), MAX_CONCURRENT_OBJECT_READS);
+
+        let mut diff = repository.update(cx, |repository, cx| {
+            repository.load_diff_between(from, to, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            (&mut diff).now_or_never().is_none(),
+            "load_diff_between skipped the object read limit"
+        );
+
+        gate.release(oids[0]);
+        cx.run_until_parked();
+        diff.await.unwrap();
+
+        gate.open();
+        cx.run_until_parked();
     }
 
     #[gpui::test]

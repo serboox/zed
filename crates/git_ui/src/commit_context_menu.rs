@@ -25,6 +25,7 @@ actions!(
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 pub(crate) const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 
+#[derive(Clone)]
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
@@ -52,20 +53,122 @@ pub(crate) fn commit_context_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
-    let sha = commit.sha;
-    let selected = commit.selected.clone();
-    let sha_short = sha.display_short();
-    let git_tasks = git_context_menu_tasks(
-        git_task_context(&repository, sha, ref_name.as_deref(), cx),
-        &workspace,
+    let entries = CommitMenuEntries::new(
+        commit,
+        source,
+        ref_name,
+        focus_handle,
+        repository,
+        workspace,
+        solo,
         cx,
     );
-    let header = match &ref_name {
-        Some(ref_name) => format!("Ref {ref_name}"),
-        None => format!("Commit {sha_short}"),
-    };
-
     ContextMenu::build(window, cx, move |context_menu, _, _| {
+        entries.add_to(context_menu)
+    })
+}
+
+/// A menu of the refs a row has no room to show, each one a submenu with the
+/// same entries its own chip offers.
+pub(crate) fn hidden_refs_context_menu(
+    commit: CommitContextMenuData,
+    source: CommitContextMenuSource,
+    ref_names: Vec<SharedString>,
+    focus_handle: FocusHandle,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    solo: Option<Rc<dyn Fn(SharedString, &mut App)>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let per_ref = ref_names
+        .into_iter()
+        .map(|name| {
+            let entries = CommitMenuEntries::new(
+                commit.clone(),
+                source,
+                Some(name.clone()),
+                focus_handle.clone(),
+                repository.clone(),
+                workspace.clone(),
+                solo.clone(),
+                cx,
+            );
+            (name, entries)
+        })
+        .collect::<Vec<_>>();
+
+    ContextMenu::build(window, cx, move |mut context_menu, _, _| {
+        context_menu = context_menu.context(focus_handle).header("Refs");
+        for (name, entries) in per_ref {
+            context_menu = context_menu.submenu(name, move |submenu, _window, _cx| {
+                entries.clone().add_to(submenu)
+            });
+        }
+        context_menu
+    })
+}
+
+/// Everything a commit's menu shows, resolved up front so that the same
+/// entries can fill a menu of their own or a submenu.
+#[derive(Clone)]
+struct CommitMenuEntries {
+    commit: CommitContextMenuData,
+    source: CommitContextMenuSource,
+    ref_name: Option<SharedString>,
+    focus_handle: FocusHandle,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    solo: Option<Rc<dyn Fn(SharedString, &mut App)>>,
+    git_tasks: Vec<(project::TaskSourceKind, task::ResolvedTask)>,
+}
+
+impl CommitMenuEntries {
+    fn new(
+        commit: CommitContextMenuData,
+        source: CommitContextMenuSource,
+        ref_name: Option<SharedString>,
+        focus_handle: FocusHandle,
+        repository: Option<WeakEntity<Repository>>,
+        workspace: WeakEntity<Workspace>,
+        solo: Option<Rc<dyn Fn(SharedString, &mut App)>>,
+        cx: &App,
+    ) -> Self {
+        let git_tasks = git_context_menu_tasks(
+            git_task_context(&repository, commit.sha, ref_name.as_deref(), cx),
+            &workspace,
+            cx,
+        );
+        Self {
+            commit,
+            source,
+            ref_name,
+            focus_handle,
+            repository,
+            workspace,
+            solo,
+            git_tasks,
+        }
+    }
+
+    fn add_to(self, context_menu: ContextMenu) -> ContextMenu {
+        let Self {
+            commit,
+            source,
+            ref_name,
+            focus_handle,
+            repository,
+            workspace,
+            solo,
+            git_tasks,
+        } = self;
+        let sha = commit.sha;
+        let selected = commit.selected.clone();
+        let header = match &ref_name {
+            Some(ref_name) => format!("Ref {ref_name}"),
+            None => format!("Commit {}", sha.display_short()),
+        };
+
         context_menu
             .context(focus_handle)
             .header(header)
@@ -211,7 +314,7 @@ pub(crate) fn commit_context_menu(
 
                 menu
             })
-    })
+    }
 }
 
 pub(crate) fn git_task_context(

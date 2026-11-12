@@ -104,6 +104,17 @@ impl Render for WhichKeyModal {
 
         let name: SharedString = "Which Key".into();
 
+        // The dialog body is a row, which would size the list to its content. The shell is
+        // wider than that, and the scrollbar and dividers belong at its edges.
+        let pending_bindings = v_flex().flex_1().min_w_0().child(PendingBindings::new(
+            "which-key-content",
+            self.pending_keys.clone(),
+            self.bindings.clone(),
+            self.scroll_handle.clone(),
+            max_panel_width,
+            max_content_height,
+        ));
+
         div()
             .id("which-key-buffer-panel-scroll")
             .occlude()
@@ -116,14 +127,7 @@ impl Render for WhichKeyModal {
                         shell.min_w(px(220.)).w(max_panel_width)
                     })
                     .child(cyberpunk::dialog_header(name, cx))
-                    .child(cyberpunk::dialog_body().child(PendingBindings::new(
-                        "which-key-content",
-                        self.pending_keys.clone(),
-                        self.bindings.clone(),
-                        self.scroll_handle.clone(),
-                        max_panel_width,
-                        max_content_height,
-                    ))),
+                    .child(cyberpunk::dialog_body().child(pending_bindings)),
             )
     }
 }
@@ -144,9 +148,28 @@ impl ModalView for WhichKeyModal {
 
 #[cfg(test)]
 mod tests {
-    use gpui::TestAppContext;
+    use gpui::{Entity, KeyBinding, TestAppContext, actions};
 
     use super::*;
+
+    actions!(which_key_modal_test, [FirstBinding, SecondBinding]);
+
+    struct ModalTestView {
+        focus_handle: FocusHandle,
+        modal: Option<Entity<WhichKeyModal>>,
+    }
+
+    impl Render for ModalTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .key_context("WhichKeyModalTest")
+                .track_focus(&self.focus_handle)
+                .on_action(|_: &FirstBinding, _, _| {})
+                .on_action(|_: &SecondBinding, _, _| {})
+                .children(self.modal.clone())
+        }
+    }
 
     #[gpui::test]
     fn test_which_key_modal_renders_inside_a_framed_dialog_shell(cx: &mut TestAppContext) {
@@ -167,6 +190,68 @@ mod tests {
         assert!(
             bounds.is_some(),
             "the which-key popup renders inside a framed, draggable dialog shell"
+        );
+    }
+
+    #[gpui::test]
+    fn test_which_key_modal_lists_pending_bindings_across_the_dialog_shell(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-b h", FirstBinding, Some("WhichKeyModalTest")),
+                KeyBinding::new("ctrl-b j", SecondBinding, Some("WhichKeyModalTest")),
+            ]);
+        });
+        let (test_view, cx) = cx.add_window_view(|_, cx| ModalTestView {
+            focus_handle: cx.focus_handle(),
+            modal: None,
+        });
+        let focus_handle = test_view.read_with(cx, |test_view, _| test_view.focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus_handle, cx);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("ctrl-b");
+        cx.run_until_parked();
+        let modal = test_view.update_in(cx, |test_view, window, cx| {
+            let modal = cx.new(|cx| WhichKeyModal::new(WeakEntity::new_invalid(), window, cx));
+            test_view.modal = Some(modal.clone());
+            cx.notify();
+            modal
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.pending_keys.len(), 1);
+            assert_eq!(
+                modal.bindings.len(),
+                2,
+                "both keys that can finish the sequence are listed"
+            );
+        });
+        let shell_bounds = cx
+            .debug_bounds("DIALOG-SHELL")
+            .expect("the which-key popup renders inside a framed dialog shell");
+        let list_bounds = cx
+            .debug_bounds("PENDING_BINDINGS")
+            .expect("the which-key popup lists the pending bindings");
+        assert!(
+            list_bounds.size.width >= shell_bounds.size.width - px(4.),
+            "the list spans the shell, so its dividers and scrollbar sit at the shell's edges: \
+             list {:?}, shell {:?}",
+            list_bounds.size.width,
+            shell_bounds.size.width,
+        );
+        assert!(
+            list_bounds.bottom() <= shell_bounds.bottom(),
+            "no row is clipped by the shell: list {list_bounds:?}, shell {shell_bounds:?}"
         );
     }
 }

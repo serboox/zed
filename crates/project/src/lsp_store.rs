@@ -395,7 +395,7 @@ pub struct LocalLspStore {
     >,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     auto_start_language_servers: bool,
-    language_server_start_overrides: HashMap<LanguageServerName, bool>,
+    language_server_start_overrides: HashMap<LanguageServerName, LanguageServerStartOverride>,
     language_server_restart_tasks: Vec<Task<()>>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
@@ -424,6 +424,16 @@ enum LanguageServerStartMode {
     Explicit,
 }
 
+/// What someone asked of a server by name, overriding the resting state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LanguageServerStartOverride {
+    Stopped,
+    /// Started by hand, and so allowed to start on its own, only for buffers
+    /// of these languages. One server often serves several languages, and
+    /// starting it for one must not bring it up for the others.
+    StartedFor(HashSet<LanguageName>),
+}
+
 impl LocalLspStore {
     /// Returns the running language server for the given ID. Note if the language server is starting, it will not be returned.
     pub fn running_language_server_for_id(
@@ -438,21 +448,60 @@ impl LocalLspStore {
         }
     }
 
-    /// Whether a server may be started without anyone asking for it.
+    /// Whether a server may be started for a buffer of this language without
+    /// anyone asking for it.
     ///
     /// Under `LanguageServerStart::ByHand` -- this fork's resting state -- the
-    /// answer is no until someone starts the server by hand, because a server
-    /// that nobody asked for is the single largest thing the editor pays for:
-    /// measured here, one held twenty-three times the editor's own memory while
-    /// every question asked of it was one the index answers.
-    fn can_start_language_server(&self, name: &LanguageServerName, cx: &App) -> bool {
+    /// answer is no until someone starts the server by hand for that language,
+    /// because a server that nobody asked for is the single largest thing the
+    /// editor pays for: measured here, one held twenty-three times the editor's
+    /// own memory while every question asked of it was one the index answers.
+    fn can_start_language_server(
+        &self,
+        name: &LanguageServerName,
+        language_name: &LanguageName,
+        cx: &App,
+    ) -> bool {
         let starts_on_its_own = self.auto_start_language_servers
             && ProjectSettings::get_global(cx).global_lsp_settings.start
                 == LanguageServerStart::Automatically;
+        match self.language_server_start_overrides.get(name) {
+            Some(LanguageServerStartOverride::Stopped) => false,
+            Some(LanguageServerStartOverride::StartedFor(languages)) => {
+                starts_on_its_own || languages.contains(language_name)
+            }
+            None => starts_on_its_own,
+        }
+    }
+
+    fn is_language_started_by_hand(&self, language_name: &LanguageName) -> bool {
         self.language_server_start_overrides
-            .get(name)
-            .copied()
-            .unwrap_or(starts_on_its_own)
+            .values()
+            .any(|start_override| match start_override {
+                LanguageServerStartOverride::StartedFor(languages) => {
+                    languages.contains(language_name)
+                }
+                LanguageServerStartOverride::Stopped => false,
+            })
+    }
+
+    fn start_language_server_by_hand_for(
+        &mut self,
+        name: &LanguageServerName,
+        language_name: &LanguageName,
+    ) {
+        if let Some(LanguageServerStartOverride::StartedFor(languages)) =
+            self.language_server_start_overrides.get_mut(name)
+        {
+            languages.insert(language_name.clone());
+            return;
+        }
+        let mut languages = HashSet::default();
+        languages.insert(language_name.clone());
+        self.language_server_start_overrides.insert(
+            name.clone(),
+            LanguageServerStartOverride::StartedFor(languages),
+        );
     }
 
     fn get_or_insert_language_server(
@@ -474,15 +523,14 @@ impl LocalLspStore {
             toolchain: disposition.toolchain.clone(),
         };
         if start_mode == LanguageServerStartMode::Explicit {
-            self.language_server_start_overrides
-                .insert(key.name.clone(), true);
+            self.start_language_server_by_hand_for(&key.name, language_name);
         }
         if let Some(state) = self.language_server_ids.get_mut(&key) {
             state.project_roots.insert(disposition.path.path.clone());
             Some(state.id)
         } else {
             if start_mode == LanguageServerStartMode::Automatic
-                && !self.can_start_language_server(&key.name, cx)
+                && !self.can_start_language_server(&key.name, language_name, cx)
             {
                 return None;
             }
@@ -6637,7 +6685,7 @@ impl LspStore {
                                     language.name(),
                                 ),
                             };
-                            if local.can_start_language_server(&key.name, cx) {
+                            if local.can_start_language_server(&key.name, &language.name(), cx) {
                                 local.language_server_ids.remove(&key);
                             }
 
@@ -13302,9 +13350,11 @@ impl LspStore {
             let (stopped_names, task) =
                 self.stop_local_language_servers_for_buffers(&buffers, also_stop_servers, cx);
             if let Some(local) = self.as_local_mut() {
-                local
-                    .language_server_start_overrides
-                    .extend(stopped_names.into_iter().map(|name| (name, false)));
+                local.language_server_start_overrides.extend(
+                    stopped_names
+                        .into_iter()
+                        .map(|name| (name, LanguageServerStartOverride::Stopped)),
+                );
             }
             cx.background_spawn(async move {
                 task.await;
@@ -13343,6 +13393,17 @@ impl LspStore {
                     let Some(local) = lsp_store.as_local_mut() else {
                         return;
                     };
+                    let mut buffers = buffers;
+                    if start_mode == LanguageServerStartMode::Automatic {
+                        // A buffer whose language was started by hand brings the shared
+                        // server up first, so the other buffers attach to it instead of
+                        // being refused for their own language.
+                        buffers.sort_by_key(|buffer| {
+                            !buffer.read(cx).language().is_some_and(|language| {
+                                local.is_language_started_by_hand(&language.name())
+                            })
+                        });
+                    }
                     for buffer in buffers {
                         if local
                             .registered_buffers
