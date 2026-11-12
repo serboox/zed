@@ -64,7 +64,12 @@ url = { workspace = true, optional = true }
 # surfman already draws through and opened again by the window. Opt-in with the
 # rest of the engine, so a build without it stays as small as it was.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, optional = true }
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
@@ -78,4 +83,10 @@ serde_json.workspace = true
 url.workspace = true
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-windows.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
