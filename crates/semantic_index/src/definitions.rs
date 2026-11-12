@@ -53,7 +53,7 @@ pub fn in_file(
     let mut matches = cursor.matches(&language.outline, tree.root_node(), contents);
     while let Some(matched) = matches.next() {
         let Some(defined) = matched
-            .captures
+            .captures()
             .iter()
             .find(|capture| capture.index == item)
             .map(|capture| capture.node)
@@ -70,7 +70,7 @@ pub fn in_file(
             continue;
         }
         let named: Vec<&str> = matched
-            .captures
+            .captures()
             .iter()
             .filter(|capture| capture.index == name)
             .filter_map(|capture| capture.node.utf8_text(contents).ok())

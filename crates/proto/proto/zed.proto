@@ -465,13 +465,6 @@ message Envelope {
     KillKernel kill_kernel = 428;
     GitRemoveWorktree git_remove_worktree = 431;
     GitRenameWorktree git_rename_worktree = 432;
-    GitCreateCheckpoint git_create_checkpoint = 433;
-    GitCreateCheckpointResponse git_create_checkpoint_response = 434;
-    GitRestoreCheckpoint git_restore_checkpoint = 435;
-    GitCompareCheckpoints git_compare_checkpoints = 436;
-    GitCompareCheckpointsResponse git_compare_checkpoints_response = 437;
-    GitDiffCheckpoints git_diff_checkpoints = 438;
-    GitDiffCheckpointsResponse git_diff_checkpoints_response = 439;
     GitGetHeadSha git_get_head_sha = 440;
     GitGetHeadShaResponse git_get_head_sha_response = 441;
     GitRepairWorktrees git_repair_worktrees = 442;
@@ -523,15 +516,17 @@ message Envelope {
     ExecuteLspCommand execute_lsp_command = 491;
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
+    GetTerminalShell get_terminal_shell = 494;
+    GetTerminalShellResponse get_terminal_shell_response = 495;
 
-    PrepareTypeHierarchy prepare_type_hierarchy = 494;
-    PrepareTypeHierarchyResponse prepare_type_hierarchy_response = 495;
-    TypeHierarchyRelatives type_hierarchy_relatives = 496;
-    TypeHierarchyRelativesResponse type_hierarchy_relatives_response = 497;
-    PrepareCallHierarchyItems prepare_call_hierarchy_items = 498;
-    PrepareCallHierarchyItemsResponse prepare_call_hierarchy_items_response = 499;
-    CallHierarchyCalls call_hierarchy_calls = 500;
-    CallHierarchyCallsResponse call_hierarchy_calls_response = 501; // current max
+    PrepareTypeHierarchy prepare_type_hierarchy = 496;
+    PrepareTypeHierarchyResponse prepare_type_hierarchy_response = 497;
+    TypeHierarchyRelatives type_hierarchy_relatives = 498;
+    TypeHierarchyRelativesResponse type_hierarchy_relatives_response = 499;
+    PrepareCallHierarchyItems prepare_call_hierarchy_items = 500;
+    PrepareCallHierarchyItemsResponse prepare_call_hierarchy_items_response = 501;
+    CallHierarchyCalls call_hierarchy_calls = 502;
+    CallHierarchyCallsResponse call_hierarchy_calls_response = 503; // current max
   }
 
   reserved 87 to 88;
@@ -560,6 +555,7 @@ message Envelope {
   reserved 211 to 216, 232 to 233;
   reserved 397 to 398;
   reserved 406 to 408;
+  reserved 433 to 439;
 }
 
 message Hello {
@@ -594,6 +590,7 @@ enum ErrorCode {
   RemoteUpgradeRequired = 17;
   RateLimitExceeded = 18;
   CommitFailed = 19;
+  AlreadyExists = 20;
   reserved 6;
   reserved 14 to 15;
 }

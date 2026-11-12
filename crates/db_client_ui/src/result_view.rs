@@ -9980,7 +9980,7 @@ impl ResultView {
                                 |this, event: &KeyDownEvent, window, cx| {
                                     let modifiers = &event.keystroke.modifiers;
                                     match event.keystroke.key.as_str() {
-                                        "enter" if modifiers.secondary() => {
+                                        "enter" if modifiers.secondary(cx) => {
                                             this.commit_value_editor(window, cx);
                                         }
                                         "escape" => {
@@ -19634,6 +19634,7 @@ mod tests {
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(-120.), px(0.))),
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         draw_result_view_frame(window, &mut cx);
 

@@ -1,4 +1,4 @@
-use crate::commit_view::CommitView;
+use crate::{commit_view::CommitView, create_tag_at_commit};
 use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
@@ -7,6 +7,7 @@ use git::repository::ResetMode;
 use std::rc::Rc;
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{App, Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
+use util::ResultExt as _;
 use workspace::Workspace;
 
 actions!(
@@ -22,7 +23,7 @@ actions!(
 );
 
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
-const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
+pub(crate) const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
@@ -138,6 +139,20 @@ pub(crate) fn commit_context_menu(
                     }
                 })
             })
+            .entry("Create Tag…", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    let Some(repository) = repository.as_ref().and_then(WeakEntity::upgrade) else {
+                        return;
+                    };
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            create_tag_at_commit(sha, false, repository, workspace, window, cx);
+                        })
+                        .log_err();
+                }
+            })
             .map(|menu| {
                 git_actions_menu(
                     menu,
@@ -199,7 +214,7 @@ pub(crate) fn commit_context_menu(
     })
 }
 
-fn git_task_context(
+pub(crate) fn git_task_context(
     repository: &Option<WeakEntity<Repository>>,
     commit_sha: git::Oid,
     ref_name: Option<&str>,
@@ -238,7 +253,7 @@ fn git_task_context(
     })
 }
 
-fn git_context_menu_tasks(
+pub(crate) fn git_context_menu_tasks(
     task_context: Option<TaskContext>,
     workspace: &WeakEntity<Workspace>,
     cx: &App,
@@ -372,11 +387,9 @@ fn git_actions_menu(
         }
     };
 
-    let tag_at = repository.clone();
     let branch_at = repository.clone();
     let cherry_pick = (commits.clone(), repository.clone());
     let revert = (commits, repository.clone());
-    let workspace_for_tag = workspace.clone();
     let workspace_for_commit_branch = workspace;
 
     let menu = menu
@@ -397,25 +410,6 @@ fn git_actions_menu(
                     let at = at.clone();
                     run_on_repository(&repository, cx, move |repository| {
                         repository.create_branch(name.to_string(), Some(at))
-                    });
-                },
-            );
-        })
-        .entry("New Tag Here…", None, move |window, cx| {
-            let repository = tag_at.clone();
-            let at = sha.to_string();
-            ask_for_a_name(
-                &workspace_for_tag,
-                "New tag",
-                "Tag name",
-                "",
-                window,
-                cx,
-                move |name, _window, cx| {
-                    let repository = repository.clone();
-                    let at = at.clone();
-                    run_on_repository(&repository, cx, move |repository| {
-                        repository.create_tag(name.to_string(), at)
                     });
                 },
             );

@@ -1,12 +1,10 @@
-use std::time::Instant;
-
 use ui::{SpinnerLabel, div, prelude::*};
 
-use crate::TabularDataPreviewPane;
+use crate::TableView;
 
 use super::settings::{refresh_controls, settings_popover_menu};
 
-impl Render for TabularDataPreviewPane {
+impl Render for TableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let row_height = window.pixel_snap(window.line_height());
@@ -18,19 +16,21 @@ impl Render for TabularDataPreviewPane {
             // item's prior size as a hint rather than dropping straight to a fresh guess.
             self.list_state.remeasure();
         }
-        let render_prep_start = Instant::now();
+        let render_prep_start = std::time::Instant::now();
         let empty_state_controls = ui::cyberpunk::segmented(
             refresh_controls(cx.entity(), self.settings.refresh_mode)
                 .into_iter()
                 .chain([settings_popover_menu(cx.entity()).into_any_element()]),
         );
         let table_with_settings = v_flex()
+            .key_context("TableView")
             .size_full()
             .bg(theme.colors().editor_background)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::move_focused_cell))
             .child({
-                let is_parsing = self.is_parsing;
-                if is_parsing || self.engine.contents.number_of_cols == 0 {
+                let is_loading = self.is_loading;
+                if is_loading || self.engine.contents.number_of_cols == 0 {
                     v_flex()
                         .size_full()
                         .child(
@@ -51,7 +51,7 @@ impl Render for TabularDataPreviewPane {
                                 .text_ui(cx)
                                 .font_buffer(cx)
                                 .text_color(cx.theme().colors().text_muted)
-                                .when(is_parsing, |div| {
+                                .when(is_loading, |div| {
                                     div.child(
                                         h_flex()
                                             .gap_2()
@@ -59,18 +59,16 @@ impl Render for TabularDataPreviewPane {
                                             .child("Loading…"),
                                     )
                                 })
-                                .when(!is_parsing, |div| div.child("No data to display")),
+                                .when(!is_loading, |div| div.child("No data to display")),
                         )
                         .into_any_element()
                 } else {
-                    self.create_table(&self.column_widths.widths, cx)
+                    self.create_table(&self.column_widths, cx)
                 }
             });
-
-        let render_prep_duration = render_prep_start.elapsed();
         self.performance_metrics.timings.insert(
             "render_prep",
-            (render_prep_duration, std::time::Instant::now()),
+            (render_prep_start.elapsed(), std::time::Instant::now()),
         );
 
         let div = div()

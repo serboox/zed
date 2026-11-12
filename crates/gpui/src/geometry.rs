@@ -743,7 +743,10 @@ impl Bounds<Pixels> {
             .or_else(|| cx.primary_display());
 
         display
-            .map(|display| Bounds::centered_at(display.bounds().center(), size))
+            .map(|display| {
+                let visible_bounds = display.visible_bounds();
+                Bounds::centered_at(visible_bounds.center(), size.min(&visible_bounds.size))
+            })
             .unwrap_or_else(|| Bounds {
                 origin: point(px(0.), px(0.)),
                 size,
@@ -2800,6 +2803,12 @@ impl Pixels {
         self.0
     }
 
+    /// Converts to `i32`, truncating toward zero.
+    /// Out-of-range values saturate, and NaN becomes zero.
+    pub fn to_i32(self) -> i32 {
+        self.0 as i32
+    }
+
     /// Floors the `Pixels` value to the nearest whole number.
     ///
     /// # Returns
@@ -3980,6 +3989,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pixels_to_i32() {
+        for (value, expected) in [
+            (12.9, 12),
+            (-12.9, -12),
+            (f32::MAX, i32::MAX),
+            (f32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MAX),
+            (f32::NEG_INFINITY, i32::MIN),
+            (f32::NAN, 0),
+        ] {
+            assert_eq!(px(value).to_i32(), expected);
+        }
+    }
 
     #[test]
     fn test_bounds_intersects() {

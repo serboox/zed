@@ -444,7 +444,7 @@ mod what_a_language_server_silences {
             LanguageConfig {
                 name: "TOML".into(),
                 matcher: Arc::new(LanguageMatcher {
-                    path_suffixes: vec!["toml".to_string()],
+                    path_suffixes: vec!["toml".into()],
                     ..Default::default()
                 }),
                 ..LanguageConfig::default()

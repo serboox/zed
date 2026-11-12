@@ -1458,7 +1458,7 @@ mod tests {
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
         while let Some(matched) = matches.next() {
-            for capture in matched.captures {
+            for capture in matched.captures() {
                 if let Ok(text) = capture.node.utf8_text(source.as_bytes()) {
                     found.push(text.to_string());
                 }
@@ -1581,7 +1581,7 @@ service Orders {
         let mut matches = cursor.matches(&language.outline, tree.root_node(), source.as_bytes());
         while let Some(matched) = matches.next() {
             let Some(defined) = matched
-                .captures
+                .captures()
                 .iter()
                 .find(|capture| capture.index == item)
                 .map(|capture| capture.node)
@@ -1592,7 +1592,7 @@ service Orders {
                 continue;
             }
             let named: Vec<&str> = matched
-                .captures
+                .captures()
                 .iter()
                 .filter(|capture| capture.index == name)
                 .filter_map(|capture| capture.node.utf8_text(source.as_bytes()).ok())

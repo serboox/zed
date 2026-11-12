@@ -1,8 +1,8 @@
 use collections::HashMap;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, Entity, ImageSource,
-    ParsedSvg, RenderImage, SMOOTH_SVG_SCALE_FACTOR, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    Size, Stateful, StyledText, Task, Window, img, pulsating_between, size,
+    ParsedSvg, RenderImage, SMOOTH_SVG_SCALE_FACTOR, ScrollDelta, ScrollEvent, ScrollHandle, Size,
+    Stateful, StyledText, Task, Window, img, pulsating_between, size,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -173,6 +173,12 @@ impl MermaidState {
             keep
         });
         self.order = new_order;
+    }
+
+    pub(crate) fn has_pending_render(&self) -> bool {
+        self.cache
+            .values()
+            .any(|cached| cached.render_image.get().is_none())
     }
 
     /// The natural (zoom 1.0) logical size of a diagram, if any raster of it
@@ -471,7 +477,7 @@ fn theme_from(theme: &Arc<theme::Theme>, cx: &Context<Markdown>) -> mermaid_rend
 
     mermaid_render::MermaidTheme {
         dark_mode: is_dark,
-        font_family: mermaid_font_family(theme_settings.ui_font.family.as_ref()),
+        font_family: mermaid_font_family(theme_settings.mermaid_font_family().as_ref()),
         background: colors.editor_background,
         primary_color: colors.surface_background,
         primary_text_color: colors.text,
@@ -645,7 +651,7 @@ fn on_mermaid_zoom_scroll(
     markdown: Entity<Markdown>,
     source_offset: usize,
     on_zoom: Option<MermaidZoomCallback>,
-) -> impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static {
+) -> impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static {
     move |event, window, cx| {
         if !(event.modifiers.control || event.modifiers.platform) {
             return;
@@ -861,7 +867,7 @@ fn mermaid_scroll_container(
         .w_full()
         .overflow_x_scroll()
         .track_scroll(scroll_handle)
-        .on_scroll_wheel(on_mermaid_zoom_scroll(markdown, source_offset, on_zoom));
+        .on_scroll(on_mermaid_zoom_scroll(markdown, source_offset, on_zoom));
     // Without this, gpui maps vertical wheel deltas onto the x axis for
     // x-only scroll containers (see `paint_scroll_listener` in gpui's div),
     // hijacking plain vertical scrolls. Restricting to the actual axis lets
@@ -1079,8 +1085,9 @@ fn render_mermaid_code_view(contents: &SharedString) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedMermaidDiagram, MermaidDiagramCache, MermaidState, ParsedMarkdownMermaidDiagram,
-        ParsedMarkdownMermaidDiagramContents, extract_mermaid_diagrams, parse_mermaid_info,
+        CachedMermaidDiagram, MermaidDiagramCache, MermaidPalette, MermaidState,
+        ParsedMarkdownMermaidDiagram, ParsedMarkdownMermaidDiagramContents,
+        extract_mermaid_diagrams, parse_mermaid_info,
     };
     use crate::{
         CodeBlockRenderer, CopyButtonVisibility, MERMAID_ZOOM_DEBOUNCE, Markdown, MarkdownElement,
@@ -1088,7 +1095,8 @@ mod tests {
     };
     use collections::HashMap;
     use gpui::{
-        Context, Entity, IntoElement, Render, RenderImage, TestAppContext, Window, point, size,
+        Bounds, Context, Entity, IntoElement, Render, RenderImage, TestAppContext, Window, canvas,
+        point, size,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1115,10 +1123,11 @@ mod tests {
     fn draw_markdown_element(
         markdown: Entity<Markdown>,
         cx: &mut gpui::VisualTestContext,
-    ) -> crate::RenderedText {
+    ) -> (crate::RenderedText, Option<Bounds<Pixels>>) {
         struct CaptureRenderedText {
             markdown: Entity<Markdown>,
             rendered_text: Rc<RefCell<Option<crate::RenderedText>>>,
+            autoscroll: Rc<RefCell<Option<Bounds<Pixels>>>>,
         }
 
         impl Render for CaptureRenderedText {
@@ -1133,23 +1142,38 @@ mod tests {
                         let rendered_text = self.rendered_text.clone();
                         move |text| *rendered_text.borrow_mut() = Some(text)
                     });
-                div().child(element)
+                let autoscroll = self.autoscroll.clone();
+                div().relative().child(element).child(
+                    canvas(
+                        move |_, window, _| *autoscroll.borrow_mut() = window.take_autoscroll(),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
             }
         }
 
         let rendered_text = Rc::new(RefCell::new(None));
+        let autoscroll = Rc::new(RefCell::new(None));
         cx.draw(Default::default(), size(px(600.0), px(600.0)), {
             let rendered_text = rendered_text.clone();
+            let autoscroll = autoscroll.clone();
             |_window, cx| {
                 cx.new(|_| CaptureRenderedText {
                     markdown,
                     rendered_text,
+                    autoscroll,
                 })
                 .into_any_element()
             }
         });
         let rendered_text = rendered_text.borrow_mut().take();
-        rendered_text.expect("markdown element should have been laid out")
+        let autoscroll = autoscroll.borrow_mut().take();
+        (
+            rendered_text.expect("markdown element should have been laid out"),
+            autoscroll,
+        )
     }
 
     fn render_markdown_with_options(
@@ -1172,7 +1196,7 @@ mod tests {
             Markdown::new_with_options(markdown.to_string().into(), None, None, options, cx)
         });
         cx.run_until_parked();
-        draw_markdown_element(markdown, cx)
+        draw_markdown_element(markdown, cx).0
     }
 
     fn mock_render_image(cx: &mut TestAppContext) -> Arc<RenderImage> {
@@ -1931,7 +1955,7 @@ mod tests {
             markdown.mermaid_state.order = vec![contents];
         });
 
-        let rendered_text = draw_markdown_element(markdown.clone(), cx);
+        let (rendered_text, _) = draw_markdown_element(markdown.clone(), cx);
 
         let mermaid_diagram = markdown.update(cx, |markdown, _| {
             markdown
@@ -1952,5 +1976,115 @@ mod tests {
                 .position_for_source_index(mermaid_diagram.content_range.end.saturating_sub(1))
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn test_search_autoscroll_waits_for_mermaid_render(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let cx = cx.add_empty_window();
+        let source = "héllo\n\n```mermaid\nflowchart TD\nA --> B\n```\n\nneedle";
+        let source_index = source.find("needle").expect("search target should exist");
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                SharedString::from(source),
+                None,
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    defer_parsing: true,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        let pending = Arc::new(CachedMermaidDiagram::new_for_test(None, None, None));
+        markdown.update(cx, |markdown, cx| {
+            markdown
+                .mermaid_state
+                .cache
+                .insert(mermaid_contents("flowchart TD\nA --> B"), pending.clone());
+            markdown.request_autoscroll_to_source_index(source_index, cx);
+        });
+
+        assert_eq!(draw_markdown_element(markdown.clone(), cx).1, None);
+        cx.run_until_parked();
+        let (rendered_text, autoscroll) = draw_markdown_element(markdown.clone(), cx);
+        assert_eq!(autoscroll, None);
+        let target = rendered_text
+            .lines
+            .iter()
+            .find(|line| line.layout.text() == "needle")
+            .expect("search target should be rendered");
+        assert!(target.layout.bounds().bottom() < px(600.0));
+        markdown.read_with(cx, |markdown, _| {
+            assert!(!markdown.is_parsing());
+            assert!(markdown.has_pending_render());
+            assert_eq!(markdown.autoscroll_request, Some(source_index));
+        });
+
+        let render_image = cx.update(|_, cx| {
+            cx.svg_renderer()
+                .render_single_frame(
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="1200"></svg>"#,
+                    1.0,
+                )
+                .expect("test diagram should rasterize")
+        });
+        assert!(pending.render_image.set(Ok(render_image)).is_ok());
+        markdown.update(cx, |_, cx| cx.notify());
+        let (rendered_text, autoscroll) = draw_markdown_element(markdown.clone(), cx);
+        let target = rendered_text
+            .lines
+            .iter()
+            .find(|line| line.layout.text() == "needle")
+            .expect("search target should be rendered")
+            .layout
+            .bounds();
+        assert!(target.top() >= px(1200.0));
+        let autoscroll = autoscroll.expect("completed diagram should release search autoscroll");
+        assert!(autoscroll.top() <= target.top());
+        assert!(autoscroll.bottom() >= target.bottom());
+        markdown.read_with(cx, |markdown, _| {
+            assert!(!markdown.has_pending_render());
+            assert_eq!(markdown.autoscroll_request, None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_has_pending_render_until_diagram_completes(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| Markdown::new(SharedString::default(), None, None, cx));
+
+        for (source, succeeds) in [("flowchart TD\n  A --> B", true), ("not a diagram", false)] {
+            let contents = mermaid_contents(source);
+            markdown.update(cx, |markdown, cx| {
+                let cached = CachedMermaidDiagram::new(
+                    contents.clone(),
+                    1.0,
+                    None,
+                    &MermaidPalette::EditorTheme,
+                    cx,
+                );
+                markdown
+                    .mermaid_state
+                    .cache
+                    .insert(contents.clone(), Arc::new(cached));
+                assert!(!markdown.is_parsing());
+                assert!(markdown.has_pending_render());
+            });
+            cx.run_until_parked();
+            markdown.read_with(cx, |markdown, _| {
+                assert!(!markdown.has_pending_render());
+                assert_eq!(
+                    markdown
+                        .mermaid_state
+                        .cache
+                        .get(&contents)
+                        .and_then(|cached| cached.render_image.get())
+                        .map(|result| result.is_ok()),
+                    Some(succeeds)
+                );
+            });
+        }
     }
 }

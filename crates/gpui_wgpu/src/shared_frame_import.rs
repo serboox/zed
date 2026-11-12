@@ -73,6 +73,8 @@ pub fn import_shared_frame(device: &wgpu::Device, frame: &SharedFrame) -> Option
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
+            wgpu::TextureUses::UNINITIALIZED,
+            true,
         )
     };
     Some(texture)

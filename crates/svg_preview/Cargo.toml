@@ -10,12 +10,14 @@ workspace = true
 
 [lib]
 path = "src/svg_preview.rs"
+doctest = false
 
 [dependencies]
 multi_buffer.workspace = true
 file_icons.workspace = true
 gpui.workspace = true
 language.workspace = true
+project.workspace = true
 theme.workspace = true
 ui.workspace = true
 util.workspace = true

@@ -25,7 +25,7 @@ pub fn by_suffix() -> HashMap<String, String> {
             .matcher
             .path_suffixes
             .iter()
-            .cloned()
+            .map(ToString::to_string)
         {
             // First claim wins, and the languages come back in a stable order,
             // so which one that is does not change between runs.
@@ -181,7 +181,12 @@ pub fn readable() -> (Vec<Readable>, Vec<String>) {
                 name,
                 grammar: grammar.clone(),
                 outline,
-                suffixes: config.matcher.path_suffixes.clone(),
+                suffixes: config
+                    .matcher
+                    .path_suffixes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 first_line: config.matcher.first_line_pattern.clone(),
             }),
             Err(trouble) => refused.push(format!("{name}: {trouble}")),

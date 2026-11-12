@@ -1,6 +1,6 @@
 use crate::store::{CliQueryOutput, DatabaseStore};
 use agent::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v2::schema as acp;
 use db_client::DatabaseDriver;
 use gpui::{App, SharedString, Task};
 use schemars::JsonSchema;

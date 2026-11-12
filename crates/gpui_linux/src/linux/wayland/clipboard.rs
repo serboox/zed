@@ -12,7 +12,7 @@ use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
-    GNOME_COPIED_FILES_MIME_TYPE, WaylandClientStatePtr, clipboard_item_from_paths, external_paths,
+    GNOME_COPIED_FILES_MIME_TYPE, clipboard_item_from_paths, external_paths,
     parse_gnome_copied_files, parse_uri_list,
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
     serialize_gnome_copied_files, serialize_uri_list,
@@ -29,7 +29,7 @@ pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8
 
 pub(crate) struct Clipboard {
     connection: Connection,
-    loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
+    loop_handle: LoopHandle<'static, ()>,
     self_mime: String,
 
     // Internal clipboard
@@ -161,10 +161,7 @@ impl<T: ReceiveData> DataOffer<T> {
 }
 
 impl Clipboard {
-    pub fn new(
-        connection: Connection,
-        loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
-    ) -> Self {
+    pub fn new(connection: Connection, loop_handle: LoopHandle<'static, ()>) -> Self {
         Self {
             connection,
             loop_handle,

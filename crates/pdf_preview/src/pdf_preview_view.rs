@@ -2753,7 +2753,7 @@ impl Render for PdfView {
 
         let viewport = self.viewport.clone();
         let last_page = self.pages.len().saturating_sub(1);
-        let mut keys = gpui::KeyContext::new_with_defaults();
+        let mut keys = gpui::KeyContext::new_with_defaults(cx.platform_info().os);
         keys.add("PdfView");
         if self.presenting {
             // A slideshow is driven by plain keys -- space, the arrows, b and w --
@@ -2923,7 +2923,7 @@ impl Render for PdfView {
                                     // scrolls, as it does in every other reader.
                                     .on_scroll_wheel(cx.listener(
                                         |view, event: &gpui::ScrollWheelEvent, window, cx| {
-                                            if !event.modifiers.secondary() {
+                                            if !event.modifiers.secondary(cx) {
                                                 return;
                                             }
                                             let by =

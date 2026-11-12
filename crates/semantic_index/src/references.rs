@@ -455,7 +455,7 @@ fn defined_symbols_in(
         // declined nearly every symbol it was offered.
         let item = item_index.and_then(|item| {
             matched
-                .captures
+                .captures()
                 .iter()
                 .find(|capture| capture.index == item)
                 .map(|capture| capture.node)
@@ -466,7 +466,7 @@ fn defined_symbols_in(
         if !declared {
             continue;
         }
-        for capture in matched.captures {
+        for capture in matched.captures() {
             if capture.index != name_index {
                 continue;
             }
@@ -1128,7 +1128,7 @@ fn declarations_by_node(
     let mut matches = cursor.matches(outline, tree.root_node(), contents);
     while let Some(matched) = matches.next() {
         let Some(item) = matched
-            .captures
+            .captures()
             .iter()
             .find(|capture| capture.index == item_index)
             .map(|capture| capture.node)
@@ -1143,13 +1143,13 @@ fn declarations_by_node(
             continue;
         }
         let names: Vec<&str> = matched
-            .captures
+            .captures()
             .iter()
             .filter(|capture| capture.index == name_index)
             .filter_map(|capture| capture.node.utf8_text(contents).ok())
             .collect();
         let Some(first) = matched
-            .captures
+            .captures()
             .iter()
             .find(|capture| capture.index == name_index)
         else {
@@ -1253,7 +1253,7 @@ fn occurrences_in(
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), contents);
     while let Some(matched) = matches.next() {
-        for capture in matched.captures {
+        for capture in matched.captures() {
             let Some(name) = capture_names.get(capture.index as usize) else {
                 continue;
             };

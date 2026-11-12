@@ -2048,6 +2048,7 @@ mod tests {
             delta: gpui::ScrollDelta::Pixels(point(-max_offset_initial.x / 2.0, px(0.))),
             modifiers: Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         draw_erd_frame(&mut cx);
 

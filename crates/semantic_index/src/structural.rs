@@ -342,7 +342,7 @@ fn search_one_file(
     let mut candidates: Vec<((usize, usize), StructuralMatch)> = Vec::new();
     while let Some(matched) = matches.next() {
         let region_nodes: Vec<(usize, usize)> = matched
-            .captures
+            .captures()
             .iter()
             .filter(|capture| capture.index == within_index)
             .map(|capture| (capture.node.start_byte(), capture.node.end_byte()))
@@ -383,7 +383,7 @@ fn structural_match(
     matched: &tree_sitter::QueryMatch,
 ) -> Option<(StructuralMatch, (usize, usize))> {
     let capture_names = query.capture_names();
-    let primary = primary_node(capture_names, matched.captures)?;
+    let primary = primary_node(capture_names, matched.captures())?;
     let byte_range = (primary.start_byte(), primary.end_byte());
     let line = primary.start_position().row as u32 + 1;
     let excerpt = lines
@@ -391,7 +391,7 @@ fn structural_match(
         .map(|text| text.trim().to_string())
         .unwrap_or_default();
 
-    let mut raw_captures: Vec<&tree_sitter::QueryCapture> = matched.captures.iter().collect();
+    let mut raw_captures: Vec<&tree_sitter::QueryCapture> = matched.captures().iter().collect();
     raw_captures.sort_by_key(|capture| capture.node.start_byte());
     let captures: Vec<Capture> = raw_captures
         .into_iter()

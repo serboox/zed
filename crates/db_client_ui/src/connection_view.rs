@@ -2741,6 +2741,7 @@ mod tests {
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-240.))),
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         window_cx.run_until_parked();
         window_cx.update(|window, cx| {
