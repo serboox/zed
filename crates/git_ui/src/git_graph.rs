@@ -70,6 +70,11 @@ const LANE_WIDTH: Pixels = px(16.0);
 const LEFT_PADDING: Pixels = px(12.0);
 const LINE_WIDTH: Pixels = px(1.5);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
+/// The line between the history and the card. The history's width is worked
+/// out from it before layout, so the line is drawn from this and nothing else.
+const SPLIT_DIVIDER_WIDTH: Pixels = px(1.);
+/// The narrowest the card gets beside the history; read before layout too.
+const CARD_MIN_WIDTH: Pixels = px(300.);
 const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const TREE_INDENT: f32 = 20.0;
@@ -576,6 +581,42 @@ impl DetailsAt {
             DetailsAt::Left => IconName::ThreadsSidebarLeftOpen,
         }
     }
+}
+
+/// What stands beside the history and takes some of its width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CardArrangement {
+    /// Nothing, or the card along the bottom, which takes height and no width.
+    Alone,
+    /// The divider, and the card at `share` of the room unless it was left out.
+    Beside { card: bool, share: f32 },
+}
+
+impl CardArrangement {
+    /// The width the history is laid out at in `room`, worked out the way the
+    /// flex layout shares it out: the card takes its share but never less than
+    /// its minimum, the divider takes its line, and the history the rest.
+    fn history_width(self, room: Pixels) -> Pixels {
+        match self {
+            CardArrangement::Alone => room,
+            CardArrangement::Beside { card, share } => {
+                let card = match card {
+                    true => (room * share).max(CARD_MIN_WIDTH),
+                    false => px(0.),
+                };
+                (room - SPLIT_DIVIDER_WIDTH - card).max(px(0.))
+            }
+        }
+    }
+}
+
+/// The history's width as it was actually laid out, with what it was laid
+/// out beside and in how much room.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HistoryReading {
+    arrangement: CardArrangement,
+    room: Option<Pixels>,
+    width: Pixels,
 }
 
 struct SplitState {
@@ -2892,10 +2933,18 @@ pub struct GitGraph {
     /// The columns the reader hid from the menu of columns.
     hidden_columns: HiddenColumns,
     /// Where the history was last laid out. An element cannot know its own
-    /// size until it has been laid out, so this is read a frame late; a change
-    /// asks for one more frame, and the layout settles on the frame after the
-    /// one that measured it rather than on the reader's next mouse move.
+    /// size until it has been laid out, so this is read a frame late; a width
+    /// the frame did not expect asks for one more frame, and the layout settles
+    /// on the frame after the one that measured it rather than on the reader's
+    /// next mouse move.
     measured: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// How wide the history and the card are together, read a frame late like
+    /// `measured`. It does not change when the card opens, closes, is dragged
+    /// or moves, so the history's share of it is known in the very frame that
+    /// does it.
+    room: Rc<Cell<Option<Pixels>>>,
+    /// The last width the history was actually given, and what with.
+    reading: Rc<Cell<Option<HistoryReading>>>,
     /// The repository's remote names, read once. Empty until they arrive, which
     /// only means a remote-tracking ref is drawn as a plain branch until then.
     remote_names: Vec<SharedString>,
@@ -4412,7 +4461,23 @@ impl GitGraph {
     }
 
     /// How wide the history is, for deciding what fits in it.
-    fn history_width(&self, window: &Window, _cx: &App) -> Pixels {
+    fn history_width(&self, window: &Window, cx: &App) -> Pixels {
+        let arrangement = self.card_arrangement(cx);
+        let room = self.room.get();
+        // What was actually laid out wins while nothing it depends on has
+        // changed: the arithmetic below is only a model of the flex layout.
+        if let Some(reading) = self.reading.get()
+            && reading.arrangement == arrangement
+            && reading.room == room
+            && reading.width > px(0.)
+        {
+            return reading.width;
+        }
+        if let Some(room) = room
+            && room > px(0.)
+        {
+            return arrangement.history_width(room);
+        }
         // Nothing until the history has been laid out once. Guessing narrow
         // there would show the narrow layout for a frame and then swap it,
         // which reads as a flicker.
@@ -4422,17 +4487,63 @@ impl GitGraph {
         }
     }
 
+    /// What takes width from the history in this frame. Mirrors the branches
+    /// of `render` and `render_commit_detail_panel`, which leave the card out
+    /// when there is no commit or repository to show.
+    fn card_arrangement(&self, cx: &App) -> CardArrangement {
+        let Some(selected) = self.selected_entry_idx else {
+            return CardArrangement::Alone;
+        };
+        if self.details_at.axis() == Axis::Vertical {
+            return CardArrangement::Alone;
+        }
+        CardArrangement::Beside {
+            card: self.graph_data.commits.get(selected).is_some()
+                && self.get_repository(cx).is_some(),
+            share: self.commit_details_split_state.read(cx).right_ratio(),
+        }
+    }
+
+    /// Records how wide the history and the card are together.
+    fn measure_room(&self) -> impl IntoElement {
+        let room = self.room.clone();
+        gpui::canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                room.set(Some(bounds.size.width));
+            },
+            |_, _: (), _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
     /// Records how wide the history was laid out, and asks for one more frame
-    /// when that changes, so the columns follow the width they were actually
-    /// given rather than the width of the frame before. Without it a window
-    /// dragged to a new size and then left alone keeps the old set of columns
-    /// until the reader touches something.
-    fn measure_history_width(&self) -> impl IntoElement {
+    /// when that is not the width this frame was laid out for, so the columns
+    /// follow the width they were actually given. Without it a window dragged
+    /// to a new size and then left alone keeps the old set of columns until
+    /// the reader touches something. The card opening, closing, being dragged
+    /// or moved needs no such frame: `history_width` already knew.
+    fn measure_history_width(
+        &self,
+        laid_out_for: Pixels,
+        arrangement: CardArrangement,
+    ) -> impl IntoElement {
+        /// Less than this is the layout rounding, not a different width.
+        const TOLERANCE: Pixels = px(0.5);
+
         let measured = self.measured.clone();
+        let reading = self.reading.clone();
+        let room = self.room.clone();
         gpui::canvas(
             move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
-                if measured.get().map(|was| was.size.width) != Some(bounds.size.width) {
-                    measured.set(Some(bounds));
+                let width = bounds.size.width;
+                measured.set(Some(bounds));
+                reading.set(Some(HistoryReading {
+                    arrangement,
+                    room: room.get(),
+                    width,
+                }));
+                if (width - laid_out_for).abs() > TOLERANCE {
                     window.request_animation_frame();
                 }
             },
@@ -4596,6 +4707,8 @@ impl GitGraph {
             column_override: Rc::new(Cell::new(None)),
             hidden_columns: HiddenColumns::default(),
             measured: Rc::new(Cell::new(None)),
+            room: Rc::new(Cell::new(None)),
+            reading: Rc::new(Cell::new(None)),
             remote_names: Vec::new(),
             _remote_names_task: None,
             selected_entry_idx: None,
@@ -6601,7 +6714,7 @@ impl GitGraph {
             .min_h_0()
             .bg(cx.theme().colors().editor_background)
             .map(|this| match across {
-                false => this.min_w(px(300.)).h_full(),
+                false => this.min_w(CARD_MIN_WIDTH).h_full(),
                 // Enough for the identity beside the subject and the first of
                 // the files, which is what the card is for. Stretched, not
                 // centred: a column taller than the strip would otherwise hang
@@ -7200,8 +7313,8 @@ impl GitGraph {
             .flex_shrink_0()
             .bg(cx.theme().colors().border_variant)
             .map(|this| match along {
-                Axis::Horizontal => this.h_full().w(px(1.)),
-                Axis::Vertical => this.w_full().h(px(1.)),
+                Axis::Horizontal => this.h_full().w(SPLIT_DIVIDER_WIDTH),
+                Axis::Vertical => this.w_full().h(SPLIT_DIVIDER_WIDTH),
             })
             .child(
                 div()
@@ -7535,7 +7648,10 @@ impl Render for GitGraph {
                         .w_full()
                         .overflow_hidden()
                         .on_scroll(cx.listener(Self::handle_lane_scroll))
-                        .child(self.measure_history_width())
+                        .child(self.measure_history_width(
+                            self.history_width(window, cx),
+                            self.card_arrangement(cx),
+                        ))
                         .child(
                             div()
                                 .tab_index(2)
@@ -7555,7 +7671,10 @@ impl Render for GitGraph {
                 DetailsAt::Right | DetailsAt::Left => h_flex(),
             };
             laid_out
+                .relative()
                 .size_full()
+                // First, so the room is read before the history in prepaint.
+                .child(self.measure_room())
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
                     let along = this.details_at.axis();
                     this.commit_details_split_state.update(cx, |state, cx| {
@@ -13110,8 +13229,83 @@ mod tests {
         assert!(cx.debug_bounds(selector("GRAPH_AGE", 0)).is_some());
     }
 
+    /// What one drawn frame painted, read before anything can draw over it.
+    struct DrawnFrame {
+        graph_cell: Option<Bounds<Pixels>>,
+        last_column: Option<Bounds<Pixels>>,
+        history: Option<Bounds<Pixels>>,
+        redraws: usize,
+    }
+
+    /// Lets pending work finish, draws once at `size`, reads what that frame
+    /// painted, then lets the frame it asked for run and counts how many times
+    /// the history marked itself for drawing again.
+    fn draw_once(
+        git_graph: &Entity<GitGraph>,
+        size: gpui::Size<Pixels>,
+        cx: &mut VisualTestContext,
+    ) -> DrawnFrame {
+        cx.run_until_parked();
+        let redraws = Rc::new(Cell::new(0usize));
+        let _subscription = cx.update(|_, cx| {
+            let redraws = redraws.clone();
+            cx.observe(git_graph, move |_, _| redraws.set(redraws.get() + 1))
+        });
+        cx.draw(point(px(0.), px(0.)), size, |_, _| {
+            git_graph.clone().into_any_element()
+        });
+        let graph_cell = cx.debug_bounds(selector("GRAPH_CELL", 0));
+        let last_column = cx
+            .debug_bounds(selector("GRAPH_AGE", 0))
+            .or_else(|| cx.debug_bounds(selector("GRAPH_SUBJECT", 0)));
+        let history = git_graph.read_with(&*cx, |graph, _| graph.measured.get());
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        DrawnFrame {
+            graph_cell,
+            last_column,
+            history,
+            redraws: redraws.get(),
+        }
+    }
+
+    /// The columns of the frame were shared out of the width the history was
+    /// actually given: the graph is exactly as wide as its lanes need, and the
+    /// last column ends where the history ends. Shares of a width from the
+    /// frame before scale the graph and nothing else notices.
+    fn assert_the_columns_fit_the_history(
+        git_graph: &Entity<GitGraph>,
+        cx: &mut VisualTestContext,
+        frame: &DrawnFrame,
+        when: &str,
+    ) -> Bounds<Pixels> {
+        let (metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
+            (graph.row_metrics(window, cx), graph.graph_data.max_lanes)
+        });
+        let history = frame
+            .history
+            .expect("the history should have been laid out");
+        let wanted = metrics.width_for(lanes.max(1));
+        let cell = frame
+            .graph_cell
+            .expect("the first row should have been painted");
+        assert!(
+            (cell.size.width - wanted).abs() < px(1.),
+            "{when}: in the same frame the graph is {:?} wide where its lanes need {wanted:?}, \
+             so its share was taken of a width the history no longer has",
+            cell.size.width
+        );
+        let last = frame.last_column.expect("the subject is never hidden");
+        assert!(
+            (last.right() - history.right()).abs() < px(1.),
+            "{when}: the last column ends at {:?}, the history at {:?}",
+            last.right(),
+            history.right()
+        );
+        history
+    }
+
     #[gpui::test]
-    async fn test_closing_the_card_beside_the_history_settles_in_one_frame(
+    async fn test_closing_the_card_beside_the_history_lays_it_out_in_the_same_frame(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -13121,60 +13315,114 @@ mod tests {
             graph.details_at = DetailsAt::Right;
             graph.select_entry(0, ScrollStrategy::Nearest, cx);
         });
-        for _ in 0..2 {
-            cx.draw(point(px(0.), px(0.)), size, |_, _| {
-                git_graph.clone().into_any_element()
-            });
-            cx.run_until_parked();
-        }
+        draw_once(&git_graph, size, cx);
+        let frame = draw_once(&git_graph, size, cx);
         let beside_the_card =
-            git_graph.update_in(cx, |graph, window, cx| graph.history_width(window, cx));
+            assert_the_columns_fit_the_history(&git_graph, cx, &frame, "beside the card");
         assert!(
-            beside_the_card < size.width - px(100.),
-            "the card was meant to take some of the width, the history has {beside_the_card:?}"
+            beside_the_card.size.width < size.width - px(100.),
+            "the card was meant to take some of the width, the history has {:?}",
+            beside_the_card.size.width
         );
 
-        let redraws = Rc::new(Cell::new(0usize));
-        let _subscription = cx.update(|_, cx| {
-            let redraws = redraws.clone();
-            cx.observe(&git_graph, move |_, _| redraws.set(redraws.get() + 1))
-        });
         git_graph.update_in(cx, |graph, window, cx| graph.cancel(&Cancel, window, cx));
-        let before = redraws.get();
-        cx.draw(point(px(0.), px(0.)), size, |_, _| {
-            git_graph.clone().into_any_element()
-        });
-        cx.update(|window, cx| window.simulate_next_frame(cx));
+        let frame = draw_once(&git_graph, size, cx);
+        let alone = assert_the_columns_fit_the_history(&git_graph, cx, &frame, "the card closed");
+        assert!(
+            (alone.size.width - size.width).abs() < px(12.),
+            "the card closed and the history is {:?} wide",
+            alone.size.width
+        );
+        assert_eq!(
+            frame.redraws, 0,
+            "the history already had its new width and still asked for another frame"
+        );
+    }
 
-        let alone = git_graph.update_in(cx, |graph, window, cx| graph.history_width(window, cx));
+    #[gpui::test]
+    async fn test_opening_the_card_beside_the_history_lays_it_out_in_the_same_frame(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let size = gpui::size(px(1240.), px(700.));
+        let (git_graph, cx) = drawn_history(cx, unlabelled_commits(20), size).await;
+        draw_once(&git_graph, size, cx);
+        let frame = draw_once(&git_graph, size, cx);
+        let alone = assert_the_columns_fit_the_history(&git_graph, cx, &frame, "alone");
+
+        git_graph.update(cx, |graph, cx| {
+            graph.details_at = DetailsAt::Right;
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        // The card may ask for frames of its own while its commit loads, so
+        // they are not counted; the widths drawn in this one frame are what
+        // must be right.
+        let frame = draw_once(&git_graph, size, cx);
+        let beside_the_card =
+            assert_the_columns_fit_the_history(&git_graph, cx, &frame, "the card opened");
         assert!(
-            (alone - size.width).abs() < px(12.),
-            "one frame after the card closed the history still thinks it is {alone:?} wide"
-        );
-        assert!(
-            redraws.get() > before,
-            "the width changed and the history did not ask to be drawn again, \
-             so the columns stay sized for the card until something else redraws"
+            beside_the_card.size.width < alone.size.width - px(100.),
+            "the card was meant to take some of the width, the history has {:?} of {:?}",
+            beside_the_card.size.width,
+            alone.size.width
         );
 
-        // The frame it asked for lays the graph out at the room its lanes need,
-        // not at the share of the row it had beside the card.
-        cx.draw(point(px(0.), px(0.)), size, |_, _| {
-            git_graph.clone().into_any_element()
+        // Dragging the divider changes the card's share, and the history follows
+        // in the frame that draws the drag.
+        git_graph.update(cx, |graph, cx| {
+            graph.commit_details_split_state.update(cx, |state, _| {
+                state.visible_left_ratio = 0.5;
+            });
+            cx.notify();
         });
-        cx.run_until_parked();
-        let (metrics, lanes) = git_graph.update_in(cx, |graph, window, cx| {
-            (graph.row_metrics(window, cx), graph.graph_data.max_lanes)
-        });
-        let cell = cx
-            .debug_bounds(selector("GRAPH_CELL", 0))
-            .expect("the first row should have been painted");
+        let frame = draw_once(&git_graph, size, cx);
+        let at_half =
+            assert_the_columns_fit_the_history(&git_graph, cx, &frame, "the divider dragged");
         assert!(
-            (cell.size.width - metrics.width_for(lanes.max(1))).abs() < px(1.),
-            "the graph is {} wide where its lanes need {}",
-            cell.size.width,
-            metrics.width_for(lanes.max(1))
+            (at_half.size.width - beside_the_card.size.width).abs() > px(100.),
+            "the divider was dragged to the middle and the history stayed {:?} wide",
+            at_half.size.width
         );
+    }
+
+    #[gpui::test]
+    async fn test_moving_the_card_lays_the_history_out_in_the_same_frame(cx: &mut TestAppContext) {
+        init_test(cx);
+        let size = gpui::size(px(1240.), px(700.));
+        let (git_graph, cx) = drawn_history(cx, unlabelled_commits(20), size).await;
+        git_graph.update(cx, |graph, cx| {
+            graph.details_at = DetailsAt::Bottom;
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        draw_once(&git_graph, size, cx);
+        let frame = draw_once(&git_graph, size, cx);
+        let above_the_card =
+            assert_the_columns_fit_the_history(&git_graph, cx, &frame, "above the card");
+
+        for (details_at, beside) in [
+            (DetailsAt::Right, true),
+            (DetailsAt::Left, true),
+            (DetailsAt::Bottom, false),
+        ] {
+            git_graph.update(cx, |graph, cx| {
+                graph.details_at = details_at;
+                cx.notify();
+            });
+            let frame = draw_once(&git_graph, size, cx);
+            let history = assert_the_columns_fit_the_history(
+                &git_graph,
+                cx,
+                &frame,
+                &format!("the card moved to the {}", details_at.name()),
+            );
+            assert_eq!(
+                history.size.width < above_the_card.size.width - px(100.),
+                beside,
+                "with the card at the {} the history is {:?} wide",
+                details_at.name(),
+                history.size.width
+            );
+        }
     }
 
     #[gpui::test]

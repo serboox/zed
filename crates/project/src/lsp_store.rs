@@ -462,15 +462,14 @@ impl LocalLspStore {
         language_name: &LanguageName,
         cx: &App,
     ) -> bool {
-        let starts_on_its_own = self.auto_start_language_servers
-            && ProjectSettings::get_global(cx).global_lsp_settings.start
-                == LanguageServerStart::Automatically;
+        let starts_automatically = ProjectSettings::get_global(cx).global_lsp_settings.start
+            == LanguageServerStart::Automatically;
         match self.language_server_start_overrides.get(name) {
             Some(LanguageServerStartOverride::Stopped) => false,
             Some(LanguageServerStartOverride::StartedFor(languages)) => {
-                starts_on_its_own || languages.contains(language_name)
+                starts_automatically || languages.contains(language_name)
             }
-            None => starts_on_its_own,
+            None => self.auto_start_language_servers && starts_automatically,
         }
     }
 

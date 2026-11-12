@@ -547,6 +547,85 @@ async fn a_server_stopped_by_hand_does_not_come_back_on_its_own(cx: &mut TestApp
     assert_eq!(running_server_count(&project, cx), 1);
 }
 
+// Under the automatic setting nothing limits a server to the languages it was
+// asked for: after everything was stopped, asking for it for one language lets
+// it serve every language it serves, as upstream defines the restart.
+#[gpui::test]
+async fn in_automatic_mode_a_server_asked_for_again_serves_every_language(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/rust-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    fs.insert_tree(path!("/json-root"), json!({ "data.json": "{}" }))
+        .await;
+
+    let project = Project::test(
+        fs,
+        [path!("/rust-root").as_ref(), path!("/json-root").as_ref()],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    language_registry.add(json_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "shared-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    language_registry.register_fake_lsp_adapter(
+        "JSON",
+        FakeLspAdapter {
+            name: "shared-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    let (rust_buffer, _rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/rust-root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 1);
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    lsp_store.update(cx, |lsp_store, cx| lsp_store.stop_all_language_servers(cx));
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 0);
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(running_server_count(&project, cx), 1);
+
+    let (_json_buffer, _json_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/json-root/data.json"), cx)
+        })
+        .await
+        .unwrap();
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        running_server_count(&project, cx),
+        2,
+        "under the automatic setting the server asked for is allowed for the other language too"
+    );
+}
+
 #[gpui::test]
 async fn test_open_buffer_via_lsp_case_variant_no_duplicate(cx: &mut TestAppContext) {
     init_test(cx);
