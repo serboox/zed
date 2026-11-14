@@ -244,6 +244,8 @@ pub struct HtmlPreviewView {
     /// is only the one that was held.
     #[cfg(feature = "servo")]
     page_pressed: std::rc::Rc<std::cell::Cell<Option<gpui::MouseButton>>>,
+    /// The pointer the page asks for, read where the page is painted.
+    page_cursor: std::rc::Rc<std::cell::Cell<gpui::CursorStyle>>,
     /// Whether this preview is the one its pane is showing. A page nobody is
     /// looking at is held back, and this is the pane saying so -- silence from
     /// the renderer would not do, because a page that has settled stops being
@@ -595,6 +597,7 @@ impl HtmlPreviewView {
                 pump: None,
                 #[cfg(feature = "servo")]
                 page_pressed: std::rc::Rc::new(std::cell::Cell::new(None)),
+                page_cursor: std::rc::Rc::new(std::cell::Cell::new(gpui::CursorStyle::Arrow)),
                 #[cfg(feature = "servo")]
                 on_screen: true,
                 #[cfg(feature = "servo")]
@@ -960,6 +963,10 @@ impl HtmlPreviewView {
                         page.resize(bounds.size, scale);
                     }
                     let painted = page.pump();
+                    let asked_for = page.cursor();
+                    if view.page_cursor.replace(asked_for) != asked_for {
+                        cx.notify();
+                    }
                     held_pointer = page.pointer_due_in();
                     let drew = painted.then_some((bounds.size, scale));
                     let for_the_card = page.waiting_for_the_card();
@@ -1341,6 +1348,7 @@ impl HtmlPreviewView {
         let frame = self.frame.clone();
         let bounds_cell = self.page_bounds.clone();
         let holding = self.page_pressed.clone();
+        let cursor = self.page_cursor.clone();
         let view = cx.entity().downgrade();
         let scroll = self.page_scroll.clone();
         let focus = self.focus_handle.clone();
@@ -1356,6 +1364,7 @@ impl HtmlPreviewView {
                 // the page rather than on something above it.
                 |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
                 move |painted_bounds, page: gpui::Hitbox, window, _| {
+                    window.set_cursor_style(cursor.get(), &page);
                     // The page's own buffer, drawn where the graphics card
                     // already holds it.
                     #[cfg(any(target_os = "linux", target_os = "windows"))]

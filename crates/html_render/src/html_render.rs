@@ -39,9 +39,10 @@ mod engine {
     use dpi::PhysicalSize;
     use gpui::{App, Global, Pixels, Point, RenderImage, SharedString, Size};
     use servo::{
-        DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton, MouseButtonAction,
-        MouseButtonEvent, MouseMoveEvent, RenderingContext, RgbaImage, Servo, ServoBuilder,
-        WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+        Cursor, DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton,
+        MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, RgbaImage, Servo,
+        ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+        WheelEvent, WheelMode,
     };
     use smallvec::SmallVec;
 
@@ -481,6 +482,11 @@ mod engine {
                 let ours = std::rc::Rc::new(servo::UserContentManager::new(servo));
                 ours.add_script(std::rc::Rc::new(servo::UserScript::from(TOOLS_SHIM)));
                 ours.add_script(std::rc::Rc::new(servo::UserScript::from(SELECTION_SHIM)));
+                if let Ok(url) = url::Url::parse("zed://html-render/controls.css") {
+                    ours.add_stylesheet(std::rc::Rc::new(
+                        servo::user_contents::UserStyleSheet::new(CONTROLS_STYLE.to_owned(), url),
+                    ));
+                }
                 WebViewBuilder::new(servo, rendering_context.clone())
                     .url(first_url)
                     .hidpi_scale_factor(euclid::Scale::new(scale))
@@ -859,6 +865,11 @@ mod engine {
                     self.evaluate(SELECTION_SHIM, |_| {});
                 }
             }
+        }
+
+        /// The pointer the page asks for where the reader's pointer is.
+        pub fn cursor(&self) -> gpui::CursorStyle {
+            cursor_style(self.delegate.cursor.get())
         }
 
         /// A link the page asked to open elsewhere -- a target of `_blank`, or a
@@ -1281,6 +1292,68 @@ mod engine {
     /// has to be in place before the page's own scripts run.
     const TOOLS_SHIM: &str = include_str!("devtools.js");
 
+    /// What the reader can press shows a hand, as in the editor's own controls.
+    /// A browser leaves buttons with an arrow; here they all answer the pointer
+    /// the same way. Handed over as the reader's own style sheet, so a page that
+    /// states its own `cursor` for a control still has the last word.
+    const CONTROLS_STYLE: &str = r#"
+        :is(
+            button,
+            summary,
+            select,
+            label[for],
+            [role="button"], [role="tab"], [role="menuitem"], [role="checkbox"],
+            [role="radio"], [role="switch"], [role="option"], [role="link"],
+            [onclick],
+            input:is(
+                [type="button"], [type="submit"], [type="reset"], [type="image"],
+                [type="checkbox"], [type="radio"], [type="file"], [type="color"],
+                [type="range"]
+            )
+        ):not(:disabled):not([aria-disabled="true"]) {
+            cursor: pointer;
+        }
+    "#;
+
+    /// The editor's pointer for the one the page asked for. `None` asks for no
+    /// pointer at all, which the editor has no way to show, so it is the arrow.
+    pub(crate) fn cursor_style(cursor: Cursor) -> gpui::CursorStyle {
+        use gpui::CursorStyle;
+        match cursor {
+            Cursor::Pointer => CursorStyle::PointingHand,
+            Cursor::Text => CursorStyle::IBeam,
+            Cursor::VerticalText => CursorStyle::IBeamCursorForVerticalLayout,
+            Cursor::Crosshair | Cursor::Cell => CursorStyle::Crosshair,
+            Cursor::Grab => CursorStyle::OpenHand,
+            Cursor::Grabbing | Cursor::Move | Cursor::AllScroll => CursorStyle::ClosedHand,
+            Cursor::ContextMenu => CursorStyle::ContextualMenu,
+            Cursor::Alias => CursorStyle::DragLink,
+            Cursor::Copy => CursorStyle::DragCopy,
+            Cursor::NoDrop | Cursor::NotAllowed => CursorStyle::OperationNotAllowed,
+            Cursor::EResize => CursorStyle::ResizeRight,
+            Cursor::WResize => CursorStyle::ResizeLeft,
+            Cursor::NResize => CursorStyle::ResizeUp,
+            Cursor::SResize => CursorStyle::ResizeDown,
+            Cursor::EwResize => CursorStyle::ResizeLeftRight,
+            Cursor::NsResize => CursorStyle::ResizeUpDown,
+            Cursor::NeswResize | Cursor::NeResize | Cursor::SwResize => {
+                CursorStyle::ResizeUpLeftDownRight
+            }
+            Cursor::NwseResize | Cursor::NwResize | Cursor::SeResize => {
+                CursorStyle::ResizeUpRightDownLeft
+            }
+            Cursor::ColResize => CursorStyle::ResizeColumn,
+            Cursor::RowResize => CursorStyle::ResizeRow,
+            Cursor::None
+            | Cursor::Default
+            | Cursor::Help
+            | Cursor::Progress
+            | Cursor::Wait
+            | Cursor::ZoomIn
+            | Cursor::ZoomOut => CursorStyle::Arrow,
+        }
+    }
+
     impl PageFile {
         fn write(html: &str, base_directory: Option<&Path>) -> Result<Self> {
             let directory = tempfile::tempdir().context("creating a directory for the page")?;
@@ -1321,6 +1394,8 @@ mod engine {
         needs_the_tools: Cell<bool>,
         /// Whether there is anywhere behind and ahead of where the page is now.
         history: Cell<(bool, bool)>,
+        /// The pointer the page asks for under the reader's pointer.
+        cursor: Cell<Cursor>,
     }
 
     impl Default for PageDelegate {
@@ -1333,6 +1408,7 @@ mod engine {
                 needs_the_shim: Cell::new(false),
                 needs_the_tools: Cell::new(false),
                 history: Cell::new((false, false)),
+                cursor: Cell::new(Cursor::Default),
             }
         }
     }
@@ -1357,6 +1433,10 @@ mod engine {
                 self.needs_the_tools.set(true);
             }
             self.load_status.set(status);
+        }
+
+        fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+            self.cursor.set(cursor);
         }
 
         fn notify_history_changed(
