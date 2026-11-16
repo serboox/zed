@@ -56,17 +56,20 @@ const SETTLE: Duration = Duration::from_millis(900);
 /// Moves the pointer onto the middle of the row, pumps the engine for the
 /// settling time and reads the pointer the page asks for.
 fn pointer_over_row(page: &mut HtmlPage, row: usize) -> CursorStyle {
-    let at = point(
-        px(100.),
-        px(CONTROL_HEIGHT * row as f32 + CONTROL_HEIGHT / 2.),
-    );
     let until = Instant::now() + SETTLE;
+    let mut turn = 0;
     while Instant::now() < until {
-        // A pointer move is heard at a pace the page can keep, so it is said
-        // again on every turn.
+        // A pointer that has not moved says nothing new to the page, so it
+        // shifts a pixel on every turn and stays inside the row. It is said
+        // again on every turn because a move is heard at a pace the page can keep.
+        let at = point(
+            px(100. + (turn % 2) as f32),
+            px(CONTROL_HEIGHT * row as f32 + CONTROL_HEIGHT / 2.),
+        );
         page.mouse_moved(at);
         page.pump();
         std::thread::sleep(Duration::from_millis(16));
+        turn += 1;
     }
     page.cursor()
 }
@@ -77,11 +80,19 @@ fn the_controls_of_a_page_answer_with_a_hand(cx: &mut TestAppContext) {
         let Some(mut page) = open(PAGE, cx) else {
             return;
         };
-        // Wait for the first paint, so there is a layout to point at.
+        // The page answers only once it has a layout under the pointer, which a
+        // first frame does not promise. Waited for on the first control, which
+        // is also the first check that a button shows a hand.
         let deadline = Instant::now() + DEADLINE;
-        while Instant::now() < deadline && page.frame().is_none() {
-            page.pump();
-            std::thread::sleep(Duration::from_millis(16));
+        // A page that was laid out under a pointer that was already there never
+        // heard the pointer arrive, so it is taken off the control and put back.
+        loop {
+            pointer_over_row(&mut page, 4);
+            if pointer_over_row(&mut page, 0) == CursorStyle::PointingHand
+                || Instant::now() > deadline
+            {
+                break;
+            }
         }
 
         assert_eq!(
