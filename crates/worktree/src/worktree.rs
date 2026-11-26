@@ -7600,15 +7600,40 @@ pub async fn decode_file_text_to_rope(
             encoding
         }
     };
-    let mut reader = DecodingReader::new(&mut *file, encoding);
+    let mut counting_file = RawByteCounter {
+        inner: &mut *file,
+        bytes_read: 0,
+        progress,
+    };
+    let mut reader = DecodingReader::new(&mut counting_file, encoding);
     let (rope, line_ending) =
-        stream_utf8_into_rope(&mut reader, Vec::new(), false, abs_path, progress, false)
+        stream_utf8_into_rope(&mut reader, Vec::new(), false, abs_path, None, false)
             .await?
             .with_context(|| format!("decoding the file {abs_path:?}"))?;
     if let Some(progress) = progress {
         progress.mark_finished();
     }
     Ok((rope, line_ending, reader.encoding(), bom_encoding.is_some()))
+}
+
+/// Reports the bytes taken off the disk, not the bytes of the text they decode
+/// to, which differ for every encoding but UTF-8. The total it is compared with
+/// is the file's size on disk.
+struct RawByteCounter<'a> {
+    inner: &'a mut (dyn Read + Send),
+    bytes_read: u64,
+    progress: Option<&'a FileReadProgress>,
+}
+
+impl Read for RawByteCounter<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes_read += count as u64;
+        if let Some(progress) = self.progress {
+            progress.set_bytes_read(self.bytes_read);
+        }
+        Ok(count)
+    }
 }
 
 /// Runs a real file read against a progress entry the caller owns, which is the

@@ -7690,6 +7690,43 @@ async fn test_reading_a_file_publishes_how_many_bytes_are_in(cx: &mut TestAppCon
     );
 }
 
+#[gpui::test]
+async fn test_a_decoded_read_publishes_the_bytes_of_the_file_not_of_its_text(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    // UTF-16 with a byte order mark: every character is two bytes on disk and
+    // one byte as the text the editor holds, so the two counts cannot agree.
+    let text = "abcdefgh".repeat(MIN_TRACKED_READ_BYTES as usize / 8 + 1);
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    let bytes_on_disk = bytes.len() as u64;
+    assert!(bytes_on_disk > MIN_TRACKED_READ_BYTES);
+    assert_ne!(bytes_on_disk, text.len() as u64);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({})).await;
+    let abs_path = Path::new(path!("/root/wide.txt"));
+    fs.insert_file(abs_path, bytes).await;
+
+    let read =
+        track_file_read(abs_path, bytes_on_disk).expect("a file this big has to be worth tracking");
+    let (decoded, _, has_bom) =
+        worktree::decode_file_text_for_tests(fs.as_ref(), abs_path, Some(&read))
+            .await
+            .expect("the file has to decode");
+
+    assert!(has_bom);
+    assert_eq!(decoded, text);
+    assert_eq!(
+        read.bytes_read(),
+        bytes_on_disk,
+        "the count has to be the file's size on disk, which is what the total is"
+    );
+    assert!(read.is_finished());
+}
+
 /// The law this fork holds its tree to: whatever is in the directory is in the
 /// tree, with nothing left out for being hidden, ignored, generated or big.
 ///
